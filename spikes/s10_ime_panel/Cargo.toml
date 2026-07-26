@@ -1,0 +1,30 @@
+# S10 - IME *into* aibo's panel (§20). CRITICAL PATH.
+#
+# > If a Japanese user cannot type Japanese into the panel, the Japanese market
+# > is closed. Spike S10, and it is on the critical path, not a nicety. — §9
+#
+# Its own workspace root: a spike must never end up linked into the product build.
+[package]
+name = "s10_ime_panel"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "LicenseRef-Proprietary"
+
+[workspace]
+
+[dependencies]
+# The exact feature set §6/§8 pin for the product. A spike that proves IME works
+# under a different renderer proves nothing: on macOS the panel is a
+# CAMetalLayer-backed wgpu surface and that is where marked text has to land.
+iced = { version = "0.14", features = ["wgpu", "advanced", "tokio", "image", "svg"] }
+
+# Release profile mirrors §15 so a timing observation here is not a debug-build
+# artefact. IME latency in particular is worth seeing under `--release`.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"

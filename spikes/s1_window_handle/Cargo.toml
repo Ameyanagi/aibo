@@ -1,0 +1,46 @@
+# S1 — iced 0.14 → native window handle (throwaway).
+#
+# This is a STANDALONE workspace root on purpose: `[workspace]` below detaches
+# it from /Users/ryuichi/dev/aibo/Cargo.toml so the spike can be built and run
+# without the integrator having to touch the product workspace.
+# If you would rather have it as a member of the root workspace, delete the
+# `[workspace]` table below and add "spikes/*" to the root `members` list.
+[workspace]
+
+[package]
+name = "s1_window_handle"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "LicenseRef-Proprietary"
+
+[dependencies]
+# Exactly the feature set docs/plan.md pins for the product, so what the spike
+# links is what aibo will link.
+iced = { version = "0.14", features = ["wgpu", "advanced", "tokio", "image", "svg"] }
+
+# §20 S1: "iced 0.14 and `window-vibrancy` 0.8 both use `raw-window-handle` 0.6 —
+# they compose directly". This dependency is the thing being proven: if cargo
+# unifies these three on ONE raw-window-handle 0.6, the composition claim holds.
+raw-window-handle = "0.6"
+window-vibrancy = "0.8"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", features = ["NSGeometry", "NSArray", "NSString"] }
+objc2-app-kit = { version = "0.3", features = [
+    "NSResponder",
+    "NSView",
+    "NSWindow",
+    "NSPanel",
+    "NSVisualEffectView",
+    "NSColor",
+    "NSGraphics",
+    "NSScreen",
+    "NSApplication",
+] }
+
+[[bin]]
+name = "s1_window_handle"
+path = "src/main.rs"

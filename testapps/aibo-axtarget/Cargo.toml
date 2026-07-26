@@ -1,0 +1,42 @@
+# testapps/aibo-axtarget — the controlled AX target (§18 tier 3).
+#
+# > `testapps/` is the important idea: a controlled AX/UIA target makes the
+# > platform layer genuinely testable instead of "run it and see". Build it in
+# > P0 alongside S2 — the spike and the test harness are the same work. — §18
+#
+# Its own workspace root, like the spikes: this is a test fixture, not a product
+# crate, and it must never be linked into the aibo binary.
+[package]
+name = "aibo-axtarget"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "LicenseRef-Proprietary"
+
+[workspace]
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSString",
+    "NSGeometry",
+    "objc2-core-foundation",
+] }
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSAccessibilityProtocols",
+    "NSApplication",
+    "NSGraphics",
+    "NSControl",
+    "NSResponder",
+    "NSRunningApplication",
+    "NSScrollView",
+    "NSSecureTextField",
+    "NSText",
+    "NSTextField",
+    "NSTextView",
+    "NSView",
+    "NSWindow",
+] }

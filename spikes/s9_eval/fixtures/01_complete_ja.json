@@ -1,0 +1,63 @@
+[
+  {
+    "id": "cmp-ja-mail-keigo",
+    "surface": "complete",
+    "lang": "ja",
+    "app": "Mail",
+    "field_label": "本文",
+    "prefix": "田中様\n\nいつもお世話になっております。株式会社アイボの山田です。\n先日ご相談いただいた件につきまして、社内で確認いたしましたので、",
+    "suffix": "",
+    "notes": "Keigo register must be matched, not just the language. A plain-form continuation is a language_match pass and a quality fail — read the reply, do not trust the column alone."
+  },
+  {
+    "id": "cmp-ja-midsentence-suffix",
+    "surface": "complete",
+    "lang": "ja",
+    "app": "Slack",
+    "field_label": "メッセージ",
+    "prefix": "リリースの件ですが、金曜の夕方だと検証の時間が取れないので、",
+    "suffix": "でいかがでしょうか。",
+    "notes": "Japanese version of the suffix-duplication trap: the continuation must lead into 「でいかがでしょうか。」 without repeating it."
+  },
+  {
+    "id": "cmp-ja-casual",
+    "surface": "complete",
+    "lang": "ja",
+    "app": "Slack",
+    "field_label": "メッセージ",
+    "prefix": "了解です！じゃあ午後のミーティングは",
+    "suffix": "",
+    "notes": "Casual register. A sudden switch to 敬語 is the failure to watch for."
+  },
+  {
+    "id": "cmp-ja-mixed-script",
+    "surface": "complete",
+    "lang": "ja",
+    "app": "Notion",
+    "field_label": null,
+    "prefix": "SQLCipher の vendored-OpenSSL ビルドが Windows で通るかどうかは未検証なので、P0 で",
+    "suffix": "",
+    "notes": "Latin technical terms inside Japanese. looks_japanese() must still classify this as ja."
+  },
+  {
+    "id": "cmp-ja-kanji-only-head",
+    "surface": "complete",
+    "lang": "ja",
+    "app": "Word",
+    "field_label": "本文",
+    "prefix": "第三四半期業績報告書\n売上高前年同期比増加要因分析結果",
+    "suffix": "",
+    "notes": "Kanji-dense with almost no kana — the hard case for the crude script heuristic in properties::looks_japanese. If this misfires, record it: the heuristic is a known approximation, not a language detector."
+  },
+  {
+    "id": "cmp-ja-list-item",
+    "surface": "complete",
+    "lang": "ja",
+    "app": "Obsidian",
+    "field_label": null,
+    "prefix": "議事録\n- 予算の再確認\n- 採用スケジュールの見直し\n- ",
+    "suffix": "",
+    "max_output_graphemes": 40,
+    "notes": "One bullet, capped."
+  }
+]

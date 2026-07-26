@@ -1,0 +1,41 @@
+# S4 - Insert reliability (§20).
+#
+# Its own workspace root: a spike must never end up linked into the product
+# build. Depends on nothing from `crates/`.
+[package]
+name = "s4_insert"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "LicenseRef-Proprietary"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+arboard = "3"
+# §8/§20: "self-described early alpha". On macOS it uses `CGEvent::set_string`
+# chunked at 20 chars, **silently fails on chunks starting with a newline**
+# (it carries a U+200B workaround), emits keydown-only events with no delivery
+# confirmation, and applies its inter-event delay only on `Drop`. Every one of
+# those claims is a test case in `src/payload.rs`.
+enigo = "0.6"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+accessibility-sys = "0.2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSPasteboard",
+    "NSRunningApplication",
+    "NSWorkspace",
+    "libc",
+] }

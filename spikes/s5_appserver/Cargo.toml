@@ -1,0 +1,26 @@
+# S5 — `codex app-server` handshake spike (throwaway).
+#
+# This is a STANDALONE workspace root on purpose: `[workspace]` below detaches
+# it from /Users/ryuichi/dev/aibo/Cargo.toml so the spike can be built and run
+# without the integrator having to touch the product workspace.
+# If you would rather have it as a member of the root workspace, delete the
+# `[workspace]` table below and add "spikes/*" to the root `members` list.
+[workspace]
+
+[package]
+name = "s5_appserver"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "LicenseRef-Proprietary"
+
+[dependencies]
+# Spikes are applications, so anyhow is the right error type (per the plan's
+# thiserror-for-libraries / anyhow-for-binaries rule).
+anyhow = "1"
+serde_json = "1"
+
+[[bin]]
+name = "s5_appserver"
+path = "src/main.rs"

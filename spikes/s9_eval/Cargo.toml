@@ -1,0 +1,38 @@
+# S9 - Complete quality + eval harness (§5, §20).
+#
+# Its own workspace root: a spike must never end up linked into the product
+# build. The property assertions in `src/properties.rs` are the part worth
+# graduating into `aibo-core` later, but that is a copy, not a dependency.
+[package]
+name = "s9_eval"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "LicenseRef-Proprietary"
+
+[workspace]
+
+[lib]
+name = "s9_eval"
+path = "src/lib.rs"
+
+[[bin]]
+name = "s9_eval"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+futures-util = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs"] }
+unicode-segmentation = "1"
+
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "stream",
+    "rustls-tls",
+    "gzip",
+] }

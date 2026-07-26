@@ -1,0 +1,45 @@
+# S3 — warm-surface idle footprint spike (throwaway).
+#
+# This is a STANDALONE workspace root on purpose: `[workspace]` below detaches
+# it from /Users/ryuichi/dev/aibo/Cargo.toml so the spike can be built and run
+# without the integrator having to touch the product workspace.
+# If you would rather have it as a member of the root workspace, delete the
+# `[workspace]` table below and add "spikes/*" to the root `members` list.
+[workspace]
+
+[package]
+name = "s3_idle_rss"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "LicenseRef-Proprietary"
+
+[dependencies]
+# Same feature set the plan pins for the product, so the measurement is
+# representative of what aibo will actually link.
+iced = { version = "0.14", features = ["wgpu", "advanced", "tokio", "image", "svg"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = "0.2"
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }
+
+# Measure the thing you ship: `dev` numbers are meaningless for a footprint
+# budget. Always run this spike with `--release`.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
+incremental = false
+
+[[bin]]
+name = "s3_idle_rss"
+path = "src/main.rs"

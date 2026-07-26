@@ -1,0 +1,43 @@
+# S2 - AX/UIA read across real apps (§20).
+#
+# A throwaway binary, deliberately OUTSIDE the aibo workspace (`[workspace]`
+# below makes it its own root) so a spike can never end up linked into the
+# product build. It depends on nothing from `crates/`.
+#
+# macOS only. The Windows half of S2 (UIA `GetSelection`, the missing
+# `ITextProvider2` on Chromium) is a separate harness on a Windows box; §8's
+# risk column is different enough that sharing one binary would obscure both.
+[package]
+name = "s2_ax_matrix"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+publish = false
+license = "LicenseRef-Proprietary"
+
+[workspace]
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# §20: "single maintainer; one release in four years — expect to read its source
+# and possibly vendor." It has been read. It is a thin `extern "C"` block over
+# ApplicationServices with no logic of its own, which is exactly why vendoring
+# it later is cheap.
+accessibility-sys = "0.2"
+core-foundation = "0.10"
+core-foundation-sys = "0.8"
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = { version = "0.3", default-features = false, features = [
+    "std",
+    "NSWorkspace",
+    "NSRunningApplication",
+    # `NSRunningApplication::processIdentifier` is behind this feature — the pid
+    # is what `AXUIElementCreateApplication` needs, so it is not optional here.
+    "libc",
+] }

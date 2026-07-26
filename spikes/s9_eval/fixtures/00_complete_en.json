@@ -1,0 +1,73 @@
+[
+  {
+    "id": "cmp-en-slack-standup",
+    "surface": "complete",
+    "lang": "en",
+    "app": "Slack",
+    "field_label": "Message",
+    "prefix": "Morning all — quick standup from me. Yesterday I finished the retry logic on the ingest worker and got the flaky test under control. Today I'm going to ",
+    "suffix": "",
+    "notes": "Baseline: short chat continuation, no suffix."
+  },
+  {
+    "id": "cmp-en-mail-midsentence",
+    "surface": "complete",
+    "lang": "en",
+    "app": "Mail",
+    "field_label": "Message body",
+    "prefix": "Hi Dana,\n\nThanks for sending the revised statement of work. I've read it through and I think we're aligned on scope. The one thing I'd like to clarify before signing is ",
+    "suffix": " Could you let me know by Thursday?\n\nBest,\nRyu",
+    "notes": "THE case §5 names as the most common autocomplete failure: text already exists after the caret."
+  },
+  {
+    "id": "cmp-en-mid-word",
+    "surface": "complete",
+    "lang": "en",
+    "app": "Notes",
+    "field_label": null,
+    "prefix": "The migration needs to run before the deploy window closes, otherwise we're stuck on the old schema until the next mainten",
+    "suffix": "",
+    "notes": "Caret sits inside a word. Finishing 'ance window' is correct and must NOT trip no_prefix_repetition."
+  },
+  {
+    "id": "cmp-en-code-comment",
+    "surface": "complete",
+    "lang": "en",
+    "app": "VS Code",
+    "field_label": "editor",
+    "prefix": "// Retry with exponential backoff. The first attempt is immediate; each\n// subsequent attempt waits ",
+    "suffix": "\nfn backoff(attempt: u32) -> Duration {",
+    "notes": "Code context. Watch for an added code fence and for the model writing the function body."
+  },
+  {
+    "id": "cmp-en-empty-field",
+    "surface": "complete",
+    "lang": "en",
+    "app": "Slack",
+    "field_label": "Message",
+    "prefix": "",
+    "suffix": "",
+    "notes": "Degenerate: nothing to continue. §13 — the panel must not call the model at all here. Recorded to prove the harness handles an empty prefix without panicking."
+  },
+  {
+    "id": "cmp-en-list-item",
+    "surface": "complete",
+    "lang": "en",
+    "app": "Obsidian",
+    "field_label": null,
+    "prefix": "Release checklist:\n- [x] Version bumped\n- [x] Changelog written\n- [ ] Notarisation ticket confirmed\n- [ ] ",
+    "suffix": "",
+    "max_output_graphemes": 80,
+    "notes": "Structured continuation: one list item, not a whole list. Length cap is the assertion."
+  },
+  {
+    "id": "cmp-en-emoji-and-marks",
+    "surface": "complete",
+    "lang": "en",
+    "app": "Slack",
+    "field_label": "Message",
+    "prefix": "Shipped 🎉 the café's naïve résumé parser is finally live — next up ",
+    "suffix": "",
+    "notes": "Grapheme-cluster safety: combining marks and emoji in the prefix. §5 requires grapheme-safe truncation everywhere."
+  }
+]
