@@ -1,0 +1,20 @@
+[
+  {
+    "reasoning": "Weighing it up."
+  },
+  {
+    "text": "Yes."
+  },
+  {
+    "usage": {
+      "input_tokens": 25,
+      "cached_input_tokens": 100,
+      "output_tokens": 7,
+      "reasoning_tokens": 0,
+      "image_tokens": 0
+    }
+  },
+  {
+    "done": "end_turn"
+  }
+]

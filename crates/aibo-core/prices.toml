@@ -1,0 +1,366 @@
+# aibo — shipped default price table (§14)
+#
+# ============================================================================
+#  THESE NUMBERS ARE A SHIPPED DEFAULT AND THEY WILL BE WRONG.
+# ============================================================================
+#
+# §14 ships the price table as TOML *precisely because* "prices change faster
+# than releases". This file is a starting point so that the spend meter, the
+# 80 % warning and the optional hard stop can function on day one — it is not
+# an authority, it is not a quote, and it is not checked against any provider's
+# billing page at run time.
+#
+# What that means in practice:
+#
+#   * `updated` below is the date these rates were last written down. The
+#     settings pane renders it next to a "prices may be stale" affordance.
+#     Treat anything older than a few weeks as indicative only.
+#   * A user file overlaid on this one wins, row for row. That is the intended
+#     way to correct a rate — do not wait for an aibo release.
+#   * A model with **no row here is unpriced, not free**. `PriceTable::lookup`
+#     returns `None` and the UI must say "cost unknown". Reporting $0.00 for a
+#     model whose price aibo does not know is worse than reporting nothing.
+#   * Enterprise, committed-use, negotiated and regional rates are not
+#     represented and cannot be. If the bill matters, override this file.
+#
+# ---------------------------------------------------------------------------
+# Units
+# ---------------------------------------------------------------------------
+#
+# Every rate is **micros per million tokens**, an integer:
+#
+#     1_000_000  micros/Mtok  =  $1.00 per million tokens
+#        25_000  micros/Mtok  =  $0.025 per million tokens
+#
+# Integers throughout: floating-point money in a spend meter accumulates a
+# drift over a month of use that the user can see.
+#
+# Optional rates fall back rather than to zero, so a minimal row is still
+# arithmetically correct:
+#
+#     cached_input  omitted -> billed at `input`
+#     reasoning     omitted -> billed at `output`   (what most providers do)
+#     image         omitted -> billed at `input`
+#
+# `tier` defaults to "standard". A tier that is not listed falls back to the
+# standard row for the same model, so a "flex" request is priced at the
+# on-demand rate rather than becoming unpriced.
+#
+# ---------------------------------------------------------------------------
+# Currency
+# ---------------------------------------------------------------------------
+#
+# USD. §12 stores `cost_micros` in "the account currency"; aibo does no FX
+# conversion, so a JPY-billed account sees USD figures until that is added.
+# Recorded here rather than assumed.
+
+version = "1"
+updated = "2026-07-26"
+source = "shipped default — published list prices, USD, no enterprise discounts; will drift"
+
+# ===========================================================================
+# Cerebras — §4 primary `Fast`, §4 `Cheap` fallback
+# ===========================================================================
+
+[[model]]
+provider = "cerebras"
+model = "llama-3.3-70b"
+input = 850_000        # $0.85 /Mtok
+output = 1_200_000     # $1.20 /Mtok
+# No prompt-cache product at the time of writing: cached_input omitted, so
+# cached prompt tokens are billed at the full input rate. Correct, not free.
+
+[[model]]
+provider = "cerebras"
+model = "qwen-3-32b"
+input = 400_000
+output = 800_000
+
+[[model]]
+provider = "cerebras"
+model = "gpt-oss-120b"
+input = 250_000
+output = 690_000
+
+# ===========================================================================
+# Groq — §4 `Fast` second
+# ===========================================================================
+
+[[model]]
+provider = "groq"
+model = "llama-3.3-70b-versatile"
+input = 590_000        # $0.59 /Mtok
+output = 790_000       # $0.79 /Mtok
+
+[[model]]
+provider = "groq"
+model = "llama-3.1-8b-instant"
+input = 50_000
+output = 80_000
+
+[[model]]
+provider = "groq"
+model = "openai/gpt-oss-120b"
+input = 150_000
+output = 750_000
+
+# ===========================================================================
+# SambaNova — §10 second `Fast` option
+# ===========================================================================
+
+[[model]]
+provider = "sambanova"
+model = "Meta-Llama-3.3-70B-Instruct"
+input = 600_000
+output = 1_200_000
+
+# ===========================================================================
+# OpenAI — §4 `Fast` (small), `Smart`, `Vision`
+# ===========================================================================
+
+[[model]]
+provider = "openai"
+model = "gpt-5"
+input = 1_250_000      # $1.25 /Mtok
+cached_input = 125_000 # $0.125 /Mtok — 90 % off, and §5's stable prompt prefix
+output = 10_000_000    # $10.00 /Mtok
+# Reasoning tokens are billed as output on this family; `reasoning` omitted so
+# it falls back to `output` rather than silently costing nothing.
+
+[[model]]
+provider = "openai"
+model = "gpt-5-mini"
+input = 250_000        # $0.25 /Mtok
+cached_input = 25_000
+output = 2_000_000     # $2.00 /Mtok
+
+[[model]]
+provider = "openai"
+model = "gpt-5-nano"
+input = 50_000
+cached_input = 5_000
+output = 400_000
+
+# Batch is a real §14 provider tier, not a hypothetical: 50 % off, and the
+# reason `ProviderTier` exists at all.
+[[model]]
+provider = "openai"
+model = "gpt-5"
+tier = "batch"
+input = 625_000
+cached_input = 125_000
+output = 5_000_000
+
+[[model]]
+provider = "openai"
+model = "gpt-5-mini"
+tier = "batch"
+input = 125_000
+cached_input = 25_000
+output = 1_000_000
+
+[[model]]
+provider = "openai"
+model = "gpt-5"
+tier = "priority"
+input = 2_500_000
+cached_input = 250_000
+output = 20_000_000
+
+# ===========================================================================
+# Anthropic — §4 `Smart` / `Vision`
+# ===========================================================================
+#
+# Anthropic bills cache *writes* above the input rate and cache *reads* far
+# below it. `Usage` has one cached-input counter, so `cached_input` here is the
+# read rate — the cheaper, far more common one for §5's stable prefix. Cache
+# writes are therefore under-counted; documented rather than hidden.
+
+[[model]]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+input = 3_000_000      # $3.00 /Mtok
+cached_input = 300_000 # $0.30 /Mtok cache read
+output = 15_000_000    # $15.00 /Mtok
+
+[[model]]
+provider = "anthropic"
+model = "claude-haiku-4-5"
+input = 1_000_000
+cached_input = 100_000
+output = 5_000_000
+
+[[model]]
+provider = "anthropic"
+model = "claude-opus-4-5"
+input = 5_000_000
+cached_input = 500_000
+output = 25_000_000
+
+[[model]]
+provider = "anthropic"
+model = "claude-sonnet-4-5"
+tier = "batch"
+input = 1_500_000
+cached_input = 300_000
+output = 7_500_000
+
+# ===========================================================================
+# Google Vertex AI — §4 `Smart` / `Vision` last, §10 secure tier
+# ===========================================================================
+#
+# Gemini prices step up past a long-context threshold (commonly 200k tokens).
+# `ModelPrices` has no threshold concept, so the **long-context** rate is used:
+# over-estimating spend is the safe direction under a hard stop.
+
+[[model]]
+provider = "vertex"
+model = "gemini-3-pro"
+input = 2_500_000      # long-context rate; short requests are billed less
+cached_input = 250_000
+output = 15_000_000
+image = 2_500_000
+
+[[model]]
+provider = "vertex"
+model = "gemini-3-flash"
+input = 300_000
+cached_input = 30_000
+output = 2_500_000
+
+# ===========================================================================
+# Azure OpenAI — §10 secure tier
+# ===========================================================================
+#
+# Rows are keyed by *model*, but Azure addresses models by **deployment name**,
+# which the user chooses. A deployment called "prod-gpt" will not match here
+# and will read as unpriced until the user adds a row. That is the honest
+# outcome; guessing a mapping would mis-bill silently.
+
+[[model]]
+provider = "azure-openai"
+model = "gpt-5"
+input = 1_250_000
+cached_input = 125_000
+output = 10_000_000
+
+[[model]]
+provider = "azure-openai"
+model = "gpt-5-mini"
+input = 250_000
+cached_input = 25_000
+output = 2_000_000
+
+# ===========================================================================
+# AWS Bedrock — §10 secure tier
+# ===========================================================================
+#
+# Bedrock model ids are region-scoped and often carry an inference-profile
+# prefix ("us.anthropic.…"). Both spellings are listed for the models aibo
+# binds by default; anything else needs a user row.
+
+[[model]]
+provider = "bedrock"
+model = "anthropic.claude-sonnet-4-5-v1:0"
+input = 3_000_000
+cached_input = 300_000
+output = 15_000_000
+
+[[model]]
+provider = "bedrock"
+model = "us.anthropic.claude-sonnet-4-5-v1:0"
+input = 3_000_000
+cached_input = 300_000
+output = 15_000_000
+
+# ===========================================================================
+# xAI — §10 fast/smart
+# ===========================================================================
+
+[[model]]
+provider = "xai"
+model = "grok-4"
+input = 3_000_000
+cached_input = 750_000
+output = 15_000_000
+
+# ===========================================================================
+# Ollama / llama.cpp — §4 `Cheap` primary, §13 offline
+# ===========================================================================
+#
+# Genuinely zero *marginal* cost: the model runs on the user's own hardware and
+# there is no bill to meter. This is the one place a 0 rate is a fact rather
+# than a missing row — which is exactly why the row exists instead of being
+# omitted. An omitted row would make every local request "cost unknown" and
+# inflate `SpendMeter::unpriced_requests` for the offline path.
+
+[[model]]
+provider = "ollama"
+model = "qwen3:8b"
+input = 0
+output = 0
+
+[[model]]
+provider = "ollama"
+model = "qwen3:14b"
+input = 0
+output = 0
+
+[[model]]
+provider = "ollama"
+model = "llama3.3:70b"
+input = 0
+output = 0
+
+[[model]]
+provider = "ollama"
+model = "gpt-oss:20b"
+input = 0
+output = 0
+
+# ===========================================================================
+# Codex — §3a, §4 `Smart` primary
+# ===========================================================================
+#
+# Zero for the same structural reason as Ollama and for a different practical
+# one: the ChatGPT subscription is a flat fee, so there is **no per-token
+# charge to meter**. The user's real constraint on this path is the plan's
+# rate/usage quota, which OpenAI enforces server-side and which §3a reads out
+# of the `chatgpt_plan_type` claim — it is not a spend, and the spend meter
+# must not invent one.
+#
+# Only the five ids §3a *measured as working* appear. The API-style ids
+# (`gpt-5`, `gpt-5-codex`, `gpt-5.1-codex`, `gpt-5.1-codex-mini`,
+# `codex-mini-latest`) are absent deliberately: they hard-400 with "not
+# supported when using Codex with a ChatGPT account", so a price for them would
+# be a price for a request that cannot be made.
+
+[[model]]
+provider = "codex"
+model = "gpt-5.5"          # 435 ms TTFT p50 (§3a) — the floor
+input = 0
+output = 0
+
+[[model]]
+provider = "codex"
+model = "gpt-5.6-terra"    # 446 ms
+input = 0
+output = 0
+
+[[model]]
+provider = "codex"
+model = "gpt-5.3-codex-spark"  # 499 ms
+input = 0
+output = 0
+
+[[model]]
+provider = "codex"
+model = "gpt-5.6-luna"     # 515 ms
+input = 0
+output = 0
+
+[[model]]
+provider = "codex"
+model = "gpt-5.6-sol"      # 623 ms — §4's `Smart` primary
+input = 0
+output = 0

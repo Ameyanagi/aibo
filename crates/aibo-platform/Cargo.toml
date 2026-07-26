@@ -1,0 +1,61 @@
+[package]
+name = "aibo-platform"
+description = "`PlatformBackend` implementations. The only crate with #[cfg(target_os)] in it (§7)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+aibo-core = { workspace = true }
+arboard = { workspace = true }
+async-trait = { workspace = true }
+enigo = { workspace = true }
+futures = { workspace = true }
+raw-window-handle = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+# The AX/UIA objects are !Send + !Sync and live on a dedicated thread; the
+# public type in this crate is only a channel handle to it (§6, §7).
+[target.'cfg(target_os = "macos")'.dependencies]
+accessibility-sys = { workspace = true }
+core-foundation = { workspace = true }
+core-graphics = { workspace = true }
+objc2 = { workspace = true }
+# The owning agent adds the per-class features these crates need
+# (NSPasteboard, NSWindow/NSPanel, NSVisualEffectView, NSWorkspace, NSScreen …).
+objc2-app-kit = { workspace = true }
+objc2-foundation = { workspace = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+uiautomation = { workspace = true }
+windows-core = { workspace = true }
+# The Win32_* namespaces used by src/windows/**. Each one is load-bearing:
+# nothing in a namespace exists without its feature.
+windows = { workspace = true, features = [
+    "Win32_Foundation",                    # HWND, HANDLE, GetLastError
+    "Win32_Graphics_Dwm",                  # §8 DWMWA_SYSTEMBACKDROP_TYPE (panel chrome)
+    "Win32_Graphics_Gdi",                  # §9 monitors: MonitorFromWindow, MONITORINFO
+    "Win32_Security",                      # token elevation / uiAccess (UIPI, §8)
+    "Win32_System_Com",                    # CoInitializeEx(MTA) for the UIA thread (§7)
+    "Win32_System_DataExchange",           # clipboard + AddClipboardFormatListener (§12)
+    "Win32_System_LibraryLoader",          # GetModuleHandleW / GetModuleFileNameW
+    "Win32_System_Memory",                 # GlobalLock for clipboard hygiene DWORDs
+    "Win32_System_Registry",               # §8 autostart Run key
+    "Win32_System_Threading",              # OpenProcess, process image name
+    "Win32_UI_Accessibility",              # UIA interfaces behind `uiautomation`
+    "Win32_UI_HiDpi",                      # §9 Per-Monitor-V2
+    "Win32_UI_Input_Ime",                  # §9 ImmGetCompositionString
+    "Win32_UI_Input_KeyboardAndMouse",     # §8 SendInput, AttachThreadInput
+    "Win32_UI_Shell",                      # AppUserModelID, CF_HDROP
+    "Win32_UI_WindowsAndMessaging",        # window, message loop, foreground window
+] }
+
+[lints.rust]
+# Not `forbid`: AX/UIA/CGEvent require FFI. Isolate each `unsafe` block in the
+# smallest possible fn and document why (project rule).
+unsafe_code = "warn"

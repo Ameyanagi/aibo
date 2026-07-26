@@ -1,0 +1,34 @@
+[package]
+name = "aibo-core"
+description = "Domain types, traits, router, prompt assembly and budgets. No platform and no network dependencies (§6)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+async-trait = { workspace = true }
+# §19 licence blob: `base64( ed25519_sig(64) || cbor(payload) )`. Both are pure
+# computation, so they do not breach §6's "no platform and no network" rule.
+base64 = { workspace = true }
+ed25519-dalek = { workspace = true }
+futures-core = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+unicode-segmentation = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+insta = { workspace = true }
+proptest = { workspace = true }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

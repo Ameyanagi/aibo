@@ -1,0 +1,20 @@
+[
+  {
+    "reasoning": "Weighing the options."
+  },
+  {
+    "text": "42"
+  },
+  {
+    "usage": {
+      "input_tokens": 9,
+      "cached_input_tokens": 0,
+      "output_tokens": 30,
+      "reasoning_tokens": 25,
+      "image_tokens": 0
+    }
+  },
+  {
+    "done": "length"
+  }
+]

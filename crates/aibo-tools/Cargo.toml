@@ -1,0 +1,63 @@
+[package]
+name = "aibo-tools"
+description = "Builtin tools, fend, sandboxed code, MCP client and shell/fs (§11)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+aibo-core = { workspace = true }
+async-trait = { workspace = true }
+base64 = { workspace = true }
+fend-core = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+
+# Tier 0 building blocks. The plan does not name these, so they are versioned
+# here rather than in the workspace table (which pins what §1..§22 names).
+# `regex` is a deliberate choice over a backtracking engine: it has no
+# catastrophic backtracking, so a model- or user-supplied pattern cannot turn a
+# tier-0 "pure, sub-ms, no consent" tool into a denial of service.
+regex = "1"
+sha2 = "0.10"
+hex = "0.4"
+similar = "2"
+
+# Tier 1's optional CPython-on-WASI path. §15: wasmtime is linked in whether or
+# not the feature is used, so it is the honest lever on binary size — keep it
+# behind a cargo feature and consider moving it into the downloadable helper.
+[dependencies.wasmtime]
+workspace = true
+optional = true
+
+[dependencies.wasmtime-wasi]
+workspace = true
+optional = true
+
+# §11 tier 2. The workspace pins the version; rmcp's default features are the
+# *server* half, so the client and its two transports are selected here.
+[dependencies.rmcp]
+workspace = true
+features = [
+    "client",
+    "transport-child-process",
+    "transport-streamable-http-client-reqwest",
+]
+
+[dev-dependencies]
+tempfile = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+
+[features]
+default = []
+python = ["dep:wasmtime", "dep:wasmtime-wasi"]
+
+[lints.rust]
+unsafe_code = "forbid"

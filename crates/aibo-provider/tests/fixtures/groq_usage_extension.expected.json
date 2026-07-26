@@ -1,0 +1,17 @@
+[
+  {
+    "text": "hi"
+  },
+  {
+    "usage": {
+      "input_tokens": 11,
+      "cached_input_tokens": 0,
+      "output_tokens": 2,
+      "reasoning_tokens": 0,
+      "image_tokens": 0
+    }
+  },
+  {
+    "done": "end_turn"
+  }
+]

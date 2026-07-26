@@ -1,0 +1,53 @@
+[package]
+name = "aibo-session"
+description = "Orchestration: capture → surface → route → assemble → dispatch → stream → reconcile → persist (§4, §5, §12, §13, §14)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The domain layer: types, traits, router, prompt assembly, budgets, spend meter.
+aibo-core = { workspace = true }
+# The provider registry, so a `ModelBinding` can be resolved to a live backend.
+# This crate is the *only* place §4's chain traversal happens.
+aibo-provider = { workspace = true }
+# §12 persistence. Behind the `SessionStore` trait so the engine — and its
+# tests — never need a database.
+aibo-store = { workspace = true }
+
+# NOTE: `aibo-agent` is deliberately NOT a dependency. §14's agent limits are
+# enforced over `dyn aibo_core::traits::AgentBackend`, which lives in
+# `aibo-core`; depending on the concrete backends would invert §6's crate order
+# for no gain. The binary picks the implementation and injects it.
+
+async-trait = { workspace = true }
+futures = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+futures = { workspace = true }
+serde_json = { workspace = true }
+# `test-util` is what makes §13's wall-clock ceiling testable: `start_paused`
+# auto-advances the clock when the runtime goes idle, so a 60 s deadline against
+# a stream that never yields is asserted in microseconds instead of a minute.
+tokio = { workspace = true, features = [
+    "macros",
+    "rt",
+    "rt-multi-thread",
+    "time",
+    "test-util",
+] }
+
+[lints.rust]
+missing_docs = "warn"
+unsafe_code = "forbid"

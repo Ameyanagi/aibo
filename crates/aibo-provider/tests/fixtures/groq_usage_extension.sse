@@ -1,0 +1,6 @@
+data: {"id":"chatcmpl-g1","choices":[{"index":0,"delta":{"role":"assistant","content":"hi"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-g1","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":null,"x_groq":{"id":"req_01","usage":{"prompt_tokens":11,"completion_tokens":2,"total_tokens":13}}}
+
+data: [DONE]
+

@@ -1,0 +1,865 @@
+//! Providers, roles, budgets, permissions, history (§6, §16).
+//!
+//! §16: "the settings window has its own information architecture — providers,
+//! roles, budgets, permissions, actions, history, about/license — and it was a
+//! single bullet in the first draft's P1." [`Section`] is that IA, made
+//! explicit so the navigation cannot quietly diverge from the plan.
+//!
+//! This module implements the **shell**: the window, the section list, the
+//! per-section frames, and the two things that must work before any provider is
+//! configured — the permission states (§8, §17) and the hotkey status (§9).
+//! The forms themselves are per-section product work.
+
+use aibo_core::types::{Health, Permission, PermissionStatus, ProviderId, Role};
+use iced::widget::{Space, button, column, container, row, scrollable, text};
+use iced::{Element, Length};
+
+use crate::hotkey::{FailureReason, HotkeyStatus};
+use crate::i18n::{self, Key, Lang};
+use crate::theme::{self, Severity, space, type_scale};
+use crate::widgets::{self, Action};
+
+/// The settings information architecture (§16).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Section {
+    /// Provider credentials and endpoints (§10).
+    #[default]
+    Providers,
+    /// Role bindings and fallback chains (§4).
+    Roles,
+    /// Per-role and global spend caps (§14).
+    Budgets,
+    /// OS permissions and their recovery paths (§8, §17).
+    Permissions,
+    /// Saved actions and custom verbs (§12).
+    Actions,
+    /// Conversation history and FTS search (§12).
+    History,
+    /// UI language (§9).
+    Language,
+    /// Version, licence, diagnostics (§19).
+    About,
+}
+
+impl Section {
+    /// Every section, in navigation order.
+    pub const ALL: [Section; 8] = [
+        Section::Providers,
+        Section::Roles,
+        Section::Budgets,
+        Section::Permissions,
+        Section::Actions,
+        Section::History,
+        Section::Language,
+        Section::About,
+    ];
+
+    /// Catalogue key for the section's title.
+    pub const fn title(self) -> Key {
+        match self {
+            Section::Providers => Key::SettingsProviders,
+            Section::Roles => Key::SettingsRoles,
+            Section::Budgets => Key::SettingsBudgets,
+            Section::Permissions => Key::SettingsPermissions,
+            Section::Actions => Key::SettingsActions,
+            Section::History => Key::SettingsHistory,
+            Section::Language => Key::SettingsLanguage,
+            Section::About => Key::SettingsAbout,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Codex sign-in (§3a)
+// ---------------------------------------------------------------------------
+
+/// Separates the human sentence from the machine tag inside the Codex row's
+/// [`Health::Degraded`] reason.
+///
+/// **Why the state travels inside `Health` at all.** The device-code flow runs
+/// on the tokio side and its progress has to reach this window, but the only
+/// per-provider push channel that exists is `UiEvent::ProviderHealth`, whose
+/// payload is a [`Health`] — and [`ProviderRow`] is the only thing the settings
+/// window receives. So the phase rides in `reason`, and it rides *after* a
+/// plain-English sentence: any renderer that ignores the tag still shows
+/// something a user can act on, and [`CodexPhase::read`] degrades to
+/// [`CodexPhase::from_health`]'s honest reading rather than to nonsense.
+///
+/// U+001F (unit separator) cannot occur in a user code, a URL or a §13 error
+/// string, so the split is unambiguous.
+///
+/// TODO(bridge): replace with a `UiEvent::CodexSignIn` variant once
+/// `bridge.rs` and `app.rs` are in scope. This encoding is the interim.
+const CODEX_MARKER: &str = "\u{1f}aibo-codex\u{1f}";
+
+/// Where a Codex device-code login has got to (§3a).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CodexPhase {
+    /// No token pair is held. The button starts a login.
+    #[default]
+    SignedOut,
+    /// `POST …/deviceauth/usercode` is in flight.
+    Starting,
+    /// The user has a code and must approve it at `auth.openai.com/codex/device`.
+    /// §3a deviation 4: pending approval is HTTP 403, so this phase can last
+    /// the whole life of the code without anything looking like an error.
+    AwaitingApproval,
+    /// Approved; the step-4 form-encoded `/oauth/token` exchange is running.
+    Exchanging,
+    /// A usable token pair is held and the provider is in the registry.
+    SignedIn,
+    /// The attempt ended badly — expiry, a refused client id, a network fault.
+    Failed,
+}
+
+impl CodexPhase {
+    /// The stable tag written into [`Health::Degraded`]'s reason.
+    const fn tag(self) -> &'static str {
+        match self {
+            Self::SignedOut => "signed-out",
+            Self::Starting => "starting",
+            Self::AwaitingApproval => "awaiting",
+            Self::Exchanging => "exchanging",
+            Self::SignedIn => "signed-in",
+            Self::Failed => "failed",
+        }
+    }
+
+    fn from_tag(tag: &str) -> Option<Self> {
+        Some(match tag {
+            "signed-out" => Self::SignedOut,
+            "starting" => Self::Starting,
+            "awaiting" => Self::AwaitingApproval,
+            "exchanging" => Self::Exchanging,
+            "signed-in" => Self::SignedIn,
+            "failed" => Self::Failed,
+            _ => return None,
+        })
+    }
+
+    /// Whether a login is in flight, so the one button means "cancel".
+    pub const fn in_flight(self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::AwaitingApproval | Self::Exchanging
+        )
+    }
+
+    /// Encode a phase and its human sentence as the health a backend publishes.
+    ///
+    /// [`CodexPhase::SignedIn`] becomes [`Health::Ok`] so the row reads as a
+    /// working provider to anything that only understands `Health`; every other
+    /// phase is `Degraded`, which is true — Codex cannot serve a request until
+    /// the login finishes.
+    ///
+    /// **`SignedIn` discards `detail`, and that is the honest trade.**
+    /// [`Health::Ok`] has nowhere to put a sentence, and widening `SignedIn` to
+    /// `Degraded` so one could ride along would publish a *working* provider as
+    /// degraded — a lie in the one field whose whole job is to say whether a
+    /// provider works (§13). So the signed-in row reads
+    /// [`codex_text::SIGNED_IN`] and anything more specific (the account id,
+    /// §3a's plan-type claim) needs a channel that can carry it.
+    ///
+    /// TODO(bridge): a `UiEvent::CodexSignIn` variant would carry both, and is
+    /// where the §3a quota readout belongs.
+    pub fn to_health(self, detail: &str) -> Health {
+        if self == Self::SignedIn {
+            return Health::Ok {
+                latency: std::time::Duration::ZERO,
+            };
+        }
+        Health::Degraded {
+            reason: format!("{detail}{CODEX_MARKER}{}", self.tag()),
+            consecutive_failures: 0,
+        }
+    }
+
+    /// Read a phase and its human sentence back out of a [`Health`].
+    ///
+    /// The fallback is deliberate rather than defensive: a Codex row whose
+    /// health came from an ordinary §13 probe — a revoked token, an unreachable
+    /// endpoint — must still render as something the user can act on, and
+    /// "there is a problem, here is the sentence, here is Sign in" is exactly
+    /// that. Silently showing "signed out" for a revoked token would hide the
+    /// one fact that matters.
+    pub fn read(health: &Health) -> (Self, String) {
+        if let Health::Degraded { reason, .. } = health
+            && let Some((detail, tag)) = reason.split_once(CODEX_MARKER)
+            && let Some(phase) = Self::from_tag(tag)
+        {
+            return (phase, detail.to_owned());
+        }
+        Self::from_health(health)
+    }
+
+    /// The reading for a health that carries no phase tag.
+    fn from_health(health: &Health) -> (Self, String) {
+        match health {
+            Health::Ok { .. } => (Self::SignedIn, codex_text::SIGNED_IN.to_owned()),
+            Health::Degraded { reason, .. } | Health::Unavailable { reason } => {
+                (Self::Failed, reason.clone())
+            }
+            Health::Unknown => (Self::SignedOut, codex_text::SIGNED_OUT.to_owned()),
+        }
+    }
+}
+
+/// Copy for the Codex card.
+///
+/// Not in the i18n catalogue, on the same grounds as [`permission_label`]: these
+/// name a third-party product and a screen OpenAI serves in one wording
+/// (`auth.openai.com/codex/device` says "Codex"), and inventing a translation
+/// for the button that leads there would make it harder to follow, not easier.
+/// The *sentences* the backend supplies alongside them are ordinary strings and
+/// can be localised at the source.
+///
+/// TODO(i18n): move to `Key::` entries when `i18n.rs` is in scope.
+pub mod codex_text {
+    /// Card title.
+    pub const TITLE: &str = "ChatGPT subscription (Codex)";
+    /// Body when nothing is held.
+    pub const SIGNED_OUT: &str = "Use your ChatGPT plan instead of an API key. aibo runs its own device-code login and \
+         stores its own tokens in the keychain — it never reads or refreshes Codex's.";
+    /// Body when a token pair is held but the backend said nothing more.
+    pub const SIGNED_IN: &str = "Signed in. Codex is bound to the Smart and Ask surfaces.";
+    /// Button: start a login.
+    pub const SIGN_IN: &str = "Sign in with ChatGPT";
+    /// Button: abandon a login in flight.
+    pub const CANCEL: &str = "Cancel sign-in";
+    /// Button: forget the tokens and remove the provider.
+    pub const SIGN_OUT: &str = "Sign out";
+    /// Standing note under the button, from §3a's posture paragraph.
+    pub const CONSENT_NOTE: &str = "The approval page is OpenAI's own Codex consent screen; the tokens it issues are stored \
+         only by aibo.";
+}
+
+/// The label on the Codex card's single button, for a given phase.
+///
+/// Public because the backend owns the *action* that button triggers and this
+/// owns its *wording*, and the two must never disagree — a button that says
+/// "Sign in" while pressing it signs the user out is the failure mode of
+/// collapsing three actions into one control. The binary asserts the agreement.
+pub const fn codex_action_label(phase: CodexPhase) -> &'static str {
+    match phase {
+        CodexPhase::SignedIn => codex_text::SIGN_OUT,
+        CodexPhase::Starting | CodexPhase::AwaitingApproval | CodexPhase::Exchanging => {
+            codex_text::CANCEL
+        }
+        CodexPhase::SignedOut | CodexPhase::Failed => codex_text::SIGN_IN,
+    }
+}
+
+/// A provider as the settings list shows it.
+#[derive(Debug, Clone)]
+pub struct ProviderRow {
+    /// The provider.
+    pub id: ProviderId,
+    /// Whether a credential is present. The credential itself never reaches
+    /// the UI — §12 keeps secrets in the keyring and out of process memory
+    /// wherever it can.
+    pub configured: bool,
+    /// Health from the last probe (§13, per provider with hysteresis).
+    pub health: aibo_core::types::Health,
+}
+
+/// A permission and its current state (§8, §17).
+#[derive(Debug, Clone, Copy)]
+pub struct PermissionRow {
+    /// Which permission.
+    pub permission: Permission,
+    /// Its status.
+    pub status: PermissionStatus,
+}
+
+/// Settings window state.
+#[derive(Debug, Clone, Default)]
+pub struct SettingsState {
+    /// The visible section.
+    pub section: Section,
+    /// Providers, for the providers section.
+    pub providers: Vec<ProviderRow>,
+    /// Permissions, for the permissions section.
+    pub permissions: Vec<PermissionRow>,
+    /// Formatted spend, for the budgets section (§14).
+    pub spend_label: String,
+    /// Spend as a fraction of the cap, if a cap is set.
+    pub spend_fraction: Option<f32>,
+    /// Whether the panel hotkey registered, and under what label (§9).
+    pub hotkey: Option<HotkeyStatus>,
+    /// The active UI language.
+    pub language: Lang,
+}
+
+/// What the settings window emits.
+#[derive(Debug, Clone)]
+pub enum Message {
+    /// Navigate to a section.
+    Select(Section),
+    /// Start the sign-in flow for a provider.
+    SignIn(ProviderId),
+    /// Open the OS privacy pane for a permission.
+    OpenSystemSettings(Permission),
+    /// Change the UI language.
+    SetLanguage(Lang),
+    /// Rebind the panel hotkey. Opens the picker; §9 scopes it to one key plus
+    /// modifiers, with no sequences and no double-taps.
+    RebindHotkey,
+    /// Copy a redacted diagnostics bundle (§19).
+    CopyDiagnostics,
+    /// Close the window.
+    Close,
+}
+
+/// Render the settings window.
+pub fn view(state: &SettingsState) -> Element<'_, Message> {
+    let body = row![
+        container(navigation(state))
+            .width(Length::Fixed(180.0))
+            .padding(space(2.0)),
+        container(scrollable(section_body(state)).style(theme::scroller))
+            .width(Length::Fill)
+            .padding(space(3.0)),
+    ]
+    .spacing(space(2.0));
+
+    container(body)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .padding(space(3.0))
+        .style(theme::panel_surface)
+        .into()
+}
+
+fn navigation(state: &SettingsState) -> Element<'_, Message> {
+    let mut list = column![].spacing(space(1.0));
+    for section in Section::ALL {
+        let selected = section == state.section;
+        list = list.push(
+            button(
+                text(i18n::t(section.title()))
+                    .size(type_scale::META)
+                    .style(if selected {
+                        theme::text_accent
+                    } else {
+                        theme::text_dim
+                    }),
+            )
+            .width(Length::Fill)
+            .padding([space(1.5), space(2.0)])
+            .style(theme::action_button)
+            .on_press(Message::Select(section)),
+        );
+    }
+    list.into()
+}
+
+fn section_body(state: &SettingsState) -> Element<'_, Message> {
+    let heading = widgets::section::<Message>(state.section.title());
+    let content: Element<'_, Message> = match state.section {
+        Section::Providers => providers(state),
+        Section::Permissions => permissions(state),
+        Section::Budgets => budgets(state),
+        Section::Language => language(state),
+        Section::About => about(state),
+        // TODO(§4, §12, §14): role chains, saved actions and the history
+        // browser are per-section product work. The IA slot exists so
+        // navigation is complete and the sections cannot drift from §16.
+        Section::Roles | Section::Actions | Section::History => widgets::state_block(
+            Severity::Info,
+            i18n::t(Key::StateEmptyTitle),
+            Some(i18n::t(Key::StateEmptyBody)),
+            Vec::new(),
+        ),
+    };
+
+    column![heading, content].spacing(space(3.0)).into()
+}
+
+/// The Codex sign-in card (§3a).
+///
+/// Always rendered, and rendered **first**, including on a fresh install with
+/// nothing configured. That is the point of it: the one credential a
+/// ChatGPT-subscription user has is not an API key, so a Providers tab that
+/// only shows already-configured rows offers them no way in at all — which is
+/// the state this card was added to end.
+fn codex_card(state: &SettingsState) -> Element<'_, Message> {
+    let health = state
+        .providers
+        .iter()
+        .find(|p| p.id == ProviderId::CODEX)
+        .map(|p| p.health.clone())
+        .unwrap_or(Health::Unknown);
+    let (phase, detail) = CodexPhase::read(&health);
+
+    let severity = match phase {
+        CodexPhase::SignedIn => Severity::Success,
+        CodexPhase::Failed => Severity::Danger,
+        CodexPhase::SignedOut => Severity::Info,
+        _ => Severity::Warning,
+    };
+
+    // One button, and its label always states what pressing it does. The
+    // settings vocabulary carries a single per-provider action
+    // (`Message::SignIn`), so the meaning is disambiguated by the label rather
+    // than by a second control the bridge cannot express.
+    let label = codex_action_label(phase);
+
+    let body = column![
+        text(codex_text::TITLE)
+            .size(type_scale::BODY)
+            .style(theme::text_primary),
+        text(detail)
+            .size(type_scale::META)
+            .style(theme::text_severity(severity)),
+        text(codex_text::CONSENT_NOTE)
+            .size(type_scale::META)
+            .style(theme::text_dim),
+        button(text(label).size(type_scale::META).style(theme::text_accent))
+            .padding([space(1.5), space(2.0)])
+            .style(theme::action_button)
+            .on_press(Message::SignIn(ProviderId::CODEX)),
+    ]
+    .spacing(space(1.5));
+
+    container(body)
+        .width(Length::Fill)
+        .padding(space(2.0))
+        .style(theme::banner(severity))
+        .into()
+}
+
+fn providers(state: &SettingsState) -> Element<'_, Message> {
+    let mut list = column![codex_card(state)].spacing(space(2.0));
+
+    // §13's blocking "no provider configured" still belongs here — but under
+    // the card, not instead of it, because the card is the way out of it.
+    let codex_usable = state
+        .providers
+        .iter()
+        .any(|p| p.id == ProviderId::CODEX && matches!(p.health, Health::Ok { .. }));
+    let others: Vec<&ProviderRow> = state
+        .providers
+        .iter()
+        .filter(|p| p.id != ProviderId::CODEX)
+        .collect();
+
+    if !codex_usable && others.is_empty() {
+        list = list.push(widgets::state_block(
+            Severity::Danger,
+            i18n::t(Key::ErrNoProvider),
+            None,
+            Vec::new(),
+        ));
+    }
+
+    for provider in others {
+        // §13: health is per provider with hysteresis, never one global
+        // "offline" boolean — so each row carries its own state.
+        let (severity, status) = match (&provider.health, provider.configured) {
+            (_, false) => (Severity::Info, i18n::t(Key::PermissionNotDetermined)),
+            (Health::Ok { .. }, _) => (Severity::Success, i18n::t(Key::PermissionGranted)),
+            (Health::Degraded { .. }, _) => (Severity::Warning, i18n::t(Key::ErrRateLimited)),
+            (Health::Unavailable { .. }, _) => {
+                (Severity::Danger, i18n::t(Key::ErrProviderUnavailable))
+            }
+            (Health::Unknown, _) => (Severity::Info, i18n::t(Key::PermissionNotDetermined)),
+        };
+
+        list = list.push(
+            container(
+                row![
+                    text(provider.id.to_string())
+                        .size(type_scale::BODY)
+                        .style(theme::text_primary),
+                    Space::new().width(Length::Fill),
+                    text(status)
+                        .size(type_scale::META)
+                        .style(theme::text_severity(severity)),
+                    widgets::action_list(vec![Action::new(
+                        Key::ActionSignIn,
+                        "⏎",
+                        Message::SignIn(provider.id.clone()),
+                    )]),
+                ]
+                .spacing(space(2.0))
+                .align_y(iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding(space(2.0))
+            .style(theme::raised),
+        );
+    }
+    list.into()
+}
+
+fn permissions(state: &SettingsState) -> Element<'_, Message> {
+    let mut list = column![].spacing(space(2.0));
+
+    // The hotkey belongs here rather than in a picker of its own: §9 wants
+    // conflict detection surfaced at first run, and this is where a user who
+    // has lost ⌥Space to Raycast will come looking.
+    if let Some(status) = &state.hotkey {
+        let rebind = || {
+            vec![Action::new(
+                Key::ActionOpenSettings,
+                "⏎",
+                Message::RebindHotkey,
+            )]
+        };
+        list = list.push(match status {
+            // §9: a shift/option-only combination gets a **soft warning**, not
+            // a rejection — it is registered and working, including the shipped
+            // `⌥Space` default. Warning severity, not Danger, and the rebind
+            // action stays optional rather than being the only way out.
+            HotkeyStatus::Registered { combo, caution } => widgets::state_block(
+                match caution {
+                    Some(_) => Severity::Warning,
+                    None => Severity::Success,
+                },
+                combo,
+                caution.map(|c| c.explanation()),
+                rebind(),
+            ),
+            HotkeyStatus::Failed { combo, reason } => widgets::state_block(
+                Severity::Danger,
+                &i18n::t1(Key::HotkeyFailedTitle, combo),
+                Some(failure_body(reason)),
+                rebind(),
+            ),
+        });
+    }
+
+    for row in &state.permissions {
+        list = list.push(widgets::permission_banner(
+            row.status,
+            permission_label(row.permission),
+            Some(Message::OpenSystemSettings(row.permission)),
+        ));
+    }
+    list.into()
+}
+
+/// The supporting line for a refused hotkey.
+///
+/// §8 names the two messages a user actually needs — "choose different
+/// modifiers" (`-9868`) and "another app already owns this shortcut" (`-9878`)
+/// — and they lead to different actions, so they must not share copy. This used
+/// to render `global_hotkey::Error`'s `Display` verbatim, which is one string
+/// for both and is in English regardless of the UI language.
+fn failure_body(reason: &FailureReason) -> &str {
+    match reason {
+        // "macOS does not accept this combination as a global shortcut."
+        FailureReason::ModifiersRejected => i18n::t(Key::HotkeyRejectedByOs),
+        // "Another app has already claimed it. Pick a different shortcut."
+        FailureReason::AlreadyOwned => i18n::t(Key::HotkeyFailedBody),
+        // Developer-facing and platform-specific, like `permission_label`.
+        FailureReason::BreaksOsShortcut(why) => why,
+        FailureReason::Unclassified(raw) => raw,
+    }
+}
+
+/// Developer-facing permission identifiers.
+///
+/// Not in the catalogue: these name OS concepts whose own UI is untranslated
+/// per-platform, and inventing a translation for "TCC Accessibility" would make
+/// the settings pane harder to follow, not easier.
+const fn permission_label(permission: Permission) -> &'static str {
+    match permission {
+        Permission::Accessibility => "Accessibility",
+        Permission::PostEvents => "Input Monitoring",
+        Permission::ElevatedWindowAccess => "Elevated window access",
+        Permission::Notifications => "Notifications",
+        Permission::Autostart => "Launch at login",
+    }
+}
+
+fn budgets(state: &SettingsState) -> Element<'_, Message> {
+    // §14: BYOK means the user pays for every mistake aibo makes, so the meter
+    // is the first thing in the section, not a footnote.
+    column![
+        widgets::spend_meter::<Message>(&state.spend_label, state.spend_fraction),
+        // TODO(§14): per-role `max_tokens` and context caps, the confirmation
+        // threshold, and the monthly ceiling.
+    ]
+    .spacing(space(2.0))
+    .into()
+}
+
+fn language(state: &SettingsState) -> Element<'_, Message> {
+    let mut list = column![].spacing(space(1.0));
+    for lang in Lang::ALL {
+        let selected = *lang == state.language;
+        list = list.push(
+            button(
+                text(lang.endonym())
+                    .size(type_scale::BODY)
+                    .style(if selected {
+                        theme::text_accent
+                    } else {
+                        theme::text_dim
+                    }),
+            )
+            .width(Length::Fill)
+            .padding([space(1.5), space(2.0)])
+            .style(theme::action_button)
+            .on_press(Message::SetLanguage(*lang)),
+        );
+    }
+    list.into()
+}
+
+fn about<'a>(_state: &'a SettingsState) -> Element<'a, Message> {
+    column![
+        text(i18n::t(Key::AppName))
+            .size(type_scale::HEADING)
+            .style(theme::text_primary),
+        text(env!("CARGO_PKG_VERSION"))
+            .size(type_scale::META)
+            .style(theme::text_dim),
+        widgets::action_list(vec![Action::new(
+            Key::ActionCopyDiagnostics,
+            "⌘C",
+            Message::CopyDiagnostics,
+        )]),
+    ]
+    .spacing(space(2.0))
+    .into()
+}
+
+/// Roles the settings UI can bind (§4). Exposed so the picker cannot fall out
+/// of step with the router's enum.
+pub const BINDABLE_ROLES: [Role; 5] = [
+    Role::Fast,
+    Role::Smart,
+    Role::Cheap,
+    Role::Vision,
+    Role::Agent,
+];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_information_architecture_matches_section_16() {
+        // §16 names: providers, roles, budgets, permissions, actions, history,
+        // about/license. Language is the §9 addition.
+        assert_eq!(Section::ALL.len(), 8);
+        assert_eq!(Section::default(), Section::Providers);
+        for section in Section::ALL {
+            assert!(!i18n::lookup(section.title(), Lang::En).is_empty());
+            assert!(!i18n::lookup(section.title(), Lang::Ja).is_empty());
+        }
+    }
+
+    /// Regression, F6. `-9868` and `-9878` used to arrive as
+    /// `global_hotkey::Error`'s `Display` string and render identically, so
+    /// "choose different modifiers" and "another app owns this shortcut" — the
+    /// two messages §8 says a user actually needs — were indistinguishable.
+    #[test]
+    fn the_two_failure_reasons_render_different_copy() {
+        let modifiers = failure_body(&FailureReason::ModifiersRejected);
+        let owned = failure_body(&FailureReason::AlreadyOwned);
+
+        assert!(!modifiers.is_empty());
+        assert!(!owned.is_empty());
+        assert_ne!(modifiers, owned);
+
+        // Both come from the catalogue, so both follow the UI language.
+        for lang in Lang::ALL {
+            i18n::set_language(*lang);
+            assert_ne!(
+                failure_body(&FailureReason::ModifiersRejected),
+                failure_body(&FailureReason::AlreadyOwned)
+            );
+            assert_eq!(
+                failure_body(&FailureReason::ModifiersRejected),
+                i18n::lookup(Key::HotkeyRejectedByOs, *lang)
+            );
+            assert_eq!(
+                failure_body(&FailureReason::AlreadyOwned),
+                i18n::lookup(Key::HotkeyFailedBody, *lang)
+            );
+        }
+        i18n::set_language(Lang::default());
+    }
+
+    // -- Codex sign-in (§3a) ------------------------------------------------
+
+    /// **The blocker, from the UI side.** Before this card existed the
+    /// Providers tab offered no way to sign in, so a user holding only a
+    /// ChatGPT subscription could reach `aibo-provider`'s verified device flow
+    /// from nowhere in the app. An empty provider list must still render an
+    /// actionable sign-in, not just §13's dead-end "no provider configured".
+    #[test]
+    fn a_fresh_install_still_offers_a_way_in() {
+        let state = SettingsState::default();
+        assert!(state.providers.is_empty());
+
+        let (phase, detail) = CodexPhase::read(&Health::Unknown);
+        assert_eq!(phase, CodexPhase::SignedOut);
+        assert!(!detail.is_empty());
+        // The card is rendered, and it is rendered with a live action.
+        let _ = providers(&state);
+        let _ = codex_card(&state);
+    }
+
+    /// The single action must always state what it does: one press means
+    /// "sign in", "cancel" or "sign out" depending on the phase, and the label
+    /// is what distinguishes them.
+    #[test]
+    fn the_one_button_says_which_of_the_three_things_it_does() {
+        let labels = [
+            (CodexPhase::SignedOut, codex_text::SIGN_IN),
+            (CodexPhase::Starting, codex_text::CANCEL),
+            (CodexPhase::AwaitingApproval, codex_text::CANCEL),
+            (CodexPhase::Exchanging, codex_text::CANCEL),
+            (CodexPhase::SignedIn, codex_text::SIGN_OUT),
+            (CodexPhase::Failed, codex_text::SIGN_IN),
+        ];
+        for (phase, expected) in labels {
+            let state = SettingsState {
+                providers: vec![ProviderRow {
+                    id: ProviderId::CODEX,
+                    configured: phase == CodexPhase::SignedIn,
+                    health: phase.to_health("detail"),
+                }],
+                ..SettingsState::default()
+            };
+            let (read, _) = CodexPhase::read(&state.providers[0].health);
+            assert_eq!(read, phase, "{phase:?} did not survive the health channel");
+            assert_eq!(codex_action_label(read), expected);
+            let _ = codex_card(&state);
+        }
+        // …and the three labels are genuinely different strings, so "sign in"
+        // can never be pressed when it would in fact sign the user out.
+        assert_ne!(codex_text::SIGN_IN, codex_text::SIGN_OUT);
+        assert_ne!(codex_text::SIGN_IN, codex_text::CANCEL);
+        assert_ne!(codex_text::CANCEL, codex_text::SIGN_OUT);
+    }
+
+    /// The phase channel must round-trip the sentence the backend wrote,
+    /// including a user code and a URL — that sentence is the *only* place the
+    /// user sees either of them.
+    #[test]
+    fn the_user_code_and_verification_url_survive_the_round_trip() {
+        let detail = "Enter code ABCD-1234 at https://auth.openai.com/codex/device \
+                      — waiting for approval (9m 45s left)";
+        let health = CodexPhase::AwaitingApproval.to_health(detail);
+        let (phase, read) = CodexPhase::read(&health);
+
+        assert_eq!(phase, CodexPhase::AwaitingApproval);
+        assert_eq!(read, detail);
+        assert!(read.contains("ABCD-1234"));
+        assert!(read.contains("https://auth.openai.com/codex/device"));
+        // The tag must not leak into what the user reads.
+        assert!(!read.contains("awaiting"));
+        assert!(!read.contains(CODEX_MARKER));
+    }
+
+    /// A health that carries no tag — an ordinary §13 probe result — must still
+    /// render as something actionable. Reading a revoked token as "signed out"
+    /// would hide the one fact the user needs.
+    #[test]
+    fn an_untagged_health_is_read_honestly_rather_than_as_signed_out() {
+        let (phase, detail) = CodexPhase::read(&Health::Degraded {
+            reason: "sign-in required (revoked)".to_owned(),
+            consecutive_failures: 3,
+        });
+        assert_eq!(phase, CodexPhase::Failed);
+        assert_eq!(detail, "sign-in required (revoked)");
+
+        let (phase, _) = CodexPhase::read(&Health::Unavailable {
+            reason: "connect failed".to_owned(),
+        });
+        assert_eq!(phase, CodexPhase::Failed);
+
+        let (phase, _) = CodexPhase::read(&Health::Ok {
+            latency: std::time::Duration::from_millis(435),
+        });
+        assert_eq!(
+            phase,
+            CodexPhase::SignedIn,
+            "a working Codex probe means a live token pair"
+        );
+    }
+
+    /// `SignedIn` deliberately carries no sentence of its own, and the test
+    /// says so rather than passing because the caller happened to hand over the
+    /// canonical string. Any *other* phase must carry its detail verbatim.
+    #[test]
+    fn signed_in_reports_health_rather_than_a_sentence() {
+        let health = CodexPhase::SignedIn.to_health("account acct_42, plan pro");
+        assert!(
+            matches!(health, Health::Ok { .. }),
+            "a working provider must not be published as Degraded so a string can ride along"
+        );
+
+        let (phase, detail) = CodexPhase::read(&health);
+        assert_eq!(phase, CodexPhase::SignedIn);
+        assert_eq!(
+            detail,
+            codex_text::SIGNED_IN,
+            "Health::Ok has nowhere to put a sentence, so the canonical copy is what shows"
+        );
+        assert!(!detail.contains("acct_42"));
+
+        // Every phase that *is* Degraded does keep its sentence.
+        for phase in [
+            CodexPhase::SignedOut,
+            CodexPhase::Starting,
+            CodexPhase::AwaitingApproval,
+            CodexPhase::Exchanging,
+            CodexPhase::Failed,
+        ] {
+            let unique = format!("sentence for {}", phase.tag());
+            let (read_phase, read_detail) = CodexPhase::read(&phase.to_health(&unique));
+            assert_eq!(read_phase, phase);
+            assert_eq!(read_detail, unique);
+        }
+    }
+
+    /// §13's blocking state must not swallow the card, and must disappear once
+    /// something usable exists.
+    #[test]
+    fn the_no_provider_block_yields_once_codex_is_signed_in() {
+        let signed_in = SettingsState {
+            providers: vec![ProviderRow {
+                id: ProviderId::CODEX,
+                configured: true,
+                health: CodexPhase::SignedIn.to_health("signed in"),
+            }],
+            ..SettingsState::default()
+        };
+        let (phase, _) = CodexPhase::read(&signed_in.providers[0].health);
+        assert_eq!(phase, CodexPhase::SignedIn);
+        assert!(matches!(signed_in.providers[0].health, Health::Ok { .. }));
+        let _ = providers(&signed_in);
+    }
+
+    /// Regression, F5. A shift/option-only combination registers, so it is a
+    /// `Warning` on a live shortcut — never `Danger`, and never a `Failed`
+    /// state. The shipped macOS default lands here.
+    #[test]
+    fn the_shift_or_option_caution_is_soft() {
+        use crate::hotkey::Caution;
+
+        let status = HotkeyStatus::Registered {
+            combo: "⌥Space".to_owned(),
+            caution: Some(Caution::ShiftOrOptionOnly),
+        };
+        let HotkeyStatus::Registered { caution, .. } = &status else {
+            panic!("a caution never produces a Failed status");
+        };
+        assert_eq!(*caution, Some(Caution::ShiftOrOptionOnly));
+        assert!(!Caution::ShiftOrOptionOnly.explanation().is_empty());
+
+        // And it renders: the permissions section must not silently drop it.
+        let state = SettingsState {
+            section: Section::Permissions,
+            hotkey: Some(status),
+            ..SettingsState::default()
+        };
+        let _ = permissions(&state);
+    }
+}

@@ -1,0 +1,33 @@
+[package]
+name = "aibo-store"
+description = "SQLCipher database, migrations, keychain, history and FTS (§12)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+aibo-core = { workspace = true }
+# Not pinned in the workspace table: the plan names no CSPRNG, but §12 needs 32
+# *random* bytes for the SQLCipher key and SQLite's own `randomblob()` is seeded
+# from the clock on Windows. `getrandom` is the smallest correct answer and is
+# already in the lock file transitively.
+getrandom = "0.3"
+keyring = { workspace = true }
+rusqlite = { workspace = true }
+secrecy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+zeroize = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"

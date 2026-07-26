@@ -1,0 +1,10 @@
+data: {"id":"chatcmpl-t1","choices":[{"index":0,"delta":{"role":"assistant","tool_calls":[{"index":0,"id":"call_abc","type":"function","function":{"name":"get_weather","arguments":""}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-t1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"city\":"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-t1","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"\"Kyoto\"}"}}]},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-t1","choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":40,"completion_tokens":12,"total_tokens":52,"prompt_tokens_details":{"cached_tokens":32}}}
+
+data: [DONE]
+

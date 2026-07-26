@@ -1,0 +1,1978 @@
+//! The iced 0.14 daemon: zero windows, a warm hidden panel, a late-built tray (§6).
+//!
+//! This is the module the whole crate exists to support, and three details in
+//! it are non-obvious enough that getting them wrong looks like a working app
+//! until it isn't:
+//!
+//! 1. **`daemon`, not `application`.** iced 0.14's `daemon(boot, update, view)`
+//!    runs with *zero windows open* and does not exit when the last one closes.
+//!    §6: "the shape a tray app needs, and the reason 0.14 is the right target."
+//!
+//! 2. **The panel is created hidden in `boot` and painted before it is ever
+//!    shown.** A window created on hotkey press costs surface creation plus
+//!    first-frame pipeline compile and misses the budget (§6). `iced_winit`
+//!    always creates windows with `with_visible(false)` and then flips them, so
+//!    `window::Settings { visible: false }` yields a window whose wgpu surface
+//!    exists and whose UI tree is built; `set_mode(Mode::Windowed)` maps to
+//!    `set_visible(true)`. Showing is then position + show + focus.
+//!
+//! 3. **The tray is created from the first `update` tick, never from `boot`.**
+//!    §6: `tray-icon` requires the event loop to be *already running* — not
+//!    merely created — and on macOS the tray must be created on the main
+//!    thread. `iced_winit` runs `boot` **before** `event_loop.run_app`, so a
+//!    tray built there does not work. `boot` therefore returns a
+//!    `Task::done(Message::Ready)` purely to guarantee there *is* a first
+//!    update tick, and [`Aibo::update`] does the shell wiring on whichever
+//!    message arrives first.
+//!
+//! iced's own tray-icon integration PR is still open and unmerged (§6), so the
+//! event plumbing below is integration work rather than a drop-in.
+
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
+
+use aibo_core::types::{DisplayInfo, StreamEvent};
+use iced::widget::operation;
+use iced::window::{self, Mode};
+use iced::{Element, Point, Size, Subscription, Task, Theme};
+use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use uuid::Uuid;
+
+use crate::bridge::{SessionId, UiEvent, UiRequest};
+use crate::error::{Result, UiError};
+use crate::hotkey::{self, HotkeyAction, HotkeyStatus, Hotkeys};
+use crate::i18n::{self, Lang};
+use crate::panel::{self, ContextState, PanelState, Phase};
+use crate::placement::{self, ObservedGeometry, Placement, PlacementRequest};
+use crate::settings::{self, SettingsState};
+use crate::task_window::{self, TaskState};
+use crate::theme::{self as ui_theme, Appearance, motion::Motion};
+use crate::tray::{self, Tray, TrayCommand, TrayState};
+
+// ---------------------------------------------------------------------------
+// Configuration and handles
+// ---------------------------------------------------------------------------
+
+/// Shell configuration, resolved from the user's config before the loop starts.
+#[derive(Debug, Clone)]
+pub struct UiConfig {
+    /// UI language (§9).
+    pub language: Lang,
+    /// Light or dark. Dark-first is the product default (§16).
+    pub appearance: Appearance,
+    /// Whether animation runs at all (§16 reduced-motion).
+    pub motion: Motion,
+    /// The panel hotkey. `None` uses the platform default from §9 — `⌥Space`
+    /// on macOS, `Ctrl+Shift+Space` on Windows.
+    pub panel_hotkey: Option<global_hotkey::hotkey::HotKey>,
+}
+
+impl Default for UiConfig {
+    fn default() -> Self {
+        Self {
+            language: Lang::default(),
+            appearance: Appearance::Dark,
+            motion: Motion::Full,
+            panel_hotkey: None,
+        }
+    }
+}
+
+/// The two ends of the §6 bridge, handed to [`run`] by the binary.
+pub struct UiHandles {
+    /// UI → tokio. Unbounded: the UI thread must never block on a full queue,
+    /// and the message rate is bounded by human input.
+    pub requests: UnboundedSender<UiRequest>,
+    /// tokio → UI. Drained by a `Subscription`.
+    pub events: UnboundedReceiver<UiEvent>,
+}
+
+// ---------------------------------------------------------------------------
+// Process-global plumbing
+// ---------------------------------------------------------------------------
+
+/// `Subscription::run` takes a bare `fn` pointer, so the receivers cannot be
+/// captured in a closure — they are parked here and taken exactly once by the
+/// subscription that owns them.
+static BACKEND_EVENTS: Mutex<Option<UnboundedReceiver<UiEvent>>> = Mutex::new(None);
+static SHELL_EVENTS: Mutex<Option<UnboundedReceiver<ShellEvent>>> = Mutex::new(None);
+
+/// The sender half of the shell channel, held for the process lifetime because
+/// `global-hotkey` and `tray-icon` install *global* handlers.
+static SHELL_SENDER: OnceLock<UnboundedSender<ShellEvent>> = OnceLock::new();
+
+/// §6 requires single-instance behaviour across the machine; this only guards
+/// the far cheaper in-process case, which the global handlers make unavoidable.
+static RUNNING: AtomicBool = AtomicBool::new(false);
+
+/// An event from one of the two OS-level shell sources.
+#[derive(Debug, Clone)]
+enum ShellEvent {
+    /// A registered hotkey fired (key-down only, see [`hotkey::forward_events`]).
+    Hotkey(u32),
+    /// A tray menu item was chosen.
+    Tray(TrayCommand),
+}
+
+// ---------------------------------------------------------------------------
+// Messages
+// ---------------------------------------------------------------------------
+
+/// Everything the daemon reacts to.
+#[derive(Debug, Clone)]
+pub enum Message {
+    /// The first update tick. Exists so the tray has a legal place to be built.
+    Ready,
+    /// A window finished opening.
+    WindowOpened(window::Id),
+    /// A window closed.
+    WindowClosed(window::Id),
+    /// A frame was painted; drives the warm-up counter (§6).
+    FramePainted,
+    /// A registered hotkey fired.
+    Hotkey(u32),
+    /// A tray command.
+    Tray(TrayCommand),
+    /// Show the panel at an already-resolved placement (§9).
+    ///
+    /// The panel is only ever made visible from a resolved [`Placement`] —
+    /// there is no "show it now and position it in a moment" path, because that
+    /// is what put it in the top-left corner.
+    Place(Placement),
+    /// Ask the window server for the panel's monitor size and scale factor.
+    ///
+    /// §9: recompute on every show, and re-layout on scale-factor and size
+    /// changes — not once at creation.
+    ProbeGeometry,
+    /// The window server answered [`Message::ProbeGeometry`].
+    Observed {
+        /// Logical size of the monitor the panel window is currently on.
+        monitor: Option<Size>,
+        /// The panel window's scale factor, as of now.
+        scale: f32,
+    },
+    /// Attached displays changed; re-clamp (§9).
+    Displays(Vec<DisplayInfo>),
+    /// A message from the panel.
+    Panel(panel::Message),
+    /// A message from a task window.
+    Task(Uuid, task_window::Message),
+    /// A message from the settings window.
+    Settings(settings::Message),
+    /// An event from the runtime.
+    Backend(Box<UiEvent>),
+    /// Nothing. Returned where a branch has no work, so `update` stays total.
+    Ignored,
+}
+
+// ---------------------------------------------------------------------------
+// State
+// ---------------------------------------------------------------------------
+
+/// Which window a given [`window::Id`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    Panel,
+    Task(Uuid),
+    Settings,
+}
+
+/// The daemon's state.
+///
+/// Not `Send` and not required to be: it holds the tray (an `NSStatusItem` on
+/// macOS) and the hotkey manager, both main-thread-affine, and iced's `daemon`
+/// imposes no `Send` bound on `State`.
+pub struct Aibo {
+    config: UiConfig,
+    requests: UnboundedSender<UiRequest>,
+
+    /// The pre-created hidden panel window (§6).
+    panel_window: window::Id,
+    panel: PanelState,
+    /// Whether the panel is currently on screen.
+    panel_visible: bool,
+    /// Placement of the last show, so a display change can re-clamp (§9).
+    last_placement: Option<Placement>,
+    /// The window server's last answer about the panel's monitor (§9).
+    ///
+    /// Refreshed on every show and on every resize/scale-factor change, never
+    /// cached from window creation. It is also the only display information
+    /// aibo can obtain without the platform layer, so it is what keeps the
+    /// panel off the corner before the first `DisplaysChanged` arrives.
+    observed: Option<ObservedGeometry>,
+    /// A show is waiting on [`Message::Observed`].
+    ///
+    /// Set only on the cold path where *nothing* is known about the displays.
+    /// §8 wants the panel up immediately, so a show with usable geometry never
+    /// waits — but a show with no geometry at all must, because the alternative
+    /// is putting the panel somewhere and moving it, and "somewhere" was the
+    /// top-left corner.
+    pending_show: bool,
+
+    settings_window: Option<window::Id>,
+    settings: SettingsState,
+
+    /// Open task windows. §6: an agent run outlives the panel and lives here.
+    tasks: Vec<(window::Id, TaskState)>,
+    /// Runs whose window has not been opened yet.
+    pending_tasks: Vec<TaskState>,
+
+    tray: Option<Tray>,
+    hotkeys: Option<Hotkeys>,
+    hotkey_status: Option<HotkeyStatus>,
+
+    displays: Vec<DisplayInfo>,
+    /// Set once the first `update` tick has run the shell wiring.
+    shell_started: bool,
+}
+
+impl std::fmt::Debug for Aibo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Aibo")
+            .field("panel_visible", &self.panel_visible)
+            .field("tasks", &self.tasks.len())
+            .field("hotkey_status", &self.hotkey_status)
+            .finish_non_exhaustive()
+    }
+}
+
+impl Aibo {
+    fn role_of(&self, id: window::Id) -> Option<Role> {
+        if id == self.panel_window {
+            return Some(Role::Panel);
+        }
+        if Some(id) == self.settings_window {
+            return Some(Role::Settings);
+        }
+        self.tasks
+            .iter()
+            .find(|(window_id, _)| *window_id == id)
+            .map(|(_, task)| Role::Task(task.id))
+    }
+
+    fn send(&self, request: UiRequest) {
+        // A closed channel means the runtime is already shutting down. Nothing
+        // useful can be done about it from a view callback, so it is logged and
+        // dropped rather than propagated into `update`.
+        if self.requests.send(request).is_err() {
+            tracing::warn!("runtime channel closed; request dropped");
+        }
+    }
+
+    /// The same dispatch as [`Aibo::send`], but as a [`Task`] so it can be
+    /// *sequenced after* another task rather than racing it.
+    ///
+    /// `send` fires the instant it is called, which is fine for requests with
+    /// no ordering constraint. `Insert` has one — §8 requires the panel to be
+    /// hidden first — and only `chain` can express it.
+    fn deferred_send(&self, request: UiRequest) -> Task<Message> {
+        let requests = self.requests.clone();
+        Task::future(async move {
+            if requests.send(request).is_err() {
+                tracing::warn!("runtime channel closed; request dropped");
+            }
+            Message::Ignored
+        })
+    }
+
+    /// Wire up the OS-level shell. **Runs on the first `update` tick** (§6).
+    fn start_shell(&mut self) {
+        if self.shell_started {
+            return;
+        }
+        self.shell_started = true;
+
+        // Unit tests drive `update` from the harness's own threads. `tray-icon`
+        // needs the main thread and a running event loop, and
+        // `GlobalHotKeyManager` installs a process-wide Carbon handler — neither
+        // is safe or meaningful here, so the shell is not started under test.
+        #[cfg(test)]
+        return;
+
+        #[cfg(not(test))]
+        self.start_shell_inner();
+    }
+
+    /// The real shell wiring. Split out only so [`Aibo::start_shell`] can skip
+    /// it under `cfg(test)` without duplicating the guard.
+    #[cfg(not(test))]
+    fn start_shell_inner(&mut self) {
+        // The tray must be created here, inside the running event loop and on
+        // the main thread — not in `boot`, where `tray-icon` cannot work (§6).
+        match tray::create() {
+            Ok(tray) => self.tray = Some(tray),
+            // A missing tray is bad but not fatal; the hotkey still works and
+            // §6 would rather have a degraded app than no app.
+            Err(error) => tracing::error!(%error, "tray icon unavailable"),
+        }
+
+        match Hotkeys::new() {
+            Ok(mut hotkeys) => {
+                let binding = match self.config.panel_hotkey {
+                    Some(combo) => hotkey::Binding::new(HotkeyAction::TogglePanel, combo),
+                    None => hotkey::Binding::default_for(HotkeyAction::TogglePanel)
+                        .expect("TogglePanel always has a platform default"),
+                };
+                let status = hotkeys.register(binding);
+                match &status {
+                    // §9: conflict detection at first run. The app stays usable
+                    // through the tray, and settings shows what happened.
+                    HotkeyStatus::Failed { combo, reason } => {
+                        tracing::error!(%combo, ?reason, "global hotkey unavailable");
+                    }
+                    // §8/§9: shift/option-only is a caution, not a failure. It
+                    // registered — including `⌥Space`, the shipped macOS
+                    // default — so this is `warn`, and the panel and settings
+                    // show it as a soft warning rather than a broken state.
+                    HotkeyStatus::Registered {
+                        combo,
+                        caution: Some(caution),
+                    } => {
+                        tracing::warn!(%combo, ?caution, "global hotkey registered with a caution");
+                    }
+                    HotkeyStatus::Registered { .. } => {}
+                }
+                self.hotkey_status = Some(status.clone());
+                self.settings.hotkey = Some(status);
+                self.hotkeys = Some(hotkeys);
+            }
+            Err(error) => {
+                tracing::error!(%error, "hotkey manager unavailable");
+                let status = HotkeyStatus::Failed {
+                    combo: String::new(),
+                    reason: hotkey::FailureReason::Unclassified(error.to_string()),
+                };
+                self.hotkey_status = Some(status.clone());
+                // `update` opens settings on this state; without the mirror the
+                // window opens showing nothing at all.
+                self.settings.hotkey = Some(status);
+            }
+        }
+    }
+
+    /// Show the panel: position, show, focus — and nothing else (§6).
+    ///
+    /// **The order is load-bearing and therefore a `chain`, not a `batch`.**
+    /// `Task::batch` merges its streams with `SelectAll`, which makes no
+    /// promise about which action reaches the window server first; `resize` and
+    /// `move_to` landing after `set_mode(Windowed)` is a visible jump from
+    /// wherever the window happened to be — and while the window happened to be
+    /// at the origin, an indistinguishable one from the placement bug itself.
+    fn show_panel(&mut self, placement: Placement) -> Task<Message> {
+        self.last_placement = Some(placement);
+        self.panel_visible = true;
+        self.pending_show = false;
+
+        let position = Point::new(placement.position.0, placement.position.1);
+        let size = Size::new(placement.size.0, placement.size.1);
+
+        window::resize(self.panel_window, size)
+            .chain(window::move_to(self.panel_window, position))
+            .chain(window::set_mode(self.panel_window, Mode::Windowed))
+            .chain(window::gain_focus(self.panel_window))
+            .chain(operation::focus(panel::INPUT_ID))
+    }
+
+    /// Hide the panel. Never cancels an agent run (§6).
+    fn hide_panel(&mut self) -> Task<Message> {
+        self.panel_visible = false;
+        // A show that was still waiting on the window server must not land
+        // after the user has already dismissed the panel.
+        self.pending_show = false;
+        window::set_mode(self.panel_window, Mode::Hidden)
+    }
+
+    /// Compute the placement for the current state (§9).
+    fn placement(&self) -> Placement {
+        // SPIKE: S1 — caret/selection bounds come from AX (`kAXBoundsForRange`)
+        // on macOS and UIA `BoundingRectangle` on Windows. The anchored path is
+        // wired end to end, but until S1 confirms the bounds are obtainable and
+        // correct under mixed DPI they arrive as `None` and the panel uses the
+        // §9 fallback: the display containing the focused window's centre, 28 %
+        // from the top.
+        placement::place(&PlacementRequest {
+            caret_bounds: self.panel.caret_bounds(),
+            // The focused window's bounds are not on the §7 capture surface, so
+            // the UI cannot know its centre. `caret_bounds` covers the anchored
+            // case and `remembered_display` the returning one; this stays
+            // `None` rather than being faked from the panel's own position,
+            // which would make the panel choose the display it is already on
+            // and never follow the user to another.
+            focused_window_centre: None,
+            remembered_display: self.last_placement.map(|p| p.display_id),
+            displays: self.displays.clone(),
+            observed: self.observed,
+            preferred_width: None,
+            content_height: self.panel.desired_height(),
+        })
+    }
+
+    /// Whether anything at all is known about where the displays are.
+    ///
+    /// False only before the first `DisplaysChanged` *and* the first answer
+    /// from the window server — in practice, before the panel window has
+    /// finished opening.
+    fn geometry_is_known(&self) -> bool {
+        !self.displays.is_empty() || self.observed.is_some()
+    }
+
+    /// Begin a new panel invocation.
+    ///
+    /// §13: pressing the hotkey while a Complete is streaming cancels the
+    /// in-flight request and discards the old session; pressing it during an
+    /// **agent run** does not interrupt — the run continues in its task window
+    /// and a fresh panel opens.
+    fn open_panel(&mut self) -> Task<Message> {
+        if matches!(self.panel.phase, Phase::Loading | Phase::Streaming) {
+            self.send(UiRequest::Cancel {
+                session: self.panel.session,
+            });
+        }
+
+        let session: SessionId = Uuid::now_v7();
+        self.panel.reset(session);
+        self.panel.phase = Phase::Idle;
+        self.send(UiRequest::CaptureContext { session });
+
+        if self.geometry_is_known() {
+            // §8: show immediately. The cached geometry is a frame old at
+            // worst, and §9's re-probe below corrects it if the window server
+            // disagrees — that is cheaper than making every hotkey press wait
+            // for a round trip it will almost always agree with.
+            let placement = self.placement();
+            self.show_panel(placement)
+                .chain(probe_geometry(self.panel_window))
+        } else {
+            // Nothing is known: resolve the placement *first*. Showing here and
+            // correcting afterwards is exactly the bug — the panel appears in
+            // the corner and then jumps.
+            self.pending_show = true;
+            probe_geometry(self.panel_window)
+        }
+    }
+
+    fn task_window_for(&self, id: Uuid) -> Option<window::Id> {
+        self.tasks
+            .iter()
+            .find(|(_, task)| task.id == id)
+            .map(|(window_id, _)| *window_id)
+    }
+
+    fn refresh_tray(&mut self) {
+        let Some(tray) = self.tray.as_mut() else {
+            return;
+        };
+        let state = if self.tasks.iter().any(|(_, t)| t.is_blocked()) {
+            TrayState::Attention
+        } else if self.tasks.iter().any(|(_, t)| t.is_running()) {
+            TrayState::Busy
+        } else {
+            TrayState::Idle
+        };
+        tray.set_state(state);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Window settings
+// ---------------------------------------------------------------------------
+
+/// Settings for the pre-created hidden panel window (§6, §9).
+fn panel_window_settings() -> window::Settings {
+    window::Settings {
+        size: Size::new(
+            ui_theme::PANEL_WIDTH_DEFAULT,
+            ui_theme::PANEL_HEIGHT_COLLAPSED,
+        ),
+        // §6, the cold-start trick: created hidden so its wgpu surface exists
+        // and its first frame is compiled before the first hotkey.
+        visible: false,
+        decorations: false,
+        transparent: true,
+        resizable: false,
+        minimizable: false,
+        closeable: false,
+        level: window::Level::AlwaysOnTop,
+        // The panel must never take over the app's lifetime; §6 keeps it alive
+        // hidden rather than destroying and recreating it.
+        exit_on_close_request: false,
+        min_size: Some(Size::new(
+            ui_theme::PANEL_WIDTH_MIN,
+            ui_theme::PANEL_HEIGHT_COLLAPSED,
+        )),
+        max_size: Some(Size::new(
+            ui_theme::PANEL_WIDTH_MAX,
+            ui_theme::PANEL_HEIGHT_MAX,
+        )),
+        platform_specific: panel_platform_settings(),
+        ..Default::default()
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn panel_platform_settings() -> window::settings::PlatformSpecific {
+    // SPIKE: S1 — three panel behaviours need the native `NSWindow` handle,
+    // which iced 0.14 does not expose directly:
+    //   * joining **all Spaces**, or the panel appears on the wrong desktop
+    //     when the user is in a fullscreen app (§9);
+    //   * `NSWindowStyleMaskNonactivatingPanel`, so showing the panel does not
+    //     steal activation from the app being edited (§8);
+    //   * `window-vibrancy` for the backdrop, which takes a
+    //     `raw-window-handle` 0.6 handle — the version iced 0.14 and
+    //     window-vibrancy 0.8 happen to agree on (§20).
+    window::settings::PlatformSpecific::default()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn panel_platform_settings() -> window::settings::PlatformSpecific {
+    #[cfg(target_os = "windows")]
+    {
+        window::settings::PlatformSpecific {
+            // A hotkey overlay has no business in the taskbar or Alt-Tab.
+            skip_taskbar: true,
+            // SPIKE: S1 — `WS_EX_NOACTIVATE` (so the panel does not steal focus
+            // from the app being edited, §8) and Per-Monitor-V2 DPI awareness
+            // in the manifest (§9) are both outside what
+            // `window::Settings` can express and need the raw `HWND`.
+            ..Default::default()
+        }
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        window::settings::PlatformSpecific::default()
+    }
+}
+
+/// Settings for a task window (§6): a real window, because an agent run has
+/// scrollback, diffs and blocking approvals.
+fn task_window_settings() -> window::Settings {
+    window::Settings {
+        size: Size::new(760.0, 640.0),
+        min_size: Some(Size::new(480.0, 360.0)),
+        exit_on_close_request: true,
+        ..Default::default()
+    }
+}
+
+/// Settings for the settings window.
+fn settings_window_settings() -> window::Settings {
+    window::Settings {
+        size: Size::new(880.0, 620.0),
+        min_size: Some(Size::new(640.0, 420.0)),
+        exit_on_close_request: true,
+        ..Default::default()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// boot / update / view / subscription
+// ---------------------------------------------------------------------------
+
+fn boot(config: UiConfig, requests: UnboundedSender<UiRequest>) -> (Aibo, Task<Message>) {
+    i18n::set_language(config.language);
+
+    // §6: pre-create the panel hidden. This is the only window opened at boot;
+    // the daemon otherwise runs with none.
+    let (panel_window, opened) = window::open(panel_window_settings());
+
+    let state = Aibo {
+        config,
+        requests,
+        panel_window,
+        panel: PanelState::new(Uuid::now_v7()),
+        panel_visible: false,
+        last_placement: None,
+        observed: None,
+        pending_show: false,
+        settings_window: None,
+        settings: SettingsState::default(),
+        tasks: Vec::new(),
+        pending_tasks: Vec::new(),
+        tray: None,
+        hotkeys: None,
+        hotkey_status: None,
+        displays: Vec::new(),
+        shell_started: false,
+    };
+
+    (
+        state,
+        Task::batch([
+            opened.map(Message::WindowOpened),
+            // Guarantees a first `update` tick even if nothing else happens,
+            // which is where the tray gets built (§6).
+            Task::done(Message::Ready),
+        ]),
+    )
+}
+
+fn update(state: &mut Aibo, message: Message) -> Task<Message> {
+    // The tray cannot be created in `boot`; this is the first moment inside the
+    // running event loop, on the main thread (§6).
+    let first_tick = !state.shell_started;
+    state.start_shell();
+
+    // §9 wants conflict detection at first run, and a refused shortcut is the
+    // one startup problem the user cannot discover on their own: the app looks
+    // installed and does nothing. Logging it is not enough, so settings opens
+    // once, on the tick that discovered it, showing which combination failed.
+    let shell_task =
+        if first_tick && matches!(state.hotkey_status, Some(HotkeyStatus::Failed { .. })) {
+            // Permissions, not Actions: the hotkey block lives in the
+            // permissions section (§9 "this is where a user who has lost
+            // ⌥Space to Raycast will come looking"). Opening on Actions
+            // showed an empty state and no explanation.
+            state.settings.section = settings::Section::Permissions;
+            open_settings(state)
+        } else {
+            Task::none()
+        };
+
+    let task = match message {
+        Message::Ready | Message::Ignored => Task::none(),
+
+        Message::WindowOpened(id) => {
+            if id == state.panel_window {
+                // The hidden window is now real: paint the throwaway frames…
+                state.panel.phase = Phase::WarmingUp { frames_left: 2 };
+                // …and ask where it is. §9's geometry is warmed up alongside
+                // the wgpu pipelines so the first hotkey has something to place
+                // against and never has to wait for a round trip.
+                probe_geometry(state.panel_window)
+            } else {
+                Task::none()
+            }
+        }
+
+        Message::WindowClosed(id) => {
+            match state.role_of(id) {
+                // §6: the panel is never destroyed, only hidden. If the OS
+                // closed it anyway, the warm surface is gone and the next show
+                // will be slow — worth knowing about.
+                Some(Role::Panel) => tracing::warn!("the panel window was closed"),
+                Some(Role::Settings) => state.settings_window = None,
+                Some(Role::Task(task_id)) => {
+                    // Closing the window does not cancel the run (§6); the run
+                    // continues and the tray keeps indicating activity.
+                    state.tasks.retain(|(_, task)| task.id != task_id);
+                    state.refresh_tray();
+                }
+                None => {}
+            }
+            Task::none()
+        }
+
+        Message::FramePainted => {
+            if let Phase::WarmingUp { frames_left } = state.panel.phase {
+                state.panel.phase = match frames_left.saturating_sub(1) {
+                    0 => Phase::Hidden,
+                    left => Phase::WarmingUp { frames_left: left },
+                };
+            }
+            Task::none()
+        }
+
+        Message::Hotkey(id) => {
+            let action = state
+                .hotkeys
+                .as_ref()
+                .and_then(|hotkeys| hotkeys.action_for(id));
+            match action {
+                Some(HotkeyAction::TogglePanel) => {
+                    if state.panel_visible {
+                        state.send(UiRequest::Cancel {
+                            session: state.panel.session,
+                        });
+                        state.hide_panel()
+                    } else {
+                        state.open_panel()
+                    }
+                }
+                Some(HotkeyAction::ShowTasks) => focus_first_task(state),
+                // TODO(§13): the revert buffer holds the pre-transform original
+                // for the session and is owned by the runtime, not the UI.
+                Some(HotkeyAction::RevertLastTransform) | None => Task::none(),
+            }
+        }
+
+        Message::Tray(command) => match command {
+            TrayCommand::OpenPanel => state.open_panel(),
+            TrayCommand::ShowTasks => focus_first_task(state),
+            TrayCommand::OpenSettings => open_settings(state),
+            TrayCommand::Quit => {
+                // §6: child processes must not outlive aibo. The runtime reaps
+                // them; the UI only asks and then exits.
+                state.send(UiRequest::Quit);
+                iced::exit()
+            }
+        },
+
+        Message::Place(placement) => state.show_panel(placement),
+
+        Message::ProbeGeometry => probe_geometry(state.panel_window),
+
+        Message::Observed { monitor, scale } => {
+            state.observed = Some(ObservedGeometry {
+                monitor_size: monitor.map(|s| (f64::from(s.width), f64::from(s.height))),
+                scale_factor: f64::from(scale),
+            });
+
+            let pending = std::mem::take(&mut state.pending_show);
+            if pending || state.panel_visible {
+                let placement = state.placement();
+                // §9's "re-layout on scale-factor and size changes" — but only
+                // when something actually changed. `show_panel` issues a
+                // resize, which produces another resize event, which probes
+                // again; without this guard that is a loop, not a correction.
+                if pending || state.last_placement != Some(placement) {
+                    update(state, Message::Place(placement))
+                } else {
+                    Task::none()
+                }
+            } else {
+                Task::none()
+            }
+        }
+
+        Message::Displays(displays) => {
+            state.displays = displays;
+            // §9: if the remembered display is gone it must not steer the next
+            // show — dropping it here is what makes `place` fall back to the
+            // primary instead of to a display id nothing matches.
+            if let Some(previous) = state.last_placement
+                && !state.displays.iter().any(|d| d.id == previous.display_id)
+            {
+                state.last_placement = None;
+            }
+            // §9: on disconnect or resolution change, re-clamp.
+            if state.panel_visible {
+                let placement = state.placement();
+                update(state, Message::Place(placement))
+            } else {
+                Task::none()
+            }
+        }
+
+        Message::Panel(message) => panel_update(state, message),
+        Message::Task(id, message) => task_update(state, id, message),
+        Message::Settings(message) => settings_update(state, message),
+        Message::Backend(event) => backend_update(state, *event),
+    };
+
+    Task::batch([shell_task, task])
+}
+
+/// Ask the window server for the panel's monitor size and scale factor (§9).
+///
+/// These are the only two facts about the displays iced 0.14 exposes — there is
+/// no monitor enumeration, so origins and multi-display topology still have to
+/// come from `aibo-platform` via [`UiEvent::DisplaysChanged`]. What they *do*
+/// give is a fresh scale factor on every show and a real frame to centre in
+/// before the platform layer has reported anything, which is the difference
+/// between a centred panel and one in the corner.
+fn probe_geometry(window: window::Id) -> Task<Message> {
+    window::monitor_size(window).then(move |monitor| {
+        window::scale_factor(window).map(move |scale| Message::Observed { monitor, scale })
+    })
+}
+
+fn focus_first_task(state: &mut Aibo) -> Task<Message> {
+    match state.tasks.first() {
+        Some((id, _)) => Task::batch([
+            window::set_mode(*id, Mode::Windowed),
+            window::gain_focus(*id),
+        ]),
+        None => Task::none(),
+    }
+}
+
+fn open_settings(state: &mut Aibo) -> Task<Message> {
+    if let Some(id) = state.settings_window {
+        return window::gain_focus(id);
+    }
+    let (id, opened) = window::open(settings_window_settings());
+    state.settings_window = Some(id);
+    opened.map(Message::WindowOpened)
+}
+
+fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
+    use panel::{ErrorAction, Message as M};
+
+    match message {
+        M::InputChanged(input) => {
+            state.panel.input = input;
+            Task::none()
+        }
+
+        M::Submit => {
+            if state.panel.input.trim().is_empty() {
+                return Task::none();
+            }
+            state.panel.phase = Phase::Loading;
+            state.panel.response.clear();
+            state.panel.error = None;
+            state.send(UiRequest::Submit {
+                session: state.panel.session,
+                instruction: state.panel.input.clone(),
+                surface: state.panel.surface,
+                role_override: None,
+            });
+            Task::none()
+        }
+
+        M::Accept => {
+            // Defence in depth: `can_accept` already gates the button, but §13
+            // makes a wrong insert the worst failure this product can have.
+            if !state.panel.can_accept() {
+                return Task::none();
+            }
+            // §8's insert sequence is ordered and the order is load-bearing:
+            //   1. hide the panel
+            //   2. restore_focus(target) — and CONFIRM it landed
+            //   3. validate_target(target)
+            //   4. one atomic paste
+            // Steps 2-4 belong to the runtime, but step 1 is the UI's, and
+            // dispatching `Insert` while the panel is still up inverts the
+            // order: the panel holds focus, so `restore_focus` starts its
+            // confirm-and-retry loop against a window aibo has not given up
+            // yet. Chaining rather than calling `send` first is what makes the
+            // hide actually precede the request instead of racing it.
+            let request = UiRequest::Insert {
+                session: state.panel.session,
+                text: state.panel.response.clone(),
+            };
+            let dispatch = state.deferred_send(request);
+            state.hide_panel().chain(dispatch)
+        }
+
+        M::Copy => {
+            state.send(UiRequest::Copy {
+                text: state.panel.response.clone(),
+            });
+            Task::none()
+        }
+
+        M::Escalate => {
+            state.panel.phase = Phase::Loading;
+            state.panel.response.clear();
+            state.send(UiRequest::Retry {
+                session: state.panel.session,
+                role: Some(aibo_core::types::Role::Smart),
+            });
+            Task::none()
+        }
+
+        M::Dismiss => {
+            // `esc` cancels in-flight work and closes the panel (§13). It never
+            // cancels an agent run — that lives in its own window (§6).
+            state.send(UiRequest::Cancel {
+                session: state.panel.session,
+            });
+            state.hide_panel()
+        }
+
+        M::DismissToast => {
+            state.panel.toast = None;
+            Task::none()
+        }
+
+        M::ShowTask => focus_first_task(state),
+
+        M::OpenSystemSettings => {
+            state.send(UiRequest::OpenSystemSettings {
+                permission: aibo_core::types::Permission::Accessibility,
+            });
+            Task::none()
+        }
+
+        M::Error(action) => {
+            let session = state.panel.session;
+            match action {
+                ErrorAction::Retry => {
+                    state.panel.phase = Phase::Loading;
+                    state.panel.error = None;
+                    state.send(UiRequest::Retry {
+                        session,
+                        role: None,
+                    });
+                    Task::none()
+                }
+                ErrorAction::RetryWith(role) => {
+                    state.panel.phase = Phase::Loading;
+                    state.panel.error = None;
+                    state.send(UiRequest::Retry {
+                        session,
+                        role: Some(role),
+                    });
+                    Task::none()
+                }
+                ErrorAction::SignIn(provider) => {
+                    state.send(UiRequest::SignIn { provider });
+                    open_settings(state)
+                }
+                ErrorAction::OpenSettings => open_settings(state),
+                ErrorAction::CopyDiagnostics => {
+                    state.send(UiRequest::CopyDiagnostics);
+                    Task::none()
+                }
+                // TODO(§5): trimming needs the capture the runtime holds; the
+                // UI cannot shorten a selection it never received in full.
+                ErrorAction::TrimSelection => Task::none(),
+                // TODO(§14): raising a budget ceiling mid-run is a settings
+                // write plus a resume, both runtime-side.
+                ErrorAction::ContinueAnyway => Task::none(),
+                // TODO(§4): rebinding the role chain to `model` is a settings
+                // write the runtime owns; until `UiRequest` carries one, take
+                // the user to the picker rather than dropping the action.
+                ErrorAction::UseModel { .. } => open_settings(state),
+            }
+        }
+    }
+}
+
+fn task_update(state: &mut Aibo, id: Uuid, message: task_window::Message) -> Task<Message> {
+    use task_window::Message as M;
+
+    let Some((window_id, task)) = state
+        .tasks
+        .iter_mut()
+        .find(|(_, task)| task.id == id)
+        .map(|(window_id, task)| (*window_id, task))
+    else {
+        return Task::none();
+    };
+
+    match message {
+        M::ToggleEntry(index) => {
+            if let Some(entry) = task.entries.get_mut(index) {
+                entry.collapsed = !entry.collapsed;
+            }
+            Task::none()
+        }
+        M::ConfirmationChanged(value) => {
+            task.typed_confirmation = value;
+            Task::none()
+        }
+        M::Decide(decision) => {
+            let Some(approval) = task.pending_approval.take() else {
+                return Task::none();
+            };
+            state.send(UiRequest::Approve {
+                task: id,
+                approval: approval.id,
+                decision,
+            });
+            state.refresh_tray();
+            Task::none()
+        }
+        M::Cancel => {
+            state.send(UiRequest::CancelTask { task: id });
+            Task::none()
+        }
+        M::CopyTranscript => {
+            let transcript = task.instruction.clone();
+            state.send(UiRequest::Copy { text: transcript });
+            Task::none()
+        }
+        // §6: closing the window does not cancel the run.
+        M::Close => window::close(window_id),
+    }
+}
+
+fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message> {
+    use settings::Message as M;
+
+    match message {
+        M::Select(section) => {
+            state.settings.section = section;
+            Task::none()
+        }
+        M::SignIn(provider) => {
+            state.send(UiRequest::SignIn { provider });
+            Task::none()
+        }
+        M::OpenSystemSettings(permission) => {
+            state.send(UiRequest::OpenSystemSettings { permission });
+            Task::none()
+        }
+        M::SetLanguage(lang) => {
+            i18n::set_language(lang);
+            state.settings.language = lang;
+            state.config.language = lang;
+            if let Some(tray) = &state.tray
+                && let Err(error) = tray.relocalise()
+            {
+                tracing::warn!(%error, "could not relocalise the tray menu");
+            }
+            state.send(UiRequest::SetLanguage(lang));
+            Task::none()
+        }
+        // TODO(§9): the picker is scoped to one key plus modifiers — no
+        // sequences, no double-taps, no left/right modifier distinction —
+        // because that is all `RegisterHotKey` supports. `Hotkeys::rebind`
+        // already keeps the previous binding if the new one is refused.
+        M::RebindHotkey => Task::none(),
+        M::CopyDiagnostics => {
+            state.send(UiRequest::CopyDiagnostics);
+            Task::none()
+        }
+        M::Close => match state.settings_window.take() {
+            Some(id) => window::close(id),
+            None => Task::none(),
+        },
+    }
+}
+
+fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
+    match event {
+        UiEvent::Context {
+            session,
+            app,
+            field,
+            selection,
+            clipboard: _,
+        } => {
+            // §13: one panel, one session. An answer for a session the user has
+            // moved on from is dropped, not rendered.
+            if session != state.panel.session {
+                return Task::none();
+            }
+            state.panel.context = match field.as_deref() {
+                // §9: while composing, aibo neither reads nor inserts.
+                Some(field) if field.ime_active => ContextState::ImeActive,
+                Some(field) => ContextState::Available {
+                    app: app.clone(),
+                    excerpt: selection
+                        .as_deref()
+                        .or(Some(field.prefix.as_str()))
+                        .map(|s| crate::widgets::elide(s, 96)),
+                    truncated: field.truncated,
+                    caret_bounds: field.caret_bounds,
+                },
+                None => match app.as_ref() {
+                    Some(app) => ContextState::Unavailable {
+                        app: Some(app.display_name.clone()),
+                    },
+                    None => ContextState::Unavailable { app: None },
+                },
+            };
+            resize_panel_if_visible(state)
+        }
+
+        UiEvent::ContextFailed { session, error } => {
+            if session != state.panel.session {
+                return Task::none();
+            }
+            if let aibo_core::AiboError::CaptureFailed {
+                reason: aibo_core::error::CaptureFailure::Denied,
+                ..
+            } = error.as_ref()
+            {
+                state.panel.context = ContextState::PermissionDenied {
+                    status: aibo_core::types::PermissionStatus::Denied,
+                };
+            }
+            state.panel.fail(&error);
+            resize_panel_if_visible(state)
+        }
+
+        UiEvent::Dispatched {
+            session,
+            provider,
+            model,
+            substituted_for,
+        } => {
+            if session != state.panel.session {
+                return Task::none();
+            }
+            state.panel.attribution.provider = Some(provider);
+            state.panel.attribution.model = Some(model);
+            state.panel.attribution.substituted_for = substituted_for;
+            state.panel.phase = Phase::Loading;
+            Task::none()
+        }
+
+        UiEvent::Stream { session, event } => {
+            if session != state.panel.session {
+                return Task::none();
+            }
+            match *event {
+                StreamEvent::Text(chunk) => {
+                    state.panel.phase = Phase::Streaming;
+                    state.panel.response.push_str(&chunk);
+                    // §16: reserve height in discrete steps so streaming never
+                    // reflows. The estimate is deliberately coarse.
+                    let estimated = 24.0 + (state.panel.response.len() as f32 / 64.0) * 20.0;
+                    if state.panel.reserve_for(estimated) {
+                        return resize_panel_if_visible(state);
+                    }
+                    Task::none()
+                }
+                StreamEvent::Reasoning(chunk) => {
+                    // §7: its own channel, rendered collapsed, never inserted.
+                    state.panel.reasoning.push_str(&chunk);
+                    Task::none()
+                }
+                StreamEvent::Usage(usage) => {
+                    state.panel.usage = usage;
+                    Task::none()
+                }
+                StreamEvent::Done(reason) => {
+                    state.panel.phase = Phase::Finished { reason };
+                    resize_panel_if_visible(state)
+                }
+                // Tool calls belong to an agent run and surface in the task
+                // window, not the panel.
+                StreamEvent::ToolCall { .. } => Task::none(),
+            }
+        }
+
+        UiEvent::FirstToken {
+            session,
+            elapsed_ms,
+        } => {
+            if session == state.panel.session {
+                state.panel.attribution.latency_ms = Some(elapsed_ms);
+            }
+            Task::none()
+        }
+
+        UiEvent::Cost {
+            session,
+            label,
+            usage,
+        } => {
+            if session == state.panel.session {
+                state.panel.attribution.cost_label = Some(label);
+                state.panel.usage = usage;
+            }
+            Task::none()
+        }
+
+        UiEvent::Failed { session, error } => {
+            if session != state.panel.session {
+                return Task::none();
+            }
+            state.panel.fail(&error);
+            // §13: `NoProviderConfigured` is the only error allowed to
+            // interrupt, and it opens settings.
+            let opens_settings = matches!(
+                state.panel.error.as_ref().map(|e| e.treatment),
+                Some(aibo_core::error::Treatment::Blocking)
+            );
+            let resize = resize_panel_if_visible(state);
+            if opens_settings {
+                Task::batch([resize, open_settings(state)])
+            } else {
+                resize
+            }
+        }
+
+        UiEvent::Inserted { session } => {
+            if session == state.panel.session {
+                return state.hide_panel();
+            }
+            Task::none()
+        }
+
+        UiEvent::TaskStarted { task, instruction } => {
+            // §6: the Do surface gets a real window that outlives the panel.
+            state.panel.handed_off_to_task = true;
+            let (window_id, opened) = window::open(task_window_settings());
+            state
+                .tasks
+                .push((window_id, TaskState::new(task, instruction)));
+            state.refresh_tray();
+            opened.map(Message::WindowOpened)
+        }
+
+        UiEvent::TaskStep { task, step } => {
+            if let Some((_, existing)) = state.tasks.iter_mut().find(|(_, t)| t.id == task) {
+                let was_blocked = existing.is_blocked();
+                existing.push(*step);
+                // §11: nothing is executed until the user answers. A run that
+                // has just become blocked is not allowed to wait behind another
+                // window — it brings its own forward, once, on the transition.
+                let now_blocked = existing.is_blocked();
+                if now_blocked && !was_blocked {
+                    state.refresh_tray();
+                    if let Some(window_id) = state.task_window_for(task) {
+                        return Task::batch([
+                            window::set_mode(window_id, Mode::Windowed),
+                            window::gain_focus(window_id),
+                        ]);
+                    }
+                }
+            } else {
+                // A step for a run whose window has not opened yet: keep it so
+                // the scrollback is complete when the window appears.
+                match state.pending_tasks.iter_mut().find(|t| t.id == task) {
+                    Some(pending) => pending.push(*step),
+                    None => {
+                        let mut pending = TaskState::new(task, String::new());
+                        pending.push(*step);
+                        state.pending_tasks.push(pending);
+                    }
+                }
+            }
+            state.refresh_tray();
+            Task::none()
+        }
+
+        UiEvent::DisplaysChanged { displays } => update(state, Message::Displays(displays)),
+
+        UiEvent::PermissionChanged { permission, status } => {
+            match state
+                .settings
+                .permissions
+                .iter_mut()
+                .find(|row| row.permission == permission)
+            {
+                Some(row) => row.status = status,
+                None => state
+                    .settings
+                    .permissions
+                    .push(settings::PermissionRow { permission, status }),
+            }
+            if permission == aibo_core::types::Permission::Accessibility
+                && matches!(
+                    status,
+                    aibo_core::types::PermissionStatus::Denied
+                        | aibo_core::types::PermissionStatus::Revoked
+                )
+            {
+                state.panel.context = ContextState::PermissionDenied { status };
+            }
+            Task::none()
+        }
+
+        UiEvent::ProviderHealth { provider, health } => {
+            match state
+                .settings
+                .providers
+                .iter_mut()
+                .find(|row| row.id == provider)
+            {
+                Some(row) => row.health = health,
+                None => state.settings.providers.push(settings::ProviderRow {
+                    id: provider,
+                    configured: true,
+                    health,
+                }),
+            }
+            Task::none()
+        }
+
+        UiEvent::Spend {
+            label,
+            fraction_of_cap,
+        } => {
+            state.settings.spend_label = label;
+            state.settings.spend_fraction = fraction_of_cap;
+            Task::none()
+        }
+
+        // TODO(§6): "aibo restarted after an error" with a diagnostics link,
+        // shown once on the next launch.
+        UiEvent::RecoveredFromCrash => Task::none(),
+    }
+}
+
+/// Re-run placement so the panel's height follows its content.
+///
+/// The height change is one of the three things §16 allows to animate; with
+/// [`Motion::Reduced`] it snaps.
+fn resize_panel_if_visible(state: &mut Aibo) -> Task<Message> {
+    if !state.panel_visible {
+        return Task::none();
+    }
+    let placement = state.placement();
+    let _ = state.config.motion;
+    state.show_panel(placement)
+}
+
+fn view(state: &Aibo, window: window::Id) -> Element<'_, Message> {
+    match state.role_of(window) {
+        Some(Role::Panel) | None => panel::view(&state.panel).map(Message::Panel),
+        Some(Role::Settings) => settings::view(&state.settings).map(Message::Settings),
+        Some(Role::Task(id)) => match state.tasks.iter().find(|(_, task)| task.id == id) {
+            Some((_, task)) => {
+                task_window::view(task).map(move |message| Message::Task(id, message))
+            }
+            None => panel::view(&state.panel).map(Message::Panel),
+        },
+    }
+}
+
+fn title(state: &Aibo, window: window::Id) -> String {
+    use crate::i18n::Key;
+    match state.role_of(window) {
+        Some(Role::Settings) => i18n::t(Key::SettingsTitle).to_owned(),
+        Some(Role::Task(_)) => i18n::t(Key::TaskWindowTitle).to_owned(),
+        _ => i18n::t(Key::AppName).to_owned(),
+    }
+}
+
+fn theme_of(state: &Aibo, _window: window::Id) -> Theme {
+    state.config.appearance.iced_theme()
+}
+
+fn subscription(state: &Aibo) -> Subscription<Message> {
+    let panel_window = state.panel_window;
+    let mut subscriptions = vec![
+        Subscription::run(shell_event_stream),
+        Subscription::run(backend_event_stream),
+        window::close_events().map(Message::WindowClosed),
+        // §9: recompute on scale-factor and size changes rather than caching
+        // the value from creation — that is the "blurry on the second monitor"
+        // bug. Dropping these events on the floor, which is what this
+        // subscription used to do, is the same as caching.
+        // `Subscription::map` rejects capturing closures at compile time, so
+        // the panel's id rides along via `with` rather than being captured.
+        window::resize_events()
+            .with(panel_window)
+            .map(|(panel, (id, _))| {
+                if id == panel {
+                    Message::ProbeGeometry
+                } else {
+                    Message::Ignored
+                }
+            }),
+        // §16: "every action has a key, shown". The action list has always
+        // *rendered* those keys — `⏎ Replace`, `⌘C Copy`, `esc Dismiss` — but
+        // nothing subscribed to keyboard events, so every one of them was a
+        // label for a binding that did not exist. The panel could not even be
+        // closed from the keyboard, in a keyboard-first tool.
+        //
+        // `text_input` consumes plain character keys before this sees them, so
+        // typing is unaffected; only the chorded and named keys below are
+        // claimed.
+        // `listen` delivers only keys no widget consumed, so `text_input`
+        // keeps ordinary typing and we claim just the named and chorded keys.
+        iced::keyboard::listen().map(|event| {
+            use iced::keyboard::key::Named;
+            use iced::keyboard::Key;
+
+            let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
+                return Message::Ignored;
+            };
+
+            match (key.as_ref(), modifiers.command()) {
+                // esc: cancel in-flight work and close (§13). Never a chord.
+                (Key::Named(Named::Escape), _) => Message::Panel(panel::Message::Dismiss),
+                // ⌘↩ escalates to the smart model, so the chord must be
+                // matched before bare ⏎ accepts (§4: escalation is explicit,
+                // never automatic).
+                (Key::Named(Named::Enter), true) => Message::Panel(panel::Message::Escalate),
+                (Key::Named(Named::Enter), false) => Message::Panel(panel::Message::Accept),
+                (Key::Character("c"), true) => Message::Panel(panel::Message::Copy),
+                _ => Message::Ignored,
+            }
+        }),
+    ];
+
+    // Frames are only interesting while the panel is warming up; subscribing
+    // permanently would wake the app 60 times a second for nothing (§15).
+    if matches!(state.panel.phase, Phase::WarmingUp { .. }) {
+        subscriptions.push(window::frames().map(|_| Message::FramePainted));
+    }
+
+    Subscription::batch(subscriptions)
+}
+
+fn shell_event_stream() -> impl iced::futures::Stream<Item = Message> {
+    let receiver = SHELL_EVENTS.lock().ok().and_then(|mut slot| slot.take());
+    iced::futures::stream::unfold(receiver, |mut receiver| async move {
+        let channel = receiver.as_mut()?;
+        let event = channel.recv().await?;
+        let message = match event {
+            ShellEvent::Hotkey(id) => Message::Hotkey(id),
+            ShellEvent::Tray(command) => Message::Tray(command),
+        };
+        Some((message, receiver))
+    })
+}
+
+fn backend_event_stream() -> impl iced::futures::Stream<Item = Message> {
+    let receiver = BACKEND_EVENTS.lock().ok().and_then(|mut slot| slot.take());
+    iced::futures::stream::unfold(receiver, |mut receiver| async move {
+        let channel = receiver.as_mut()?;
+        let event = channel.recv().await?;
+        Some((Message::Backend(Box::new(event)), receiver))
+    })
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+/// Run the aibo shell. Blocks until the daemon exits.
+///
+/// Must be called on the **main thread**: winit requires it, and so do
+/// `tray-icon` and `global-hotkey` on macOS.
+///
+/// The daemon opens no window of its own beyond the hidden panel and does not
+/// exit when windows close (§6) — only [`UiRequest::Quit`] ends it.
+pub fn run(config: UiConfig, handles: UiHandles) -> Result<()> {
+    if RUNNING.swap(true, Ordering::SeqCst) {
+        return Err(UiError::AlreadyRunning);
+    }
+
+    // Park the backend receiver for the subscription to claim.
+    *BACKEND_EVENTS
+        .lock()
+        .map_err(|_| UiError::Runtime("event channel poisoned".to_owned()))? = Some(handles.events);
+
+    // The OS installs *global* handlers for hotkeys and tray menus, so their
+    // sink lives for the process lifetime rather than in app state.
+    let (shell_tx, shell_rx) = tokio::sync::mpsc::unbounded_channel();
+    *SHELL_EVENTS
+        .lock()
+        .map_err(|_| UiError::Runtime("shell channel poisoned".to_owned()))? = Some(shell_rx);
+    let _ = SHELL_SENDER.set(shell_tx);
+
+    if let Some(sender) = SHELL_SENDER.get() {
+        let hotkey_sink = sender.clone();
+        hotkey::forward_events(move |id| {
+            let _ = hotkey_sink.send(ShellEvent::Hotkey(id));
+        });
+
+        let tray_sink = sender.clone();
+        tray::forward_events(move |command| {
+            let _ = tray_sink.send(ShellEvent::Tray(command));
+        });
+    }
+
+    let requests = handles.requests;
+    let boot_config = config.clone();
+
+    /// The window fill, beneath every widget.
+    ///
+    /// **Must be fully transparent.** The panel window is `transparent: true`
+    /// and undecorated (§9), and its rounded corners come from the
+    /// `panel_surface` container drawn *inside* it. iced's default daemon style
+    /// fills the whole window rect with `palette.background` — an opaque dark
+    /// surface — so the container's 18 pt radius was drawn correctly and then
+    /// framed by four black square corners. The border looked rounded; the
+    /// panel looked rectangular.
+    ///
+    /// Leaving this to the default is also why a translucent or vibrant
+    /// backdrop could never work: an opaque fill sits between the desktop and
+    /// the panel.
+    fn app_style(_state: &Aibo, theme: &iced::Theme) -> iced::theme::Style {
+        iced::theme::Style {
+            background_color: iced::Color::TRANSPARENT,
+            text_color: theme.palette().text,
+        }
+    }
+
+    iced::daemon(
+        move || boot(boot_config.clone(), requests.clone()),
+        update,
+        view,
+    )
+    .title(title)
+    .theme(theme_of)
+    .style(app_style)
+    .subscription(subscription)
+    .run()
+    .map_err(|error| UiError::Runtime(error.to_string()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aibo_core::types::{AppInfo, AppRef, FieldContext};
+
+    fn app() -> Aibo {
+        let (requests, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (state, _task) = boot(UiConfig::default(), requests);
+        state
+    }
+
+    fn field(ime_active: bool) -> FieldContext {
+        FieldContext {
+            prefix: "the deployment should be".to_owned(),
+            suffix: String::new(),
+            caret: None,
+            label: None,
+            is_secure: false,
+            ime_active,
+            truncated: false,
+            caret_bounds: None,
+        }
+    }
+
+    fn app_info() -> AppInfo {
+        AppInfo {
+            app_ref: AppRef {
+                pid: 1,
+                window: None,
+            },
+            identifier: "com.google.Chrome".to_owned(),
+            display_name: "Chrome".to_owned(),
+            is_code_app: false,
+        }
+    }
+
+    #[test]
+    fn the_panel_is_created_hidden_and_warms_up() {
+        let settings = panel_window_settings();
+        assert!(
+            !settings.visible,
+            "§6: the panel must be pre-created hidden"
+        );
+        assert!(!settings.decorations);
+        assert_eq!(settings.level, window::Level::AlwaysOnTop);
+
+        let mut state = app();
+        let panel_window = state.panel_window;
+        let _ = update(&mut state, Message::WindowOpened(panel_window));
+        assert!(matches!(state.panel.phase, Phase::WarmingUp { .. }));
+        let _ = update(&mut state, Message::FramePainted);
+        let _ = update(&mut state, Message::FramePainted);
+        assert_eq!(state.panel.phase, Phase::Hidden);
+        assert!(!state.panel_visible);
+    }
+
+    #[test]
+    fn events_for_a_stale_session_are_dropped() {
+        let mut state = app();
+        let stale = Uuid::now_v7();
+        assert_ne!(stale, state.panel.session);
+        let _ = backend_update(
+            &mut state,
+            UiEvent::Stream {
+                session: stale,
+                event: Box::new(StreamEvent::Text("wrong session".to_owned())),
+            },
+        );
+        assert!(state.panel.response.is_empty());
+    }
+
+    #[test]
+    fn an_ime_composition_puts_the_panel_in_its_ime_state() {
+        let mut state = app();
+        let session = state.panel.session;
+        let _ = backend_update(
+            &mut state,
+            UiEvent::Context {
+                session,
+                app: Some(app_info()),
+                field: Some(Box::new(field(true))),
+                selection: None,
+                clipboard: None,
+            },
+        );
+        assert!(matches!(state.panel.context, ContextState::ImeActive));
+    }
+
+    #[test]
+    fn context_that_never_arrives_is_not_an_error() {
+        let mut state = app();
+        let session = state.panel.session;
+        let _ = backend_update(
+            &mut state,
+            UiEvent::Context {
+                session,
+                app: Some(app_info()),
+                field: None,
+                selection: None,
+                clipboard: None,
+            },
+        );
+        assert!(matches!(
+            state.panel.context,
+            ContextState::Unavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn a_task_window_survives_the_panel_being_dismissed() {
+        let mut state = app();
+        let task = Uuid::now_v7();
+        let _ = backend_update(
+            &mut state,
+            UiEvent::TaskStarted {
+                task,
+                instruction: "rename the flag".to_owned(),
+            },
+        );
+        assert_eq!(state.tasks.len(), 1);
+        let _ = panel_update(&mut state, panel::Message::Dismiss);
+        assert!(!state.panel_visible);
+        assert_eq!(
+            state.tasks.len(),
+            1,
+            "§6: dismissing the panel never cancels a run"
+        );
+    }
+
+    /// Regression, F2. `Accept` used to call `send(UiRequest::Insert)` and
+    /// return `Task::none()`, so the request reached the runtime while the
+    /// panel was still on screen holding focus — inverting §8's ordered insert
+    /// sequence, whose first step is "hide the panel" and whose second is a
+    /// `restore_focus` that must *confirm* the target got focus back.
+    #[test]
+    fn accept_hides_the_panel_before_the_insert_is_dispatched() {
+        use aibo_core::types::StopReason;
+
+        let (requests, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (mut state, _boot) = boot(UiConfig::default(), requests);
+
+        state.panel_visible = true;
+        state.panel.phase = Phase::Finished {
+            reason: StopReason::EndTurn,
+        };
+        state.panel.response = "the deployment should be reverted".to_owned();
+        assert!(state.panel.can_accept());
+
+        let task = panel_update(&mut state, panel::Message::Accept);
+
+        // Step 1 of the sequence, and it has already happened.
+        assert!(!state.panel_visible, "§8 step 1: hide the panel");
+
+        // The request must not have been fired yet: it is sequenced *behind*
+        // the hide rather than racing it. The old code failed here.
+        assert!(
+            events.try_recv().is_err(),
+            "§8: Insert must not be dispatched while the panel still has focus"
+        );
+
+        // Two units of work: the `set_mode(Hidden)` effect, then the dispatch.
+        // `Task::none()` — what the old code returned — is zero.
+        assert_eq!(task.units(), 2, "the hide and the dispatch are both queued");
+    }
+
+    /// The dismiss path has no insert to order, so it must stay a plain hide.
+    #[test]
+    fn dismiss_still_sends_immediately() {
+        let (requests, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (mut state, _boot) = boot(UiConfig::default(), requests);
+        state.panel_visible = true;
+
+        let _ = panel_update(&mut state, panel::Message::Dismiss);
+        assert!(!state.panel_visible);
+        assert!(matches!(events.try_recv(), Ok(UiRequest::Cancel { .. })));
+    }
+
+    #[test]
+    fn window_roles_are_resolved_by_id() {
+        let state = app();
+        assert_eq!(state.role_of(state.panel_window), Some(Role::Panel));
+    }
+
+    // -----------------------------------------------------------------------
+    // §9 placement wiring
+    //
+    // The regression these guard was visible on screen: the panel rendered
+    // correctly and sat in the top-left corner of the display. `placement`
+    // itself was fine — nothing ever fed it a display, and its empty-list
+    // answer was the origin, which `show_panel` then dutifully applied.
+    // -----------------------------------------------------------------------
+
+    fn screen(id: u64, x: f64, y: f64, width: f64, height: f64, is_primary: bool) -> DisplayInfo {
+        use aibo_core::types::Rect;
+        DisplayInfo {
+            id,
+            bounds: Rect {
+                x,
+                y,
+                width,
+                height,
+            },
+            visible_frame: Rect {
+                x,
+                y: y + 25.0,
+                width,
+                height: height - 25.0,
+            },
+            scale_factor: 2.0,
+            is_primary,
+        }
+    }
+
+    fn monitor(width: f32, height: f32, scale: f32) -> Message {
+        Message::Observed {
+            monitor: Some(Size::new(width, height)),
+            scale,
+        }
+    }
+
+    /// The ordering fix. With nothing known about the displays the panel must
+    /// stay hidden until the window server answers — showing first and
+    /// correcting afterwards is what produced the corner, then a jump.
+    #[test]
+    fn the_panel_is_never_shown_before_its_placement_is_resolved() {
+        let mut state = app();
+        assert!(!state.geometry_is_known(), "a fresh daemon knows nothing");
+
+        let _ = state.open_panel();
+        assert!(
+            !state.panel_visible,
+            "§9: the panel must not be shown before its placement is resolved"
+        );
+        assert!(state.last_placement.is_none());
+        assert!(state.pending_show);
+
+        let _ = update(&mut state, monitor(1920.0, 1080.0, 2.0));
+        assert!(state.panel_visible, "the answer completes the show");
+        assert!(!state.pending_show);
+
+        let placement = state.last_placement.expect("placed");
+        assert_ne!(placement.position, (0.0, 0.0), "the original bug");
+        assert!(placement.position.0 > 0.0 && placement.position.1 > 0.0);
+    }
+
+    /// Once geometry is known the panel goes up on the spot (§8 wants it
+    /// immediate) and re-probes behind itself.
+    #[test]
+    fn a_second_show_does_not_wait_for_the_window_server() {
+        let mut state = app();
+        let _ = update(&mut state, monitor(1920.0, 1080.0, 2.0));
+
+        let task = state.open_panel();
+        assert!(state.panel_visible, "§8: show immediately");
+        assert!(!state.pending_show);
+        assert!(
+            task.units() > 5,
+            "the show is followed by a re-probe: {}",
+            task.units()
+        );
+    }
+
+    /// The whole point, stated once: no display arrangement the UI can be in
+    /// puts the panel in the corner.
+    #[test]
+    fn no_display_arrangement_puts_the_panel_in_the_corner() {
+        let arrangements = vec![
+            Vec::new(),
+            vec![screen(1, 0.0, 0.0, 1920.0, 1080.0, true)],
+            // An external display above and to the left of the laptop.
+            vec![
+                screen(1, 0.0, 0.0, 1440.0, 900.0, true),
+                screen(2, -2560.0, -400.0, 2560.0, 1440.0, false),
+            ],
+            // Portrait secondary.
+            vec![
+                screen(1, 0.0, 0.0, 1280.0, 800.0, true),
+                screen(3, 1280.0, -600.0, 1080.0, 1920.0, false),
+            ],
+        ];
+
+        for displays in arrangements {
+            let mut state = app();
+            let _ = update(&mut state, monitor(1440.0, 900.0, 2.0));
+            let _ = update(&mut state, Message::Displays(displays.clone()));
+            let _ = state.open_panel();
+
+            let p = state
+                .last_placement
+                .expect("every show resolves a placement");
+            assert!(state.panel_visible);
+            assert_ne!(p.position, (0.0, 0.0), "displays: {displays:?}");
+            assert!(p.size.0 > 0.0 && p.size.1 > 0.0);
+        }
+    }
+
+    /// §9: on disconnect or resolution change, re-clamp.
+    #[test]
+    fn a_resolution_change_reclamps_a_visible_panel() {
+        let mut state = app();
+        let _ = update(&mut state, monitor(3840.0, 2160.0, 2.0));
+        let _ = update(
+            &mut state,
+            Message::Displays(vec![screen(1, 0.0, 0.0, 3840.0, 2160.0, true)]),
+        );
+        let _ = state.open_panel();
+        let wide = state.last_placement.expect("placed");
+
+        // The same display, now at a much smaller resolution.
+        let _ = update(
+            &mut state,
+            Message::Displays(vec![screen(1, 0.0, 0.0, 1024.0, 768.0, true)]),
+        );
+        let narrow = state.last_placement.expect("re-placed");
+        assert_ne!(wide, narrow, "§9: a resolution change must re-clamp");
+        assert!(narrow.position.0 + narrow.size.0 <= 1024.0);
+        assert!(narrow.position.1 + narrow.size.1 <= 768.0);
+    }
+
+    /// §9: if the remembered display is gone, fall back to the primary.
+    #[test]
+    fn a_disconnected_display_is_forgotten_and_the_primary_takes_over() {
+        let mut state = app();
+        let _ = update(&mut state, monitor(1440.0, 900.0, 2.0));
+        let _ = update(
+            &mut state,
+            Message::Displays(vec![
+                screen(1, 0.0, 0.0, 1440.0, 900.0, true),
+                screen(2, 1440.0, 0.0, 1920.0, 1080.0, false),
+            ]),
+        );
+        // Pretend the last show landed on the external display.
+        let _ = state.open_panel();
+        state.last_placement = state.last_placement.map(|mut p| {
+            p.display_id = 2;
+            p
+        });
+
+        // Unplug it.
+        let _ = update(
+            &mut state,
+            Message::Displays(vec![screen(1, 0.0, 0.0, 1440.0, 900.0, true)]),
+        );
+        let p = state.last_placement.expect("re-placed on the primary");
+        assert_eq!(p.display_id, 1, "§9: fall back to the primary");
+        assert!(p.position.0 >= 0.0 && p.position.0 + p.size.0 <= 1440.0);
+    }
+
+    /// A display list that arrives while the panel is hidden still has to clear
+    /// a remembered display that no longer exists, or the next show steers by a
+    /// dangling id.
+    #[test]
+    fn a_disconnect_while_hidden_still_forgets_the_display() {
+        let mut state = app();
+        let _ = update(&mut state, monitor(1440.0, 900.0, 2.0));
+        let _ = update(
+            &mut state,
+            Message::Displays(vec![screen(9, 0.0, 0.0, 1440.0, 900.0, true)]),
+        );
+        let _ = state.open_panel();
+        let _ = panel_update(&mut state, panel::Message::Dismiss);
+        assert!(!state.panel_visible);
+        assert_eq!(state.last_placement.map(|p| p.display_id), Some(9));
+
+        let _ = update(
+            &mut state,
+            Message::Displays(vec![screen(4, -1920.0, -200.0, 1920.0, 1080.0, true)]),
+        );
+        assert!(state.last_placement.is_none(), "§9: forget what is gone");
+    }
+
+    /// §9: "recompute scale factor on every show, not just at creation".
+    #[test]
+    fn the_scale_factor_is_recomputed_on_every_show() {
+        let mut state = app();
+        let _ = update(&mut state, monitor(1920.0, 1080.0, 2.0));
+        let _ = update(
+            &mut state,
+            Message::Displays(vec![screen(1, 0.0, 0.0, 1920.0, 1080.0, true)]),
+        );
+        let _ = state.open_panel();
+        assert_eq!(state.last_placement.map(|p| p.scale_factor), Some(2.0));
+
+        // The panel was dragged to a 1× display, or the user changed the
+        // display's scaling. The snapshot still says 2×; the window server does
+        // not, and it is the window server that is right.
+        let _ = update(&mut state, monitor(1920.0, 1080.0, 1.0));
+        assert_eq!(
+            state.last_placement.map(|p| p.scale_factor),
+            Some(1.0),
+            "a stale factor renders blurry or wrong-sized (§9)"
+        );
+    }
+
+    /// Resize and scale-factor events used to be mapped to `Ignored`, which is
+    /// indistinguishable from caching the value from creation.
+    #[test]
+    fn a_resize_event_re_reads_the_geometry() {
+        let mut state = app();
+        assert!(
+            update(&mut state, Message::ProbeGeometry).units() > 0,
+            "§9: re-layout on size and scale-factor changes"
+        );
+    }
+
+    /// The re-probe that follows every show must not re-show the panel when
+    /// nothing changed, or `resize` → resize event → probe → `resize` never
+    /// settles.
+    #[test]
+    fn an_unchanged_geometry_answer_does_not_re_show_the_panel() {
+        let mut state = app();
+        let _ = update(&mut state, monitor(1920.0, 1080.0, 2.0));
+        let _ = state.open_panel();
+        let before = state.last_placement;
+
+        let task = update(&mut state, monitor(1920.0, 1080.0, 2.0));
+        assert_eq!(task.units(), 0, "nothing changed, so nothing is re-issued");
+        assert_eq!(state.last_placement, before);
+    }
+
+    /// An answer that arrives after the user pressed `esc` must not resurrect
+    /// the panel.
+    #[test]
+    fn a_late_geometry_answer_does_not_resurrect_a_dismissed_panel() {
+        let mut state = app();
+        let _ = state.open_panel();
+        assert!(state.pending_show);
+
+        let _ = panel_update(&mut state, panel::Message::Dismiss);
+        assert!(!state.pending_show, "the pending show is cancelled with it");
+
+        let _ = update(&mut state, monitor(1920.0, 1080.0, 2.0));
+        assert!(!state.panel_visible);
+    }
+
+    /// §9: the position and size must reach the window server *before* it is
+    /// made visible. `Task::batch` merges with `SelectAll` and makes no such
+    /// promise, so the show is a chain — five effects, in order.
+    #[test]
+    fn the_show_sequence_is_ordered() {
+        let mut state = app();
+        let _ = update(&mut state, monitor(1440.0, 900.0, 2.0));
+        let placement = state.placement();
+        let task = state.show_panel(placement);
+        assert_eq!(
+            task.units(),
+            5,
+            "resize, move, show, focus window, focus input"
+        );
+    }
+
+    /// The caret path, end to end through the panel's context state: a caret in
+    /// the bottom-right of a display anchors the panel on that display and
+    /// nowhere near the corner of the desktop.
+    #[test]
+    fn a_caret_on_a_secondary_display_anchors_the_panel_there() {
+        use aibo_core::types::Rect;
+
+        let mut state = app();
+        let _ = update(&mut state, monitor(1440.0, 900.0, 2.0));
+        let _ = update(
+            &mut state,
+            Message::Displays(vec![
+                screen(1, 0.0, 0.0, 1440.0, 900.0, true),
+                screen(2, -2560.0, -400.0, 2560.0, 1440.0, false),
+            ]),
+        );
+
+        let session = state.panel.session;
+        let mut context = field(false);
+        context.caret_bounds = Some(Rect {
+            x: -2100.0,
+            y: -300.0,
+            width: 2.0,
+            height: 18.0,
+        });
+        let _ = backend_update(
+            &mut state,
+            UiEvent::Context {
+                session,
+                app: Some(app_info()),
+                field: Some(Box::new(context)),
+                selection: None,
+                clipboard: None,
+            },
+        );
+
+        // The caret reaches placement through `PanelState::caret_bounds`, which
+        // is the wiring §9 depends on and the reason `ContextState` carries
+        // bounds at all.
+        let placement = state.placement();
+        assert_eq!(placement.display_id, 2, "anchored on the caret's display");
+        assert!(placement.anchored);
+        assert!(placement.position.0 < 0.0 && placement.position.1 < 0.0);
+        assert!(placement.position.0 >= -2560.0);
+    }
+}

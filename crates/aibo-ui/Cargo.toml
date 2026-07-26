@@ -1,0 +1,26 @@
+[package]
+name = "aibo-ui"
+description = "iced daemon, theme, panel, task window, settings and custom widgets (§16)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+aibo-core = { workspace = true }
+global-hotkey = { workspace = true }
+iced = { workspace = true }
+muda = { workspace = true }
+nucleo-matcher = { workspace = true }
+raw-window-handle = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tray-icon = { workspace = true }
+uuid = { workspace = true }
+window-vibrancy = { workspace = true }
+
+[lints.rust]
+unsafe_code = "warn"

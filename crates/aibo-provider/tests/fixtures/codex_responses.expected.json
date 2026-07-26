@@ -1,0 +1,23 @@
+[
+  {
+    "reasoning": "Considering the options"
+  },
+  {
+    "text": "fn main"
+  },
+  {
+    "text": "() {}"
+  },
+  {
+    "usage": {
+      "input_tokens": 20,
+      "cached_input_tokens": 100,
+      "output_tokens": 9,
+      "reasoning_tokens": 4,
+      "image_tokens": 0
+    }
+  },
+  {
+    "done": "end_turn"
+  }
+]

@@ -1,0 +1,23 @@
+[
+  {
+    "tool_call": {
+      "id": "call_abc",
+      "name": "get_weather",
+      "args": {
+        "city": "Kyoto"
+      }
+    }
+  },
+  {
+    "usage": {
+      "input_tokens": 8,
+      "cached_input_tokens": 32,
+      "output_tokens": 12,
+      "reasoning_tokens": 0,
+      "image_tokens": 0
+    }
+  },
+  {
+    "done": "tool_use"
+  }
+]

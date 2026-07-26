@@ -1,0 +1,4 @@
+data: {"id":"chatcmpl-o1","model":"llama3.2","choices":[{"index":0,"delta":{"role":"assistant","content":"local"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-o1","model":"llama3.2","choices":[{"index":0,"delta":{"content":" reply"},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2}}
+

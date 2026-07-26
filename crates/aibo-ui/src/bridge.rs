@@ -1,0 +1,271 @@
+//! The UI ↔ tokio bridge (§6).
+//!
+//! §6 fixes the shape: "Bridge tokio → UI with `iced::Subscription::run` over an
+//! mpsc receiver; UI → tokio with an unbounded sender in app state." This module
+//! is the *vocabulary* that crosses that boundary, and it is deliberately the
+//! only coupling between `aibo-ui` and the rest of the workspace beyond
+//! `aibo-core`'s domain types.
+//!
+//! Two properties are load-bearing:
+//!
+//! * **Nothing here blocks.** Every variant is a plain data message. The UI
+//!   thread never awaits a provider, an AX read or a SQLite write; §6 is
+//!   explicit that UI Automation and macOS AX must not run on the event loop.
+//! * **Errors cross as `Arc`.** [`aibo_core::AiboError`] is not `Clone` (it can
+//!   carry a boxed source), and iced messages want to be. Arc-wrapping keeps the
+//!   original error intact for logging instead of flattening it to a string at
+//!   the boundary.
+
+use std::sync::Arc;
+
+use aibo_core::AiboError;
+use aibo_core::types::{
+    AgentStep, AppInfo, ClipboardItem, DisplayInfo, FieldContext, Health, Permission,
+    PermissionStatus, ProviderId, Role, StreamEvent, Surface, Usage,
+};
+use uuid::Uuid;
+
+use crate::i18n::Lang;
+
+/// Correlates a panel invocation with the work it started.
+///
+/// §13: "one panel, one session". Pressing the hotkey while a Complete is
+/// streaming cancels the in-flight request and discards the old session — so
+/// every event carries the session it belongs to and the UI drops anything for
+/// a session it has moved on from. Without this, a slow response from a
+/// cancelled request overwrites a fresh one.
+pub type SessionId = Uuid;
+
+/// Something the UI asks the runtime to do.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum UiRequest {
+    /// The hotkey fired. Capture context for the frontmost app.
+    ///
+    /// §8 splits capture in two: the cheap synchronous part (app ref, displays)
+    /// and everything else behind a deadline. The UI shows the panel without
+    /// waiting for either.
+    CaptureContext {
+        /// The session this capture belongs to.
+        session: SessionId,
+    },
+
+    /// Run the user's instruction.
+    Submit {
+        /// Session.
+        session: SessionId,
+        /// Exactly what the user typed, untouched. §5: this is the only
+        /// content permitted to authorise a tool call.
+        instruction: String,
+        /// The surface the panel resolved, frozen for the session (§1).
+        surface: Surface,
+        /// `@model` / `⌘1..4` override; wins over every routing rule (§4).
+        role_override: Option<Role>,
+    },
+
+    /// Cancel in-flight work for a session (`esc`, or a new submission).
+    Cancel {
+        /// Session.
+        session: SessionId,
+    },
+
+    /// Insert the accepted text into the source app.
+    ///
+    /// §13 invariant: aibo never streams into a third-party app. This is sent
+    /// once, on accept, with the complete string — never per chunk.
+    Insert {
+        /// Session, so the runtime can re-validate the insert target (§8).
+        session: SessionId,
+        /// The full text.
+        text: String,
+    },
+
+    /// Put text on the clipboard.
+    Copy {
+        /// The text.
+        text: String,
+    },
+
+    /// Re-run a session against a different role (the "Retry with Smart"
+    /// inline action from §13).
+    Retry {
+        /// Session.
+        session: SessionId,
+        /// Role to use, or `None` to repeat the original routing.
+        role: Option<Role>,
+    },
+
+    /// Start the re-authentication flow for a provider.
+    SignIn {
+        /// Provider whose credential was rejected.
+        provider: ProviderId,
+    },
+
+    /// Open the OS privacy pane for a permission (§17).
+    OpenSystemSettings {
+        /// Which permission.
+        permission: Permission,
+    },
+
+    /// Answer a blocking approval request (§11).
+    Approve {
+        /// Task the approval belongs to.
+        task: Uuid,
+        /// Backend-assigned approval id.
+        approval: String,
+        /// The user's answer.
+        decision: aibo_core::types::ApprovalDecision,
+    },
+
+    /// Cancel an agent run.
+    CancelTask {
+        /// Task id.
+        task: Uuid,
+    },
+
+    /// Copy a redacted diagnostics bundle (§13 `Internal`, §19).
+    CopyDiagnostics,
+
+    /// Persist and apply a new UI language.
+    SetLanguage(Lang),
+
+    /// Begin an orderly shutdown: cancel runs, reap children, close the
+    /// database. §6 — child processes must not outlive aibo.
+    Quit,
+}
+
+/// Something the runtime tells the UI.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum UiEvent {
+    /// Context capture finished, partially or fully.
+    ///
+    /// §8: the panel "tolerates context arriving late, empty or never". Every
+    /// field is optional for that reason.
+    Context {
+        /// Session.
+        session: SessionId,
+        /// The frontmost app, if it could be identified.
+        app: Option<AppInfo>,
+        /// The focused field, if readable.
+        field: Option<Box<FieldContext>>,
+        /// The selection, if any.
+        selection: Option<String>,
+        /// The clipboard, if it was consulted.
+        clipboard: Option<Box<ClipboardItem>>,
+    },
+
+    /// Capture failed. Rendered as a toast, never blocking (§13).
+    ContextFailed {
+        /// Session.
+        session: SessionId,
+        /// The failure.
+        error: Arc<AiboError>,
+    },
+
+    /// The request was dispatched; the panel switches to its loading state.
+    Dispatched {
+        /// Session.
+        session: SessionId,
+        /// Provider that took it.
+        provider: ProviderId,
+        /// Wire model id.
+        model: String,
+        /// Set when the role chain fell back; §13 requires a subtle footnote
+        /// naming the substitute rather than silence.
+        substituted_for: Option<ProviderId>,
+    },
+
+    /// A provider stream event (§7).
+    Stream {
+        /// Session.
+        session: SessionId,
+        /// The event.
+        event: Box<StreamEvent>,
+    },
+
+    /// Latency to the first token, for the §16 metadata line and the §15
+    /// budget.
+    FirstToken {
+        /// Session.
+        session: SessionId,
+        /// Milliseconds from hotkey-down.
+        elapsed_ms: u64,
+    },
+
+    /// Running cost for the session, in the user's display currency (§14).
+    Cost {
+        /// Session.
+        session: SessionId,
+        /// Already formatted — currency and precision are a settings concern.
+        label: String,
+        /// Token accounting behind the label.
+        usage: Usage,
+    },
+
+    /// The request failed. The UI maps it to a §13 treatment; it never renders
+    /// the error's own `Display` for `Internal`.
+    Failed {
+        /// Session.
+        session: SessionId,
+        /// The failure.
+        error: Arc<AiboError>,
+    },
+
+    /// The insert succeeded; the panel may close.
+    Inserted {
+        /// Session.
+        session: SessionId,
+    },
+
+    /// An agent run started and needs a task window (§6).
+    TaskStarted {
+        /// Task id.
+        task: Uuid,
+        /// The instruction, shown as the window's subject and as approval
+        /// provenance (§5 rule 3).
+        instruction: String,
+    },
+
+    /// A step from an agent run.
+    TaskStep {
+        /// Task id.
+        task: Uuid,
+        /// The step.
+        step: Box<AgentStep>,
+    },
+
+    /// Attached displays changed; re-clamp the panel (§9, §13 `DisplaysChanged`).
+    DisplaysChanged {
+        /// The new display set.
+        displays: Vec<DisplayInfo>,
+    },
+
+    /// A permission's status changed — including the §17 revoked-after-update
+    /// case, which gets its own recovery treatment.
+    PermissionChanged {
+        /// Which permission.
+        permission: Permission,
+        /// Its new status.
+        status: PermissionStatus,
+    },
+
+    /// A provider's health changed (§13: per provider, with hysteresis).
+    ProviderHealth {
+        /// The provider.
+        provider: ProviderId,
+        /// Its health.
+        health: Health,
+    },
+
+    /// Spend against the configured cap, for the meter (§14).
+    Spend {
+        /// Formatted amount.
+        label: String,
+        /// Fraction of the cap, if one is set.
+        fraction_of_cap: Option<f32>,
+    },
+
+    /// aibo restarted after a panic (§6). Shown once, with a diagnostics link.
+    RecoveredFromCrash,
+}

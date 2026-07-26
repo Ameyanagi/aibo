@@ -1,0 +1,35 @@
+[package]
+name = "aibo-agent"
+description = "Tool-calling loop, step streaming, permission gate and limits (§7, §11, §14)."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+aibo-core = { workspace = true }
+# NOTE: `aibo-provider` is deliberately NOT a dependency. `NativeLoop` runs over
+# `dyn aibo_core::traits::Provider`, so the agent layer needs the *trait*, which
+# lives in `aibo-core`, and never a concrete backend. The binary picks the
+# implementation and injects it. Adding the dependency back would invert the
+# §6 crate ordering for no gain.
+#
+# NOTE: `aibo-tools` is likewise NOT a dependency. §11 requires a tool to declare
+# what it is about to do *before* it does it, so the loop can gate it — that is
+# `native_loop::ToolExecutor`, and it is the loop's contract, not any particular
+# tool's. Having `aibo-agent` depend on `aibo-tools` would only work if the trait
+# lived there; having `aibo-tools` implement a trait from `aibo-agent` inverts
+# the layering. The binary owns the small adapter between them.
+async-trait = { workspace = true }
+futures = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+
+[lints.rust]
+unsafe_code = "forbid"
