@@ -1,0 +1,18 @@
+# Build artefacts. Deliberately NOT anchored with a leading slash: every spike
+# under `spikes/` and each app under `testapps/` declares its own `[workspace]`
+# and therefore has its own `target/`. Anchoring to the repo root missed all of
+# them — ~29,000 files and 8 GB that nearly went into the first commit.
+target/
+
+# Spike output. S6 writes live OAuth tokens here; its own README says to delete
+# them when finished, and they must never reach a commit.
+s6-tokens.json
+*-tokens.json
+
+# Local operator notes and captured traffic from the manual spikes (S2's app
+# matrix, S4's insert results, S6's mitmproxy dumps). Real findings belong in
+# docs/, not in whatever the console happened to produce.
+spikes/**/out/
+spikes/**/dump/
+
+.DS_Store

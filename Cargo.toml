@@ -1,0 +1,194 @@
+[workspace]
+# §6's workspace layout is `crates/*` plus `src/main.rs` (this package). That is
+# the whole product.
+#
+# `spikes/*` is deliberately NOT a member. Every §20 spike declares its own
+# `[workspace]` table and is a standalone root, so listing them here is not just
+# undesirable, it does not build:
+#
+#     error: multiple workspace roots found in the same workspace
+#
+# The separation is the point. A throwaway harness must never end up linked into
+# the product, must be free to pin a different dependency version while it
+# probes one, and must stay buildable after the answer it was written to find
+# has been folded into `crates/`. Build one with
+# `cargo check --manifest-path spikes/<name>/Cargo.toml`.
+members = ["crates/*"]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+authors = ["aibo"]
+license = "LicenseRef-Proprietary"
+publish = false
+
+# Every third-party version named in docs/plan.md is pinned here, once.
+# Member crates opt in with `dep = { workspace = true }`.
+# Versions annotated with a section reference come from the plan; unannotated
+# ones are ordinary infrastructure the plan does not pin.
+[workspace.dependencies]
+# --- internal ---------------------------------------------------------------
+aibo-core = { path = "crates/aibo-core" }
+aibo-provider = { path = "crates/aibo-provider" }
+aibo-session = { path = "crates/aibo-session" }
+aibo-platform = { path = "crates/aibo-platform" }
+aibo-store = { path = "crates/aibo-store" }
+aibo-agent = { path = "crates/aibo-agent" }
+aibo-tools = { path = "crates/aibo-tools" }
+aibo-ui = { path = "crates/aibo-ui" }
+
+# --- async runtime and streams ---------------------------------------------
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "process", "io-util", "fs", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+futures = "0.3"
+futures-core = "0.3"
+futures-util = "0.3"
+
+# --- errors, logging, serialisation ----------------------------------------
+thiserror = "2"                      # libraries (all crates/*)
+anyhow = "1"                         # binary only (src/main.rs)
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.9"
+uuid = { version = "1", features = ["v7", "serde"] }
+url = "2"
+unicode-segmentation = "1"           # §5 grapheme-safe middle-out truncation
+nucleo-matcher = "0.3"               # fzf-style history search; Unicode-aware, returns match indices
+
+# --- secrets ----------------------------------------------------------------
+secrecy = "0.10.3"                   # §12 [plan note: no release in 21 months]
+zeroize = "1"                        # §12
+keyring = "4.1"                      # §8 [plan note: 4.x is a facade over keyring-core]
+
+# --- network / providers ----------------------------------------------------
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip"] }
+eventsource-stream = "0.2"
+http = "1"
+base64 = "0.22"
+
+# --- storage ----------------------------------------------------------------
+rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl", "uuid", "backup"] }  # §12, §20
+# NOTE §12/S8: the vendored-OpenSSL build on Windows is the risky half and is
+# marked [unverified] in the plan. Confirm in P0 before relying on it.
+
+# --- tools ------------------------------------------------------------------
+fend-core = "1.5.8"                  # §1 Compute
+wasmtime = "47"                      # §11 tier 1, downloaded-on-demand CPython
+wasmtime-wasi = "47"
+rmcp = "2.2"                         # §11 tier 2 [plan note: 3.0 beta exists; migration expected]
+
+# --- ui / shell -------------------------------------------------------------
+iced = { version = "0.14", features = ["wgpu", "advanced", "tokio", "image", "svg"] }
+global-hotkey = "0.8"                # §8
+tray-icon = "0.24"                   # §8
+muda = "0.19"                        # §8
+window-vibrancy = "0.8"              # §8
+raw-window-handle = "0.6"            # §20 S1 — iced 0.14 and window-vibrancy 0.8 agree on 0.6
+arboard = "3"
+enigo = "0.6"                        # §8 [plan note: self-described early alpha]
+
+# --- updates ----------------------------------------------------------------
+ed25519-dalek = "2.2"                # §19 [plan note: prefer the 2.2 line over 3.0]
+
+# --- macOS ------------------------------------------------------------------
+objc2 = "0.6"
+objc2-foundation = "0.3"
+objc2-app-kit = "0.3"
+accessibility-sys = "0.2"            # §20 [plan note: single maintainer; expect to vendor]
+core-foundation = "0.10"
+core-graphics = "0.24"
+
+# --- Windows ----------------------------------------------------------------
+windows = "0.62"
+windows-core = "0.62"
+uiautomation = "0.25"                # §8 [!Send + !Sync — dedicated MTA thread]
+
+# --- dev --------------------------------------------------------------------
+insta = "1"
+proptest = "1"
+tempfile = "3"
+
+# §15: the release profile. `panic = "abort"` is deliberately ABSENT — §6 requires
+# unwinding so a panic can be caught at every task boundary and the tray survives.
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "unwind"
+incremental = false
+
+[package]
+name = "aibo"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+publish = false
+
+# The binary is thin: wire everything together, install the panic/crash handler (§6).
+#
+# Every entry is either a workspace member or something only the process entry
+# point can use. `anyhow` appears here and nowhere else — §6/§13 keep it out of
+# the libraries, which use `thiserror`.
+[dependencies]
+anyhow = { workspace = true }
+
+# The two schedulers of §6. `tokio-util` is here for `CancellationToken`, which
+# §7 puts on every `Provider::chat` and §13 makes the `esc` path.
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+# `FutureExt::catch_unwind` — §6's "catch at every task boundary".
+futures = { workspace = true }
+
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+
+# The workspace members the binary wires together.
+aibo-core = { workspace = true }
+aibo-platform = { workspace = true }
+aibo-provider = { workspace = true }
+# The orchestration layer: §4 chain fallback, §5 assembly, §13 offline
+# hysteresis and cancellation, §14 reserve-then-reconcile, §12 persistence.
+aibo-session = { workspace = true }
+# Opening the §12 database and reading credentials out of the OS keychain are
+# both process-entry concerns: they decide what the engine is *built with*.
+aibo-store = { workspace = true }
+aibo-ui = { workspace = true }
+
+# `SessionId` is a uuid, and the binary mints one per agent task.
+uuid = { workspace = true }
+# `SecretString`, to hand a keychain-resolved API key to `aibo-session` without
+# it ever landing in a `String` that could be logged.
+secrecy = { workspace = true }
+
+# `PlatformBackend` exposes a clipboard *read* only, so `UiRequest::Copy` has no
+# home in aibo-platform yet. arboard is the same crate aibo-platform already
+# uses, so this is one implementation, not two.
+arboard = { workspace = true }
+
+# §12's oversize-secret path. `aibo-store`'s `Keychain` writes through
+# `set_password`, which `keyring` UTF-16 doubles — so the 2560-byte Windows cap
+# lands at ~1280 characters and §3a's measured **1652-byte** access token cannot
+# be stored at all. `keyring::Entry::set_secret` writes the raw blob instead,
+# and the binary is where that backend is wired in (see `mod secrets`).
+keyring = { workspace = true }
+# `aibo_provider::StoredTokens` is `serde`-shaped; the keychain holds one JSON
+# document per token pair.
+serde_json = { workspace = true }
+# `aibo_provider::TokenStore` is an `#[async_trait]`, and the binary implements
+# it over the keychain.
+async-trait = { workspace = true }
+# `aibo_store::SecretStore::get` returns `Zeroizing<String>`; implementing the
+# trait means naming the type. Same crate `aibo-store` already uses.
+zeroize = { workspace = true }
+
+[dev-dependencies]
+# The panic-boundary test in `diagnostics` needs `#[tokio::test]`.
+tokio = { workspace = true, features = ["macros", "rt"] }

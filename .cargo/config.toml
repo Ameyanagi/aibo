@@ -1,0 +1,47 @@
+# Workspace cargo configuration.
+#
+# ## Why `CC`/`CXX` are pinned
+#
+# This machine has a nix profile on `PATH` ahead of the system toolchain:
+#
+#     $ which -a gcc cc
+#     /etc/profiles/per-user/ryuichi/bin/gcc     <- nix, GCC 15.2.0
+#     /usr/bin/gcc                               <- Apple clang
+#     /etc/profiles/per-user/ryuichi/bin/cc      <- nix
+#     /usr/bin/cc                                <- Apple clang
+#
+# The `cc` crate resolves the compiler by name and picks up whatever `cc`/`gcc`
+# `PATH` offers first, so every build script in the tree that compiles C gets
+# nix GCC instead of Apple clang. Two of them are in this workspace's graph and
+# both fail:
+#
+#   * `libsqlite3-sys` (§12 storage, `bundled-sqlcipher-vendored-openssl`)
+#   * `mac-notification-sys` (via `notify-rust`, §8 notifications)
+#
+# GCC cannot compile against the macOS SDK headers — Apple's headers use clang
+# blocks, availability attributes and `__has_feature`. The failure surfaces
+# inside a build script, so cargo reports it as "error: failed to run custom
+# build command for `libsqlite3-sys`" with the real cause buried in the log.
+# That reads exactly like a broken dependency version and it is not: it is a
+# `PATH` problem, and the fix is one line of environment.
+#
+# Without this file every developer and every agent on this machine has to
+# remember `export CC=/usr/bin/clang CXX=/usr/bin/clang++` before a plain
+# `cargo check`, and misreads the failure the first time they forget.
+#
+# ## Why this is safe
+#
+# `[env]` entries are **not** forced by default (`force = false` is the
+# default), so an explicit `CC=...` already in the environment still wins. This
+# is a default, not an override — CI, a cross-compile with its own toolchain, or
+# a developer testing another compiler are all unaffected.
+#
+# This is deliberately *not* target-scoped. Cargo's `[env]` has no per-target
+# form, and nothing in this workspace's graph compiles C for a non-Apple target
+# — the Windows backend is cross-*checked* only
+# (`cargo check -p aibo-platform --target x86_64-pc-windows-msvc`), which runs
+# no C compiler at all. If that ever changes, set `CC_x86_64-pc-windows-msvc`
+# rather than removing this.
+[env]
+CC = "/usr/bin/clang"
+CXX = "/usr/bin/clang++"
