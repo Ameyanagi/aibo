@@ -15,8 +15,13 @@ pub mod macos;
 #[cfg(target_os = "windows")]
 pub mod windows;
 
+mod accessibility;
 mod overlay;
 
+pub use accessibility::{
+    AccessibilityError, AccessibilityEvent, AccessibilitySurface, attach_accessibility,
+    detach_accessibility, set_accessibility_focus, update_accessibility,
+};
 pub use overlay::{
     BackdropStatus, OverlayWindowConfiguration, OverlayWindowError, announce_accessibility,
     configure_panel_window, present_panel_without_activation, reduced_motion_preferred,

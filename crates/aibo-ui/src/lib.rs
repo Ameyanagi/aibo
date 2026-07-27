@@ -44,6 +44,7 @@
 
 #![warn(missing_docs)]
 
+mod a11y;
 pub mod app;
 pub mod bridge;
 pub mod error;

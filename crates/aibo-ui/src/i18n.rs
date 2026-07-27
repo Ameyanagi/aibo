@@ -107,6 +107,8 @@ pub enum Key {
     // --- panel: input ----------------------------------------------------
     /// Placeholder in the empty panel input.
     PanelPlaceholder,
+    /// Accessible name for the generated answer surface.
+    PanelResponse,
     /// Context chip label when the source app is known: `{}` = app name.
     ContextChipFrom,
     /// Context chip when no context could be captured at all.
@@ -329,6 +331,12 @@ pub enum Key {
     SettingsWelcomeTitle,
     /// First-run setup explanation.
     SettingsWelcomeBody,
+    /// First onboarding step: connect a provider.
+    SettingsSetupConnect,
+    /// Second onboarding step: review OS permissions.
+    SettingsSetupPermissions,
+    /// Third onboarding step: invoke the panel once.
+    SettingsSetupTryHotkey,
     /// Encrypted history has not been enabled.
     SettingsHistorySetupTitle,
     /// Explanation of encrypted history and recovery.
@@ -363,6 +371,8 @@ pub enum Key {
     SettingsCodexSignOut,
     /// Codex consent/storage posture note.
     SettingsCodexConsentNote,
+    /// Expand or collapse the Codex sign-in security detail.
+    SettingsCodexHowSignInWorks,
     /// Copy a Codex device code.
     SettingsCopyDeviceCode,
     /// Open the Codex device approval page.
@@ -387,6 +397,10 @@ pub enum Key {
     PermissionDenied,
     /// Permission banner: never asked.
     PermissionNotDetermined,
+    /// Permission banner: blocked by device policy.
+    PermissionRestricted,
+    /// Permission banner: meaningless on this platform.
+    PermissionNotApplicable,
     /// Permission banner: revoked after an update (§17).
     PermissionRevoked,
 }
@@ -449,6 +463,7 @@ fn en(key: Key) -> &'static str {
         K::AppName => "aibo",
 
         K::PanelPlaceholder => "Ask, transform, or compute…",
+        K::PanelResponse => "Response",
         K::ContextChipFrom => "{}",
         K::ContextChipNone => "No context",
 
@@ -561,9 +576,10 @@ fn en(key: Key) -> &'static str {
         K::SettingsAbout => "About",
         K::SettingsLanguage => "Language",
         K::SettingsWelcomeTitle => "Welcome to aibo",
-        K::SettingsWelcomeBody => {
-            "Sign in to a provider, then review Permissions so aibo can read and replace text only when you ask."
-        }
+        K::SettingsWelcomeBody => "Three quick steps, then aibo is ready wherever you write.",
+        K::SettingsSetupConnect => "Connect ChatGPT",
+        K::SettingsSetupPermissions => "Review permissions",
+        K::SettingsSetupTryHotkey => "Try ⌥Space",
         K::SettingsHistorySetupTitle => "Encrypted history is off",
         K::SettingsHistorySetupBody => {
             "Enable it to save conversations in a local SQLCipher database. The encryption key stays in your OS credential store."
@@ -575,9 +591,7 @@ fn en(key: Key) -> &'static str {
         }
         K::SettingsHistoryFailed => "aibo could not enable encrypted history.",
         K::SettingsCodexTitle => "ChatGPT subscription (Codex)",
-        K::SettingsCodexSignedOut => {
-            "Use your ChatGPT plan instead of an API key. aibo runs its own device-code login and stores its own tokens in the keychain — it never reads or refreshes Codex's."
-        }
+        K::SettingsCodexSignedOut => "Use your ChatGPT plan—no API key required.",
         K::SettingsCodexSignedIn => "Signed in. Codex is bound to the Smart and Ask surfaces.",
         K::SettingsCodexStarting => "Starting ChatGPT sign-in…",
         K::SettingsCodexAwaitingApproval => "Enter the device code on OpenAI's approval page.",
@@ -587,8 +601,9 @@ fn en(key: Key) -> &'static str {
         K::SettingsCodexCancelSignIn => "Cancel sign-in",
         K::SettingsCodexSignOut => "Sign out",
         K::SettingsCodexConsentNote => {
-            "The approval page is OpenAI's own Codex consent screen; the tokens it issues are stored only by aibo."
+            "aibo uses OpenAI's device-code consent page and stores only its own tokens in your OS credential store. It never reads or refreshes tokens owned by the Codex CLI."
         }
+        K::SettingsCodexHowSignInWorks => "How sign-in works",
         K::SettingsCopyDeviceCode => "Copy code",
         K::SettingsOpenDevicePage => "Open the page",
         K::SettingsPermissionAccessibility => "Accessibility",
@@ -601,6 +616,8 @@ fn en(key: Key) -> &'static str {
         K::PermissionGranted => "Granted",
         K::PermissionDenied => "Denied",
         K::PermissionNotDetermined => "Not asked yet",
+        K::PermissionRestricted => "Restricted by device policy",
+        K::PermissionNotApplicable => "Not applicable on this device",
         K::PermissionRevoked => "Permission was removed — grant it again",
     }
 }
@@ -611,6 +628,7 @@ fn ja(key: Key) -> &'static str {
         K::AppName => "aibo",
 
         K::PanelPlaceholder => "質問・書き換え・計算…",
+        K::PanelResponse => "応答",
         K::ContextChipFrom => "{}",
         K::ContextChipNone => "コンテキストなし",
 
@@ -728,8 +746,11 @@ fn ja(key: Key) -> &'static str {
         K::SettingsLanguage => "言語",
         K::SettingsWelcomeTitle => "aibo へようこそ",
         K::SettingsWelcomeBody => {
-            "プロバイダーにサインインした後、「権限」を確認してください。aibo は、あなたが指示したときだけテキストを読み取り、置き換えます。"
+            "3 つの簡単な手順で、どこで文章を書いていても aibo を使えるようになります。"
         }
+        K::SettingsSetupConnect => "ChatGPT に接続",
+        K::SettingsSetupPermissions => "権限を確認",
+        K::SettingsSetupTryHotkey => "⌥Space を試す",
         K::SettingsHistorySetupTitle => "暗号化履歴はオフです",
         K::SettingsHistorySetupBody => {
             "会話をローカルの SQLCipher データベースに保存するには有効にしてください。暗号化キーは OS の資格情報ストアに保管されます。"
@@ -741,9 +762,7 @@ fn ja(key: Key) -> &'static str {
         }
         K::SettingsHistoryFailed => "暗号化履歴を有効にできませんでした。",
         K::SettingsCodexTitle => "ChatGPT サブスクリプション（Codex）",
-        K::SettingsCodexSignedOut => {
-            "API キーの代わりに ChatGPT プランを使用します。aibo は専用のデバイスコードでサインインし、トークンをキーチェーンに保存します。Codex のトークンを読み取ったり更新したりすることはありません。"
-        }
+        K::SettingsCodexSignedOut => "API キーを使わず、ChatGPT プランで利用できます。",
         K::SettingsCodexSignedIn => {
             "サインイン済みです。Codex は「高性能」と「質問」に割り当てられています。"
         }
@@ -757,8 +776,9 @@ fn ja(key: Key) -> &'static str {
         K::SettingsCodexCancelSignIn => "サインインをキャンセル",
         K::SettingsCodexSignOut => "サインアウト",
         K::SettingsCodexConsentNote => {
-            "承認ページは OpenAI の Codex 同意画面です。発行されたトークンは aibo だけが保存します。"
+            "aibo は OpenAI のデバイスコード同意画面を使用し、aibo 専用のトークンだけを OS の資格情報ストアに保存します。Codex CLI のトークンを読み取ったり更新したりすることはありません。"
         }
+        K::SettingsCodexHowSignInWorks => "サインインの仕組み",
         K::SettingsCopyDeviceCode => "コードをコピー",
         K::SettingsOpenDevicePage => "承認ページを開く",
         K::SettingsPermissionAccessibility => "アクセシビリティ",
@@ -771,6 +791,8 @@ fn ja(key: Key) -> &'static str {
         K::PermissionGranted => "許可済み",
         K::PermissionDenied => "拒否",
         K::PermissionNotDetermined => "未確認",
+        K::PermissionRestricted => "デバイスポリシーにより制限",
+        K::PermissionNotApplicable => "このデバイスでは対象外",
         K::PermissionRevoked => "権限が取り消されました — 再度許可してください",
     }
 }
@@ -863,6 +885,10 @@ mod tests {
             Key::SettingsCodexCancelSignIn,
             Key::SettingsCodexSignOut,
             Key::SettingsCodexConsentNote,
+            Key::SettingsCodexHowSignInWorks,
+            Key::SettingsSetupConnect,
+            Key::SettingsSetupPermissions,
+            Key::SettingsSetupTryHotkey,
             Key::SettingsCopyDeviceCode,
             Key::SettingsOpenDevicePage,
             Key::SettingsPermissionAccessibility,
@@ -870,6 +896,9 @@ mod tests {
             Key::SettingsPermissionElevatedWindowAccess,
             Key::SettingsPermissionNotifications,
             Key::SettingsPermissionAutostart,
+            Key::PermissionRestricted,
+            Key::PermissionNotApplicable,
+            Key::PanelResponse,
             Key::SettingsHistorySetupTitle,
             Key::SettingsHistorySetupBody,
             Key::SettingsHistoryReady,

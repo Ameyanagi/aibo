@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+accesskit = { workspace = true }
 aibo-core = { workspace = true }
 arboard = { workspace = true }
 async-trait = { workspace = true }
@@ -22,6 +23,7 @@ tracing = { workspace = true }
 # The AX/UIA objects are !Send + !Sync and live on a dedicated thread; the
 # public type in this crate is only a channel handle to it (§6, §7).
 [target.'cfg(target_os = "macos")'.dependencies]
+accesskit_macos = { workspace = true }
 accessibility-sys = { workspace = true }
 core-foundation = { workspace = true }
 core-graphics = { workspace = true }
@@ -32,6 +34,7 @@ objc2-app-kit = { workspace = true }
 objc2-foundation = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
+accesskit_windows = { workspace = true }
 uiautomation = { workspace = true }
 windows-core = { workspace = true }
 # The Win32_* namespaces used by src/windows/**. Each one is load-bearing:

@@ -95,6 +95,11 @@ rmcp = { version = "2.2", default-features = false } # §11 tier 2 client only
 
 # --- ui / shell -------------------------------------------------------------
 iced = { version = "0.14", default-features = false, features = ["wgpu", "advanced", "crisp", "tokio", "image-without-codecs", "svg"] }
+accesskit = "0.24.1"
+# Iced 0.14 has no accessibility tree. The official platform adapters attach
+# directly to the raw AppKit/Win32 view owned by iced/winit.
+accesskit_macos = "0.26.3"
+accesskit_windows = "0.34.0"
 global-hotkey = "0.8"                # §8
 tray-icon = "0.24"                   # §8
 muda = "0.19"                        # §8

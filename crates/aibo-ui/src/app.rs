@@ -28,11 +28,13 @@
 //! iced's own tray-icon integration PR is still open and unmerged (§6), so the
 //! event plumbing below is integration work rather than a drop-in.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use accesskit::{NodeId, TreeUpdate};
 use aibo_core::types::{DisplayInfo, StreamEvent};
+use aibo_platform::{AccessibilityEvent, AccessibilitySurface};
 use iced::widget::operation;
 use iced::window::{self, Mode};
 use iced::{Element, Point, Size, Subscription, Task, Theme};
@@ -40,6 +42,7 @@ use secrecy::ExposeSecret as _;
 use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
 use uuid::Uuid;
 
+use crate::a11y;
 #[cfg(test)]
 use crate::bridge::UI_REQUEST_CHANNEL_CAPACITY;
 use crate::bridge::{SessionId, UiEvent, UiRequest};
@@ -100,6 +103,7 @@ pub struct UiHandles {
 /// subscription that owns them.
 static BACKEND_EVENTS: Mutex<Option<Receiver<UiEvent>>> = Mutex::new(None);
 static SHELL_EVENTS: Mutex<Option<Receiver<ShellEvent>>> = Mutex::new(None);
+static ACCESSIBILITY_EVENTS: Mutex<Option<Receiver<AccessibilityEvent>>> = Mutex::new(None);
 
 /// The sender half of the shell channel, held for the process lifetime because
 /// `global-hotkey` and `tray-icon` install *global* handlers.
@@ -109,6 +113,9 @@ static SHELL_SENDER: OnceLock<Sender<ShellEvent>> = OnceLock::new();
 /// bounded queue absorbs normal bursts and coalesces overload by dropping only
 /// events that arrive after the queue is already full.
 const SHELL_EVENT_CHANNEL_CAPACITY: usize = 32;
+/// Assistive-technology input is human-scale and must not create an unbounded
+/// queue if a native client repeats an action while the renderer is busy.
+const ACCESSIBILITY_EVENT_CHANNEL_CAPACITY: usize = 32;
 /// A tray Quit must remain deliverable even if a hotkey source is noisy.
 const SHELL_EVENT_CRITICAL_RESERVE: usize = 1;
 
@@ -117,6 +124,10 @@ const SHELL_EVENT_CRITICAL_RESERVE: usize = 1;
 /// before they can consume these slots; the queue itself remains the sole
 /// backlog, so overload cannot create an unbounded collection of retry tasks.
 const UI_REQUEST_CRITICAL_RESERVE: usize = 8;
+
+const PANEL_ACCESSIBILITY: AccessibilitySurface = AccessibilitySurface(1);
+const SETTINGS_ACCESSIBILITY: AccessibilitySurface = AccessibilitySurface(2);
+const TASK_ACCESSIBILITY_FLAG: u64 = 1 << 63;
 
 /// §6 requires single-instance behaviour across the machine; this only guards
 /// the far cheaper in-process case, which the global handlers make unavoidable.
@@ -201,6 +212,32 @@ pub enum Message {
     Task(Uuid, task_window::Message),
     /// A message from the settings window.
     Settings(settings::Message),
+    /// A semantic action from VoiceOver, Narrator, or another native client.
+    Accessibility(AccessibilityEvent),
+    /// The native adapter finished attaching to a still-hidden window.
+    AccessibilityAttached {
+        /// Window receiving the adapter.
+        window: window::Id,
+        /// Stable semantic surface identity.
+        surface: AccessibilitySurface,
+        /// Empty on success; contains no user content on failure.
+        result: std::result::Result<(), String>,
+    },
+    /// Initial native scale is known, so the already-adapted window may show.
+    AccessibilityReadyToReveal {
+        /// Window to reveal or finish configuring.
+        window: window::Id,
+        /// Surface installed on that window.
+        surface: AccessibilitySurface,
+        /// Current native scale factor.
+        scale: f32,
+    },
+    /// A window's logical client size changed.
+    AccessibilityResize(window::Id, Size),
+    /// A window crossed to a display with another scale factor.
+    AccessibilityScale(window::Id, f32),
+    /// A native host window gained or lost focus.
+    AccessibilityFocus(window::Id, bool),
     /// An event from the runtime.
     Backend(Box<UiEvent>),
     /// Nothing. Returned where a branch has no work, so `update` stays total.
@@ -300,6 +337,16 @@ pub struct Aibo {
     ui_ready_sent: bool,
     /// Windows with an active uncommitted composition.
     ime_preedit: HashSet<window::Id>,
+    /// Bounded native-action sink cloned into each AccessKit adapter.
+    accessibility_events: Sender<AccessibilityEvent>,
+    /// Surfaces whose native adapters have completed installation.
+    accessibility_attached: HashSet<AccessibilitySurface>,
+    /// Last semantic focus reported to each surface.
+    accessibility_focus: HashMap<AccessibilitySurface, NodeId>,
+    /// Last observed logical client size for semantic bounds.
+    accessibility_sizes: HashMap<AccessibilitySurface, (f32, f32)>,
+    /// Last observed native scale factor for semantic transforms.
+    accessibility_scales: HashMap<AccessibilitySurface, f32>,
 }
 
 impl std::fmt::Debug for Aibo {
@@ -336,6 +383,69 @@ impl Aibo {
             .iter()
             .find(|(window_id, _)| *window_id == id)
             .map(|(_, task)| Role::Task(task.id))
+    }
+
+    fn accessibility_surface(role: Role) -> AccessibilitySurface {
+        match role {
+            Role::Panel => PANEL_ACCESSIBILITY,
+            Role::Settings => SETTINGS_ACCESSIBILITY,
+            Role::Task(id) => AccessibilitySurface(
+                TASK_ACCESSIBILITY_FLAG | (id.as_u128() as u64 & !TASK_ACCESSIBILITY_FLAG),
+            ),
+        }
+    }
+
+    fn role_for_accessibility_surface(&self, surface: AccessibilitySurface) -> Option<Role> {
+        if surface == PANEL_ACCESSIBILITY {
+            return Some(Role::Panel);
+        }
+        if surface == SETTINGS_ACCESSIBILITY && self.settings_window.is_some() {
+            return Some(Role::Settings);
+        }
+        self.tasks
+            .iter()
+            .find(|(_, task)| Self::accessibility_surface(Role::Task(task.id)) == surface)
+            .map(|(_, task)| Role::Task(task.id))
+    }
+
+    fn accessibility_tree(&self, surface: AccessibilitySurface) -> Option<TreeUpdate> {
+        let role = self.role_for_accessibility_surface(surface)?;
+        let size = self
+            .accessibility_sizes
+            .get(&surface)
+            .copied()
+            .unwrap_or_else(|| default_accessibility_size(role, &self.panel));
+        let scale = self
+            .accessibility_scales
+            .get(&surface)
+            .copied()
+            .unwrap_or(1.0);
+        let focus = self
+            .accessibility_focus
+            .get(&surface)
+            .copied()
+            .unwrap_or_else(|| accessibility_root(role));
+
+        Some(match role {
+            Role::Panel => a11y::panel_tree(&self.panel, size, scale, focus),
+            Role::Settings => a11y::settings_tree(&self.settings, size, scale, focus),
+            Role::Task(task_id) => {
+                let task = self
+                    .tasks
+                    .iter()
+                    .find(|(_, task)| task.id == task_id)
+                    .map(|(_, task)| task)?;
+                a11y::task_tree(task, size, scale, focus)
+            }
+        })
+    }
+
+    fn sync_accessibility(&self) {
+        for surface in &self.accessibility_attached {
+            if let Some(tree) = self.accessibility_tree(*surface) {
+                aibo_platform::update_accessibility(*surface, tree);
+            }
+        }
     }
 
     fn send(&self, request: UiRequest) {
@@ -597,6 +707,22 @@ impl Aibo {
     }
 }
 
+fn accessibility_root(role: Role) -> NodeId {
+    match role {
+        Role::Panel => a11y::PANEL_ROOT,
+        Role::Settings => a11y::SETTINGS_ROOT,
+        Role::Task(_) => a11y::TASK_ROOT,
+    }
+}
+
+fn default_accessibility_size(role: Role, panel: &PanelState) -> (f32, f32) {
+    match role {
+        Role::Panel => (ui_theme::PANEL_WIDTH_DEFAULT, panel.desired_height()),
+        Role::Settings => (880.0, 520.0),
+        Role::Task(_) => (760.0, 640.0),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Window settings
 // ---------------------------------------------------------------------------
@@ -666,6 +792,9 @@ fn task_window_settings() -> window::Settings {
     window::Settings {
         size: Size::new(760.0, 640.0),
         min_size: Some(Size::new(480.0, 360.0)),
+        // AccessKit must attach to the native view before it is first shown or
+        // focused. `WindowOpened` installs the adapter, then reveals the window.
+        visible: false,
         exit_on_close_request: true,
         ..Default::default()
     }
@@ -674,8 +803,11 @@ fn task_window_settings() -> window::Settings {
 /// Settings for the settings window.
 fn settings_window_settings() -> window::Settings {
     window::Settings {
-        size: Size::new(880.0, 620.0),
+        size: Size::new(880.0, 520.0),
         min_size: Some(Size::new(640.0, 420.0)),
+        // Keep the first frame private until the native semantic tree is
+        // attached; see the task-window setting above.
+        visible: false,
         exit_on_close_request: true,
         ..Default::default()
     }
@@ -687,6 +819,12 @@ fn settings_window_settings() -> window::Settings {
 
 fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) {
     i18n::set_language(config.language);
+
+    let (accessibility_events, accessibility_receiver) =
+        tokio::sync::mpsc::channel(ACCESSIBILITY_EVENT_CHANNEL_CAPACITY);
+    if let Ok(mut receiver) = ACCESSIBILITY_EVENTS.lock() {
+        *receiver = Some(accessibility_receiver);
+    }
 
     // §6: pre-create the panel hidden. This is the only window opened at boot;
     // the daemon otherwise runs with none.
@@ -712,6 +850,17 @@ fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) 
         shell_started: false,
         ui_ready_sent: false,
         ime_preedit: HashSet::new(),
+        accessibility_events,
+        accessibility_attached: HashSet::new(),
+        accessibility_focus: HashMap::from([(PANEL_ACCESSIBILITY, a11y::PANEL_ROOT)]),
+        accessibility_sizes: HashMap::from([(
+            PANEL_ACCESSIBILITY,
+            (
+                ui_theme::PANEL_WIDTH_DEFAULT,
+                ui_theme::PANEL_HEIGHT_COLLAPSED,
+            ),
+        )]),
+        accessibility_scales: HashMap::from([(PANEL_ACCESSIBILITY, 1.0)]),
     };
 
     (
@@ -751,36 +900,44 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
         Message::Ready | Message::Ignored => Task::none(),
 
         Message::WindowOpened(id) => {
-            if id == state.panel_window {
+            let Some(role) = state.role_of(id) else {
+                return Task::batch([shell_task, Task::none()]);
+            };
+            let surface = Aibo::accessibility_surface(role);
+            state
+                .accessibility_focus
+                .entry(surface)
+                .or_insert_with(|| accessibility_root(role));
+            state
+                .accessibility_sizes
+                .entry(surface)
+                .or_insert_with(|| default_accessibility_size(role, &state.panel));
+            state.accessibility_scales.entry(surface).or_insert(1.0);
+            tracing::debug!(?role, ?surface, "native window opened");
+
+            if role == Role::Panel {
                 // The hidden window is now real: paint the throwaway frames…
                 state.panel.phase = Phase::WarmingUp { frames_left: 2 };
                 state.notify_ui_ready();
-                // …and ask where it is. §9's geometry is warmed up alongside
-                // the wgpu pipelines so the first hotkey has something to place
-                // against and never has to wait for a round trip.
-                configure_or_present_panel(state.panel_window, true)
-                    .chain(probe_geometry(state.panel_window))
-            } else if matches!(state.role_of(id), Some(Role::Task(_))) {
-                let focus = window::gain_focus(id);
-                let needs_confirmation = state
-                    .tasks
-                    .iter()
-                    .find(|(window, _)| *window == id)
-                    .and_then(|(_, task)| task.pending_approval.as_ref())
-                    .is_some_and(|approval| approval.requires_typed_confirmation);
-                if needs_confirmation {
-                    focus.chain(operation::focus(task_window::CONFIRMATION_ID))
-                } else {
-                    focus
-                }
-            } else {
-                Task::none()
             }
+            // Every aibo surface is born hidden. Install the native semantic
+            // adapter first; `AccessibilityAttached` performs the role-specific
+            // reveal/configuration only after this task completes.
+            attach_accessibility_window(state, id, role)
         }
 
         Message::WindowClosed(id) => {
             state.ime_preedit.remove(&id);
-            match state.role_of(id) {
+            let role = state.role_of(id);
+            if let Some(role) = role {
+                let surface = Aibo::accessibility_surface(role);
+                aibo_platform::detach_accessibility(surface);
+                state.accessibility_attached.remove(&surface);
+                state.accessibility_focus.remove(&surface);
+                state.accessibility_sizes.remove(&surface);
+                state.accessibility_scales.remove(&surface);
+            }
+            match role {
                 // §6: the panel is never destroyed, only hidden. If the OS
                 // closed it anyway, the warm surface is gone and the next show
                 // will be slow — worth knowing about.
@@ -809,6 +966,153 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
             Task::none()
         }
 
+        Message::AccessibilityAttached {
+            window,
+            surface,
+            result,
+        } => {
+            if result.is_ok() {
+                state.accessibility_attached.insert(surface);
+                tracing::debug!(?surface, "native accessibility adapter attached");
+            } else if let Err(error) = result {
+                tracing::warn!(%error, ?surface, "native accessibility adapter unavailable");
+            }
+
+            let Some(role) = state.role_of(window) else {
+                if state.accessibility_attached.remove(&surface) {
+                    aibo_platform::detach_accessibility(surface);
+                }
+                return Task::batch([shell_task, Task::none()]);
+            };
+            if Aibo::accessibility_surface(role) != surface {
+                tracing::warn!(
+                    ?surface,
+                    "accessibility surface no longer matches its window"
+                );
+                aibo_platform::detach_accessibility(surface);
+                state.accessibility_attached.remove(&surface);
+                Task::none()
+            } else {
+                // Resolve DPI while the window is still hidden. The next
+                // message stores it and synchronously refreshes the tree before
+                // any reveal action reaches the window server.
+                window::scale_factor(window).map(move |scale| Message::AccessibilityReadyToReveal {
+                    window,
+                    surface,
+                    scale,
+                })
+            }
+        }
+
+        Message::AccessibilityReadyToReveal {
+            window,
+            surface,
+            scale,
+        } => {
+            let Some(role) = state.role_of(window) else {
+                if state.accessibility_attached.remove(&surface) {
+                    aibo_platform::detach_accessibility(surface);
+                }
+                return Task::batch([shell_task, Task::none()]);
+            };
+            if Aibo::accessibility_surface(role) != surface {
+                aibo_platform::detach_accessibility(surface);
+                state.accessibility_attached.remove(&surface);
+                Task::none()
+            } else {
+                state.accessibility_scales.insert(surface, scale);
+                match role {
+                    Role::Panel => {
+                        configure_or_present_panel(window, true).chain(probe_geometry(window))
+                    }
+                    Role::Settings => {
+                        window::set_mode(window, Mode::Windowed).chain(window::gain_focus(window))
+                    }
+                    Role::Task(task_id) => {
+                        let needs_confirmation = state
+                            .tasks
+                            .iter()
+                            .find(|(_, task)| task.id == task_id)
+                            .and_then(|(_, task)| task.pending_approval.as_ref())
+                            .is_some_and(|approval| approval.requires_typed_confirmation);
+                        let reveal = window::set_mode(window, Mode::Windowed)
+                            .chain(window::gain_focus(window));
+                        if needs_confirmation {
+                            reveal.chain(operation::focus(task_window::CONFIRMATION_ID))
+                        } else {
+                            reveal
+                        }
+                    }
+                }
+            }
+        }
+
+        Message::AccessibilityResize(id, size) => {
+            if let Some(role) = state.role_of(id) {
+                state
+                    .accessibility_sizes
+                    .insert(Aibo::accessibility_surface(role), (size.width, size.height));
+                if role == Role::Panel {
+                    probe_geometry(state.panel_window)
+                } else {
+                    Task::none()
+                }
+            } else {
+                Task::none()
+            }
+        }
+
+        Message::AccessibilityScale(id, scale) => {
+            if let Some(role) = state.role_of(id) {
+                state
+                    .accessibility_scales
+                    .insert(Aibo::accessibility_surface(role), scale);
+                if role == Role::Panel {
+                    probe_geometry(state.panel_window)
+                } else {
+                    Task::none()
+                }
+            } else {
+                Task::none()
+            }
+        }
+
+        Message::AccessibilityFocus(id, focused) => {
+            if let Some(role) = state.role_of(id) {
+                aibo_platform::set_accessibility_focus(Aibo::accessibility_surface(role), focused);
+            }
+            Task::none()
+        }
+
+        Message::Accessibility(event) => {
+            // Native clients may hold a node reference across a repaint. Only
+            // honor actions whose target is still present in this snapshot;
+            // this prevents a stale permission or approval control from
+            // activating after its UI has disappeared.
+            let target_exists = state.accessibility_tree(event.surface).is_some_and(|tree| {
+                tree.nodes
+                    .iter()
+                    .any(|(node_id, _)| *node_id == event.request.target_node)
+            });
+            if !target_exists {
+                return Task::batch([shell_task, Task::none()]);
+            }
+            if let Some(focus) = a11y::requested_focus(&event.request) {
+                state.accessibility_focus.insert(event.surface, focus);
+                Task::none()
+            } else {
+                match state.role_for_accessibility_surface(event.surface) {
+                    Some(Role::Panel) => a11y::panel_message(&event.request)
+                        .map_or_else(Task::none, |message| panel_update(state, message)),
+                    Some(Role::Settings) => a11y::settings_message(&state.settings, &event.request)
+                        .map_or_else(Task::none, |message| settings_update(state, message)),
+                    Some(Role::Task(task_id)) => a11y::task_message(&event.request)
+                        .map_or_else(Task::none, |message| task_update(state, task_id, message)),
+                    None => Task::none(),
+                }
+            }
+        }
+
         Message::FramePainted => {
             if let Phase::WarmingUp { frames_left } = state.panel.phase {
                 state.panel.phase = match frames_left.saturating_sub(1) {
@@ -830,6 +1134,11 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                         discard_panel_session(state, true);
                         state.hide_panel()
                     } else {
+                        // The final onboarding step is an actual hotkey
+                        // invocation. Provider health alone used to dismiss the
+                        // guide before the user ever learned how to reopen the
+                        // panel.
+                        state.settings.onboarding = false;
                         state.open_panel()
                     }
                 }
@@ -915,6 +1224,7 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
         Message::Backend(event) => backend_update(state, *event),
     };
 
+    state.sync_accessibility();
     Task::batch([shell_task, task])
 }
 
@@ -929,6 +1239,33 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
 fn probe_geometry(window: window::Id) -> Task<Message> {
     window::monitor_size(window).then(move |monitor| {
         window::scale_factor(window).map(move |scale| Message::Observed { monitor, scale })
+    })
+}
+
+fn attach_accessibility_window(state: &Aibo, id: window::Id, role: Role) -> Task<Message> {
+    let surface = Aibo::accessibility_surface(role);
+    let Some(tree) = state.accessibility_tree(surface) else {
+        return Task::done(Message::AccessibilityAttached {
+            window: id,
+            surface,
+            result: Err("semantic tree was unavailable".to_owned()),
+        });
+    };
+    let events = state.accessibility_events.clone();
+
+    window::run(id, move |window| {
+        let result = window
+            .window_handle()
+            .map_err(|error| error.to_string())
+            .and_then(|handle| {
+                aibo_platform::attach_accessibility(handle, surface, tree, events)
+                    .map_err(|error| error.to_string())
+            });
+        Message::AccessibilityAttached {
+            window: id,
+            surface,
+            result,
+        }
     })
 }
 
@@ -1409,6 +1746,10 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             state.settings.section = section;
             Task::none()
         }
+        M::ToggleCodexDetails => {
+            state.settings.codex_details_expanded = !state.settings.codex_details_expanded;
+            Task::none()
+        }
         M::SignIn(provider) => {
             state.send(UiRequest::SignIn { provider });
             Task::none()
@@ -1467,7 +1808,7 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             }),
         M::Close => {
             state.settings.recovery_code = None;
-            match state.settings_window.take() {
+            match state.settings_window {
                 Some(id) => window::close(id),
                 None => Task::none(),
             }
@@ -1753,10 +2094,6 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 }),
             }
             state.settings.sync_device_code();
-            if matches!(health, aibo_core::types::Health::Ok { .. }) {
-                state.settings.onboarding = false;
-            }
-
             // A provider coming back healthy has to clear the panel's stale
             // auth error, not just repaint the settings row.
             //
@@ -1822,6 +2159,7 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
         }
 
         UiEvent::OnboardingRequired => {
+            tracing::debug!("opening settings for first-run onboarding");
             aibo_platform::announce_accessibility(i18n::t(crate::i18n::Key::SettingsWelcomeTitle));
             state.settings.onboarding = true;
             state.settings.section = settings::Section::Providers;
@@ -1962,26 +2300,16 @@ fn theme_of(state: &Aibo, _window: window::Id) -> Theme {
 }
 
 fn subscription(state: &Aibo) -> Subscription<Message> {
-    let panel_window = state.panel_window;
     let mut subscriptions = vec![
         Subscription::run(shell_event_stream),
         Subscription::run(backend_event_stream),
+        Subscription::run(accessibility_event_stream),
         window::close_events().map(Message::WindowClosed),
         // §9: recompute on scale-factor and size changes rather than caching
         // the value from creation — that is the "blurry on the second monitor"
         // bug. Dropping these events on the floor, which is what this
         // subscription used to do, is the same as caching.
-        // `Subscription::map` rejects capturing closures at compile time, so
-        // the panel's id rides along via `with` rather than being captured.
-        window::resize_events()
-            .with(panel_window)
-            .map(|(panel, (id, _))| {
-                if id == panel {
-                    Message::ProbeGeometry
-                } else {
-                    Message::Ignored
-                }
-            }),
+        window::resize_events().map(|(id, size)| Message::AccessibilityResize(id, size)),
         // Window-aware keyboard routing. Ordinary shortcuts are handled only
         // when the focused widget ignored them, preventing a focused button or
         // text selection from firing twice. Attach and empty-input backspace are
@@ -1990,6 +2318,19 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
         iced::event::listen_with(|event, status, window| {
             use iced::keyboard::Key;
             use iced::keyboard::key::Named;
+
+            if let iced::Event::Window(event) = event {
+                return match event {
+                    iced::window::Event::Focused => Some(Message::AccessibilityFocus(window, true)),
+                    iced::window::Event::Unfocused => {
+                        Some(Message::AccessibilityFocus(window, false))
+                    }
+                    iced::window::Event::Rescaled(scale) => {
+                        Some(Message::AccessibilityScale(window, scale))
+                    }
+                    _ => None,
+                };
+            }
 
             if let iced::Event::InputMethod(event) = event {
                 let active = match event {
@@ -2070,6 +2411,18 @@ fn backend_event_stream() -> impl iced::futures::Stream<Item = Message> {
         let channel = receiver.as_mut()?;
         let event = channel.recv().await?;
         Some((Message::Backend(Box::new(event)), receiver))
+    })
+}
+
+fn accessibility_event_stream() -> impl iced::futures::Stream<Item = Message> {
+    let receiver = ACCESSIBILITY_EVENTS
+        .lock()
+        .ok()
+        .and_then(|mut slot| slot.take());
+    iced::futures::stream::unfold(receiver, |mut receiver| async move {
+        let channel = receiver.as_mut()?;
+        let event = channel.recv().await?;
+        Some((Message::Accessibility(event), receiver))
     })
 }
 

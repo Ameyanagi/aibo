@@ -8,6 +8,7 @@ license.workspace = true
 publish = false
 
 [dependencies]
+accesskit = { workspace = true }
 aibo-core = { workspace = true }
 aibo-platform = { workspace = true }
 global-hotkey = { workspace = true }

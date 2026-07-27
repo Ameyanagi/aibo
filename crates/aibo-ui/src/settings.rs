@@ -55,6 +55,21 @@ impl Section {
         Section::About,
     ];
 
+    /// Sections that currently provide real settings controls.
+    ///
+    /// Roles and Actions remain in the durable information architecture, but
+    /// showing them before their editors exist creates navigation that ends in
+    /// unrelated generic empty-state copy. Add them here when their controls
+    /// ship.
+    pub const VISIBLE: [Section; 6] = [
+        Section::Providers,
+        Section::Budgets,
+        Section::Permissions,
+        Section::History,
+        Section::Language,
+        Section::About,
+    ];
+
     /// Catalogue key for the section's title.
     pub const fn title(self) -> Key {
         match self {
@@ -305,6 +320,8 @@ pub struct SettingsState {
     pub language: Lang,
     /// Whether this window is the first-run setup rather than a later visit.
     pub onboarding: bool,
+    /// Whether the optional Codex security/storage explanation is expanded.
+    pub codex_details_expanded: bool,
     /// Current selectable Codex device code, when approval is pending.
     device_code: Option<String>,
     /// Read-only selection state for [`Self::device_code`].
@@ -320,6 +337,14 @@ pub struct SettingsState {
 }
 
 impl SettingsState {
+    /// Current device code, exposed only to the semantic tree and copy action.
+    ///
+    /// This value is never formatted by infrastructure or retained after the
+    /// provider leaves the approval phase.
+    pub(crate) fn device_code(&self) -> Option<&str> {
+        self.device_code.as_deref()
+    }
+
     /// Synchronize the selectable device-code surface after provider health
     /// changes.
     pub fn sync_device_code(&mut self) {
@@ -356,6 +381,8 @@ pub enum Message {
     Select(Section),
     /// Start the sign-in flow for a provider.
     SignIn(ProviderId),
+    /// Expand or collapse the detailed Codex sign-in explanation.
+    ToggleCodexDetails,
     /// Open the OS privacy pane for a permission.
     OpenSystemSettings(Permission),
     /// Change the UI language.
@@ -407,7 +434,7 @@ pub fn view(state: &SettingsState) -> Element<'_, Message> {
 
 fn navigation(state: &SettingsState) -> Element<'_, Message> {
     let mut list = column![].spacing(space(1.0));
-    for section in Section::ALL {
+    for section in Section::VISIBLE {
         let selected = section == state.section;
         list = list.push(
             button(
@@ -417,7 +444,7 @@ fn navigation(state: &SettingsState) -> Element<'_, Message> {
                         .size(type_scale::META)
                         .style(theme::text_primary),
                     text(i18n::t(section.title()))
-                        .size(type_scale::META)
+                        .size(type_scale::BODY)
                         .style(if selected {
                             theme::text_primary
                         } else {
@@ -590,6 +617,25 @@ fn codex_card(state: &SettingsState) -> Element<'_, Message> {
     ]
     .spacing(space(1.5));
 
+    // The provider action is the first interactive object in the card. On a
+    // fresh install it is the one thing the user came here to do; burying it
+    // below two security paragraphs made it look like a secondary link.
+    let primary = matches!(phase, CodexPhase::SignedOut | CodexPhase::Failed);
+    let action = button(text(label).size(type_scale::META).style(if primary {
+        theme::text_on_primary
+    } else {
+        theme::text_accent
+    }))
+    .height(Length::Fixed(theme::MIN_HIT_TARGET))
+    .padding([space(1.5), space(2.0)])
+    .style(if primary {
+        theme::primary_button
+    } else {
+        theme::action_button
+    })
+    .on_press(Message::SignIn(ProviderId::CODEX));
+    body = body.push(action);
+
     // While waiting for approval the code is the only thing that matters, so it
     // gets display scale and its own controls. This is the one screen where a
     // transcription error costs a full 15-minute retry cycle.
@@ -639,19 +685,32 @@ fn codex_card(state: &SettingsState) -> Element<'_, Message> {
         );
     }
 
-    let body = body
-        .push(
+    let disclosure_marker = if state.codex_details_expanded {
+        "▾"
+    } else {
+        "▸"
+    };
+    body = body.push(
+        button(
+            text(format!(
+                "{disclosure_marker} {}",
+                i18n::t(Key::SettingsCodexHowSignInWorks)
+            ))
+            .size(type_scale::META)
+            .style(theme::text_dim),
+        )
+        .height(Length::Fixed(theme::MIN_HIT_TARGET))
+        .padding([space(1.0), space(1.5)])
+        .style(theme::action_button)
+        .on_press(Message::ToggleCodexDetails),
+    );
+    if state.codex_details_expanded {
+        body = body.push(
             text(i18n::t(Key::SettingsCodexConsentNote))
                 .size(type_scale::META)
                 .style(theme::text_dim),
-        )
-        .push(
-            button(text(label).size(type_scale::META).style(theme::text_accent))
-                .height(Length::Fixed(theme::MIN_HIT_TARGET))
-                .padding([space(1.5), space(2.0)])
-                .style(theme::action_button)
-                .on_press(Message::SignIn(ProviderId::CODEX)),
         );
+    }
 
     container(body)
         .width(Length::Fill)
@@ -663,35 +722,15 @@ fn codex_card(state: &SettingsState) -> Element<'_, Message> {
 fn providers(state: &SettingsState) -> Element<'_, Message> {
     let mut list = column![].spacing(space(2.0));
     if state.onboarding {
-        list = list.push(widgets::state_block(
-            Severity::Info,
-            i18n::t(Key::SettingsWelcomeTitle),
-            Some(i18n::t(Key::SettingsWelcomeBody)),
-            Vec::new(),
-        ));
+        list = list.push(onboarding_steps(state));
     }
     list = list.push(codex_card(state));
 
-    // §13's blocking "no provider configured" still belongs here — but under
-    // the card, not instead of it, because the card is the way out of it.
-    let codex_usable = state
-        .providers
-        .iter()
-        .any(|p| p.id == ProviderId::CODEX && matches!(p.health, Health::Ok { .. }));
     let others: Vec<&ProviderRow> = state
         .providers
         .iter()
         .filter(|p| p.id != ProviderId::CODEX)
         .collect();
-
-    if !codex_usable && others.is_empty() {
-        list = list.push(widgets::state_block(
-            Severity::Danger,
-            i18n::t(Key::ErrNoProvider),
-            None,
-            Vec::new(),
-        ));
-    }
 
     for provider in others {
         // §13: health is per provider with hysteresis, never one global
@@ -726,6 +765,68 @@ fn providers(state: &SettingsState) -> Element<'_, Message> {
         );
     }
     list.into()
+}
+
+fn onboarding_steps(state: &SettingsState) -> Element<'_, Message> {
+    let connected = state
+        .providers
+        .iter()
+        .any(|provider| matches!(provider.health, Health::Ok { .. }));
+    let permissions_ready = state.permissions.iter().any(|row| {
+        row.permission == Permission::Accessibility && row.status == PermissionStatus::Granted
+    });
+    let completed = [connected, connected && permissions_ready, false];
+    let labels = [
+        Key::SettingsSetupConnect,
+        Key::SettingsSetupPermissions,
+        Key::SettingsSetupTryHotkey,
+    ];
+    let current = completed.iter().position(|done| !done).unwrap_or(2);
+
+    let mut steps = column![
+        text(i18n::t(Key::SettingsWelcomeTitle))
+            .size(type_scale::BODY)
+            .style(theme::text_primary),
+        text(i18n::t(Key::SettingsWelcomeBody))
+            .size(type_scale::META)
+            .style(theme::text_dim),
+    ]
+    .spacing(space(1.5));
+
+    for (index, key) in labels.into_iter().enumerate() {
+        let marker = if completed[index] {
+            "✓".to_owned()
+        } else {
+            (index + 1).to_string()
+        };
+        steps = steps.push(
+            row![
+                text(marker)
+                    .width(Length::Fixed(theme::MIN_HIT_TARGET))
+                    .size(type_scale::BODY)
+                    .style(if completed[index] || index == current {
+                        theme::text_accent
+                    } else {
+                        theme::text_dim
+                    }),
+                text(i18n::t(key))
+                    .size(type_scale::BODY)
+                    .style(if index == current {
+                        theme::text_primary
+                    } else {
+                        theme::text_dim
+                    }),
+            ]
+            .height(Length::Fixed(theme::MIN_HIT_TARGET))
+            .align_y(iced::Alignment::Center),
+        );
+    }
+
+    container(steps)
+        .width(Length::Fill)
+        .padding(space(2.0))
+        .style(theme::raised)
+        .into()
 }
 
 fn permissions(state: &SettingsState) -> Element<'_, Message> {
@@ -795,7 +896,7 @@ fn failure_body(reason: &FailureReason) -> &str {
 }
 
 /// Catalogue key for a user-visible OS permission name.
-const fn permission_key(permission: Permission) -> Key {
+pub(crate) const fn permission_key(permission: Permission) -> Key {
     match permission {
         Permission::Accessibility => Key::SettingsPermissionAccessibility,
         Permission::PostEvents => Key::SettingsPermissionInputMonitoring,
@@ -891,8 +992,12 @@ mod tests {
     #[test]
     fn the_information_architecture_matches_section_16() {
         // §16 names: providers, roles, budgets, permissions, actions, history,
-        // about/license. Language is the §9 addition.
+        // about/license. Language is the §9 addition. Unfinished editors stay
+        // in the durable enum without creating dead-end navigation.
         assert_eq!(Section::ALL.len(), 8);
+        assert_eq!(Section::VISIBLE.len(), 6);
+        assert!(!Section::VISIBLE.contains(&Section::Roles));
+        assert!(!Section::VISIBLE.contains(&Section::Actions));
         assert_eq!(Section::default(), Section::Providers);
         for section in Section::ALL {
             assert!(!i18n::lookup(section.title(), Lang::En).is_empty());
