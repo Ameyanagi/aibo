@@ -43,3 +43,13 @@ CC_aarch64_apple_darwin = "/usr/bin/clang"
 CXX_aarch64_apple_darwin = "/usr/bin/clang++"
 CC_x86_64_apple_darwin = "/usr/bin/clang"
 CXX_x86_64_apple_darwin = "/usr/bin/clang++"
+
+# `rustc` linker-signs a raw development binary ad hoc. Its designated
+# requirement changes after each link, so macOS treats every rebuild as a new
+# application when it reads Aibo's database key or Codex token from Keychain.
+#
+# The runner signs only the actual `aibo` executable with a stable development
+# identity immediately before `cargo run` launches it. Test binaries and the
+# other workspace tools pass through unchanged.
+[target.'cfg(target_os = "macos")']
+runner = ["./scripts/macos-codesign-runner.sh"]

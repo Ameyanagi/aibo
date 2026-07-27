@@ -70,6 +70,16 @@ pub const PANEL_HEIGHT_MAX: f32 = 520.0;
 /// discrete steps, never per token.
 pub const ANSWER_BOX_MIN_HEIGHT: f32 = 96.0;
 
+/// Minimum selectable answer height inside a chat bubble.
+///
+/// The standalone rewrite surface needs a generous editing region, while a
+/// one-line chat reply should remain one line. Keeping these as separate
+/// tokens prevents a short reply from turning into a large empty card.
+pub const CHAT_ANSWER_MIN_HEIGHT: f32 = 28.0;
+
+/// Shared height for composer and action controls.
+pub const CONTROL_HEIGHT: f32 = 36.0;
+
 /// Height of the action row — `⏎ Replace`, `⌘C Copy`, `esc Dismiss`.
 ///
 /// **Must be added to the panel height whenever an answer is shown.**
@@ -79,7 +89,7 @@ pub const ANSWER_BOX_MIN_HEIGHT: f32 = 96.0;
 /// is an answer with no visible way to accept, copy or dismiss it — §16's
 /// "every action has a key, shown" failing at the one moment the actions
 /// matter.
-pub const ACTION_ROW_HEIGHT: f32 = 48.0;
+pub const ACTION_ROW_HEIGHT: f32 = 36.0;
 
 /// Height of one metadata line below the answer.
 ///
@@ -414,6 +424,44 @@ pub fn chip(theme: &Theme) -> container::Style {
     }
 }
 
+/// A user-authored chat bubble, aligned to the right of the transcript.
+pub fn user_bubble(theme: &Theme) -> container::Style {
+    let p = palette_of(theme);
+    container::Style {
+        text_color: Some(p.text),
+        background: Some(Background::Color(Color {
+            a: 0.20,
+            ..p.accent
+        })),
+        border: Border {
+            color: Color {
+                a: 0.55,
+                ..p.accent
+            },
+            width: 1.0,
+            radius: Radius::new(12.0),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+/// An assistant-authored chat bubble, aligned to the left.
+pub fn assistant_bubble(theme: &Theme) -> container::Style {
+    let p = palette_of(theme);
+    container::Style {
+        text_color: Some(p.text),
+        background: Some(Background::Color(p.surface_raised)),
+        border: Border {
+            color: p.border,
+            width: 1.0,
+            radius: Radius::new(12.0),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
 /// Severity of a banner or inline treatment, mapped from §13.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Severity {
@@ -566,6 +614,22 @@ pub fn answer_editor(theme: &Theme, status: text_editor::Status) -> text_editor:
             color: border_color,
             width: 1.0,
             radius: Radius::new(RADIUS_SMALL),
+        },
+        placeholder: p.text_faint,
+        value: p.text,
+        selection: p.accent_muted,
+    }
+}
+
+/// Read-only assistant text inside an already-bordered chat bubble.
+pub fn chat_answer_editor(theme: &Theme, _status: text_editor::Status) -> text_editor::Style {
+    let p = palette_of(theme);
+    text_editor::Style {
+        background: Background::Color(Color::TRANSPARENT),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: Radius::new(0.0),
         },
         placeholder: p.text_faint,
         value: p.text,

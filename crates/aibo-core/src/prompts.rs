@@ -570,7 +570,10 @@ fn output_reserve(inputs: &PromptInputs) -> u32 {
                 .unwrap_or(Tokens::new(512));
             (payload.get().saturating_mul(2)).clamp(256, 4_096) as u32
         }
-        Surface::Ask => 2_048,
+        // Ask is a general-purpose explanatory surface. The old 2K reserve
+        // was enough for most turns, but combined with the old "be short"
+        // system prompt it made the panel feel artificially constrained.
+        Surface::Ask => 4_096,
         Surface::Do => 4_096,
     }
 }
@@ -607,6 +610,10 @@ fn generation_params(
             p.temperature = 0.2;
         }
         PromptKind::Ask => {
+            // Ask follows the selected model's natural output length. Zero is
+            // the provider-neutral "unset" sentinel; adapters omit an optional
+            // output-cap field instead of sending a literal zero.
+            p.max_tokens = 0;
             // §5: temperature 0.7.
             p.temperature = 0.7;
         }
@@ -1407,6 +1414,8 @@ mod tests {
         inputs.history = vec![Turn::pair("hello", "Hi — what are you working on?")];
         let a = assemble(&inputs).unwrap();
 
+        assert_eq!(a.request.params.max_tokens, 0);
+        assert_eq!(a.request.budget.max_output_tokens, 4_096);
         assert_eq!(a.request.params.temperature, 0.7);
         insta::assert_snapshot!(render(&a));
     }

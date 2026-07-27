@@ -824,7 +824,8 @@ pub fn quirks() -> Quirks {
         // this endpoint returns HTTP 400 *after* auth succeeds, which reads
         // like a credential or model problem and is neither. The endpoint
         // serves reasoning-family models only, and they reject sampling
-        // parameters. aibo still enforces its own output budget locally (§14).
+        // parameters. aibo retains its context/cost planning reserve and hard
+        // byte-safety ceiling locally, without imposing a token cap.
         sampling_params: false,
         output_cap: false,
         ..Quirks::responses()

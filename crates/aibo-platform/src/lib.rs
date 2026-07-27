@@ -17,6 +17,7 @@ pub mod windows;
 
 mod accessibility;
 mod overlay;
+mod screen_capture;
 
 pub use accessibility::{
     AccessibilityError, AccessibilityEvent, AccessibilitySurface, attach_accessibility,
@@ -26,3 +27,4 @@ pub use overlay::{
     BackdropStatus, OverlayWindowConfiguration, OverlayWindowError, announce_accessibility,
     configure_panel_window, present_panel_without_activation, reduced_motion_preferred,
 };
+pub use screen_capture::{ScreenCaptureError, capture_screen_region};

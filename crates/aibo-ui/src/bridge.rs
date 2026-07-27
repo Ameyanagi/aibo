@@ -21,9 +21,10 @@
 use std::sync::Arc;
 
 use aibo_core::AiboError;
+use aibo_core::context::Turn;
 use aibo_core::types::{
-    AgentStep, AppInfo, ClipboardItem, DisplayInfo, FieldContext, Health, ModelBinding, Permission,
-    PermissionStatus, ProviderId, Role, StreamEvent, Surface, Usage,
+    AgentStep, AppInfo, Attachment, ClipboardItem, DisplayInfo, FieldContext, Health, ModelBinding,
+    Permission, PermissionStatus, ProviderId, Role, StreamEvent, Surface, Usage,
 };
 use secrecy::SecretString;
 use uuid::Uuid;
@@ -106,6 +107,22 @@ pub enum UiRequest {
         surface: Surface,
         /// `@model` / `⌘1..4` override; wins over every routing rule (§4).
         role_override: Option<Role>,
+        /// Images the user deliberately attached to this turn.
+        ///
+        /// Ambient clipboard state never populates this field. A crop shortcut
+        /// or explicit attach gesture does, and prompt assembly keeps the pixels
+        /// fenced as untrusted context.
+        attachments: Vec<Attachment>,
+        /// Completed chat turns, oldest first.
+        ///
+        /// The selected text remains separate captured context; history is
+        /// only what the user and assistant said inside this panel session.
+        history: Vec<Turn>,
+        /// Whether the pinned captured selection should be included.
+        ///
+        /// Removing the context card changes this to `false` without mutating
+        /// the backend's captured insertion target.
+        include_selection: bool,
     },
 
     /// Cancel in-flight work for a session (`esc`, or a new submission).

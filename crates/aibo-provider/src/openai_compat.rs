@@ -173,9 +173,9 @@ pub struct Quirks {
     pub sampling_params: bool,
     /// An explicit output cap (`max_output_tokens` / `max_tokens`) is accepted.
     ///
-    /// Also false for Codex — see [`Self::sampling_params`]. Aibo still
-    /// enforces its own budget locally (§14); it simply cannot ask the server
-    /// to enforce one.
+    /// Also false for Codex — see [`Self::sampling_params`]. Aibo retains a
+    /// finite planning reserve and a hard byte-safety ceiling, but cannot ask
+    /// that server to enforce a token limit.
     pub output_cap: bool,
     /// Extra headers sent on every request.
     pub extra_headers: Vec<(String, String)>,
@@ -580,11 +580,13 @@ pub fn build_chat_completions_body(req: &ChatRequest, q: &Quirks) -> Value {
     });
     let obj = body.as_object_mut().expect("object literal");
 
-    let max_tokens = req.params.max_tokens.min(req.budget.max_output_tokens);
-    if q.max_completion_tokens {
-        obj.insert("max_completion_tokens".into(), json!(max_tokens));
-    } else {
-        obj.insert("max_tokens".into(), json!(max_tokens));
+    if req.params.max_tokens > 0 {
+        let max_tokens = req.params.max_tokens.min(req.budget.max_output_tokens);
+        if q.max_completion_tokens {
+            obj.insert("max_completion_tokens".into(), json!(max_tokens));
+        } else {
+            obj.insert("max_tokens".into(), json!(max_tokens));
+        }
     }
 
     if let Some(p) = req.params.top_p {
@@ -708,7 +710,7 @@ pub fn build_responses_body(req: &ChatRequest, q: &Quirks) -> Value {
 
     // Gated: the ChatGPT-backed Codex endpoint 400s on either of these, after
     // auth has already succeeded. See `Quirks::sampling_params`.
-    if q.output_cap {
+    if q.output_cap && req.params.max_tokens > 0 {
         obj.insert(
             "max_output_tokens".into(),
             json!(req.params.max_tokens.min(req.budget.max_output_tokens)),

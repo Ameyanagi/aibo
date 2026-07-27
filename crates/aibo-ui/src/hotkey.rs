@@ -94,6 +94,9 @@ pub enum HotkeyAction {
     /// §13: pressing this during an agent run does **not** interrupt it — the
     /// run continues in the task window and a fresh panel opens.
     TogglePanel,
+    /// Interactively crop a screen region and open it as a deliberate image
+    /// attachment in a fresh panel.
+    CaptureScreenRegion,
     /// Bring the task window forward.
     ShowTasks,
     /// Re-insert the pre-transform original ("revert last transform", §13).
@@ -127,11 +130,32 @@ impl Binding {
     pub fn default_for(action: HotkeyAction) -> Option<Self> {
         match action {
             HotkeyAction::TogglePanel => Some(Self::new(action, default_panel_hotkey())),
+            HotkeyAction::CaptureScreenRegion => {
+                default_screen_capture_hotkey().map(|hotkey| Self::new(action, hotkey))
+            }
             // No defaults: both would collide with common editor bindings, and
             // §9 forbids shipping a picker that implies more than
             // `RegisterHotKey` can express.
             HotkeyAction::ShowTasks | HotkeyAction::RevertLastTransform => None,
         }
+    }
+}
+
+/// The crop-and-ask shortcut.
+///
+/// On macOS this extends the panel's `⌥Space` with Shift: `⌥⇧Space`. Other
+/// platforms keep it unbound until their native picker path is implemented.
+pub fn default_screen_capture_hotkey() -> Option<HotKey> {
+    #[cfg(target_os = "macos")]
+    {
+        Some(HotKey::new(
+            Some(Modifiers::ALT | Modifiers::SHIFT),
+            Code::Space,
+        ))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
     }
 }
 

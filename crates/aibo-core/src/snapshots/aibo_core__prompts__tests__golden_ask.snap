@@ -5,10 +5,10 @@ expression: render(&a)
 surface      = Ask
 role         = Smart
 binding      = cerebras/llama-3.3-70b
-prompt       = ask/1
-params       = max_tokens=2048 temperature=0.7 candidates=1 stop=[]
+prompt       = ask/2
+params       = max_tokens=0 temperature=0.7 candidates=1 stop=[]
 candidates   = 1 -> 1 (SingleRequest)
-budget       = context=14336 payload=8192 output=2048
+budget       = context=12288 payload=8192 output=4096
 tools        = 0
 untrusted    = 1
 instruction  = Some("What does this error mean?")
@@ -17,8 +17,11 @@ instruction  = Some("What does this error mean?")
 You are aibo, an assistant that lives in a small panel over whatever the user is
 working in. Answer the question they actually asked.
 
-- Be direct and short. The panel is small; a screen of prose to answer a
-  one-line question is a worse answer, not a more thorough one.
+- Match the depth of the answer to the question. Keep genuinely simple answers
+  concise, but give complex, analytical, or explanatory questions enough
+  detail to be complete and useful. Do not omit important reasoning, examples,
+  caveats, or next steps merely because the answer is shown in a panel; the
+  panel scrolls.
 - Lead with the answer, then the reasoning if any is needed. Never open with a
   restatement of the question or with "Great question".
 - Say plainly when you do not know or cannot tell from what you were given.

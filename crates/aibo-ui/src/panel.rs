@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use aibo_core::context::Turn;
 use aibo_core::error::{AttachmentRejection, Treatment};
 use aibo_core::types::{
     AppInfo, Attachment, AttachmentSource, PermissionStatus, ProviderId, Rect, Role, StopReason,
@@ -27,7 +28,7 @@ use aibo_core::types::{
 };
 use aibo_core::{AiboError, types::Usage};
 use iced::widget::{
-    Space, column, container, image, pick_list, row, text, text_editor, text_input,
+    Space, column, container, image, pick_list, row, scrollable, text, text_editor, text_input,
 };
 use iced::{Alignment, Element, Length};
 use uuid::Uuid;
@@ -101,6 +102,12 @@ pub enum ContextState {
         app: Option<AppInfo>,
         /// A one-line excerpt for the chip.
         excerpt: Option<String>,
+        /// The full captured selection shown inside the composer.
+        ///
+        /// It remains distinct from [`PanelState::input`]: captured content is
+        /// untrusted context and must not become a tool-authorizing instruction
+        /// merely because the UI makes it visible beside the question.
+        selection: Option<String>,
         /// The captured payload was middle-out truncated to fit the budget (§5).
         truncated: bool,
         /// Caret or selection bounds, when the platform layer supplied them.
@@ -589,6 +596,15 @@ pub struct Attribution {
     pub substituted_for: Option<ProviderId>,
 }
 
+/// One completed exchange retained in the visible panel transcript.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ConversationTurn {
+    /// The instruction the user submitted.
+    pub user: String,
+    /// The assistant response.
+    pub assistant: String,
+}
+
 /// Everything the panel renders from.
 #[derive(Debug, Clone)]
 pub struct PanelState {
@@ -607,6 +623,12 @@ pub struct PanelState {
     pub response: String,
     /// Selectable rendering state for [`Self::response`].
     response_editor: text_editor::Content,
+    /// Completed exchanges above the active turn.
+    pub turns: Vec<ConversationTurn>,
+    /// User message currently being answered or reviewed.
+    pub active_user: Option<String>,
+    /// Whether the pinned selected-text card is expanded.
+    pub context_expanded: bool,
     /// Reasoning tokens, kept on their own channel: rendered collapsed, never
     /// inserted (§7).
     pub reasoning: String,
@@ -658,6 +680,9 @@ impl PanelState {
             surface: Surface::Ask,
             response: String::new(),
             response_editor: text_editor::Content::new(),
+            turns: Vec::new(),
+            active_user: None,
+            context_expanded: false,
             reasoning: String::new(),
             reserved_answer_height: theme::ANSWER_BOX_MIN_HEIGHT,
             attribution: Attribution::default(),
@@ -717,6 +742,95 @@ impl PanelState {
     pub fn clear_response(&mut self) {
         self.response.clear();
         self.response_editor = text_editor::Content::new();
+    }
+
+    /// Completed turns to include before the next user message.
+    pub fn history_for_next_turn(&self) -> Vec<Turn> {
+        let mut history: Vec<Turn> = self
+            .turns
+            .iter()
+            .map(|turn| Turn::pair(turn.user.clone(), turn.assistant.clone()))
+            .collect();
+        if matches!(
+            self.phase,
+            Phase::Finished {
+                reason: StopReason::EndTurn
+            }
+        ) && let Some(user) = &self.active_user
+            && !self.response.is_empty()
+        {
+            history.push(Turn::pair(user.clone(), self.response.clone()));
+        }
+        history
+    }
+
+    /// Start a new visible chat turn, retaining the completed active exchange.
+    pub fn begin_turn(&mut self, user: String) {
+        if matches!(
+            self.phase,
+            Phase::Finished {
+                reason: StopReason::EndTurn
+            }
+        ) && let Some(previous_user) = self.active_user.take()
+            && !self.response.is_empty()
+        {
+            self.turns.push(ConversationTurn {
+                user: previous_user,
+                assistant: self.response.clone(),
+            });
+        }
+        self.active_user = Some(user);
+        self.input.clear();
+        self.phase = Phase::Loading;
+        self.clear_response();
+        self.reasoning.clear();
+        self.attribution = Attribution::default();
+        self.usage = Usage::default();
+        self.error = None;
+        self.reserved_answer_height = theme::ANSWER_BOX_MIN_HEIGHT;
+    }
+
+    /// Prepare the active turn to be generated again.
+    pub fn begin_retry(&mut self) {
+        self.phase = Phase::Loading;
+        self.clear_response();
+        self.reasoning.clear();
+        self.attribution = Attribution::default();
+        self.usage = Usage::default();
+        self.error = None;
+        self.reserved_answer_height = theme::ANSWER_BOX_MIN_HEIGHT;
+    }
+
+    /// Whether a selected-text card is currently pinned to the conversation.
+    pub fn includes_selection(&self) -> bool {
+        matches!(
+            self.context,
+            ContextState::Available {
+                selection: Some(_),
+                ..
+            }
+        )
+    }
+
+    /// Whether the compact composer has expanded into a chat transcript.
+    pub fn has_conversation(&self) -> bool {
+        self.active_user.is_some() || !self.turns.is_empty()
+    }
+
+    /// Remove the selected text from the visible card and future requests.
+    pub fn remove_selection(&mut self) {
+        if let ContextState::Available {
+            excerpt,
+            selection,
+            truncated,
+            ..
+        } = &mut self.context
+        {
+            *excerpt = None;
+            *selection = None;
+            *truncated = false;
+        }
+        self.context_expanded = false;
     }
 
     /// Apply cursor and selection actions while keeping the answer read-only.
@@ -947,9 +1061,20 @@ impl PanelState {
         // constant. Attaching an image into a fixed-height panel would push the
         // input out from under the caret.
         let attachments = self.attachment_block_height();
+        let selection = self.selection_preview_height();
+        if self.has_conversation() {
+            return (theme::PANEL_HEIGHT_COLLAPSED
+                + attachments
+                + selection
+                + self.transcript_height()
+                + self.footer_height())
+            .clamp(CHAT_PANEL_MIN_HEIGHT, theme::PANEL_HEIGHT_MAX);
+        }
+
         match self.phase {
             Phase::Hidden | Phase::WarmingUp { .. } | Phase::Idle => {
-                (theme::PANEL_HEIGHT_COLLAPSED + attachments).min(theme::PANEL_HEIGHT_MAX)
+                (theme::PANEL_HEIGHT_COLLAPSED + attachments + selection)
+                    .min(theme::PANEL_HEIGHT_MAX)
             }
             // `COLLAPSED` is input-plus-chrome only. Everything `footer()`
             // renders — the attribution line, any footnotes, and the action row
@@ -958,6 +1083,7 @@ impl PanelState {
             // action row still cut it off; the rows above it push it down.
             _ => (theme::PANEL_HEIGHT_COLLAPSED
                 + attachments
+                + selection
                 + self.answer_height()
                 + self.footer_height())
             .min(theme::PANEL_HEIGHT_MAX),
@@ -989,6 +1115,8 @@ pub enum Message {
     Accept,
     /// Copy the response.
     Copy,
+    /// Generate the active assistant response again.
+    Retry,
     /// Re-run against `Smart`.
     Escalate,
     /// `esc`: cancel in-flight work and close (§13).
@@ -1014,6 +1142,10 @@ pub enum Message {
     DetachLast,
     /// The `×` on a chip: remove that image.
     Detach(Uuid),
+    /// Expand or collapse the pinned selected-text card.
+    ToggleContext,
+    /// Remove selected text from this conversation.
+    RemoveSelection,
     /// Selection, cursor, or an ignored edit attempt in the read-only answer.
     ResponseAction(text_editor::Action),
 }
@@ -1029,18 +1161,25 @@ pub fn view(state: &PanelState) -> Element<'_, Message> {
     }
 
     let mut body = column![chip_row(state)].spacing(space(2.0));
-    // The attachment chips sit directly under the context chip: both answer
-    // "what is aibo looking at", and the difference between them — one is
-    // ambient, the other the user put there — is what the panel has to make
-    // obvious. Their own row rather than the context chip's, because four
-    // chips plus a source line do not fit across `PANEL_WIDTH_MIN`.
+    if let Some(card) = selection_card(state) {
+        body = body.push(card);
+    }
     if let Some(row) = attachment_row(state) {
         body = body.push(row);
     }
-    let body = body
-        .push(input_row(state))
-        .push(content(state))
-        .push(footer(state));
+    if state.has_conversation()
+        || !matches!(state.phase, Phase::Hidden | Phase::Idle)
+        || matches!(
+            state.context,
+            ContextState::PermissionDenied { .. } | ContextState::ImeActive
+        )
+    {
+        body = body.push(content(state));
+    }
+    if state.has_conversation() || !matches!(state.phase, Phase::Hidden | Phase::Idle) {
+        body = body.push(footer(state));
+    }
+    let body = body.push(input_row(state));
 
     let mut stack = column![body].spacing(space(2.0));
     if let Some(toast) = &state.toast {
@@ -1058,7 +1197,10 @@ pub fn view(state: &PanelState) -> Element<'_, Message> {
 
     container(stack)
         .width(Length::Fill)
-        .height(Length::Shrink)
+        // The native visual-effect view fills the window. Filling the same
+        // bounds here prevents a transparent strip of blur below the rounded
+        // panel when the window is resized for a chat transcript.
+        .height(Length::Fill)
         .padding(space(4.0))
         .style(theme::panel_surface)
         .into()
@@ -1066,10 +1208,9 @@ pub fn view(state: &PanelState) -> Element<'_, Message> {
 
 fn chip_row(state: &PanelState) -> Element<'_, Message> {
     let context = match &state.context {
-        ContextState::Available { app, excerpt, .. } => widgets::context_chip(
-            app.as_ref().map(|a| a.display_name.as_str()),
-            excerpt.as_deref(),
-        ),
+        ContextState::Available { app, .. } => {
+            widgets::context_chip(app.as_ref().map(|a| a.display_name.as_str()), None)
+        }
         // Capture in flight: render the chip in its "no context" form rather
         // than nothing, so the layout does not shift when it lands (§8).
         ContextState::Pending => widgets::context_chip(None, None),
@@ -1103,6 +1244,63 @@ fn chip_row(state: &PanelState) -> Element<'_, Message> {
     .spacing(space(1.5))
     .align_y(Alignment::Center)
     .into()
+}
+
+/// Pinned captured selection, shown once and never duplicated in the header.
+fn selection_card(state: &PanelState) -> Option<Element<'_, Message>> {
+    let ContextState::Available {
+        selection: Some(selection),
+        ..
+    } = &state.context
+    else {
+        return None;
+    };
+
+    let preview: Element<'_, Message> = if state.context_expanded {
+        scrollable(
+            text(selection)
+                .size(type_scale::CHIP)
+                .font(theme::UI_FONT)
+                .style(theme::text_dim),
+        )
+        .height(Length::Fixed(88.0))
+        .style(theme::scroller)
+        .into()
+    } else {
+        text(widgets::elide(selection, 240))
+            .size(type_scale::CHIP)
+            .font(theme::UI_FONT)
+            .style(theme::text_dim)
+            .into()
+    };
+
+    let toggle = if state.context_expanded {
+        Action::new(Key::ActionCollapse, "⌘E", Message::ToggleContext)
+    } else {
+        Action::new(Key::ActionExpand, "⌘E", Message::ToggleContext)
+    };
+    let remove = Action::new(Key::ActionRemoveSelection, "⌘⇧E", Message::RemoveSelection);
+
+    Some(
+        container(
+            column![
+                row![
+                    text(i18n::t(Key::ContextSelectedText))
+                        .size(type_scale::META)
+                        .style(theme::text_primary),
+                    Space::new().width(Length::Fill),
+                    widgets::action_list(vec![toggle, remove]),
+                ]
+                .align_y(Alignment::Center),
+                preview,
+            ]
+            .spacing(space(1.0)),
+        )
+        .width(Length::Fill)
+        .padding([space(1.5), space(2.0)])
+        .style(theme::raised)
+        .into(),
+    )
 }
 
 /// The row of attachment chips, or `None` when nothing is attached.
@@ -1152,14 +1350,147 @@ fn input_row(state: &PanelState) -> Element<'_, Message> {
     //
     // SPIKE: S10 — iced's IME support has historically been incomplete and an
     // overlay window makes it harder. On the critical path, not a nicety.
-    text_input(i18n::t(Key::PanelPlaceholder), &state.input)
+    let input = text_input(i18n::t(Key::PanelPlaceholder), &state.input)
         .id(INPUT_ID)
         .on_input(Message::InputChanged)
-        .on_submit(Message::Submit)
         .size(type_scale::BODY)
         .font(theme::MONO_FONT)
         .padding(space(2.5))
-        .style(theme::input)
+        .style(theme::input);
+
+    container(
+        row![input, widgets::action_list(composer_actions_for(state)),]
+            .spacing(space(1.5))
+            .align_y(Alignment::Center),
+    )
+    .width(Length::Fill)
+    .padding(space(1.0))
+    .style(theme::raised)
+    .into()
+}
+
+fn composer_actions_for(state: &PanelState) -> Vec<Action<Message>> {
+    let attach = Action::new(Key::ActionAttachImage, ATTACH_KEY, Message::Attach);
+    let attach = if state.clipboard.is_attachable() {
+        attach
+    } else {
+        attach.disabled()
+    };
+
+    let primary = Action::new(Key::ActionSend, "↩", Message::Submit).primary();
+    let primary = if state.input.trim().is_empty()
+        || matches!(state.phase, Phase::Loading | Phase::Streaming)
+    {
+        primary.disabled()
+    } else {
+        primary
+    };
+    vec![attach, primary]
+}
+
+fn user_bubble(message: &str) -> Element<'_, Message> {
+    row![
+        Space::new().width(Length::FillPortion(1)),
+        container(
+            column![
+                text(i18n::t(Key::ChatYou))
+                    .size(type_scale::META)
+                    .style(theme::text_dim),
+                text(message.to_owned())
+                    .size(type_scale::BODY)
+                    .font(theme::UI_FONT)
+                    .style(theme::text_primary),
+            ]
+            .spacing(space(1.0)),
+        )
+        .width(Length::FillPortion(4))
+        .padding([space(2.0), space(2.5)])
+        .style(theme::user_bubble),
+    ]
+    .into()
+}
+
+fn assistant_text_bubble(message: &str) -> Element<'_, Message> {
+    row![
+        container(
+            column![
+                text(i18n::t(Key::ChatAssistant))
+                    .size(type_scale::META)
+                    .style(theme::text_dim),
+                text(message.to_owned())
+                    .size(type_scale::BODY)
+                    .font(theme::UI_FONT)
+                    .style(theme::text_primary),
+            ]
+            .spacing(space(1.0)),
+        )
+        .width(Length::FillPortion(4))
+        .padding([space(2.0), space(2.5)])
+        .style(theme::assistant_bubble),
+        Space::new().width(Length::FillPortion(1)),
+    ]
+    .into()
+}
+
+fn active_assistant_bubble(state: &PanelState) -> Element<'_, Message> {
+    let body: Element<'_, Message> = match state.phase {
+        Phase::Loading => text(i18n::t(Key::StateLoading))
+            .size(type_scale::BODY)
+            .style(theme::text_dim)
+            .into(),
+        Phase::Streaming | Phase::Finished { .. } => widgets::selectable_chat_answer(
+            &state.response_editor,
+            state.chat_answer_height(),
+            state.is_truncated(),
+            Message::ResponseAction,
+        ),
+        Phase::Failed if !state.response.is_empty() => widgets::selectable_chat_answer(
+            &state.response_editor,
+            state.chat_answer_height(),
+            true,
+            Message::ResponseAction,
+        ),
+        _ => Space::new().height(0.0).into(),
+    };
+
+    row![
+        container(
+            column![
+                text(i18n::t(Key::ChatAssistant))
+                    .size(type_scale::META)
+                    .style(theme::text_dim),
+                body,
+            ]
+            .spacing(space(1.0)),
+        )
+        .width(Length::FillPortion(4))
+        .padding([space(2.0), space(2.5)])
+        .style(theme::assistant_bubble),
+        Space::new().width(Length::FillPortion(1)),
+    ]
+    .into()
+}
+
+fn conversation(state: &PanelState) -> Element<'_, Message> {
+    let mut transcript = column![].spacing(space(2.0));
+    for turn in &state.turns {
+        transcript = transcript
+            .push(user_bubble(&turn.user))
+            .push(assistant_text_bubble(&turn.assistant));
+    }
+    if let Some(user) = &state.active_user {
+        transcript = transcript.push(user_bubble(user));
+        if matches!(
+            state.phase,
+            Phase::Loading | Phase::Streaming | Phase::Finished { .. } | Phase::Failed
+        ) {
+            transcript = transcript.push(active_assistant_bubble(state));
+        }
+    }
+
+    scrollable(transcript)
+        .height(Length::Fixed(state.transcript_height()))
+        .style(theme::scroller)
         .into()
 }
 
@@ -1185,55 +1516,44 @@ fn content(state: &PanelState) -> Element<'_, Message> {
         _ => {}
     }
 
-    match &state.phase {
-        Phase::Hidden | Phase::WarmingUp { .. } | Phase::Idle => {
-            if matches!(state.context, ContextState::Unavailable { .. }) {
-                widgets::state_block(
-                    Severity::Info,
-                    i18n::t(Key::StateContextUnavailableTitle),
-                    Some(i18n::t(Key::StateContextUnavailableBody)),
-                    Vec::new(),
-                )
-            } else {
-                widgets::state_block(
-                    Severity::Info,
-                    i18n::t(Key::StateEmptyTitle),
-                    Some(i18n::t(Key::StateEmptyBody)),
-                    Vec::new(),
-                )
-            }
-        }
-
-        // Loading reserves the same height the answer box will use, so the
-        // first token does not move anything (§16).
-        Phase::Loading => container(
-            row![
-                text(i18n::t(Key::StateLoading))
-                    .size(type_scale::BODY)
-                    .style(theme::text_dim),
-                Space::new().width(Length::Fill),
+    if state.has_conversation() {
+        if matches!(state.phase, Phase::Failed)
+            && let Some(error) = &state.error
+            && state.response.is_empty()
+        {
+            let actions = error
+                .action
+                .clone()
+                .and_then(error_action)
+                .into_iter()
+                .collect();
+            return column![
+                conversation(state),
+                widgets::state_block(error.severity, &error.headline, None, actions),
             ]
-            .align_y(Alignment::Center),
+            .spacing(space(2.0))
+            .into();
+        }
+        return conversation(state);
+    }
+
+    match &state.phase {
+        Phase::Hidden | Phase::WarmingUp { .. } | Phase::Idle => Space::new().height(0.0).into(),
+        Phase::Loading => container(
+            text(i18n::t(Key::StateLoading))
+                .size(type_scale::BODY)
+                .style(theme::text_dim),
         )
-        .height(Length::Fixed(state.answer_height()))
+        .height(Length::Fill)
         .padding(space(2.0))
         .style(theme::raised)
         .into(),
-
-        Phase::Streaming => widgets::selectable_answer(
-            &state.response_editor,
-            state.answer_height(),
-            false,
-            Message::ResponseAction,
-        ),
-
-        Phase::Finished { .. } => widgets::selectable_answer(
+        Phase::Streaming | Phase::Finished { .. } => widgets::selectable_answer(
             &state.response_editor,
             state.answer_height(),
             state.is_truncated(),
             Message::ResponseAction,
         ),
-
         Phase::Failed => {
             let Some(error) = &state.error else {
                 return widgets::state_block(
@@ -1243,30 +1563,13 @@ fn content(state: &PanelState) -> Element<'_, Message> {
                     Vec::new(),
                 );
             };
-
             let actions = error
                 .action
                 .clone()
                 .and_then(error_action)
                 .into_iter()
                 .collect();
-
-            // A partial response survives the failure and stays copyable (§13).
-            if state.response.is_empty() {
-                widgets::state_block(error.severity, &error.headline, None, actions)
-            } else {
-                column![
-                    widgets::state_block(error.severity, &error.headline, None, actions),
-                    widgets::selectable_answer(
-                        &state.response_editor,
-                        state.answer_height(),
-                        true,
-                        Message::ResponseAction,
-                    ),
-                ]
-                .spacing(space(2.0))
-                .into()
-            }
+            widgets::state_block(error.severity, &error.headline, None, actions)
         }
     }
 }
@@ -1296,11 +1599,46 @@ fn error_action(action: ErrorAction) -> Option<Action<Message>> {
 }
 
 impl PanelState {
+    /// Compact answer height used inside the active assistant bubble.
+    fn chat_answer_height(&self) -> f32 {
+        estimated_text_height(&self.response, CHAT_ASSISTANT_CHARS_PER_LINE)
+            .clamp(theme::CHAT_ANSWER_MIN_HEIGHT, CHAT_ANSWER_MAX_HEIGHT)
+    }
+
+    /// Visible transcript height, content-sized until a useful scrolling cap.
+    fn transcript_height(&self) -> f32 {
+        let mut height = 0.0;
+        let mut messages = 0usize;
+
+        for turn in &self.turns {
+            height += chat_bubble_height(&turn.user, false);
+            height += chat_bubble_height(&turn.assistant, true);
+            messages += 2;
+        }
+        if let Some(user) = &self.active_user {
+            height += chat_bubble_height(user, false);
+            messages += 1;
+            if matches!(
+                self.phase,
+                Phase::Loading | Phase::Streaming | Phase::Finished { .. } | Phase::Failed
+            ) {
+                height += CHAT_BUBBLE_CHROME_HEIGHT + self.chat_answer_height();
+                messages += 1;
+            }
+        }
+        if messages > 1 {
+            height += (messages - 1) as f32 * CHAT_MESSAGE_SPACING;
+        }
+
+        height.clamp(CHAT_TRANSCRIPT_MIN_HEIGHT, CHAT_TRANSCRIPT_MAX_HEIGHT)
+    }
+
     /// Maximum height the answer may consume while preserving fixed chrome.
     fn max_answer_height(&self) -> f32 {
         (theme::PANEL_HEIGHT_MAX
             - theme::PANEL_HEIGHT_COLLAPSED
             - self.attachment_block_height()
+            - self.selection_preview_height()
             - self.footer_height())
         .max(theme::ANSWER_BOX_MIN_HEIGHT)
     }
@@ -1359,6 +1697,18 @@ impl PanelState {
         let rows = self.attachments.len().div_ceil(2) as f32;
         rows * ATTACHMENT_ROW_HEIGHT + theme::META_LINE_HEIGHT
     }
+
+    fn selection_preview_height(&self) -> f32 {
+        match self.context {
+            ContextState::Available {
+                selection: Some(_), ..
+            } if self.context_expanded => SELECTION_CARD_EXPANDED_HEIGHT,
+            ContextState::Available {
+                selection: Some(_), ..
+            } => SELECTION_CARD_COLLAPSED_HEIGHT,
+            _ => 0.0,
+        }
+    }
 }
 
 /// Height of one row of attachment chips, including the column's spacing.
@@ -1367,6 +1717,34 @@ impl PanelState {
 /// composition — a 20 pt thumbnail plus the chip's vertical padding — rather
 /// than a shared token.
 const ATTACHMENT_ROW_HEIGHT: f32 = 36.0;
+const SELECTION_CARD_COLLAPSED_HEIGHT: f32 = 64.0;
+const SELECTION_CARD_EXPANDED_HEIGHT: f32 = 132.0;
+const CHAT_PANEL_MIN_HEIGHT: f32 = 320.0;
+const CHAT_TRANSCRIPT_MIN_HEIGHT: f32 = 112.0;
+const CHAT_TRANSCRIPT_MAX_HEIGHT: f32 = 268.0;
+const CHAT_ANSWER_MAX_HEIGHT: f32 = 172.0;
+const CHAT_BUBBLE_CHROME_HEIGHT: f32 = 38.0;
+const CHAT_MESSAGE_SPACING: f32 = 8.0;
+const CHAT_USER_CHARS_PER_LINE: usize = 72;
+const CHAT_ASSISTANT_CHARS_PER_LINE: usize = 68;
+
+fn chat_bubble_height(message: &str, assistant: bool) -> f32 {
+    let chars_per_line = if assistant {
+        CHAT_ASSISTANT_CHARS_PER_LINE
+    } else {
+        CHAT_USER_CHARS_PER_LINE
+    };
+    CHAT_BUBBLE_CHROME_HEIGHT + estimated_text_height(message, chars_per_line)
+}
+
+fn estimated_text_height(message: &str, chars_per_line: usize) -> f32 {
+    let lines = message
+        .split('\n')
+        .map(|line| line.chars().count().max(1).div_ceil(chars_per_line))
+        .sum::<usize>()
+        .max(1);
+    lines as f32 * 20.0 + 4.0
+}
 
 fn footer(state: &PanelState) -> Element<'_, Message> {
     let mut stack = column![].spacing(space(1.5));
@@ -1431,7 +1809,11 @@ fn actions_for(state: &PanelState) -> Vec<Action<Message>> {
         ));
     }
 
-    let replace = Action::new(Key::ActionReplace, "⏎", Message::Accept).primary();
+    let replace = Action::new(
+        Key::ActionReplace,
+        widgets::primary_shortcut("⌘↩", "Ctrl+Enter"),
+        Message::Accept,
+    );
     actions.push(if state.can_accept() {
         replace
     } else {
@@ -1449,16 +1831,20 @@ fn actions_for(state: &PanelState) -> Vec<Action<Message>> {
         copy.disabled()
     });
 
-    // §16: "every action has a key, shown" — and attaching must be discoverable
-    // without already knowing the chord. Always listed, disabled when the
-    // clipboard holds nothing attachable, so the row does not change length the
-    // moment the user copies a screenshot in another app.
-    let attach = Action::new(Key::ActionAttachImage, ATTACH_KEY, Message::Attach);
-    actions.push(if state.clipboard.is_attachable() {
-        attach
-    } else {
-        attach.disabled()
-    });
+    let retry = Action::new(
+        Key::ActionRegenerate,
+        widgets::primary_shortcut("⌘R", "Ctrl+R"),
+        Message::Retry,
+    );
+    actions.push(
+        if matches!(state.phase, Phase::Finished { .. } | Phase::Failed)
+            && state.active_user.is_some()
+        {
+            retry
+        } else {
+            retry.disabled()
+        },
+    );
 
     // Removal is listed only while there is something to remove. It is not the
     // "disabled rather than absent" case: unlike Replace and Copy, this action
@@ -1478,7 +1864,7 @@ fn actions_for(state: &PanelState) -> Vec<Action<Message>> {
     } else {
         actions.push(Action::new(
             Key::ActionSmartModel,
-            widgets::primary_shortcut("⌘↩", "Ctrl+Enter"),
+            widgets::primary_shortcut("⌘⇧↩", "Ctrl+Shift+Enter"),
             Message::Escalate,
         ));
         actions.push(Action::new(Key::ActionDismiss, "esc", Message::Dismiss));
@@ -2093,7 +2479,7 @@ mod tests {
         let mut state = panel();
 
         let listed = |state: &PanelState| {
-            actions_for(state)
+            composer_actions_for(state)
                 .into_iter()
                 .find(|a| a.label == Key::ActionAttachImage)
         };
@@ -2132,10 +2518,10 @@ mod tests {
         };
         assert!(state.clipboard.is_image());
         assert!(!state.clipboard.is_attachable());
-        let attach = actions_for(&state)
+        let attach = composer_actions_for(&state)
             .into_iter()
             .find(|action| action.label == Key::ActionAttachImage)
-            .expect("the stable action row keeps the disabled entry");
+            .expect("the stable composer keeps the disabled entry");
         assert!(attach.on_press.is_none());
     }
 
@@ -2244,6 +2630,22 @@ mod tests {
     }
 
     #[test]
+    fn a_chat_window_grows_with_wrapped_lines_then_stops_at_its_maximum() {
+        let mut state = panel();
+        state.active_user = Some("Explain this".to_owned());
+        state.phase = Phase::Streaming;
+        state.set_response("Short answer");
+        let short = state.desired_height();
+
+        state.set_response("A long wrapped response. ".repeat(80));
+        let long = state.desired_height();
+
+        assert!(long > short, "{long} must grow beyond {short}");
+        assert!(long <= theme::PANEL_HEIGHT_MAX);
+        assert_eq!(state.transcript_height(), CHAT_TRANSCRIPT_MAX_HEIGHT);
+    }
+
+    #[test]
     fn selectable_answers_reject_edit_actions() {
         let mut state = panel();
         state.set_response("server-owned answer");
@@ -2266,5 +2668,54 @@ mod tests {
 
         assert_eq!(state.response, "Hello 世界 👨‍👩‍👧‍👦");
         assert_eq!(state.response_editor.text(), state.response);
+    }
+
+    #[test]
+    fn a_follow_up_keeps_complete_turns_and_starts_a_fresh_active_bubble() {
+        let mut state = panel();
+        state.begin_turn("first question".to_owned());
+        state.append_response("first answer");
+        state.phase = Phase::Finished {
+            reason: StopReason::EndTurn,
+        };
+
+        assert_eq!(
+            state.history_for_next_turn(),
+            vec![Turn::pair("first question", "first answer")]
+        );
+
+        state.begin_turn("follow up".to_owned());
+        assert_eq!(state.turns.len(), 1);
+        assert_eq!(state.turns[0].user, "first question");
+        assert_eq!(state.turns[0].assistant, "first answer");
+        assert_eq!(state.active_user.as_deref(), Some("follow up"));
+        assert!(state.response.is_empty());
+        assert!(state.input.is_empty());
+        assert_eq!(state.phase, Phase::Loading);
+    }
+
+    #[test]
+    fn removing_the_context_card_excludes_selection_from_future_turns() {
+        let mut state = panel();
+        state.context = ContextState::Available {
+            app: None,
+            excerpt: Some("selected".to_owned()),
+            selection: Some("selected text".to_owned()),
+            truncated: true,
+            caret_bounds: None,
+        };
+
+        assert!(state.includes_selection());
+        state.remove_selection();
+        assert!(!state.includes_selection());
+        assert!(matches!(
+            state.context,
+            ContextState::Available {
+                excerpt: None,
+                selection: None,
+                truncated: false,
+                ..
+            }
+        ));
     }
 }

@@ -10,7 +10,7 @@ use objc2_app_kit::{
     NSAccessibilityPostNotificationWithUserInfo, NSApplication, NSAutoresizingMaskOptions, NSColor,
     NSFloatingWindowLevel, NSUserInterfaceItemIdentification, NSView, NSVisualEffectBlendingMode,
     NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior,
-    NSWindowOrderingMode, NSWindowStyleMask, NSWorkspace,
+    NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility, NSWorkspace,
 };
 use objc2_foundation::{NSDictionary, NSString};
 use raw_window_handle::AppKitWindowHandle;
@@ -22,7 +22,11 @@ const EFFECT_IDENTIFIER: &str = "com.aibo.panel.backdrop";
 /// Bits to add to a borderless winit window without turning it into an
 /// `NSPanel` (which it is not).
 fn overlay_style_mask(mut current: NSWindowStyleMask) -> NSWindowStyleMask {
-    current.insert(NSWindowStyleMask::UtilityWindow);
+    current.insert(
+        NSWindowStyleMask::UtilityWindow
+            | NSWindowStyleMask::Titled
+            | NSWindowStyleMask::FullSizeContentView,
+    );
     current
 }
 
@@ -62,6 +66,14 @@ pub(crate) fn configure_panel_window(
         window.setLevel(NSFloatingWindowLevel);
         window.setOpaque(false);
         window.setBackgroundColor(Some(&NSColor::clearColor()));
+        // Give the visually borderless panel a real, transparent AppKit title
+        // region. `movableByWindowBackground` alone is ignored by winit's
+        // renderer view; the title region provides a dependable drag target in
+        // the unused outer surface while FullSizeContentView preserves the
+        // existing edge-to-edge layout.
+        window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
+        window.setTitlebarAppearsTransparent(true);
+        window.setMovableByWindowBackground(true);
 
         let backdrop = install_backdrop(mtm, view);
         Ok(OverlayWindowConfiguration { backdrop })
@@ -201,6 +213,8 @@ mod tests {
         let current = NSWindowStyleMask::Borderless | NSWindowStyleMask::Resizable;
         let result = overlay_style_mask(current);
         assert!(result.contains(NSWindowStyleMask::UtilityWindow));
+        assert!(result.contains(NSWindowStyleMask::Titled));
+        assert!(result.contains(NSWindowStyleMask::FullSizeContentView));
         assert!(result.contains(NSWindowStyleMask::Resizable));
         assert!(!result.contains(NSWindowStyleMask::NonactivatingPanel));
     }

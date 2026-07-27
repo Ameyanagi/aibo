@@ -103,7 +103,7 @@ pub fn context_chip<'a, Message: 'a>(
 
     let mut line = row![
         // The accent leading rule from the §16 mock.
-        container(Space::new().width(2.0).height(Length::Fill)).style(|t: &iced::Theme| {
+        container(Space::new().width(2.0).height(20.0)).style(|t: &iced::Theme| {
             container::Style {
                 background: Some(Background::Color(theme::palette_of(t).accent)),
                 ..Default::default()
@@ -291,9 +291,17 @@ pub fn action_list<'a, Message: Clone + 'a>(actions: Vec<Action<Message>>) -> El
         .spacing(space(1.5))
         .align_y(Alignment::Center);
 
+        // The overlay's footer is a compact keyboard legend, not a toolbar.
+        // The audit pass forced these to 44 pt, which becomes an 88 px wall on
+        // Retina displays and visually outweighs the answer. Restore the
+        // original compact vertical rhythm while keeping generous horizontal
+        // click area.
+        let label = container(label)
+            .height(Length::Fill)
+            .align_y(iced::alignment::Vertical::Center);
         let mut widget = button(label)
-            .height(Length::Fixed(theme::MIN_HIT_TARGET))
-            .padding([space(1.0), space(3.0)]);
+            .height(Length::Fixed(theme::CONTROL_HEIGHT))
+            .padding([space(1.0), space(2.0)]);
         widget = if action.destructive {
             widget.style(theme::danger_button)
         } else if action.primary {
@@ -405,7 +413,7 @@ pub fn selectable_answer<'a, Message: Clone + 'a>(
         text_editor(content)
             .on_action(on_action)
             .height(Length::Fixed(
-                reserved_height.max(theme::ANSWER_BOX_MIN_HEIGHT)
+                reserved_height.max(theme::ANSWER_BOX_MIN_HEIGHT),
             ))
             .padding(space(2.0))
             .size(type_scale::BODY)
@@ -413,6 +421,40 @@ pub fn selectable_answer<'a, Message: Clone + 'a>(
             .style(theme::answer_editor),
     ]
     .spacing(space(1.5));
+
+    if truncated {
+        stack = stack.push(
+            text(i18n::t(Key::StateTruncated))
+                .size(type_scale::META)
+                .style(theme::text_severity(Severity::Warning)),
+        );
+    }
+
+    stack.into()
+}
+
+/// Selectable assistant text rendered inside a chat bubble.
+///
+/// The bubble already owns its background and border, so this editor keeps
+/// only selection behavior and typography.
+pub fn selectable_chat_answer<'a, Message: Clone + 'a>(
+    content: &'a text_editor::Content,
+    reserved_height: f32,
+    truncated: bool,
+    on_action: impl Fn(text_editor::Action) -> Message + 'a,
+) -> Element<'a, Message> {
+    let mut stack = column![
+        text_editor(content)
+            .on_action(on_action)
+            .height(Length::Fixed(
+                reserved_height.max(theme::CHAT_ANSWER_MIN_HEIGHT)
+            ))
+            .padding(0.0)
+            .size(type_scale::BODY)
+            .font(theme::UI_FONT)
+            .style(theme::chat_answer_editor),
+    ]
+    .spacing(space(1.0));
 
     if truncated {
         stack = stack.push(

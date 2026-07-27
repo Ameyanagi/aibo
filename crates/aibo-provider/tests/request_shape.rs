@@ -141,3 +141,21 @@ fn the_output_cap_never_exceeds_the_budget() {
     let anthropic = build_messages_body(&req);
     assert_eq!(anthropic["max_tokens"], 512);
 }
+
+#[test]
+fn a_zero_output_cap_uses_the_model_default_when_the_protocol_allows_it() {
+    let mut req = request();
+    req.params.max_tokens = 0;
+
+    let chat = build_chat_completions_body(&req, &cerebras::quirks());
+    assert!(chat.get("max_tokens").is_none());
+    assert!(chat.get("max_completion_tokens").is_none());
+
+    let responses = build_responses_body(&req, &openai::quirks());
+    assert!(responses.get("max_output_tokens").is_none());
+
+    // Anthropic requires this field, so its closest valid equivalent is the
+    // finite reserve prompt assembly already made for context/cost planning.
+    let anthropic = build_messages_body(&req);
+    assert_eq!(anthropic["max_tokens"], req.budget.max_output_tokens);
+}

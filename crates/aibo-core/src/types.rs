@@ -1092,7 +1092,8 @@ pub struct ToolSchema {
 /// Sampling and decoding parameters (§5 per-surface specs).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationParams {
-    /// Output cap. §5: 64 for Complete.
+    /// Output cap. §5: 64 for Complete. `0` means use the model/provider
+    /// default and omit the optional wire parameter.
     pub max_tokens: u32,
     /// §5: 0.2 for Complete and Transform, 0.7 for Ask.
     pub temperature: f32,
@@ -1174,7 +1175,9 @@ pub struct RequestBudget {
     /// Hard cap on captured payload, §5: 50% of the model's context regardless
     /// of budget, so a huge selection can never crowd out the instruction.
     pub max_payload_tokens: usize,
-    /// Output cap; mirrors [`GenerationParams::max_tokens`].
+    /// Finite output reserve used for context fitting and cost estimation.
+    /// This is also the output cap when [`GenerationParams::max_tokens`] is
+    /// nonzero; an unset generation cap may still retain this planning value.
     pub max_output_tokens: u32,
     /// Cost reserved at dispatch and reconciled when real `Usage` lands (§14).
     /// A meter that only counts completed responses under-reports.

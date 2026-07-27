@@ -177,6 +177,8 @@ pub enum Message {
     FramePainted,
     /// A registered hotkey fired.
     Hotkey(u32),
+    /// The OS screen-region picker finished. `None` means the user cancelled.
+    ScreenRegionCaptured(std::result::Result<Option<aibo_core::types::Attachment>, String>),
     /// A tray command.
     Tray(TrayCommand),
     /// Show the panel at an already-resolved placement (§9).
@@ -272,6 +274,10 @@ pub enum WindowChord {
     Attach,
     /// [`panel::DETACH_KEY`] — remove the most recent attachment.
     DetachLast,
+    /// Expand or collapse the pinned selected-text card.
+    ToggleContext,
+    /// Remove the pinned selected text from future turns.
+    RemoveSelection,
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +564,18 @@ impl Aibo {
                 }
                 self.hotkey_status = Some(status.clone());
                 self.settings.hotkey = Some(status);
+                if let Some(binding) =
+                    hotkey::Binding::default_for(HotkeyAction::CaptureScreenRegion)
+                {
+                    match hotkeys.register(binding) {
+                        HotkeyStatus::Registered { combo, .. } => {
+                            tracing::info!(%combo, "screen-region hotkey registered");
+                        }
+                        HotkeyStatus::Failed { combo, reason } => {
+                            tracing::warn!(%combo, ?reason, "screen-region hotkey unavailable");
+                        }
+                    }
+                }
                 self.hotkeys = Some(hotkeys);
             }
             Err(error) => {
@@ -647,7 +665,7 @@ impl Aibo {
     /// in-flight request and discards the old session; pressing it during an
     /// **agent run** does not interrupt — the run continues in its task window
     /// and a fresh panel opens.
-    fn open_panel(&mut self) -> Task<Message> {
+    fn begin_panel_session(&mut self) {
         let old_session = self.panel.session;
         if matches!(self.panel.phase, Phase::Loading | Phase::Streaming) {
             self.send(UiRequest::Cancel {
@@ -662,7 +680,9 @@ impl Aibo {
         self.panel.reset(session);
         self.panel.phase = Phase::Idle;
         self.send(UiRequest::CaptureContext { session });
+    }
 
+    fn present_panel(&mut self) -> Task<Message> {
         if self.geometry_is_known() {
             // §8: show immediately. The cached geometry is a frame old at
             // worst, and §9's re-probe below corrects it if the window server
@@ -678,6 +698,11 @@ impl Aibo {
             self.pending_show = true;
             probe_geometry(self.panel_window)
         }
+    }
+
+    fn open_panel(&mut self) -> Task<Message> {
+        self.begin_panel_session();
+        self.present_panel()
     }
 
     fn refresh_tray(&mut self) {
@@ -1142,12 +1167,45 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                         state.open_panel()
                     }
                 }
+                Some(HotkeyAction::CaptureScreenRegion) => {
+                    // Keep the panel out of the pixels. `chain` begins the picker
+                    // only after the window server has hidden the overlay.
+                    let hidden = if state.panel_visible {
+                        discard_panel_session(state, true);
+                        state.hide_panel()
+                    } else {
+                        Task::none()
+                    };
+                    hidden.chain(capture_screen_region_task())
+                }
                 Some(HotkeyAction::ShowTasks) => focus_first_task(state),
                 // TODO(§13): the revert buffer holds the pre-transform original
                 // for the session and is owned by the runtime, not the UI.
                 Some(HotkeyAction::RevertLastTransform) | None => Task::none(),
             }
         }
+
+        Message::ScreenRegionCaptured(result) => match result {
+            Ok(None) => Task::none(),
+            Ok(Some(mut attachment)) => {
+                attachment.label = i18n::t(crate::i18n::Key::AttachmentScreenRegion).to_owned();
+                state.begin_panel_session();
+                if let Err(error) = state.panel.attach(attachment) {
+                    state.panel.fail(&std::sync::Arc::new(error));
+                }
+                state.present_panel()
+            }
+            Err(error) => {
+                tracing::warn!(%error, "screen-region capture failed");
+                state.begin_panel_session();
+                state.panel.toast = Some(panel::ToastView {
+                    severity: ui_theme::Severity::Warning,
+                    body: i18n::t(crate::i18n::Key::ToastScreenCaptureFailed).to_owned(),
+                    offer_diagnostics: false,
+                });
+                state.present_panel()
+            }
+        },
 
         Message::Tray(command) => match command {
             TrayCommand::OpenPanel => state.open_panel(),
@@ -1326,12 +1384,23 @@ fn discard_panel_session(state: &Aibo, cancel: bool) {
 }
 
 fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> Task<Message> {
+    if state.ime_preedit.contains(&window) && matches!(chord, WindowChord::Enter { .. }) {
+        return Task::none();
+    }
+
     match state.role_of(window) {
         Some(Role::Panel) if state.panel_visible => {
             let message = match chord {
                 WindowChord::Escape if state.panel.toast.is_some() => panel::Message::DismissToast,
                 WindowChord::Escape => panel::Message::Dismiss,
-                WindowChord::Enter { command: true, .. } => panel::Message::Escalate,
+                WindowChord::Enter {
+                    command: true,
+                    shift: true,
+                } => panel::Message::Escalate,
+                WindowChord::Enter {
+                    command: true,
+                    shift: false,
+                } => panel::Message::Accept,
                 WindowChord::Enter { command: false, .. } => panel::Message::Submit,
                 WindowChord::Copy => {
                     if state.panel.can_copy() {
@@ -1347,17 +1416,13 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
                         return Task::none();
                     }
                 }
-                WindowChord::Retry => {
-                    let Some(panel::ErrorAction::Retry) = state
-                        .panel
-                        .error
-                        .as_ref()
-                        .and_then(|error| error.action.clone())
-                    else {
-                        return Task::none();
-                    };
-                    panel::Message::Error(panel::ErrorAction::Retry)
+                WindowChord::Retry
+                    if matches!(state.panel.phase, Phase::Finished { .. } | Phase::Failed)
+                        && state.panel.active_user.is_some() =>
+                {
+                    panel::Message::Retry
                 }
+                WindowChord::Retry => return Task::none(),
                 WindowChord::ShowTask => panel::Message::ShowTask,
                 WindowChord::HistoryOlder => panel::Message::HistoryOlder,
                 WindowChord::HistoryNewer => panel::Message::HistoryNewer,
@@ -1370,7 +1435,16 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
                 {
                     panel::Message::DetachLast
                 }
-                WindowChord::DetachLast | WindowChord::CancelTask => return Task::none(),
+                WindowChord::ToggleContext if state.panel.includes_selection() => {
+                    panel::Message::ToggleContext
+                }
+                WindowChord::RemoveSelection if state.panel.includes_selection() => {
+                    panel::Message::RemoveSelection
+                }
+                WindowChord::DetachLast
+                | WindowChord::ToggleContext
+                | WindowChord::RemoveSelection
+                | WindowChord::CancelTask => return Task::none(),
             };
             panel_update(state, message)
         }
@@ -1436,11 +1510,6 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
         }
 
         M::Submit => {
-            // The focused input owns Enter, so the state-dependent default
-            // action must be resolved here rather than in the global listener.
-            if state.panel.can_accept() {
-                return panel_update(state, M::Accept);
-            }
             if matches!(state.panel.context, ContextState::PermissionDenied { .. }) {
                 return panel_update(state, M::OpenSystemSettings);
             }
@@ -1453,45 +1522,39 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             {
                 return panel_update(state, M::Error(action));
             }
-            if !matches!(state.panel.phase, Phase::Idle) {
+            if matches!(state.panel.phase, Phase::Loading | Phase::Streaming) {
                 return Task::none();
             }
             if state.panel.input.trim().is_empty() {
+                if matches!(state.panel.phase, Phase::Finished { .. } | Phase::Failed)
+                    && state.panel.active_user.is_some()
+                {
+                    return panel_update(state, M::Retry);
+                }
                 return Task::none();
             }
-            // The one place the transport gap could turn into a lie. `UiRequest`
-            // has no attachment field yet (see `clipboard_offer`), so a panel
-            // that held an image here would show a chip, send a text-only
-            // request, and hand back an answer from a model that never saw the
-            // picture — worse than the defect this feature retires, because it
-            // is silent.
-            //
-            // It cannot happen: the same missing `bridge` change is what keeps
-            // `ClipboardOffer::image` `None`, so `attachments` is provably empty
-            // on this line, and `the_transport_gap_cannot_silently_drop_an_image`
-            // pins the coupling. This is the tripwire for whoever wires the
-            // bytes in and forgets to wire them back out.
-            debug_assert!(
-                !state.panel.has_attachments(),
-                "UiRequest::Submit must carry `attachments` before the panel can hold one"
-            );
-            if state.panel.has_attachments() {
-                tracing::error!(
-                    attachments = state.panel.attachments().len(),
-                    "dropping attachments: UiRequest::Submit does not carry them yet"
-                );
-            }
-            state.panel.history.record(&state.panel.input);
-            state.panel.phase = Phase::Loading;
-            state.panel.clear_response();
-            state.panel.error = None;
+
+            let instruction = state.panel.input.clone();
+            let history = state.panel.history_for_next_turn();
+            let include_selection = state.panel.includes_selection();
+            let attachments = state
+                .panel
+                .attachments()
+                .iter()
+                .map(|attached| attached.attachment.clone())
+                .collect();
+            state.panel.history.record(&instruction);
+            state.panel.begin_turn(instruction.clone());
             state.send(UiRequest::Submit {
                 session: state.panel.session,
-                instruction: state.panel.input.clone(),
+                instruction,
                 surface: state.panel.surface,
                 role_override: None,
+                attachments,
+                history,
+                include_selection,
             });
-            Task::none()
+            resize_panel_if_visible(state)
         }
 
         // ↑ / ↓ recall. Only meaningful while the user is composing: once a
@@ -1598,12 +1661,25 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             Task::none()
         }
 
+        M::Retry => {
+            if !matches!(state.panel.phase, Phase::Finished { .. } | Phase::Failed)
+                || state.panel.active_user.is_none()
+            {
+                return Task::none();
+            }
+            state.panel.begin_retry();
+            state.send(UiRequest::Retry {
+                session: state.panel.session,
+                role: None,
+            });
+            resize_panel_if_visible(state)
+        }
+
         M::Escalate => {
             if !matches!(state.panel.phase, Phase::Finished { .. } | Phase::Failed) {
                 return Task::none();
             }
-            state.panel.phase = Phase::Loading;
-            state.panel.clear_response();
+            state.panel.begin_retry();
             state.send(UiRequest::Retry {
                 session: state.panel.session,
                 role: Some(aibo_core::types::Role::Smart),
@@ -1632,6 +1708,22 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             Task::none()
         }
 
+        M::ToggleContext => {
+            if state.panel.includes_selection() {
+                state.panel.context_expanded = !state.panel.context_expanded;
+                return resize_panel_if_visible(state);
+            }
+            Task::none()
+        }
+
+        M::RemoveSelection => {
+            if state.panel.includes_selection() {
+                state.panel.remove_selection();
+                return resize_panel_if_visible(state);
+            }
+            Task::none()
+        }
+
         M::ShowTask => focus_first_task(state),
 
         M::OpenSystemSettings => {
@@ -1645,8 +1737,7 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             let session = state.panel.session;
             match action {
                 ErrorAction::Retry => {
-                    state.panel.phase = Phase::Loading;
-                    state.panel.error = None;
+                    state.panel.begin_retry();
                     state.send(UiRequest::Retry {
                         session,
                         role: None,
@@ -1654,8 +1745,7 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                     Task::none()
                 }
                 ErrorAction::RetryWith(role) => {
-                    state.panel.phase = Phase::Loading;
-                    state.panel.error = None;
+                    state.panel.begin_retry();
                     state.send(UiRequest::Retry {
                         session,
                         role: Some(role),
@@ -1844,6 +1934,7 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 return Task::none();
             }
             state.panel.clipboard = clipboard_offer(clipboard.as_deref());
+            let selection = selection.filter(|text| !text.is_empty());
             state.panel.context = match field.as_deref() {
                 // §9: while composing, aibo neither reads nor inserts.
                 Some(field) if field.ime_active => ContextState::ImeActive,
@@ -1852,9 +1943,22 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                     excerpt: selection
                         .as_deref()
                         .or(Some(field.prefix.as_str()))
-                        .map(|s| crate::widgets::elide(s, 96)),
+                        .map(|text| crate::widgets::elide(text, 96)),
+                    selection,
                     truncated: field.truncated,
                     caret_bounds: field.caret_bounds,
+                },
+                // A terminal or canvas may expose a selection through the
+                // synthetic-copy fallback while exposing no readable text
+                // field. That is usable context, not "unavailable".
+                None if selection.is_some() => ContextState::Available {
+                    app: app.clone(),
+                    excerpt: selection
+                        .as_deref()
+                        .map(|text| crate::widgets::elide(text, 96)),
+                    selection,
+                    truncated: false,
+                    caret_bounds: None,
                 },
                 None => match app.as_ref() {
                     Some(app) => ContextState::Unavailable {
@@ -1905,12 +2009,16 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             }
             match *event {
                 StreamEvent::Text(chunk) => {
+                    let height_before = state.panel.desired_height();
                     state.panel.phase = Phase::Streaming;
                     state.panel.append_response(&chunk);
                     // §16: reserve height in discrete steps so streaming never
                     // reflows. The estimate is deliberately coarse.
                     let estimated = 24.0 + (state.panel.response.len() as f32 / 64.0) * 20.0;
-                    if state.panel.reserve_for(estimated) {
+                    let reserve_changed = state.panel.reserve_for(estimated);
+                    let content_height_changed =
+                        (state.panel.desired_height() - height_before).abs() >= 1.0;
+                    if reserve_changed || content_height_changed {
                         return resize_panel_if_visible(state);
                     }
                     Task::none()
@@ -2273,6 +2381,16 @@ fn resize_panel_if_visible(state: &mut Aibo) -> Task<Message> {
     state.show_panel(placement)
 }
 
+fn capture_screen_region_task() -> Task<Message> {
+    Task::future(async {
+        Message::ScreenRegionCaptured(
+            aibo_platform::capture_screen_region()
+                .await
+                .map_err(|error| error.to_string()),
+        )
+    })
+}
+
 /// Apply the durable native overlay policy, or present the already-configured
 /// panel without activating the source application.
 fn configure_or_present_panel(id: window::Id, configure: bool) -> Task<Message> {
@@ -2341,7 +2459,7 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
         // a normal listener sees them.
         iced::event::listen_with(|event, status, window| {
             use iced::keyboard::Key;
-            use iced::keyboard::key::Named;
+            use iced::keyboard::key::{Code, Named, NativeCode, Physical};
 
             if let iced::Event::Window(event) = event {
                 return match event {
@@ -2381,6 +2499,45 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
             }
             if modifiers.command() && key.to_latin(physical_key) == Some('v') {
                 return Some(Message::WindowKey(window, WindowChord::Attach));
+            }
+            if modifiers.command() && key.to_latin(physical_key) == Some('e') {
+                return Some(Message::WindowKey(
+                    window,
+                    if modifiers.shift() {
+                        WindowChord::RemoveSelection
+                    } else {
+                        WindowChord::ToggleContext
+                    },
+                ));
+            }
+            // A focused `text_input` captures every Enter variant. Route them
+            // here before the captured-event gate so exactly one semantic
+            // action fires: plain Enter submits, Command-Enter replaces, and
+            // Command-Shift-Enter retries with Smart. `window_shortcut` blocks
+            // these while an IME preedit is active.
+            let is_enter = matches!(
+                key.as_ref(),
+                Key::Named(Named::Enter) | Key::Character("\r" | "\n")
+            ) || matches!(
+                physical_key,
+                Physical::Code(Code::Enter | Code::NumpadEnter)
+                    | Physical::Unidentified(NativeCode::MacOS(36 | 76))
+            );
+            if is_enter {
+                tracing::debug!(
+                    ?key,
+                    ?physical_key,
+                    ?modifiers,
+                    ?status,
+                    "routing panel Enter shortcut"
+                );
+                return Some(Message::WindowKey(
+                    window,
+                    WindowChord::Enter {
+                        command: modifiers.command(),
+                        shift: modifiers.shift(),
+                    },
+                ));
             }
             if status == iced::event::Status::Captured {
                 return None;
@@ -2531,7 +2688,7 @@ pub fn run(config: UiConfig, handles: UiHandles) -> Result<()> {
 mod tests {
     use super::*;
     use aibo_core::types::{
-        AppInfo, AppRef, ClipboardKind, FieldContext, ModelBinding, ProviderId,
+        AppInfo, AppRef, ClipboardKind, FieldContext, ModelBinding, ProviderId, StopReason,
     };
 
     fn app() -> Aibo {
@@ -2797,6 +2954,39 @@ mod tests {
     }
 
     #[test]
+    fn a_selection_without_a_readable_field_is_prompt_context() {
+        let mut state = app();
+        let session = state.panel.session;
+        let collapsed = state.panel.desired_height();
+        let _ = backend_update(
+            &mut state,
+            UiEvent::Context {
+                session,
+                app: Some(app_info()),
+                field: None,
+                selection: Some("the selected terminal output".to_owned()),
+                clipboard: None,
+            },
+        );
+
+        assert!(matches!(
+            &state.panel.context,
+            ContextState::Available {
+                selection: Some(selection),
+                ..
+            } if selection == "the selected terminal output"
+        ));
+        assert!(
+            state.panel.desired_height() > collapsed,
+            "the in-composer selection preview needs visible space"
+        );
+        assert!(
+            state.panel.input.is_empty(),
+            "captured text must stay separate from the trusted instruction"
+        );
+    }
+
+    #[test]
     fn a_task_window_survives_the_panel_being_dismissed() {
         let mut state = app();
         let task = Uuid::now_v7();
@@ -2964,6 +3154,64 @@ mod tests {
         assert_eq!(task.units(), 2, "the hide and the dispatch are both queued");
     }
 
+    #[test]
+    fn command_enter_routes_to_replace_while_the_composer_is_focused() {
+        let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _boot) = boot(UiConfig::default(), requests);
+        state.panel_visible = true;
+        state.panel.phase = Phase::Finished {
+            reason: StopReason::EndTurn,
+        };
+        state.panel.set_response("replacement");
+
+        let panel_window = state.panel_window;
+        let task = update(
+            &mut state,
+            Message::WindowKey(
+                panel_window,
+                WindowChord::Enter {
+                    command: true,
+                    shift: false,
+                },
+            ),
+        );
+
+        assert!(!state.panel_visible);
+        assert_eq!(task.units(), 2);
+        assert!(
+            events.try_recv().is_err(),
+            "Insert remains sequenced after the hide"
+        );
+    }
+
+    #[test]
+    fn enter_does_not_submit_or_replace_during_ime_preedit() {
+        let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _boot) = boot(UiConfig::default(), requests);
+        state.panel_visible = true;
+        state.panel.phase = Phase::Finished {
+            reason: StopReason::EndTurn,
+        };
+        state.panel.set_response("replacement");
+        let panel_window = state.panel_window;
+        state.ime_preedit.insert(panel_window);
+
+        let task = update(
+            &mut state,
+            Message::WindowKey(
+                panel_window,
+                WindowChord::Enter {
+                    command: true,
+                    shift: false,
+                },
+            ),
+        );
+
+        assert_eq!(task.units(), 0);
+        assert!(state.panel_visible);
+        assert!(events.try_recv().is_err());
+    }
+
     /// The dismiss path has no insert to order, so it must stay a plain hide.
     #[test]
     fn dismiss_still_sends_immediately() {
@@ -3009,6 +3257,57 @@ mod tests {
         assert_eq!(task.units(), 0);
         assert!(events.try_recv().is_err());
         assert_eq!(state.panel.phase, Phase::Streaming);
+    }
+
+    #[tokio::test]
+    async fn return_after_an_answer_regenerates_and_never_inserts() {
+        let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _boot) = boot(UiConfig::default(), requests);
+        state.panel.active_user = Some("question".to_owned());
+        state.panel.set_response("answer");
+        state.panel.phase = Phase::Finished {
+            reason: StopReason::EndTurn,
+        };
+
+        let _ = panel_update(&mut state, panel::Message::Submit);
+        assert!(matches!(
+            events.recv().await,
+            Some(UiRequest::Retry { role: None, .. })
+        ));
+        assert!(events.try_recv().is_err(), "Return must not send Insert");
+        assert_eq!(state.panel.phase, Phase::Loading);
+    }
+
+    #[tokio::test]
+    async fn a_follow_up_submission_carries_the_completed_chat_history() {
+        let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _boot) = boot(UiConfig::default(), requests);
+        state.panel.active_user = Some("first question".to_owned());
+        state.panel.set_response("first answer");
+        state.panel.phase = Phase::Finished {
+            reason: StopReason::EndTurn,
+        };
+        state.panel.input = "follow up".to_owned();
+
+        let _ = panel_update(&mut state, panel::Message::Submit);
+        let Some(UiRequest::Submit {
+            instruction,
+            history,
+            ..
+        }) = events.recv().await
+        else {
+            panic!("follow-up submit was not delivered");
+        };
+        assert_eq!(instruction, "follow up");
+        assert_eq!(
+            history,
+            vec![aibo_core::context::Turn::pair(
+                "first question",
+                "first answer"
+            )]
+        );
+        assert_eq!(state.panel.turns.len(), 1);
+        assert_eq!(state.panel.active_user.as_deref(), Some("follow up"));
     }
 
     #[test]
@@ -3406,26 +3705,35 @@ mod tests {
         assert!(!state.panel.has_attachments());
     }
 
-    /// The two halves of the missing `bridge` change are the same change, and
-    /// that is what makes the gap safe rather than silent: an image cannot get
-    /// *into* the panel until `UiEvent` carries bytes, and the same edit is
-    /// what puts an `attachments` field on `UiRequest::Submit`. So there is no
-    /// window in which the panel shows a chip and submits a request that has
-    /// lost it.
-    ///
-    /// This test is the coupling, written down. It fails the moment someone
-    /// wires the bytes in without wiring them back out.
-    #[test]
-    fn the_transport_gap_cannot_silently_drop_an_image() {
-        let offer = clipboard_offer(Some(&clipboard(ClipboardKind::ImageRef)));
-        let panel::ClipboardOffer::Image { image, .. } = &offer else {
-            panic!("an image on the clipboard is still offered: {offer:?}");
+    /// A visible chip and a dispatched image are one transaction. This is the
+    /// regression boundary for the old bridge gap, where the UI could hold
+    /// pixels but `Submit` had nowhere to carry them.
+    #[tokio::test]
+    async fn submit_carries_every_deliberately_attached_image() {
+        use aibo_core::types::{Attachment, AttachmentSource};
+
+        let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+        state.panel.phase = Phase::Idle;
+        state.panel.input = "what is shown here?".to_owned();
+        state
+            .panel
+            .attach(Attachment::image(
+                AttachmentSource::ScreenRegion,
+                vec![0x89, b'P', b'N', b'G'],
+                "image/png",
+                1200,
+                750,
+                "Screen region",
+            ))
+            .expect("test image attaches");
+
+        let _ = panel_update(&mut state, panel::Message::Submit);
+        let Some(UiRequest::Submit { attachments, .. }) = received.recv().await else {
+            panic!("submit request was not delivered");
         };
-        assert!(
-            image.is_none(),
-            "`UiRequest::Submit` has no attachment field yet; until it does, \
-             `ClipboardOffer::image` must stay `None` or submit loses the image"
-        );
+        assert_eq!(attachments.len(), 1);
+        assert_eq!(attachments[0].source, AttachmentSource::ScreenRegion);
     }
 
     /// ⌘V attaches; ⌫ on an empty instruction takes it back off. Both through

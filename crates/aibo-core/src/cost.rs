@@ -362,15 +362,24 @@ impl PriceTable {
 /// (§14).
 ///
 /// Input is the §4 character-class estimate of the assembled messages; output
-/// is the request's `max_tokens`, i.e. the worst case. Erring high is
+/// is the explicit generation cap, or the context-planning reserve when the
+/// cap is unset. Either way, erring high is
 /// deliberate: an over-reserve is released on completion, an under-reserve
 /// lets a runaway request past a hard stop.
 pub fn estimate_request_usage(req: &ChatRequest) -> Usage {
     let input: usize = req.messages.iter().map(message_tokens).sum();
+    // `0` means "let the provider/model choose". Cost reservation still needs
+    // a finite estimate, so use prompt assembly's context-planning reserve
+    // without turning that estimate into a generation cap.
+    let estimated_output = if req.params.max_tokens == 0 {
+        req.budget.max_output_tokens
+    } else {
+        req.params.max_tokens.min(req.budget.max_output_tokens)
+    };
     Usage {
         input_tokens: input as u64,
         cached_input_tokens: 0,
-        output_tokens: u64::from(req.params.max_tokens)
+        output_tokens: u64::from(estimated_output)
             .saturating_mul(u64::from(req.params.candidates.max(1))),
         reasoning_tokens: 0,
         image_tokens: 0,
@@ -1204,6 +1213,13 @@ output = 1
         // or a hard stop can be walked straight past.
         let u = estimate_request_usage(&request(64, 3));
         assert_eq!(u.output_tokens, 192);
+    }
+
+    #[test]
+    fn an_unset_model_cap_still_uses_the_planning_reserve_for_cost() {
+        let request = request(0, 1);
+        let u = estimate_request_usage(&request);
+        assert_eq!(u.output_tokens, u64::from(request.budget.max_output_tokens));
     }
 
     // -- the spend meter ----------------------------------------------------

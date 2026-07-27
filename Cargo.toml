@@ -204,6 +204,7 @@ async-trait = { workspace = true }
 # `aibo_store::SecretStore::get` returns `Zeroizing<String>`; implementing the
 # trait means naming the type. Same crate `aibo-store` already uses.
 zeroize = { workspace = true }
+unicode-segmentation = { workspace = true }
 
 [dev-dependencies]
 # The panic-boundary test in `diagnostics` needs `#[tokio::test]`.

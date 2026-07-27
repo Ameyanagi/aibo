@@ -2235,10 +2235,11 @@ mod runtime {
     use std::time::Duration;
 
     use aibo_core::AiboError;
+    use aibo_core::context::Turn;
     use aibo_core::error::InsertFailure;
     use aibo_core::traits::PlatformBackend;
     use aibo_core::types::{
-        AgentLimits, AgentOutcome, AgentStatus, AgentStep, AgentTask, AppInfo, AppRef,
+        AgentLimits, AgentOutcome, AgentStatus, AgentStep, AgentTask, AppInfo, AppRef, Attachment,
         ClipboardItem, ContentOrigin, FieldContext, InsertMode, InsertTarget, ModelBinding,
         PowerEvent, ProviderId, Role, StreamEvent, Surface, UntrustedBlock, Usage,
     };
@@ -2251,6 +2252,7 @@ mod runtime {
     use futures::StreamExt as _;
     use tokio::sync::mpsc::{Receiver, Sender};
     use tokio_util::sync::CancellationToken;
+    use unicode_segmentation::UnicodeSegmentation as _;
     use zeroize::Zeroize as _;
 
     use crate::bootstrap::Bootstrap;
@@ -2269,6 +2271,18 @@ mod runtime {
     const INTERNAL_CHANNEL_CAPACITY: usize = 64;
     /// Device-login progress is human-paced and adjacent ticks are equivalent.
     const CODEX_PROGRESS_CHANNEL_CAPACITY: usize = 8;
+    /// Graphemes per reveal frame at the start of an answer.
+    ///
+    /// Codex sometimes emits a whole short sentence as one SSE delta. Four
+    /// graphemes gives even a one-line answer several visible frames without
+    /// splitting an emoji or combining sequence.
+    const UI_INITIAL_TEXT_BATCH_GRAPHEMES: usize = 4;
+    /// Number of deliberately small reveal frames before catching up.
+    const UI_INITIAL_TEXT_BATCHES: usize = 8;
+    /// Larger batches after the opening reveal keep long answers responsive.
+    const UI_CATCH_UP_TEXT_BATCH_GRAPHEMES: usize = 24;
+    /// Leave a perceptible frame opportunity between visible text batches.
+    const UI_TEXT_FRAME_INTERVAL: Duration = Duration::from_millis(25);
 
     /// What the backend remembers about one panel invocation.
     ///
@@ -2417,6 +2431,9 @@ mod runtime {
         instruction: String,
         surface: Surface,
         role: Option<Role>,
+        attachments: Vec<Attachment>,
+        history: Vec<Turn>,
+        include_selection: bool,
     }
 
     /// Messages the backend's own tasks send back to its loop.
@@ -2756,15 +2773,19 @@ mod runtime {
                     instruction,
                     surface,
                     role_override,
+                    attachments,
+                    history,
+                    include_selection,
                 } => {
-                    self.submit(
-                        session,
+                    let submission = LastSubmission {
                         instruction,
-                        Some(surface),
-                        role_override,
-                        internal.clone(),
-                    )
-                    .await;
+                        surface,
+                        role: role_override,
+                        attachments,
+                        history,
+                        include_selection,
+                    };
+                    self.submit(session, submission, internal.clone()).await;
                 }
 
                 // §13: `esc`. The engine owns the token; a cancel for a session
@@ -2810,15 +2831,9 @@ mod runtime {
                 // user pressing ⌘↩ or the inline "Retry with Smart" button, so
                 // the re-run is a new submission at a named role.
                 UiRequest::Retry { session, role } => match self.replay(session) {
-                    Some(last) => {
-                        self.submit(
-                            session,
-                            last.instruction,
-                            Some(last.surface),
-                            role.or(last.role),
-                            internal.clone(),
-                        )
-                        .await;
+                    Some(mut last) => {
+                        last.role = role.or(last.role);
+                        self.submit(session, last, internal.clone()).await;
                     }
                     None => tracing::warn!(%session, "nothing to retry for this session"),
                 },
@@ -3347,9 +3362,7 @@ mod runtime {
         async fn submit(
             &mut self,
             session: SessionId,
-            instruction: String,
-            surface: Option<Surface>,
-            role_override: Option<Role>,
+            request: LastSubmission,
             internal: Sender<Internal>,
         ) {
             if self.active_session != Some(session) {
@@ -3360,13 +3373,17 @@ mod runtime {
                 tracing::warn!(%session, "ignoring submission without captured session state");
                 return;
             };
-            state.last = Some(LastSubmission {
-                instruction: instruction.clone(),
-                surface: surface.unwrap_or(Surface::Ask),
+            state.last = Some(request.clone());
+            let LastSubmission {
+                instruction,
+                surface,
                 role: role_override,
-            });
+                attachments,
+                history,
+                include_selection,
+            } = request;
 
-            if surface == Some(Surface::Do) {
+            if surface == Surface::Do {
                 let context = captured_agent_context(state);
                 self.submit_agent(instruction, role_override, context).await;
                 return;
@@ -3375,22 +3392,19 @@ mod runtime {
             let submission = Submission {
                 session,
                 instruction,
-                surface,
+                surface: Some(surface),
                 role_override,
                 capture: Capture {
                     app: state.app.clone(),
                     field: state.field.clone(),
-                    selection: state.selection.clone(),
+                    selection: include_selection.then(|| state.selection.clone()).flatten(),
                     clipboard: state.clipboard.clone(),
                 },
-                // Empty until the panel grows an attach affordance. Note what
-                // is *not* written here: `state.clipboard` is already carried
-                // as ambient context two lines up, and copying it into
-                // `attachments` would reintroduce the 2026-07-26 defect —
-                // an attachment is a gesture, never a pasteboard reading.
-                attachments: Vec::new(),
+                // Deliberate UI gestures only. `state.clipboard` remains
+                // ambient context above and is never promoted into this list.
+                attachments,
                 conversation_id: None,
-                history: Vec::new(),
+                history,
             };
 
             let engine = self.engine.clone();
@@ -3818,15 +3832,18 @@ mod runtime {
     /// Forward one session stream through the bounded UI bridge.
     ///
     /// Provider SDKs often split a single word across several immediately
-    /// available chunks. Joining only adjacent text/reasoning chunks reduces
-    /// renderer wakeups without changing ordering or allowing the queue to
-    /// grow: the first different event is retained in one fixed pending slot.
+    /// available chunks. Joining adjacent output reduces renderer wakeups, but
+    /// text batches stay bounded and are paced by one frame so a fast producer
+    /// cannot collapse a real stream into one synchronous-looking repaint.
+    /// The first remainder or different event is retained in one fixed pending
+    /// slot, so ordering and the hard memory bound remain unchanged.
     async fn forward_session_events(
         session: SessionId,
         mut source: Receiver<SessionEvent>,
         events: Sender<UiEvent>,
     ) {
         let mut pending = None;
+        let mut text_batches = 0usize;
         loop {
             let event = match pending.take() {
                 Some(event) => event,
@@ -3835,12 +3852,27 @@ mod runtime {
                     None => return,
                 },
             };
-            let event = coalesce_adjacent_output(event, &mut source, &mut pending);
+            let maximum_graphemes = if text_batches < UI_INITIAL_TEXT_BATCHES {
+                UI_INITIAL_TEXT_BATCH_GRAPHEMES
+            } else {
+                UI_CATCH_UP_TEXT_BATCH_GRAPHEMES
+            };
+            let event =
+                coalesce_adjacent_output(event, &mut source, &mut pending, maximum_graphemes);
+            let visible_text = matches!(
+                &event,
+                SessionEvent::Stream(stream)
+                    if matches!(stream.as_ref(), StreamEvent::Text(text) if !text.is_empty())
+            );
 
             for ui in translate(session, event) {
                 if events.send(ui).await.is_err() {
                     return;
                 }
+            }
+            if visible_text {
+                text_batches = text_batches.saturating_add(1);
+                tokio::time::sleep(UI_TEXT_FRAME_INTERVAL).await;
             }
         }
     }
@@ -3849,6 +3881,7 @@ mod runtime {
         event: SessionEvent,
         source: &mut Receiver<SessionEvent>,
         pending: &mut Option<SessionEvent>,
+        maximum_graphemes: usize,
     ) -> SessionEvent {
         let SessionEvent::Stream(stream) = event else {
             return event;
@@ -3856,10 +3889,34 @@ mod runtime {
 
         match *stream {
             StreamEvent::Text(mut text) => {
+                if text.graphemes(true).count() > maximum_graphemes {
+                    let boundary = grapheme_boundary_after(&text, maximum_graphemes);
+                    let remainder = text.split_off(boundary);
+                    *pending = Some(SessionEvent::Stream(Box::new(StreamEvent::Text(remainder))));
+                    return SessionEvent::Stream(Box::new(StreamEvent::Text(text)));
+                }
+
                 loop {
                     match source.try_recv() {
                         Ok(SessionEvent::Stream(next)) => match *next {
-                            StreamEvent::Text(delta) => text.push_str(&delta),
+                            StreamEvent::Text(mut delta) => {
+                                let available =
+                                    maximum_graphemes.saturating_sub(text.graphemes(true).count());
+                                if delta.graphemes(true).count() <= available {
+                                    text.push_str(&delta);
+                                    continue;
+                                }
+
+                                let boundary = grapheme_boundary_after(&delta, available);
+                                if boundary > 0 {
+                                    let remainder = delta.split_off(boundary);
+                                    text.push_str(&delta);
+                                    delta = remainder;
+                                }
+                                *pending =
+                                    Some(SessionEvent::Stream(Box::new(StreamEvent::Text(delta))));
+                                break;
+                            }
                             other => {
                                 *pending = Some(SessionEvent::Stream(Box::new(other)));
                                 break;
@@ -3895,6 +3952,12 @@ mod runtime {
             }
             other => SessionEvent::Stream(Box::new(other)),
         }
+    }
+
+    fn grapheme_boundary_after(text: &str, maximum_graphemes: usize) -> usize {
+        text.grapheme_indices(true)
+            .nth(maximum_graphemes)
+            .map_or(text.len(), |(index, _)| index)
     }
 
     /// [`SessionEvent`] → [`UiEvent`].
@@ -4814,27 +4877,75 @@ mod runtime {
                 "the one-slot UI queue must backpressure the terminal event"
             );
 
-            let first = events_rx.recv().await.unwrap();
-            assert!(matches!(
-                first,
-                UiEvent::Stream {
+            let mut rendered = String::new();
+            while let Some(event) = events_rx.recv().await {
+                if let UiEvent::Stream {
                     session: event_session,
                     event,
-                } if event_session == session
-                    && matches!(*event, StreamEvent::Text(ref text) if text == "hello")
-            ));
-            let terminal = events_rx.recv().await.unwrap();
-            assert!(matches!(
-                terminal,
-                UiEvent::Stream {
-                    session: event_session,
-                    event,
-                } if event_session == session
-                    && matches!(*event, StreamEvent::Done(
-                        aibo_core::types::StopReason::EndTurn
-                    ))
-            ));
+                } = event
+                {
+                    assert_eq!(event_session, session);
+                    match *event {
+                        StreamEvent::Text(text) => rendered.push_str(&text),
+                        StreamEvent::Done(aibo_core::types::StopReason::EndTurn) => break,
+                        _ => {}
+                    }
+                }
+            }
+            assert_eq!(rendered, "hello");
             pump.await.unwrap();
+        }
+
+        #[tokio::test]
+        async fn session_forwarding_splits_a_fast_text_stream_into_renderable_batches() {
+            let session = SessionId::now_v7();
+            let original = "I’m doing well, thanks 😊 How about you?".to_owned();
+            let (source_tx, source_rx) = tokio::sync::mpsc::channel(2);
+            source_tx
+                .send(SessionEvent::Stream(Box::new(StreamEvent::Text(
+                    original.clone(),
+                ))))
+                .await
+                .unwrap();
+            source_tx
+                .send(SessionEvent::Stream(Box::new(StreamEvent::Done(
+                    aibo_core::types::StopReason::EndTurn,
+                ))))
+                .await
+                .unwrap();
+            drop(source_tx);
+
+            let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(8);
+            let pump = tokio::spawn(forward_session_events(session, source_rx, events_tx));
+            let mut rendered = String::new();
+            let mut batch_sizes = Vec::new();
+            while let Some(event) = events_rx.recv().await {
+                if let UiEvent::Stream { event, .. } = event {
+                    match *event {
+                        StreamEvent::Text(text) => {
+                            batch_sizes.push(text.graphemes(true).count());
+                            rendered.push_str(&text);
+                        }
+                        StreamEvent::Done(_) => break,
+                        _ => {}
+                    }
+                }
+            }
+            pump.await.unwrap();
+
+            assert!(
+                batch_sizes.len() >= 3,
+                "one short provider chunk must still visibly stream"
+            );
+            for (index, size) in batch_sizes.into_iter().enumerate() {
+                let maximum = if index < UI_INITIAL_TEXT_BATCHES {
+                    UI_INITIAL_TEXT_BATCH_GRAPHEMES
+                } else {
+                    UI_CATCH_UP_TEXT_BATCH_GRAPHEMES
+                };
+                assert!(size <= maximum);
+            }
+            assert_eq!(rendered, original);
         }
 
         #[test]

@@ -111,6 +111,12 @@ pub enum Key {
     PanelModel,
     /// Accessible name for the generated answer surface.
     PanelResponse,
+    /// Label above user-authored chat bubbles.
+    ChatYou,
+    /// Label above assistant-authored chat bubbles.
+    ChatAssistant,
+    /// Heading on the pinned selected-text context card.
+    ContextSelectedText,
     /// Context chip label when the source app is known: `{}` = app name.
     ContextChipFrom,
     /// Context chip when no context could be captured at all.
@@ -121,6 +127,8 @@ pub enum Key {
     AttachmentClipboardFrom,
     /// Chip label for a clipboard image with no known source app.
     AttachmentClipboardLabel,
+    /// Chip label for an image created by the crop-and-ask shortcut.
+    AttachmentScreenRegion,
     /// Marker on a chip whose pixels were downscaled before sending, so
     /// "why is my screenshot blurry" has an answer (§14).
     AttachmentDownscaled,
@@ -170,6 +178,16 @@ pub enum Key {
     ActionDismiss,
     /// Retry the failed request.
     ActionRetry,
+    /// Submit a message from the chat composer.
+    ActionSend,
+    /// Generate the active assistant message again.
+    ActionRegenerate,
+    /// Expand the selected-text context card.
+    ActionExpand,
+    /// Collapse the selected-text context card.
+    ActionCollapse,
+    /// Remove selected text from future chat turns.
+    ActionRemoveSelection,
     /// Re-authenticate with a provider.
     ActionSignIn,
     /// Shorten the selection so it fits the context budget.
@@ -258,6 +276,8 @@ pub enum Key {
     // --- toasts (§13 non-blocking) ---------------------------------------
     /// ⌘V found an image the pasteboard would not hand over.
     ToastClipboardImageUnreadable,
+    /// The OS crop picker failed rather than being cancelled.
+    ToastScreenCaptureFailed,
     /// Startup recovered persisted state after a crash; names the diagnostics
     /// action so the user has a concrete next step if it repeats.
     ToastRecoveredFromCrash,
@@ -464,14 +484,18 @@ fn en(key: Key) -> &'static str {
     match key {
         K::AppName => "aibo",
 
-        K::PanelPlaceholder => "Ask, transform, or compute…",
+        K::PanelPlaceholder => "Ask about the selection or reply…",
         K::PanelModel => "Model",
         K::PanelResponse => "Response",
+        K::ChatYou => "You",
+        K::ChatAssistant => "Aibo",
+        K::ContextSelectedText => "Selected text",
         K::ContextChipFrom => "{}",
         K::ContextChipNone => "No context",
 
         K::AttachmentClipboardFrom => "Image from {}",
         K::AttachmentClipboardLabel => "Clipboard image",
+        K::AttachmentScreenRegion => "Screen region",
         K::AttachmentDownscaled => "resized",
 
         K::StateLoading => "Thinking…",
@@ -498,6 +522,11 @@ fn en(key: Key) -> &'static str {
         K::ActionSmartModel => "Smart model",
         K::ActionDismiss => "Dismiss",
         K::ActionRetry => "Retry",
+        K::ActionSend => "Send",
+        K::ActionRegenerate => "Regenerate",
+        K::ActionExpand => "Expand",
+        K::ActionCollapse => "Collapse",
+        K::ActionRemoveSelection => "Remove",
         K::ActionSignIn => "Sign in",
         K::ActionTrimSelection => "Trim selection",
         K::ActionOpenSettings => "Open settings",
@@ -539,6 +568,7 @@ fn en(key: Key) -> &'static str {
         K::ErrInternal => "Something went wrong inside aibo.",
 
         K::ToastClipboardImageUnreadable => "aibo could not read the image on the clipboard.",
+        K::ToastScreenCaptureFailed => "aibo could not capture that screen region.",
         K::ToastRecoveredFromCrash => {
             "aibo recovered from a previous crash. Copy diagnostics if this keeps happening."
         }
@@ -630,14 +660,18 @@ fn ja(key: Key) -> &'static str {
     match key {
         K::AppName => "aibo",
 
-        K::PanelPlaceholder => "質問・書き換え・計算…",
+        K::PanelPlaceholder => "選択範囲について質問、または返信…",
         K::PanelModel => "モデル",
         K::PanelResponse => "応答",
+        K::ChatYou => "あなた",
+        K::ChatAssistant => "Aibo",
+        K::ContextSelectedText => "選択したテキスト",
         K::ContextChipFrom => "{}",
         K::ContextChipNone => "コンテキストなし",
 
         K::AttachmentClipboardFrom => "{} の画像",
         K::AttachmentClipboardLabel => "クリップボードの画像",
+        K::AttachmentScreenRegion => "画面の選択範囲",
         K::AttachmentDownscaled => "縮小済み",
 
         K::StateLoading => "考えています…",
@@ -662,6 +696,11 @@ fn ja(key: Key) -> &'static str {
         K::ActionSmartModel => "高性能モデル",
         K::ActionDismiss => "閉じる",
         K::ActionRetry => "再試行",
+        K::ActionSend => "送信",
+        K::ActionRegenerate => "再生成",
+        K::ActionExpand => "展開",
+        K::ActionCollapse => "折りたたむ",
+        K::ActionRemoveSelection => "削除",
         K::ActionSignIn => "サインイン",
         K::ActionTrimSelection => "選択範囲を短縮",
         K::ActionOpenSettings => "設定を開く",
@@ -707,6 +746,7 @@ fn ja(key: Key) -> &'static str {
         K::ErrInternal => "aibo の内部で問題が発生しました。",
 
         K::ToastClipboardImageUnreadable => "クリップボードの画像を読み取れませんでした。",
+        K::ToastScreenCaptureFailed => "画面の選択範囲を取り込めませんでした。",
         K::ToastRecoveredFromCrash => {
             "前回のクラッシュから復旧しました。繰り返す場合は診断情報をコピーしてください。"
         }

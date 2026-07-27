@@ -910,7 +910,10 @@ pub struct ContextBudget {
     pub max_payload_tokens: usize,
     /// Hard cap on a clipboard attachment (priority 4).
     pub max_clipboard_tokens: usize,
-    /// Output reserve, mirrored into [`crate::types::GenerationParams::max_tokens`].
+    /// Output reserve used for context fitting and cost estimation. It is
+    /// normally mirrored into [`crate::types::GenerationParams::max_tokens`];
+    /// an uncapped surface may leave that parameter unset while retaining this
+    /// finite planning reserve.
     pub max_output_tokens: u32,
 }
 

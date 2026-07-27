@@ -310,11 +310,19 @@ pub fn build_messages_body(req: &ChatRequest) -> Value {
         }
     }
 
+    // Anthropic requires `max_tokens`; unlike OpenAI-compatible APIs it cannot
+    // express "provider default". Use the finite planning reserve when the
+    // provider-neutral parameter is unset.
+    let max_tokens = if req.params.max_tokens == 0 {
+        req.budget.max_output_tokens
+    } else {
+        req.params.max_tokens.min(req.budget.max_output_tokens)
+    };
     let mut body = json!({
         "model": req.binding.model,
         "messages": messages,
         "stream": true,
-        "max_tokens": req.params.max_tokens.min(req.budget.max_output_tokens),
+        "max_tokens": max_tokens,
         "temperature": req.params.temperature,
     });
     let obj = body.as_object_mut().expect("object literal");
@@ -332,7 +340,7 @@ pub fn build_messages_body(req: &ChatRequest) -> Value {
         // Anthropic budgets thinking in tokens rather than taking an effort
         // enum, so the §5 knob is mapped onto a budget. The budget must stay
         // below `max_tokens` or the request is rejected.
-        let max = req.params.max_tokens.min(req.budget.max_output_tokens);
+        let max = max_tokens;
         let budget = match effort {
             ReasoningEffort::Low => max / 4,
             ReasoningEffort::Medium => max / 2,
