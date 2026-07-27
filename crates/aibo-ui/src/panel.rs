@@ -28,7 +28,8 @@ use aibo_core::types::{
 };
 use aibo_core::{AiboError, types::Usage};
 use iced::widget::{
-    Space, column, container, image, pick_list, row, scrollable, text, text_editor, text_input,
+    Space, column, container, image, markdown, pick_list, row, scrollable, text, text_editor,
+    text_input,
 };
 use iced::{Alignment, Element, Length};
 use uuid::Uuid;
@@ -597,16 +598,18 @@ pub struct Attribution {
 }
 
 /// One completed exchange retained in the visible panel transcript.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ConversationTurn {
     /// The instruction the user submitted.
     pub user: String,
     /// The assistant response.
     pub assistant: String,
+    /// Parsed assistant Markdown retained for zero-copy rendering.
+    assistant_markdown: Vec<markdown::Item>,
 }
 
 /// Everything the panel renders from.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct PanelState {
     /// The session this panel is bound to. §13: one panel, one session.
     pub session: SessionId,
@@ -623,6 +626,8 @@ pub struct PanelState {
     pub response: String,
     /// Selectable rendering state for [`Self::response`].
     response_editor: text_editor::Content,
+    /// Incrementally parsed Markdown for the active assistant response.
+    response_markdown: markdown::Content,
     /// Completed exchanges above the active turn.
     pub turns: Vec<ConversationTurn>,
     /// User message currently being answered or reviewed.
@@ -680,6 +685,7 @@ impl PanelState {
             surface: Surface::Ask,
             response: String::new(),
             response_editor: text_editor::Content::new(),
+            response_markdown: markdown::Content::new(),
             turns: Vec::new(),
             active_user: None,
             context_expanded: false,
@@ -722,6 +728,7 @@ impl PanelState {
     pub fn set_response(&mut self, response: impl Into<String>) {
         self.response = response.into();
         self.response_editor = text_editor::Content::with_text(&self.response);
+        self.response_markdown = markdown::Content::parse(&self.response);
     }
 
     /// Append a streaming chunk to both response representations.
@@ -736,12 +743,14 @@ impl PanelState {
             .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
                 Arc::new(chunk.to_owned()),
             )));
+        self.response_markdown.push_str(chunk);
     }
 
     /// Clear both response representations.
     pub fn clear_response(&mut self) {
         self.response.clear();
         self.response_editor = text_editor::Content::new();
+        self.response_markdown = markdown::Content::new();
     }
 
     /// Completed turns to include before the next user message.
@@ -777,6 +786,7 @@ impl PanelState {
             self.turns.push(ConversationTurn {
                 user: previous_user,
                 assistant: self.response.clone(),
+                assistant_markdown: self.response_markdown.items().to_vec(),
             });
         }
         self.active_user = Some(user);
@@ -1146,6 +1156,8 @@ pub enum Message {
     ToggleContext,
     /// Remove selected text from this conversation.
     RemoveSelection,
+    /// Copy a model-supplied Markdown link instead of launching it.
+    CopyLink(String),
     /// Selection, cursor, or an ignored edit attempt in the read-only answer.
     ResponseAction(text_editor::Action),
 }
@@ -1155,7 +1167,7 @@ pub enum Message {
 /// Dispatches on [`Phase`] and [`ContextState`] so every §16 state has exactly
 /// one code path; nothing here reaches into a fallback "and otherwise show the
 /// happy path" branch.
-pub fn view(state: &PanelState) -> Element<'_, Message> {
+pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Message> {
     if let Phase::WarmingUp { .. } = state.phase {
         return warm_up_view();
     }
@@ -1174,7 +1186,7 @@ pub fn view(state: &PanelState) -> Element<'_, Message> {
             ContextState::PermissionDenied { .. } | ContextState::ImeActive
         )
     {
-        body = body.push(content(state));
+        body = body.push(content(state, appearance));
     }
     if state.has_conversation() || !matches!(state.phase, Phase::Hidden | Phase::Idle) {
         body = body.push(footer(state));
@@ -1410,17 +1422,58 @@ fn user_bubble(message: &str) -> Element<'_, Message> {
     .into()
 }
 
-fn assistant_text_bubble(message: &str) -> Element<'_, Message> {
+fn markdown_settings(appearance: theme::Appearance) -> markdown::Settings {
+    let palette = appearance.palette();
+    let mut style = markdown::Style::from_palette(iced::theme::Palette {
+        background: palette.surface,
+        text: palette.text,
+        primary: palette.accent,
+        success: palette.success,
+        warning: palette.warning,
+        danger: palette.danger,
+    });
+    style.font = theme::UI_FONT;
+    style.inline_code_font = theme::MONO_FONT;
+    style.code_block_font = theme::MONO_FONT;
+    style.inline_code_color = palette.text;
+    style.inline_code_highlight.background = palette.surface_raised.into();
+
+    let mut settings = markdown::Settings::with_text_size(type_scale::BODY, style);
+    // A compact overlay needs visible hierarchy without document-sized
+    // headings that make a short answer dominate the screen.
+    settings.h1_size = 20.0.into();
+    settings.h2_size = 18.0.into();
+    settings.h3_size = 17.0.into();
+    settings.h4_size = 16.0.into();
+    settings.h5_size = type_scale::BODY.into();
+    settings.h6_size = type_scale::BODY.into();
+    settings.code_size = 14.0.into();
+    settings.spacing = space(2.0).into();
+    settings
+}
+
+fn markdown_view<'a>(
+    items: impl IntoIterator<Item = &'a markdown::Item>,
+    appearance: theme::Appearance,
+) -> Element<'a, Message> {
+    markdown::view(items, markdown_settings(appearance))
+        // Model output is untrusted context. Links are rendered so their
+        // destination remains visible and can be copied, but never launched
+        // automatically.
+        .map(Message::CopyLink)
+}
+
+fn assistant_text_bubble(
+    turn: &ConversationTurn,
+    appearance: theme::Appearance,
+) -> Element<'_, Message> {
     row![
         container(
             column![
                 text(i18n::t(Key::ChatAssistant))
                     .size(type_scale::META)
                     .style(theme::text_dim),
-                text(message.to_owned())
-                    .size(type_scale::BODY)
-                    .font(theme::UI_FONT)
-                    .style(theme::text_primary),
+                markdown_view(&turn.assistant_markdown, appearance),
             ]
             .spacing(space(1.0)),
         )
@@ -1432,24 +1485,38 @@ fn assistant_text_bubble(message: &str) -> Element<'_, Message> {
     .into()
 }
 
-fn active_assistant_bubble(state: &PanelState) -> Element<'_, Message> {
+fn active_assistant_bubble(
+    state: &PanelState,
+    appearance: theme::Appearance,
+) -> Element<'_, Message> {
     let body: Element<'_, Message> = match state.phase {
         Phase::Loading => text(i18n::t(Key::StateLoading))
             .size(type_scale::BODY)
             .style(theme::text_dim)
             .into(),
-        Phase::Streaming | Phase::Finished { .. } => widgets::selectable_chat_answer(
-            &state.response_editor,
-            state.chat_answer_height(),
-            state.is_truncated(),
-            Message::ResponseAction,
-        ),
-        Phase::Failed if !state.response.is_empty() => widgets::selectable_chat_answer(
-            &state.response_editor,
-            state.chat_answer_height(),
-            true,
-            Message::ResponseAction,
-        ),
+        Phase::Streaming | Phase::Finished { .. } => {
+            let rendered = markdown_view(state.response_markdown.items(), appearance);
+            if state.is_truncated() {
+                column![
+                    rendered,
+                    text(i18n::t(Key::StateTruncated))
+                        .size(type_scale::META)
+                        .style(theme::text_severity(Severity::Warning)),
+                ]
+                .spacing(space(1.0))
+                .into()
+            } else {
+                rendered
+            }
+        }
+        Phase::Failed if !state.response.is_empty() => column![
+            markdown_view(state.response_markdown.items(), appearance),
+            text(i18n::t(Key::StateTruncated))
+                .size(type_scale::META)
+                .style(theme::text_severity(Severity::Warning)),
+        ]
+        .spacing(space(1.0))
+        .into(),
         _ => Space::new().height(0.0).into(),
     };
 
@@ -1471,12 +1538,12 @@ fn active_assistant_bubble(state: &PanelState) -> Element<'_, Message> {
     .into()
 }
 
-fn conversation(state: &PanelState) -> Element<'_, Message> {
+fn conversation(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Message> {
     let mut transcript = column![].spacing(space(2.0));
     for turn in &state.turns {
         transcript = transcript
             .push(user_bubble(&turn.user))
-            .push(assistant_text_bubble(&turn.assistant));
+            .push(assistant_text_bubble(turn, appearance));
     }
     if let Some(user) = &state.active_user {
         transcript = transcript.push(user_bubble(user));
@@ -1484,17 +1551,25 @@ fn conversation(state: &PanelState) -> Element<'_, Message> {
             state.phase,
             Phase::Loading | Phase::Streaming | Phase::Finished { .. } | Phase::Failed
         ) {
-            transcript = transcript.push(active_assistant_bubble(state));
+            transcript = transcript.push(active_assistant_bubble(state, appearance));
         }
     }
 
-    scrollable(transcript)
-        .height(Length::Fixed(state.transcript_height()))
-        .style(theme::scroller)
-        .into()
+    let height = Length::Fixed(state.transcript_height());
+    if state.transcript_content_height() > CHAT_TRANSCRIPT_MAX_HEIGHT {
+        scrollable(transcript)
+            .height(height)
+            .style(theme::scroller)
+            .into()
+    } else {
+        // Avoid retaining a scroll offset while retrying or replacing a short
+        // answer. On macOS that stale offset can yield an invalid glyph
+        // position after the window shrinks.
+        container(transcript).height(height).into()
+    }
 }
 
-fn content(state: &PanelState) -> Element<'_, Message> {
+fn content(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Message> {
     // Context problems outrank response state: there is no point streaming a
     // rewrite of text aibo could not read.
     match &state.context {
@@ -1528,13 +1603,13 @@ fn content(state: &PanelState) -> Element<'_, Message> {
                 .into_iter()
                 .collect();
             return column![
-                conversation(state),
+                conversation(state, appearance),
                 widgets::state_block(error.severity, &error.headline, None, actions),
             ]
             .spacing(space(2.0))
             .into();
         }
-        return conversation(state);
+        return conversation(state, appearance);
     }
 
     match &state.phase {
@@ -1605,8 +1680,8 @@ impl PanelState {
             .clamp(theme::CHAT_ANSWER_MIN_HEIGHT, CHAT_ANSWER_MAX_HEIGHT)
     }
 
-    /// Visible transcript height, content-sized until a useful scrolling cap.
-    fn transcript_height(&self) -> f32 {
+    /// Estimated height of all messages before applying viewport bounds.
+    fn transcript_content_height(&self) -> f32 {
         let mut height = 0.0;
         let mut messages = 0usize;
 
@@ -1630,7 +1705,13 @@ impl PanelState {
             height += (messages - 1) as f32 * CHAT_MESSAGE_SPACING;
         }
 
-        height.clamp(CHAT_TRANSCRIPT_MIN_HEIGHT, CHAT_TRANSCRIPT_MAX_HEIGHT)
+        height
+    }
+
+    /// Visible transcript height, content-sized until a useful scrolling cap.
+    fn transcript_height(&self) -> f32 {
+        self.transcript_content_height()
+            .clamp(CHAT_TRANSCRIPT_MIN_HEIGHT, CHAT_TRANSCRIPT_MAX_HEIGHT)
     }
 
     /// Maximum height the answer may consume while preserving fixed chrome.
@@ -2170,7 +2251,7 @@ mod tests {
 
         assert_eq!(state.selected_model, Some(selected));
         assert_eq!(state.model_options.len(), 2);
-        let _ = view(&state);
+        let _ = view(&state, theme::Appearance::Dark);
     }
 
     // -----------------------------------------------------------------------
@@ -2671,6 +2752,36 @@ mod tests {
     }
 
     #[test]
+    fn streamed_chunks_build_markdown_incrementally() {
+        let mut state = panel();
+        for chunk in [
+            "# Heading\n\n",
+            "- **one**\n- two\n\n",
+            "```rust\nfn main() {}\n",
+            "```\n",
+        ] {
+            state.append_response(chunk);
+        }
+
+        let items = state.response_markdown.items();
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, markdown::Item::Heading(..)))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, markdown::Item::List { .. }))
+        );
+        assert!(
+            items
+                .iter()
+                .any(|item| matches!(item, markdown::Item::CodeBlock { .. }))
+        );
+    }
+
+    #[test]
     fn a_follow_up_keeps_complete_turns_and_starts_a_fresh_active_bubble() {
         let mut state = panel();
         state.begin_turn("first question".to_owned());
@@ -2688,6 +2799,7 @@ mod tests {
         assert_eq!(state.turns.len(), 1);
         assert_eq!(state.turns[0].user, "first question");
         assert_eq!(state.turns[0].assistant, "first answer");
+        assert!(!state.turns[0].assistant_markdown.is_empty());
         assert_eq!(state.active_user.as_deref(), Some("follow up"));
         assert!(state.response.is_empty());
         assert!(state.input.is_empty());

@@ -94,7 +94,7 @@ wasmtime-wasi = "47"
 rmcp = { version = "2.2", default-features = false } # §11 tier 2 client only
 
 # --- ui / shell -------------------------------------------------------------
-iced = { version = "0.14", default-features = false, features = ["wgpu", "advanced", "crisp", "tokio", "image-without-codecs", "svg"] }
+iced = { version = "0.14", default-features = false, features = ["wgpu", "advanced", "crisp", "tokio", "image-without-codecs", "svg", "markdown"] }
 accesskit = "0.24.1"
 # Iced 0.14 has no accessibility tree. The official platform adapters attach
 # directly to the raw AppKit/Win32 view owned by iced/winit.

@@ -1491,6 +1491,8 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
     use panel::{ErrorAction, Message as M};
 
     match message {
+        M::CopyLink(url) => iced::clipboard::write(url),
+
         M::InputChanged(input) => {
             state.panel.input = input;
             Task::none()
@@ -1526,11 +1528,6 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 return Task::none();
             }
             if state.panel.input.trim().is_empty() {
-                if matches!(state.panel.phase, Phase::Finished { .. } | Phase::Failed)
-                    && state.panel.active_user.is_some()
-                {
-                    return panel_update(state, M::Retry);
-                }
                 return Task::none();
             }
 
@@ -2417,13 +2414,15 @@ fn configure_or_present_panel(id: window::Id, configure: bool) -> Task<Message> 
 
 fn view(state: &Aibo, window: window::Id) -> Element<'_, Message> {
     match state.role_of(window) {
-        Some(Role::Panel) | None => panel::view(&state.panel).map(Message::Panel),
+        Some(Role::Panel) | None => {
+            panel::view(&state.panel, state.config.appearance).map(Message::Panel)
+        }
         Some(Role::Settings) => settings::view(&state.settings).map(Message::Settings),
         Some(Role::Task(id)) => match state.tasks.iter().find(|(_, task)| task.id == id) {
             Some((_, task)) => {
                 task_window::view(task).map(move |message| Message::Task(id, message))
             }
-            None => panel::view(&state.panel).map(Message::Panel),
+            None => panel::view(&state.panel, state.config.appearance).map(Message::Panel),
         },
     }
 }
@@ -2863,7 +2862,7 @@ mod tests {
         let _ = backend_update(&mut state, UiEvent::RecoveredFromCrash);
         let toast = state.panel.toast.as_ref().expect("recovery toast");
         assert!(toast.offer_diagnostics);
-        let _ = panel::view(&state.panel);
+        let _ = panel::view(&state.panel, state.config.appearance);
     }
 
     #[test]
@@ -3259,8 +3258,8 @@ mod tests {
         assert_eq!(state.panel.phase, Phase::Streaming);
     }
 
-    #[tokio::test]
-    async fn return_after_an_answer_regenerates_and_never_inserts() {
+    #[test]
+    fn return_with_an_empty_composer_does_nothing_after_an_answer() {
         let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
         let (mut state, _boot) = boot(UiConfig::default(), requests);
         state.panel.active_user = Some("question".to_owned());
@@ -3270,12 +3269,14 @@ mod tests {
         };
 
         let _ = panel_update(&mut state, panel::Message::Submit);
-        assert!(matches!(
-            events.recv().await,
-            Some(UiRequest::Retry { role: None, .. })
-        ));
-        assert!(events.try_recv().is_err(), "Return must not send Insert");
-        assert_eq!(state.panel.phase, Phase::Loading);
+        assert!(events.try_recv().is_err());
+        assert_eq!(
+            state.panel.phase,
+            Phase::Finished {
+                reason: StopReason::EndTurn
+            }
+        );
+        assert_eq!(state.panel.response, "answer");
     }
 
     #[tokio::test]
