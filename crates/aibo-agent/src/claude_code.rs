@@ -903,6 +903,7 @@ impl Run {
 mod tests {
     use super::*;
     use aibo_core::types::{ContentOrigin, UntrustedBlock};
+    #[cfg(unix)]
     use futures::StreamExt;
     use uuid::Uuid;
 
