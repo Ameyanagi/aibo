@@ -5,7 +5,9 @@
 //! attachment retains [`AttachmentSource::ScreenRegion`] so prompt assembly
 //! fences the pixels as untrusted context.
 
-use aibo_core::types::{Attachment, AttachmentSource};
+use aibo_core::types::Attachment;
+#[cfg(target_os = "macos")]
+use aibo_core::types::AttachmentSource;
 
 /// A failure to start or read the platform screen-region picker.
 #[derive(Debug, thiserror::Error)]
