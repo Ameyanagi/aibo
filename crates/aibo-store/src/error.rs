@@ -80,7 +80,7 @@ pub enum StoreError {
     /// §12 requires this to be **loud**: one sentence, then "restore with
     /// recovery code" or "start fresh". Never silently create a second
     /// database next to an unreadable one.
-    #[error("the database at {} cannot be decrypted with the key from the keychain", path.display())]
+    #[error("the database at {} cannot be decrypted with the key from credential storage", path.display())]
     KeyLoss {
         /// The unreadable file.
         path: PathBuf,

@@ -6,7 +6,7 @@
 //! `$CODEX_HOME/auth.json`."* That replaces the earlier "read Codex's token
 //! file" design and removes its worst failure mode — two processes sharing one
 //! single-use refresh token and logging the user out of their own Codex. aibo
-//! now owns a separate token pair, in its own keychain entry, refreshed on its
+//! now owns a separate token pair, in its own credential file, refreshed on its
 //! own schedule.
 //!
 //! # ✅ S6 RESOLVED — executed end-to-end 2026-07-26
@@ -140,10 +140,10 @@ pub const TOKEN_REFRESH_PATH: &str = "oauth/token";
 /// can change without a release.
 pub const CLIENT_ID_ENV_VAR: &str = "AIBO_CODEX_CLIENT_ID";
 
-/// The keychain entry aibo stores its Codex tokens under.
+/// The credential-storage key aibo stores its Codex tokens under.
 ///
-/// §12: a multi-kilobyte JWT does not fit in Windows Credential Manager; the
-/// [`TokenStore`] implementation must chunk or use DPAPI files (spike S8).
+/// Windows production stores the corresponding file as one DPAPI-encrypted
+/// blob, so multi-kilobyte JWTs do not need chunking.
 pub const TOKEN_STORAGE_KEY: &str = "codex/device-auth";
 
 /// `originator` value sent on every Codex request.

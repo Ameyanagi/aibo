@@ -13,10 +13,10 @@
 //!
 //! ## Secrets are not in this file
 //!
-//! §12 is unambiguous: provider credentials live in the OS keychain, settings
-//! live in plaintext TOML. So the TOML names a provider and its *shape*, and a
+//! Provider credentials live in separate credential files, while settings live
+//! in plaintext TOML. So the TOML names a provider and its *shape*, and a
 //! [`CredentialSource`] resolves the secret separately. A config file that
-//! contained an API key would end up in a support bundle, a screenshot and a
+//! contained an API key would end up in a support bundle, a screenshot, or a
 //! dotfiles repo.
 //!
 //! ## What is deliberately not supported yet
@@ -42,7 +42,7 @@
 //! The seam that fixes it is [`Config::build_with_codex`]: the TOML carries
 //! [`CodexConfig`] — *enabled*, the chosen model, and the OAuth client id, which
 //! are settings, not secrets — and the caller passes the live
-//! [`RefreshingTokenProvider`] it built over the OS keychain. Tokens never touch
+//! [`RefreshingTokenProvider`] it built over credential storage. Tokens never touch
 //! this file (§12), and `enabled = true` with no token provider is
 //! [`ConfigError::CodexNotSignedIn`] rather than a registry that silently lacks
 //! the provider the user turned on.
@@ -96,7 +96,7 @@ pub enum ConfigError {
     },
 
     /// A provider was named with no credential available.
-    #[error("no API key for `{provider}`; store one in the keychain or set {env}")]
+    #[error("no API key for `{provider}`; store one in aibo's credential files or set {env}")]
     MissingCredential {
         /// The provider.
         provider: String,
@@ -138,9 +138,9 @@ pub enum ConfigError {
 
 /// Where an API key comes from.
 ///
-/// The engine never reads a secret itself; §12 puts credentials in the OS
-/// keychain and this is the seam. The binary implements a keychain-backed
-/// source over `aibo_store::SecretStorage`; tests and headless runs use
+/// The engine never reads a secret itself; credentials are resolved through
+/// this seam. The binary implements a file-backed source over
+/// `aibo_store::SecretStorage`; tests and headless runs use
 /// [`EnvCredentials`].
 pub trait CredentialSource: Send + Sync {
     /// The API key for a provider, if one is available.
@@ -150,7 +150,7 @@ pub trait CredentialSource: Send + Sync {
 /// Reads `AIBO_<PROVIDER>_API_KEY`, upper-cased with `-` mapped to `_`.
 ///
 /// For CI, the eval harness and a first run before anything has been stored in
-/// the keychain.
+/// credential storage.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct EnvCredentials;
 
@@ -362,7 +362,7 @@ pub const DEFAULT_CODEX_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 
 /// The `[codex]` table (§3a).
 ///
-/// Three settings and **no tokens**. §12 puts credentials in the OS keychain,
+/// Three settings and **no tokens**. Credentials live in separate files,
 /// so what persists here is only the fact that the user signed in, which model
 /// they chose, and — because it is a posture knob rather than a secret — the
 /// OAuth client id.
@@ -500,7 +500,7 @@ impl Config {
     ///
     /// Equivalent to [`Config::build_with_codex`] with no token provider, so
     /// `[codex] enabled = true` is [`ConfigError::CodexNotSignedIn`] here. Use
-    /// the other entry point from the binary, which owns the keychain.
+    /// the other entry point from the binary, which owns credential storage.
     pub fn build(
         &self,
         credentials: &dyn CredentialSource,
@@ -513,9 +513,9 @@ impl Config {
     /// live device-code token provider for it (§3a).
     ///
     /// `codex_tokens` is the thing TOML cannot express and the reason this
-    /// second entry point exists: a [`RefreshingTokenProvider`] over the OS
-    /// keychain, built by the binary. It is passed even when no token has been
-    /// stored yet — construction touches neither the network nor the keychain,
+    /// second entry point exists: a [`RefreshingTokenProvider`] over credential
+    /// files, built by the binary. It is passed even when no token has been
+    /// stored yet — construction touches neither the network nor storage,
     /// and `CodexProvider::health` then reports *"sign-in required"* instead of
     /// the provider being absent, which is the difference between a settings
     /// row the user can act on and a provider that does not exist.

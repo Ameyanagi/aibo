@@ -153,7 +153,7 @@ impl Db {
     /// rekey now even if unused ... adding it later means touching every user's
     /// file").
     ///
-    /// The caller must store `new` in the keychain **after** this returns `Ok`,
+    /// The caller must store `new` in credential storage **after** this returns `Ok`,
     /// and must be prepared for a crash in between — which is what the recovery
     /// code is for.
     pub fn rekey(&self, new: &DbKey) -> Result<()> {

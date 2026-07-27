@@ -36,7 +36,7 @@
 //! translate its [`aibo_session::SessionEvent`]s into `aibo_ui::UiEvent`s.
 //!
 //! Everything the engine needs is allowed to fail softly. A missing config, a
-//! locked keychain and an unopenable database each degrade one capability and
+//! unavailable credentials and an unopenable database each degrade one capability and
 //! none of them stop the tray from appearing: §13's only blocking error is
 //! `NoProviderConfigured`, and that one already has a designed treatment.
 
@@ -1068,11 +1068,9 @@ mod children {
 
 /// The production credential façade and the `TokenStore` over it.
 ///
-/// Secrets use the OS credential store. On Windows, raw blobs at or below
-/// Credential Manager's 2560-byte cap remain there; larger serialized token
-/// pairs are stored as one atomic, owner-only file encrypted for the current
-/// user by DPAPI. This keeps writes indivisible without ever falling back to
-/// production plaintext.
+/// On macOS, secrets use owner-only local files. On Windows, the same file
+/// envelope is encrypted for the current user by DPAPI. Writes use one atomic
+/// rename, and credentials never enter `config.toml`.
 mod secrets {
     use std::sync::Arc;
 
@@ -1086,32 +1084,33 @@ mod secrets {
     ///
     /// One JSON document is written per storage key. [`SecretStorage`] applies
     /// the platform routing policy described above.
-    pub struct KeychainTokenStore {
+    pub struct CredentialTokenStore {
         storage: Arc<SecretStorage>,
     }
 
-    impl std::fmt::Debug for KeychainTokenStore {
+    impl std::fmt::Debug for CredentialTokenStore {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("KeychainTokenStore").finish_non_exhaustive()
+            f.debug_struct("CredentialTokenStore")
+                .finish_non_exhaustive()
         }
     }
 
-    impl KeychainTokenStore {
-        /// Wrap a size-routing storage façade.
+    impl CredentialTokenStore {
+        /// Wrap the platform credential-file storage façade.
         pub fn new(storage: Arc<SecretStorage>) -> Self {
             Self { storage }
         }
     }
 
-    /// The keychain account a token-storage key is filed under.
+    /// The credential-file account a token-storage key is filed under.
     ///
-    /// Shares `provider:`-prefixed naming with API keys so one keychain audit
-    /// shows every credential aibo holds.
+    /// Shares `provider:`-prefixed naming with API keys so one credential-file
+    /// audit shows every credential aibo holds.
     pub fn token_account(key: &str) -> String {
         provider_account(key)
     }
 
-    /// §13: a keychain fault is never rendered raw, so it crosses as
+    /// §13: a credential-store fault is never rendered raw, so it crosses as
     /// `Internal`, which §13 gives the generic treatment plus "copy
     /// diagnostics". `StoreError`'s `Display` names the service, the account
     /// and the platform detail, and never the secret.
@@ -1120,11 +1119,11 @@ mod secrets {
     }
 
     #[async_trait]
-    impl TokenStore for KeychainTokenStore {
+    impl TokenStore for CredentialTokenStore {
         async fn load(&self, key: &str) -> CoreResult<Option<StoredTokens>> {
             let storage = self.storage.clone();
             let account = token_account(key);
-            // `keyring` is blocking and can put a consent dialog on screen.
+            // File I/O and DPAPI are blocking.
             let found = tokio::task::spawn_blocking(move || storage.get(&account))
                 .await
                 .map_err(|e| AiboError::Internal(Box::new(e)))?
@@ -1137,7 +1136,7 @@ mod secrets {
                 Ok(tokens) => Ok(Some(tokens)),
                 Err(error) => {
                     // A blob written by an older build, or a half-restored
-                    // keychain. Treat as "no credential" rather than as a hard
+                    // credential file. Treat as "no credential" rather than as a hard
                     // failure: §13's answer to that is "sign in", which works.
                     tracing::warn!(%error, "stored Codex tokens could not be parsed; ignoring");
                     Ok(None)
@@ -1184,8 +1183,8 @@ mod secrets {
             assert!(raw_fits_in_credential_manager(access_token.as_bytes()));
         }
 
-        /// The token entry is filed alongside the API keys, so one keychain
-        /// audit shows everything aibo holds.
+        /// The token entry is filed alongside the API keys, so one credential
+        /// directory audit shows everything aibo holds.
         #[test]
         fn the_token_account_is_namespaced_with_the_other_credentials() {
             let account = token_account(aibo_provider::codex::TOKEN_STORAGE_KEY);
@@ -1205,7 +1204,7 @@ mod secrets {
 /// | Input | Missing means |
 /// |---|---|
 /// | `config.toml` | no providers — §13's blocking `NoProviderConfigured`, which is the correct state for a fresh install |
-/// | keychain credential | that provider cannot be built; the error names the environment variable instead |
+/// | credential file | that provider cannot be built; the error names the environment variable instead |
 /// | database key | history and clipboard search are off; inference still works |
 ///
 /// Nothing here aborts startup. §6 wants the tray up and the hotkey live even
@@ -1221,27 +1220,28 @@ mod bootstrap {
     use aibo_session::{Config, CredentialSource, EngineConfig, EnvCredentials};
 
     use crate::paths::Paths;
-    use crate::secrets::KeychainTokenStore;
+    use crate::secrets::CredentialTokenStore;
 
-    /// Credentials from the OS keychain (§12), falling back to the environment.
+    /// Credentials from the local credential files (§12), falling back to the
+    /// environment.
     ///
     /// The fallback is not a weakening: `AIBO_<PROVIDER>_API_KEY` is what CI,
     /// the §5 eval harness and a first run before onboarding have, and §12's
     /// rule is about not writing secrets to *disk*, which this does not.
     struct Credentials {
-        keychain: Arc<aibo_store::SecretStorage>,
+        storage: Arc<aibo_store::SecretStorage>,
     }
 
     impl CredentialSource for Credentials {
         fn api_key(&self, provider: &ProviderId) -> Option<secrecy::SecretString> {
             let account = aibo_store::secrets::provider_account(provider.as_str());
-            match self.keychain.get(&account) {
+            match self.storage.get(&account) {
                 Ok(Some(secret)) => Some(secrecy::SecretString::from(secret.to_string())),
                 Ok(None) => EnvCredentials.api_key(provider),
                 Err(error) => {
-                    // A locked or denied keychain is not fatal: §13 would rather
+                    // An unreadable credential file is not fatal: §13 would rather
                     // show "sign in" than fail to start.
-                    tracing::warn!(%provider, %error, "could not read the keychain (§12)");
+                    tracing::warn!(%provider, %error, "could not read the credential files (§12)");
                     EnvCredentials.api_key(provider)
                 }
             }
@@ -1274,9 +1274,8 @@ mod bootstrap {
     }
 
     impl Bootstrap {
-        /// Resolve the storage seams. Touches neither the keychain nor the
-        /// database — both are opened lazily, which is what keeps the
-        /// fresh-install path free of an unprompted keychain dialog (§17).
+        /// Resolve the storage seams. Touches neither credential contents nor
+        /// the database — both are opened lazily.
         pub fn new(paths: Paths) -> Self {
             Self {
                 secrets: Arc::new(production_secret_storage(&paths)),
@@ -1344,15 +1343,14 @@ mod bootstrap {
             )
         }
 
-        /// A Codex token provider over the OS keychain (§3a).
+        /// A Codex token provider over local credential files (§3a).
         ///
         /// Constructed on demand and never cached: the client id is a setting,
         /// so a provider built before it changed would keep using the old one.
         /// Construction reads nothing — [`RefreshingTokenProvider`] loads on
-        /// first use — so building one is free and cannot prompt for keychain
-        /// access on a fresh install.
+        /// first use — so building one is free and performs no credential I/O.
         pub fn codex_tokens(&self, config: &Config) -> Option<Arc<RefreshingTokenProvider>> {
-            let store = Arc::new(KeychainTokenStore::new(self.secrets.clone()));
+            let store = Arc::new(CredentialTokenStore::new(self.secrets.clone()));
             match aibo_provider::codex::token_provider(config.codex.client_id(), store, None) {
                 Ok(tokens) => Some(tokens),
                 Err(error) => {
@@ -1372,9 +1370,8 @@ mod bootstrap {
             let config_path = self.paths.config();
             if !config_path.exists() {
                 // The fresh-install path. Deliberately does *not* touch the
-                // keychain: an unprompted "aibo wants to use your keychain"
-                // dialog before the user has configured anything is the worst
-                // possible first impression, and §17 owns that moment.
+                // credential files: an empty first run should not create
+                // storage before the user has configured anything.
                 tracing::info!(
                     path = %config_path.display(),
                     "no configuration; starting with no providers (§13 NoProviderConfigured)"
@@ -1388,7 +1385,7 @@ mod bootstrap {
             let config = self.config();
             let prices = load_prices(&self.paths);
             let credentials = Credentials {
-                keychain: self.secrets.clone(),
+                storage: self.secrets.clone(),
             };
             // The token provider is passed whether or not `[codex] enabled` is
             // set: building one is free, and handing it over unconditionally
@@ -1423,9 +1420,10 @@ mod bootstrap {
 
     #[cfg(target_os = "macos")]
     fn production_secret_storage(paths: &Paths) -> aibo_store::SecretStorage {
-        let storage = aibo_store::SecretStorage::os_keychain();
-        migrate_plaintext_credentials(paths, &storage);
-        storage
+        aibo_store::SecretStorage::owner_only_plaintext_files(
+            paths.credentials_dir(),
+            aibo_store::secrets::OwnerOnlyPlaintext::acknowledge_risk(),
+        )
     }
 
     #[cfg(target_os = "windows")]
@@ -1465,73 +1463,15 @@ mod bootstrap {
             paths.credentials_dir().join("protected"),
             Arc::new(WindowsDpapiProtector),
         );
-        let storage =
-            aibo_store::SecretStorage::with_oversize(aibo_store::Keychain::default(), protected);
-        migrate_plaintext_credentials(paths, &storage);
-        storage
+        aibo_store::SecretStorage::single_backend(protected)
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     fn production_secret_storage(paths: &Paths) -> aibo_store::SecretStorage {
-        // Non-shipping builds are development/evaluation harnesses. Keeping
-        // plaintext behind an explicit acknowledgement makes that exception
-        // visible and prevents production targets from taking this branch.
-        aibo_store::SecretStorage::development_plaintext_files(
+        aibo_store::SecretStorage::owner_only_plaintext_files(
             paths.credentials_dir(),
-            aibo_store::secrets::DevelopmentOnlyPlaintext::acknowledge_risk(),
+            aibo_store::secrets::OwnerOnlyPlaintext::acknowledge_risk(),
         )
-    }
-
-    #[cfg(any(target_os = "macos", target_os = "windows"))]
-    fn migrate_plaintext_credentials(paths: &Paths, destination: &aibo_store::SecretStorage) {
-        use std::collections::BTreeSet;
-
-        use aibo_session::config::Backend;
-        use aibo_store::secrets::{
-            DB_KEY_ACCOUNT, DevelopmentOnlyPlaintext, FileSecretStore, MigrationOutcome,
-            PlaintextProtector, provider_account,
-        };
-
-        let source = FileSecretStore::new(
-            paths.credentials_dir(),
-            Arc::new(PlaintextProtector::development_only(
-                DevelopmentOnlyPlaintext::acknowledge_risk(),
-            )),
-        );
-        let mut accounts = BTreeSet::from([
-            DB_KEY_ACCOUNT.to_owned(),
-            crate::secrets::token_account(aibo_provider::codex::TOKEN_STORAGE_KEY),
-        ]);
-        if let Ok(config) = Config::load(&paths.config()) {
-            for provider in config.providers {
-                let id = provider.id.unwrap_or_else(|| {
-                    match provider.backend {
-                        Backend::Cerebras => ProviderId::CEREBRAS,
-                        Backend::SambaNova => ProviderId::SAMBANOVA,
-                        Backend::Groq => ProviderId::GROQ,
-                        Backend::Xai => ProviderId::XAI,
-                        Backend::OpenAi | Backend::OpenAiChatCompletions => ProviderId::OPENAI,
-                        Backend::Anthropic => ProviderId::ANTHROPIC,
-                        Backend::Azure => ProviderId::AZURE_OPENAI,
-                        Backend::Ollama => ProviderId::OLLAMA,
-                        Backend::Custom => ProviderId::new("custom"),
-                    }
-                    .as_str()
-                    .to_owned()
-                });
-                accounts.insert(provider_account(&id));
-            }
-        }
-
-        for account in accounts {
-            match destination.migrate_from(&account, &source) {
-                Ok(MigrationOutcome::Missing) => {}
-                Ok(outcome) => tracing::info!(%account, ?outcome, "migrated legacy credential"),
-                Err(error) => {
-                    tracing::warn!(%account, %error, "could not migrate legacy credential")
-                }
-            }
-        }
     }
 
     /// §14's table: the shipped defaults with the user's overlay on top.
@@ -1556,7 +1496,7 @@ mod bootstrap {
     /// Deliberately read-only about the key. `SecretStorage::db_key_or_create`
     /// would work, but §12 requires the recovery code to be *shown exactly
     /// once, at setup* — generating one silently would leave the user with an
-    /// encrypted database and no way back into it after a keychain loss.
+    /// encrypted database and no way back into it after credential-file loss.
     /// Creating the key belongs to onboarding (§17).
     fn open_store(
         paths: &Paths,
@@ -1593,10 +1533,10 @@ mod bootstrap {
         use super::*;
 
         /// The fresh-install path, and the one this test can assert without
-        /// touching the user's keychain — which is exactly the property the
+        /// touching credential contents — which is exactly the property the
         /// early return exists to guarantee.
         #[test]
-        fn a_fresh_install_starts_with_no_providers_and_no_keychain_access() {
+        fn a_fresh_install_starts_with_no_providers_and_no_credential_access() {
             let dir = std::env::temp_dir().join("aibo-bootstrap-test");
             let _ = std::fs::remove_dir_all(&dir);
             std::fs::create_dir_all(&dir).unwrap();
@@ -1613,8 +1553,7 @@ mod bootstrap {
 
         /// Building a Codex token provider must stay free of I/O, because it
         /// happens on every engine build — including the fresh-install one,
-        /// where a keychain prompt would be the user's first experience of the
-        /// app (§17).
+        /// before the user has configured the app (§17).
         #[test]
         fn building_the_codex_token_provider_touches_nothing() {
             // Per-process and per-test, so two `cargo test` invocations against
@@ -1643,9 +1582,9 @@ mod bootstrap {
                 .join(format!("aibo-history-setup-test-{}", uuid::Uuid::now_v7()));
             std::fs::create_dir_all(&dir).unwrap();
             let paths = Paths::for_root(dir.clone());
-            let secrets = Arc::new(aibo_store::SecretStorage::development_plaintext_files(
+            let secrets = Arc::new(aibo_store::SecretStorage::owner_only_plaintext_files(
                 paths.credentials_dir(),
-                aibo_store::secrets::DevelopmentOnlyPlaintext::acknowledge_risk(),
+                aibo_store::secrets::OwnerOnlyPlaintext::acknowledge_risk(),
             ));
             let boot = Bootstrap {
                 paths,
@@ -1681,9 +1620,9 @@ mod bootstrap {
             let database = paths.database();
             let canary = b"existing encrypted history";
             std::fs::write(&database, canary).unwrap();
-            let secrets = Arc::new(aibo_store::SecretStorage::development_plaintext_files(
+            let secrets = Arc::new(aibo_store::SecretStorage::owner_only_plaintext_files(
                 paths.credentials_dir(),
-                aibo_store::secrets::DevelopmentOnlyPlaintext::acknowledge_risk(),
+                aibo_store::secrets::OwnerOnlyPlaintext::acknowledge_risk(),
             ));
             let boot = Bootstrap {
                 paths,
@@ -1707,7 +1646,7 @@ mod bootstrap {
 
 /// Writing the parts of `config.toml` the app owns.
 ///
-/// §12 keeps settings in plaintext TOML and credentials in the keychain, so
+/// §12 keeps settings in plaintext TOML and credentials in separate files, so
 /// what a completed Codex login persists here is non-secret configuration —
 /// whether the user signed in, which model they chose, and an optional public
 /// OAuth client id — and **never a token**.
@@ -1974,7 +1913,7 @@ mod codex_signin {
             /// Human-readable, already redacted — never a token.
             detail: String,
         },
-        /// Tokens are in the keychain and the provider can be built.
+        /// Tokens are in the credential files and the provider can be built.
         Succeeded {
             /// `chatgpt_account_id`, when the ID token carried one.
             account: Option<String>,
@@ -2083,12 +2022,12 @@ mod codex_signin {
 
         progress(
             CodexPhase::Exchanging,
-            "Approved. Storing the tokens in your keychain…".to_owned(),
+            "Approved. Storing the tokens locally…".to_owned(),
         );
 
         let account = token_set.account_id.clone();
         // §12: this is the only place the tokens are written, and they go to
-        // the OS keychain — never to the config file.
+        // the credential files — never to the config file.
         if let Err(error) = tokens.seed(token_set).await {
             return Event::Failed {
                 detail: format!("Signed in, but the tokens could not be stored: {error}"),
@@ -2214,7 +2153,7 @@ mod codex_signin {
         fn progress_lines_never_carry_a_token() {
             for detail in [
                 awaiting_detail(&challenge(120), SystemTime::now()),
-                "Approved. Storing the tokens in your keychain…".to_owned(),
+                "Approved. Storing the tokens locally…".to_owned(),
             ] {
                 assert!(!detail.contains("eyJ"), "{detail}");
                 assert!(!detail.to_lowercase().contains("bearer"), "{detail}");
@@ -2467,13 +2406,11 @@ mod runtime {
     }
 
     impl CodexAuth {
-        /// The startup phase, taken from the config rather than the keychain.
+        /// The startup phase, taken from the config rather than credential
+        /// contents.
         ///
-        /// Reading the keychain here would put a consent dialog on screen
-        /// before the user has done anything, which §17 rules out. `enabled` is
-        /// exactly the fact that a login once completed; if the token has since
-        /// been revoked, the first request's §13 `Auth` failure says so, which
-        /// is both truthful and later than a startup prompt.
+        /// `enabled` records that a login once completed; if the token has
+        /// since been revoked, the first request's §13 `Auth` failure says so.
         fn at_startup(config: &aibo_session::Config) -> Self {
             Self {
                 phase: if config.codex.enabled {
@@ -2591,7 +2528,7 @@ mod runtime {
         startup_language: Option<Lang>,
         /// Fresh installs open the functional provider setup automatically.
         onboarding_required: bool,
-        /// Publish the already-opened history state without another keychain
+        /// Publish the already-opened history state without another credential
         /// read on the UI path.
         startup_history_ready: bool,
         /// Prevent concurrent first-run key generation.
@@ -3167,7 +3104,7 @@ mod runtime {
             let model = config.codex.model.clone();
 
             // Order matters. The config flag is what the next launch reads, so
-            // it is written even if the keychain delete fails — a keychain
+            // it is written even if credential deletion fails — a credential
             // entry aibo no longer uses is inert, while an `enabled = true`
             // whose token is gone is a provider that 401s on every request.
             if let Err(error) = crate::config_file::write_codex(
@@ -3185,9 +3122,11 @@ mod runtime {
 
             tokio::spawn(crate::diagnostics::supervise("codex-signout", async move {
                 let Some(tokens) = tokens else { return };
-                // `forget` clears the cached pair *and* the keychain entry.
+                // `forget` clears the cached pair and its credential file.
                 match tokens.forget().await {
-                    Ok(()) => tracing::info!("cleared the Codex tokens from the keychain (§12)"),
+                    Ok(()) => {
+                        tracing::info!("cleared the Codex tokens from credential files (§12)")
+                    }
                     Err(error) => tracing::error!(%error, "could not clear the Codex tokens"),
                 }
                 let _ = internal
@@ -3228,7 +3167,7 @@ mod runtime {
                     self.codex.cancel = None;
                     self.codex.phase = CodexPhase::SignedIn;
 
-                    // §12: the tokens are already in the keychain. What lands
+                    // §12: the tokens are already in credential files. What lands
                     // in plaintext is non-secret configuration only: Codex is
                     // on, which model it uses, and any public OAuth client id.
                     let config = self.bootstrap.config();
@@ -4769,11 +4708,10 @@ mod runtime {
             }
         }
 
-        /// Startup must read the config, not the keychain: a consent dialog
-        /// before the user has done anything is what §17 rules out. The two
+        /// Startup must read the config, not credential contents. The two
         /// states the config can express map to the two phases.
         #[test]
-        fn the_startup_phase_comes_from_the_config_not_the_keychain() {
+        fn the_startup_phase_comes_from_the_config_not_credentials() {
             let signed_out = aibo_session::Config::from_toml_str("").unwrap();
             assert_eq!(
                 CodexAuth::at_startup(&signed_out).phase,

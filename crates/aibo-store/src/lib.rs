@@ -12,10 +12,14 @@
 //! # Opening a database
 //!
 //! ```no_run
-//! use aibo_store::{Db, Keychain, SecretStorage};
+//! use aibo_store::secrets::OwnerOnlyPlaintext;
+//! use aibo_store::{Db, SecretStorage};
 //!
 //! # fn main() -> aibo_store::Result<()> {
-//! let secrets = SecretStorage::keychain_only(Keychain::default());
+//! let secrets = SecretStorage::owner_only_plaintext_files(
+//!     "/path/to/credentials",
+//!     OwnerOnlyPlaintext::acknowledge_risk(),
+//! );
 //! let (key, is_new) = secrets.db_key_or_create()?;
 //! if is_new {
 //!     // Show the recovery code exactly once, at setup (§12).
@@ -33,7 +37,7 @@
 //!
 //! # What is deliberately *not* stored here
 //!
-//! - Provider credentials — OS keychain, see [`secrets`].
+//! - Provider credentials — separate credential files, see [`secrets`].
 //! - Settings — plaintext TOML, so the app is still configured after a
 //!   "start fresh" (§12).
 //! - Concealed clipboard content — never written at all, see [`clipboard`].

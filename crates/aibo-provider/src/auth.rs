@@ -75,12 +75,10 @@ impl TokenSet {
     }
 }
 
-/// The serialisable form written to the OS keychain.
+/// The serialisable form written to credential storage.
 ///
-/// §12 storage note: a multi-kilobyte JWT does not fit in Windows Credential
-/// Manager (2560 bytes, i.e. ~1280 ASCII characters after `keyring`'s UTF-16
-/// doubling). An implementation of [`TokenStore`] targeting Windows must chunk
-/// or fall back to a DPAPI-protected file — that is spike **S8**.
+/// On Windows, aibo stores this as one DPAPI-encrypted file, so a multi-kilobyte
+/// JWT is written atomically without Credential Manager's blob-size limit.
 #[derive(Clone, Serialize, Deserialize)]
 pub struct StoredTokens {
     /// Bearer token.

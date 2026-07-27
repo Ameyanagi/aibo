@@ -53,7 +53,7 @@ impl DbKey {
         Ok(Self(bytes))
     }
 
-    /// Adopt raw key bytes, e.g. read back from the keychain.
+    /// Adopt raw key bytes, e.g. read back from credential storage.
     pub fn from_bytes(bytes: [u8; KEY_LEN]) -> Self {
         Self(bytes)
     }

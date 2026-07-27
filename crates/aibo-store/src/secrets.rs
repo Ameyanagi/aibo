@@ -1,10 +1,10 @@
-//! OS keychain access. Note the Windows 2560-byte credential cap (§12).
+//! Credential storage for local files and legacy OS credential stores (§12).
 //!
 //! Two things live outside the encrypted database: provider credentials and the
-//! database key itself. Both go to the OS keychain — Keychain Services on
-//! macOS, Credential Manager on Windows.
+//! database key itself. Production wiring stores both in credential files:
+//! owner-only files on macOS and DPAPI-encrypted files on Windows.
 //!
-//! ## The Windows cap, which decides the shape of this module
+//! ## Legacy Windows Credential Manager support
 //!
 //! Windows Credential Manager caps a secret at 2560 bytes
 //! (`CRED_MAX_CREDENTIAL_BLOB_SIZE`). Older `keyring::set_password` wiring
@@ -109,27 +109,28 @@ pub trait Protector: Send + Sync {
     fn unprotect(&self, ciphertext: &[u8]) -> Result<Vec<u8>>;
 }
 
-/// No encryption. Owner-only file permissions are the whole protection.
+/// No application-level encryption. Owner-only file permissions are the whole
+/// protection.
 ///
-/// This protector is intentionally limited to local development. Production
-/// callers should use [`Keychain`] or inject an OS-bound [`Protector`] (DPAPI
-/// on Windows) into [`FileSecretStore`].
+/// This is suitable only when the caller deliberately accepts that every
+/// process running as the same OS user can read the credential. Windows
+/// production uses a DPAPI-backed [`Protector`] instead.
 #[derive(Debug, Clone, Copy)]
 pub struct PlaintextProtector {
     _private: (),
 }
 
-/// Explicit acknowledgement required to construct a plaintext development
+/// Explicit acknowledgement required to construct an owner-only plaintext
 /// store through the supported API.
 ///
 /// The marker makes plaintext storage difficult to enable accidentally in
-/// production wiring and straightforward to find in code review.
+/// wiring and straightforward to find in code review.
 #[derive(Debug, Clone, Copy)]
-pub struct DevelopmentOnlyPlaintext {
+pub struct OwnerOnlyPlaintext {
     _private: (),
 }
 
-impl DevelopmentOnlyPlaintext {
+impl OwnerOnlyPlaintext {
     /// Acknowledge that credentials will be readable by the current user and
     /// any process able to access their account.
     #[must_use]
@@ -139,10 +140,10 @@ impl DevelopmentOnlyPlaintext {
 }
 
 impl PlaintextProtector {
-    /// Construct the plaintext protector after an explicit development-only
-    /// risk acknowledgement.
+    /// Construct the plaintext protector after an explicit risk
+    /// acknowledgement.
     #[must_use]
-    pub const fn development_only(_acknowledgement: DevelopmentOnlyPlaintext) -> Self {
+    pub const fn owner_only(_acknowledgement: OwnerOnlyPlaintext) -> Self {
         Self { _private: () }
     }
 }
@@ -675,90 +676,71 @@ pub fn migrate_secret(
 
 /// The storage interface the rest of aibo uses.
 ///
-/// Small secrets (the 32-byte database key, an API key) go to the OS keychain.
-/// Anything over the Windows cap goes to the protected file store. `get` checks
-/// the keychain first and then the file store, so a token that grew past the
-/// cap on a later refresh is still found.
+/// The primary backend can be an OS credential store or a file store. An
+/// optional secondary backend supports the legacy Windows size-routing mode.
 pub struct SecretStorage {
-    keychain: Box<dyn SecretStore>,
-    oversize: Option<Box<dyn SecretStore>>,
-    /// Raw byte limit used when this façade has an oversize fallback.
+    primary: Box<dyn SecretStore>,
+    secondary: Option<Box<dyn SecretStore>>,
+    /// Raw byte limit used when this façade has a secondary backend.
     primary_limit: Option<usize>,
 }
 
 impl std::fmt::Debug for SecretStorage {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SecretStorage")
-            .field("oversize_configured", &self.oversize.is_some())
+            .field("secondary_configured", &self.secondary.is_some())
             .finish_non_exhaustive()
     }
 }
 
 impl SecretStorage {
-    /// Development-only plaintext credential files.
+    /// Owner-only plaintext credential files.
     ///
-    /// Production wiring should prefer [`Self::os_keychain`] or
-    /// [`Self::with_oversize`] with an OS-bound protector.
-    pub fn development_plaintext_files(
+    /// The directory is forced to `0700` and each file to `0600` on Unix.
+    /// Contents are not application-encrypted.
+    pub fn owner_only_plaintext_files(
         dir: impl Into<PathBuf>,
-        acknowledgement: DevelopmentOnlyPlaintext,
+        acknowledgement: OwnerOnlyPlaintext,
     ) -> Self {
-        tracing::warn!("using development-only plaintext credential storage");
-        let protector = PlaintextProtector::development_only(acknowledgement);
+        tracing::warn!("using owner-only plaintext credential files");
+        let protector = PlaintextProtector::owner_only(acknowledgement);
         let store = FileSecretStore::new(dir, Arc::new(protector));
-        Self {
-            keychain: Box::new(store),
-            oversize: None,
-            primary_limit: None,
-        }
+        Self::single_backend(store)
     }
 
-    /// Compatibility shim for existing development wiring.
-    ///
-    /// New callers must use [`Self::development_plaintext_files`] and make the
-    /// risk acknowledgement visible at the call site.
-    #[deprecated(
-        note = "plaintext credentials are development-only; use development_plaintext_files with DevelopmentOnlyPlaintext::acknowledge_risk(), or os_keychain in production"
-    )]
-    pub fn file_only(dir: impl Into<std::path::PathBuf>) -> Self {
-        Self::development_plaintext_files(dir, DevelopmentOnlyPlaintext::acknowledge_risk())
+    /// One primary backend with no façade-level size routing.
+    pub fn single_backend(primary: impl SecretStore + 'static) -> Self {
+        Self {
+            primary: Box::new(primary),
+            secondary: None,
+            primary_limit: None,
+        }
     }
 
     /// The platform's OS-backed credential store.
     pub fn os_keychain() -> Self {
-        Self::keychain_only(Keychain::default())
-    }
-
-    /// One primary secret backend with no façade-level size routing.
-    ///
-    /// The real [`Keychain`] still enforces the platform cap on Windows.
-    pub fn keychain_only(keychain: impl SecretStore + 'static) -> Self {
-        Self {
-            keychain: Box::new(keychain),
-            oversize: None,
-            primary_limit: None,
-        }
+        Self::single_backend(Keychain::default())
     }
 
     /// Keychain plus a fallback for oversize secrets. This is the Windows
-    /// configuration, with a DPAPI-backed [`FileSecretStore`].
+    /// legacy configuration, with a DPAPI-backed [`FileSecretStore`].
     pub fn with_oversize(
-        keychain: impl SecretStore + 'static,
+        primary: impl SecretStore + 'static,
         oversize: impl SecretStore + 'static,
     ) -> Self {
         Self {
-            keychain: Box::new(keychain),
-            oversize: Some(Box::new(oversize)),
+            primary: Box::new(primary),
+            secondary: Some(Box::new(oversize)),
             primary_limit: Some(WINDOWS_CREDENTIAL_BLOB_MAX_BYTES),
         }
     }
 
     /// Fetch a secret from wherever it was put.
     pub fn get(&self, account: &str) -> Result<Option<Zeroizing<String>>> {
-        if let Some(found) = self.keychain.get(account)? {
+        if let Some(found) = self.primary.get(account)? {
             return Ok(Some(found));
         }
-        match &self.oversize {
+        match &self.secondary {
             Some(store) => store.get(account),
             None => Ok(None),
         }
@@ -771,19 +753,19 @@ impl SecretStorage {
     /// resurrect later.
     pub fn set(&self, account: &str, secret: &str) -> Result<()> {
         let Some(primary_limit) = self.primary_limit else {
-            return self.keychain.set(account, secret);
+            return self.primary.set(account, secret);
         };
         if secret.len() <= primary_limit {
-            self.keychain.set(account, secret)?;
-            if let Some(store) = &self.oversize {
+            self.primary.set(account, secret)?;
+            if let Some(store) = &self.secondary {
                 store.delete(account)?;
             }
             return Ok(());
         }
-        match &self.oversize {
+        match &self.secondary {
             Some(store) => {
                 store.set(account, secret)?;
-                self.keychain.delete(account)
+                self.primary.delete(account)
             }
             // Refuse rather than silently truncating or writing plaintext.
             None => Err(StoreError::SecretTooLarge {
@@ -796,8 +778,8 @@ impl SecretStorage {
 
     /// Remove a secret from both backends.
     pub fn delete(&self, account: &str) -> Result<()> {
-        self.keychain.delete(account)?;
-        if let Some(store) = &self.oversize {
+        self.primary.delete(account)?;
+        if let Some(store) = &self.secondary {
             store.delete(account)?;
         }
         Ok(())
@@ -1004,7 +986,7 @@ mod tests {
 
     #[test]
     fn without_a_fallback_an_oversize_secret_is_refused_not_truncated() {
-        let storage = SecretStorage::keychain_only(FakeKeychain::capped());
+        let storage = SecretStorage::single_backend(FakeKeychain::capped());
         let err = storage
             .set("chatgpt", &"x".repeat(4000))
             .expect_err("must refuse");
@@ -1032,12 +1014,39 @@ mod tests {
 
     #[test]
     fn the_database_key_round_trips_through_storage() {
-        let storage = SecretStorage::keychain_only(FakeKeychain::default());
+        let storage = SecretStorage::single_backend(FakeKeychain::default());
         let (key, created) = storage.db_key_or_create().expect("create");
         assert!(created);
         let (again, created_again) = storage.db_key_or_create().expect("load");
         assert!(!created_again);
         assert_eq!(key, again);
+    }
+
+    #[test]
+    fn owner_only_file_storage_round_trips_without_a_platform_credential_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let credentials = dir.path().join("credentials");
+        let storage = SecretStorage::owner_only_plaintext_files(
+            &credentials,
+            OwnerOnlyPlaintext::acknowledge_risk(),
+        );
+        let token = format!("header.{}.signature", "x".repeat(4000));
+
+        storage.set("provider:codex", &token).expect("store");
+        assert_eq!(
+            *storage
+                .get("provider:codex")
+                .expect("read")
+                .expect("present"),
+            token
+        );
+        storage.delete("provider:codex").expect("delete");
+        assert!(
+            storage
+                .get("provider:codex")
+                .expect("read after delete")
+                .is_none()
+        );
     }
 
     #[test]

@@ -3,9 +3,9 @@
 # Cargo runner for development on macOS.
 #
 # A raw Rust executable receives an ad-hoc signature whose identity changes
-# after every link. Keychain correctly treats that as a different application
-# and asks again before returning Aibo's database key or OAuth token. Signing
-# the main executable with the same development certificate and bundle
+# after every link. macOS privacy permissions are keyed to application
+# identity, so Accessibility and screen-capture grants become unreliable.
+# Signing the main executable with the same development certificate and bundle
 # identifier gives it a stable designated requirement instead.
 #
 # Set AIBO_CODESIGN_IDENTITY to a certificate hash or full identity name to
@@ -26,7 +26,7 @@ if [[ "$(/usr/bin/basename "$executable")" == "aibo" ]]; then
     fi
 
     if [[ -z "$identity" ]]; then
-        echo "Aibo needs a stable macOS development signature for Keychain access." >&2
+        echo "Aibo needs a stable macOS development signature for privacy permissions." >&2
         echo "Install an Apple Development certificate or set AIBO_CODESIGN_IDENTITY." >&2
         exit 1
     fi

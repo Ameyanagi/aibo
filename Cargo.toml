@@ -171,7 +171,7 @@ aibo-provider = { workspace = true }
 # The orchestration layer: §4 chain fallback, §5 assembly, §13 offline
 # hysteresis and cancellation, §14 reserve-then-reconcile, §12 persistence.
 aibo-session = { workspace = true }
-# Opening the §12 database and reading credentials out of the OS keychain are
+# Opening the §12 database and reading credential files are
 # both process-entry concerns: they decide what the engine is *built with*.
 aibo-store = { workspace = true }
 aibo-ui = { workspace = true }
@@ -180,7 +180,7 @@ aibo-agent-tools-adapter = { workspace = true }
 
 # `SessionId` is a uuid, and the binary mints one per agent task.
 uuid = { workspace = true }
-# `SecretString`, to hand a keychain-resolved API key to `aibo-session` without
+# `SecretString`, to hand a storage-resolved API key to `aibo-session` without
 # it ever landing in a `String` that could be logged.
 secrecy = { workspace = true }
 
@@ -189,17 +189,14 @@ secrecy = { workspace = true }
 # uses, so this is one implementation, not two.
 arboard = { workspace = true }
 
-# §12's oversize-secret path. `aibo-store`'s `Keychain` writes through
-# `set_password`, which `keyring` UTF-16 doubles — so the 2560-byte Windows cap
-# lands at ~1280 characters and §3a's measured **1652-byte** access token cannot
-# be stored at all. `keyring::Entry::set_secret` writes the raw blob instead,
-# and the binary is where that backend is wired in (see `mod secrets`).
+# Retained for the legacy `aibo-store::Keychain` compatibility backend.
+# Production uses credential files instead.
 keyring = { workspace = true }
-# `aibo_provider::StoredTokens` is `serde`-shaped; the keychain holds one JSON
-# document per token pair.
+# `aibo_provider::StoredTokens` is `serde`-shaped; credential storage holds one
+# JSON document per token pair.
 serde_json = { workspace = true }
 # `aibo_provider::TokenStore` is an `#[async_trait]`, and the binary implements
-# it over the keychain.
+# it over credential files.
 async-trait = { workspace = true }
 # `aibo_store::SecretStore::get` returns `Zeroizing<String>`; implementing the
 # trait means naming the type. Same crate `aibo-store` already uses.

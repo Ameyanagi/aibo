@@ -89,7 +89,7 @@ or disable currency when offline. The "Compute works with no network" claim in
 | Providers | **Full trait abstraction**, hand-written per backend |
 | Model selection | **Auto-routing by task** — deterministic, see §4 |
 | Execution | Built-in Rust tools · WASM sandbox · MCP client · shell/fs with consent · **Codex `app-server`** delegate |
-| Persistence | **Local-only, encrypted, with history** — SQLCipher + OS keychain, zero telemetry |
+| Persistence | **Local-only, with encrypted history** — SQLCipher + credential files, zero telemetry |
 | Distribution | **Paid license, BYOK, closed source** |
 | Platforms | **Both from day one**, every capability behind a trait |
 | Design | **Distinctive cross-platform identity**, dark-first, mono accents, spring motion |
@@ -936,7 +936,7 @@ This table is the real work of the project. Everything else is ordinary Rust.
 | **Secure input mode** | `IsSecureEventInputEnabled()` — password fields, Terminal, and password managers block keystroke synthesis and AX reads. Other apps can leave it stuck **globally**. | password fields behave similarly under UIPI | **High.** Paste-based insert fails silently with no diagnosable cause unless you detect and explain it. |
 | Overlay window | `Level::AlwaysOnTop` → `kCGFloatingWindowLevel` works. A true non-activating `NSPanel` **does not** — winit only ever creates `NSWindow`, and the only known route is ObjC class swizzling (the unsupported `tauri-nspanel` technique). `canJoinAllSpaces` has no winit surface but is settable natively once you hold the `NSWindow`. | **`WS_EX_NOACTIVATE` and a text input are mutually exclusive.** Keyboard input goes to the focus window, which must be active; MSDN's own remedy is `SetForegroundWindow` — i.e. the focus stealing the flag exists to prevent. Use `WS_EX_TOOLWINDOW｜WS_EX_TOPMOST` and accept activation. | **High.** Note the platforms are **not symmetric**: macOS `nonactivatingPanel` genuinely can take key input; Windows cannot. Spike S1. |
 | Vibrancy / blur | `window-vibrancy` 0.8 + `NSVisualEffectView`. **iced's `blur` flag is not vibrancy** — winit calls the private SPI `CGSSetWindowBackgroundBlurRadius` at a hardcoded radius: a plain Gaussian backdrop, no material, no tint, no light/dark adaptation. | `DWMWA_SYSTEMBACKDROP_TYPE`, floor **build 22621** (not 22000). Use `DWMSBT_TRANSIENTWINDOW` (acrylic), not Mica, for a transient palette. Set `DWMWA_USE_IMMERSIVE_DARK_MODE` explicitly — windows default to light regardless of system setting. | Medium. Acrylic *"falls back to a neutral colour when the window deactivates"*, which interacts badly with an always-inactive panel. |
-| Secrets | Keychain via `keyring` 4.1 | Credential Manager / DPAPI | Low. |
+| Secrets | Owner-only credential files (`0700` directory, `0600` files) | DPAPI-encrypted credential files | Low. |
 | Notifications | `notify-rust` 4.18 | same, needs registered AppUserModelID | Low. |
 | Autostart | `SMAppService` login item | Run registry key | Low. |
 
@@ -1107,7 +1107,7 @@ rejects shift/option-only combos (§8).
 | Google Vertex AI | secure | native Gemini | service account → OAuth2 | Regional endpoints, JWT refresh. |
 | AWS Bedrock | secure | `converse-stream` | SigV4 | Per-request signing, region-scoped model ids. |
 | Ollama / llama.cpp | local | OpenAI-compat | none | `Cheap` binding **and the offline story** — see §13. |
-| Codex | **smart only** | Responses SSE against `CHATGPT_CODEX_BASE_URL` | **aibo's own device-code OAuth**, tokens in the keychain, refreshed by aibo | ✅ **S6-verified.** Not eligible for `Fast` — 461 ms TTFT floor and no small model on the allowlist (§3a). Opt-in, health-probed. |
+| Codex | **smart only** | Responses SSE against `CHATGPT_CODEX_BASE_URL` | **aibo's own device-code OAuth**, tokens in credential files, refreshed by aibo | ✅ **S6-verified.** Not eligible for `Fast` — 461 ms TTFT floor and no small model on the allowlist (§3a). Opt-in, health-probed. |
 | Codex (`app-server`) | agent | JSON-RPC over stdio | Codex-owned, independent of the above | `AgentBackend`. |
 | Claude Code CLI | agent | subprocess | CLI-owned | No published protocol crate; adapt to `AgentStep`. |
 
@@ -1208,7 +1208,7 @@ on every scan. The clean resolution is **whole-database encryption**:
   The whole file is encrypted; FTS5 indexes live *inside* it and work normally.
   One key, no per-row crypto, no index/privacy trade-off. **[unverified: confirm
   the vendored-OpenSSL build works on Windows in P0 — that's the risky half.]**
-- Key: 32 random bytes in Keychain / Credential Manager, `PRAGMA key` at open.
+- Key: 32 random bytes in the credential-file store, `PRAGMA key` at open.
 - WAL mode, `synchronous=NORMAL`, **`PRAGMA foreign_keys=ON`** (off by default,
   and the schema below depends on `ON DELETE CASCADE`), in the app-support dir.
 - **Migrations run in a transaction with a file backup taken first**, and roll
@@ -1315,18 +1315,13 @@ CREATE TABLE schema_version (version INTEGER NOT NULL);
 `actions` also backs the per-app routing rules in §4 — same table, same
 evaluation order.
 
-Provider credentials are **not** in this database — they live in the OS keychain,
-one entry per provider, `secrecy` + `zeroize` in memory, with a `Debug` impl
-test asserting redaction.
-
-**Windows Credential Manager caps a secret at 2560 bytes**
-(`CRED_MAX_CREDENTIAL_BLOB_SIZE`), and `keyring` UTF-16-doubles first — so
-`set_password` tops out around **1280 ASCII characters**. A 32-byte database key
-is fine; **a multi-kilobyte OAuth JWT is not**, and OpenAI hit exactly this in
-Codex. Anything token-shaped needs either DPAPI-encrypted file storage or
-chunking across entries. Decide before P1, since it changes the storage
-interface. Note `keyring` 4.x is a facade over `keyring-core` plus per-OS
-backends and the repo has moved — 3.x docs and API examples are stale.
+Provider credentials are **not** in this database or `config.toml` — they live
+in a dedicated credential directory, one atomic file per account, with
+`secrecy` + `zeroize` in memory and a `Debug` impl test asserting redaction.
+macOS relies on owner-only permissions (`0700` directory, `0600` files).
+Windows encrypts every credential file with current-user DPAPI, avoiding
+Credential Manager's 2560-byte cap while keeping multi-kilobyte OAuth tokens in
+one indivisible blob.
 
 ### Key loss
 

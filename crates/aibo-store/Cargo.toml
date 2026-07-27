@@ -1,6 +1,6 @@
 [package]
 name = "aibo-store"
-description = "SQLCipher database, migrations, keychain, history and FTS (§12)."
+description = "SQLCipher database, migrations, credential storage, history and FTS (§12)."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
