@@ -1708,8 +1708,9 @@ mod bootstrap {
 /// Writing the parts of `config.toml` the app owns.
 ///
 /// §12 keeps settings in plaintext TOML and credentials in the keychain, so
-/// what a completed Codex login persists here is exactly two facts — that the
-/// user signed in, and which model they chose — and **never a token**.
+/// what a completed Codex login persists here is non-secret configuration —
+/// whether the user signed in, which model they chose, and an optional public
+/// OAuth client id — and **never a token**.
 ///
 /// This splices a table rather than re-serialising the file. `Config` is
 /// `Deserialize`-only by design (it holds no secrets *because* nothing round
@@ -1721,13 +1722,21 @@ mod config_file {
     use std::path::Path;
 
     /// Rewrite `config.toml`'s `[codex]` table (§3a).
-    pub fn write_codex(path: &Path, enabled: bool, model: &str) -> io::Result<()> {
+    pub fn write_codex(
+        path: &Path,
+        enabled: bool,
+        model: &str,
+        client_id: Option<&str>,
+    ) -> io::Result<()> {
         let existing = match std::fs::read_to_string(path) {
             Ok(s) => s,
             Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
             Err(e) => return Err(e),
         };
-        let body = format!("enabled = {enabled}\nmodel = {}\n", quote(model));
+        let mut body = format!("enabled = {enabled}\nmodel = {}\n", quote(model));
+        if let Some(client_id) = client_id.filter(|value| !value.trim().is_empty()) {
+            body.push_str(&format!("client_id = {}\n", quote(client_id)));
+        }
         let updated = splice_table(&existing, "codex", &body);
         crate::paths::atomic_write(path, updated.as_bytes())
     }
@@ -1857,11 +1866,12 @@ degrade_after = 4
             let _ = std::fs::remove_dir_all(&dir);
             let path = dir.join("config.toml");
 
-            write_codex(&path, true, "gpt-5.5").unwrap();
+            write_codex(&path, true, "gpt-5.5", Some("custom-client")).unwrap();
             let text = std::fs::read_to_string(&path).unwrap();
             let config = aibo_session::Config::from_toml_str(&text).unwrap();
             assert!(config.codex.enabled);
             assert_eq!(config.codex.model, "gpt-5.5");
+            assert_eq!(config.codex.client_id.as_deref(), Some("custom-client"));
 
             for forbidden in ["access_token", "refresh_token", "id_token", "Bearer", "eyJ"] {
                 assert!(
@@ -1871,11 +1881,12 @@ degrade_after = 4
             }
 
             // Signing out flips one flag and leaves the rest alone.
-            write_codex(&path, false, "gpt-5.5").unwrap();
+            write_codex(&path, false, "gpt-5.5", Some("custom-client")).unwrap();
             let config =
                 aibo_session::Config::from_toml_str(&std::fs::read_to_string(&path).unwrap())
                     .unwrap();
             assert!(!config.codex.enabled);
+            assert_eq!(config.codex.client_id.as_deref(), Some("custom-client"));
 
             let _ = std::fs::remove_dir_all(&dir);
         }
@@ -2228,14 +2239,15 @@ mod runtime {
     use aibo_core::traits::PlatformBackend;
     use aibo_core::types::{
         AgentLimits, AgentOutcome, AgentStatus, AgentStep, AgentTask, AppInfo, AppRef,
-        ClipboardItem, ContentOrigin, FieldContext, InsertMode, InsertTarget, PowerEvent,
-        ProviderId, Role, StreamEvent, Surface, UntrustedBlock, Usage,
+        ClipboardItem, ContentOrigin, FieldContext, InsertMode, InsertTarget, ModelBinding,
+        PowerEvent, ProviderId, Role, StreamEvent, Surface, UntrustedBlock, Usage,
     };
     use aibo_session::{
-        AgentEvent, AgentSink, Capture, Engine, EventSink, Outcome, SessionEvent, Submission,
+        AgentEvent, AgentSink, Capture, Config, Engine, EventSink, Outcome, SessionEvent,
+        Submission,
     };
     use aibo_ui::settings::CodexPhase;
-    use aibo_ui::{Lang, SessionId, UiEvent, UiRequest};
+    use aibo_ui::{Lang, ModelOption, SessionId, UiEvent, UiRequest};
     use futures::StreamExt as _;
     use tokio::sync::mpsc::{Receiver, Sender};
     use tokio_util::sync::CancellationToken;
@@ -2457,6 +2469,41 @@ mod runtime {
         }
     }
 
+    fn codex_model_options_event(config: &Config) -> UiEvent {
+        let selected = ModelBinding {
+            provider: ProviderId::CODEX,
+            model: config.codex.model.clone(),
+        };
+        let mut options = aibo_provider::registry::CODEX_MODELS
+            .iter()
+            .map(|model| ModelOption {
+                binding: ModelBinding {
+                    provider: ProviderId::CODEX,
+                    model: model.id.to_owned(),
+                },
+                display_name: model.display_name.to_owned(),
+                latency_ms: Some(model.ttft_p50_ms),
+            })
+            .collect::<Vec<_>>();
+        if !options.iter().any(|option| option.binding == selected) {
+            options.push(ModelOption {
+                binding: selected.clone(),
+                display_name: selected.model.clone(),
+                latency_ms: None,
+            });
+        }
+        UiEvent::ModelOptions {
+            options,
+            selected: Some(selected),
+        }
+    }
+
+    fn model_selection_allowed(config: &Config, binding: &ModelBinding) -> bool {
+        binding.provider == ProviderId::CODEX
+            && (aibo_provider::registry::is_codex_model_allowed(&binding.model)
+                || binding.model == config.codex.model)
+    }
+
     /// The deadline-bounded half of §8's capture, once it has landed.
     struct Captured {
         session: SessionId,
@@ -2619,6 +2666,9 @@ mod runtime {
             {
                 return;
             }
+            if self.events.send(self.model_options_event()).await.is_err() {
+                return;
+            }
             if let Some(language) = self.startup_language
                 && self
                     .events
@@ -2745,6 +2795,8 @@ mod runtime {
                         tracing::warn!(%error, "could not persist UI language");
                     }
                 }
+
+                UiRequest::SetModel { binding } => self.set_model(binding),
 
                 UiRequest::Approve { task, .. } => {
                     tracing::warn!(%task, "approval ignored because no native agent run is active");
@@ -2978,6 +3030,46 @@ mod runtime {
             });
         }
 
+        /// Models exposed by the panel selector.
+        ///
+        /// The shipped Codex catalogue is the authoritative source because
+        /// this endpoint publishes no `/models`. Preserve a configured future
+        /// id as the current option so an upgrade cannot silently rewrite a
+        /// choice merely because this build predates it.
+        fn model_options_event(&self) -> UiEvent {
+            codex_model_options_event(&self.bootstrap.config())
+        }
+
+        fn publish_model_options(&self) {
+            self.emit(self.model_options_event());
+        }
+
+        /// Persist and activate a backend-offered model.
+        ///
+        /// Only Codex is exposed today. The second predicate allows the
+        /// already-configured future id emitted by [`Self::model_options_event`]
+        /// while rejecting arbitrary provider/model pairs injected across the
+        /// UI bridge.
+        fn set_model(&mut self, binding: ModelBinding) {
+            let config = self.bootstrap.config();
+            if !model_selection_allowed(&config, &binding) {
+                tracing::warn!("refused a model selection outside the offered catalogue");
+                return;
+            }
+
+            let path = self.bootstrap.paths().config();
+            if let Err(error) = crate::config_file::write_codex(
+                &path,
+                config.codex.enabled,
+                &binding.model,
+                config.codex.client_id.as_deref(),
+            ) {
+                tracing::warn!(%error, "could not persist the selected model");
+                return;
+            }
+            self.rebuild_engine();
+        }
+
         /// The Providers tab's one Codex action.
         ///
         /// Three meanings, disambiguated by the phase — and the button's label
@@ -3063,7 +3155,12 @@ mod runtime {
             // it is written even if the keychain delete fails — a keychain
             // entry aibo no longer uses is inert, while an `enabled = true`
             // whose token is gone is a provider that 401s on every request.
-            if let Err(error) = crate::config_file::write_codex(&path, false, &model) {
+            if let Err(error) = crate::config_file::write_codex(
+                &path,
+                false,
+                &model,
+                config.codex.client_id.as_deref(),
+            ) {
                 tracing::error!(%error, "could not record the Codex sign-out in the config");
             }
 
@@ -3117,13 +3214,16 @@ mod runtime {
                     self.codex.phase = CodexPhase::SignedIn;
 
                     // §12: the tokens are already in the keychain. What lands
-                    // in the plaintext config is the two facts that are not
-                    // secrets — that Codex is on, and which model it uses.
+                    // in plaintext is non-secret configuration only: Codex is
+                    // on, which model it uses, and any public OAuth client id.
                     let config = self.bootstrap.config();
                     let path = self.bootstrap.paths().config();
-                    if let Err(error) =
-                        crate::config_file::write_codex(&path, true, &config.codex.model)
-                    {
+                    if let Err(error) = crate::config_file::write_codex(
+                        &path,
+                        true,
+                        &config.codex.model,
+                        config.codex.client_id.as_deref(),
+                    ) {
                         tracing::error!(%error, "signed in, but the config could not be written");
                         self.codex.phase = CodexPhase::Failed;
                         self.publish_codex_detail(format!(
@@ -3168,6 +3268,7 @@ mod runtime {
                     self.emit(UiEvent::ProviderHealth { provider, health });
                 }
             }
+            self.publish_model_options();
         }
 
         // -- capture ---------------------------------------------------------
@@ -3960,6 +4061,51 @@ mod runtime {
         /// runs. Every value below that mentions it is a value the product must
         /// never produce.
         const AIBO_PID: i32 = 99;
+
+        #[test]
+        fn popup_model_catalogue_tracks_config_and_rejects_injected_choices() {
+            let config =
+                Config::from_toml_str("[codex]\nenabled = true\nmodel = \"gpt-5.6-terra\"\n")
+                    .unwrap();
+            let UiEvent::ModelOptions { options, selected } = codex_model_options_event(&config)
+            else {
+                panic!("expected model options");
+            };
+            let selected = selected.expect("selected model");
+            assert_eq!(selected.model, "gpt-5.6-terra");
+            assert_eq!(options.len(), 5);
+            assert!(options.iter().all(|option| option.latency_ms.is_some()));
+            assert!(model_selection_allowed(&config, &selected));
+            assert!(!model_selection_allowed(
+                &config,
+                &ModelBinding {
+                    provider: ProviderId::CODEX,
+                    model: "unoffered-model".to_owned(),
+                }
+            ));
+            assert!(!model_selection_allowed(
+                &config,
+                &ModelBinding {
+                    provider: ProviderId::OPENAI,
+                    model: "gpt-5.6-terra".to_owned(),
+                }
+            ));
+        }
+
+        #[test]
+        fn a_configured_future_model_remains_visible_and_selectable() {
+            let config =
+                Config::from_toml_str("[codex]\nenabled = true\nmodel = \"gpt-5.7-future\"\n")
+                    .unwrap();
+            let UiEvent::ModelOptions { options, selected } = codex_model_options_event(&config)
+            else {
+                panic!("expected model options");
+            };
+            let selected = selected.expect("selected model");
+            assert_eq!(options.len(), 6);
+            assert!(options.iter().any(|option| option.binding == selected));
+            assert!(model_selection_allowed(&config, &selected));
+        }
 
         #[test]
         fn agent_context_keeps_ambient_content_tainted() {

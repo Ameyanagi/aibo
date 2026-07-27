@@ -1102,7 +1102,7 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                 Task::none()
             } else {
                 match state.role_for_accessibility_surface(event.surface) {
-                    Some(Role::Panel) => a11y::panel_message(&event.request)
+                    Some(Role::Panel) => a11y::panel_message(&state.panel, &event.request)
                         .map_or_else(Task::none, |message| panel_update(state, message)),
                     Some(Role::Settings) => a11y::settings_message(&state.settings, &event.request)
                         .map_or_else(Task::none, |message| settings_update(state, message)),
@@ -1419,6 +1419,19 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
     match message {
         M::InputChanged(input) => {
             state.panel.input = input;
+            Task::none()
+        }
+
+        M::SelectModel(option) => {
+            // Rebuilding the engine cancels its in-flight request. Keep model
+            // changes available while composing or reviewing an answer, but
+            // never let a dropdown gesture silently terminate a stream.
+            if matches!(state.panel.phase, Phase::Loading | Phase::Streaming) {
+                return Task::none();
+            }
+            state.send(UiRequest::SetModel {
+                binding: option.binding,
+            });
             Task::none()
         }
 
@@ -2116,6 +2129,17 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             Task::none()
         }
 
+        UiEvent::ModelOptions { options, selected } => {
+            state.panel.selected_model = selected.and_then(|binding| {
+                options
+                    .iter()
+                    .find(|option| option.binding == binding)
+                    .cloned()
+            });
+            state.panel.model_options = options;
+            Task::none()
+        }
+
         UiEvent::LanguageChanged { language } => {
             i18n::set_language(language);
             state.settings.language = language;
@@ -2506,7 +2530,9 @@ pub fn run(config: UiConfig, handles: UiHandles) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aibo_core::types::{AppInfo, AppRef, ClipboardKind, FieldContext};
+    use aibo_core::types::{
+        AppInfo, AppRef, ClipboardKind, FieldContext, ModelBinding, ProviderId,
+    };
 
     fn app() -> Aibo {
         let (requests, _rx) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
@@ -2537,6 +2563,49 @@ mod tests {
             display_name: "Chrome".to_owned(),
             is_code_app: false,
         }
+    }
+
+    fn model_option(model: &str) -> crate::bridge::ModelOption {
+        crate::bridge::ModelOption {
+            binding: ModelBinding {
+                provider: ProviderId::CODEX,
+                model: model.to_owned(),
+            },
+            display_name: model.to_owned(),
+            latency_ms: Some(435),
+        }
+    }
+
+    #[test]
+    fn popup_model_selection_uses_the_validated_runtime_request() {
+        let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+        let selected = model_option("gpt-5.6-terra");
+        let _ = backend_update(
+            &mut state,
+            UiEvent::ModelOptions {
+                options: vec![model_option("gpt-5.5"), selected.clone()],
+                selected: Some(selected.binding.clone()),
+            },
+        );
+        assert_eq!(state.panel.selected_model, Some(selected.clone()));
+
+        state.panel.phase = Phase::Idle;
+        let _ = panel_update(&mut state, panel::Message::SelectModel(selected.clone()));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(UiRequest::SetModel { binding }) if binding == selected.binding
+        ));
+
+        state.panel.phase = Phase::Streaming;
+        let _ = panel_update(
+            &mut state,
+            panel::Message::SelectModel(model_option("gpt-5.5")),
+        );
+        assert!(
+            received.try_recv().is_err(),
+            "changing models must not cancel an active response"
+        );
     }
 
     #[test]

@@ -107,6 +107,8 @@ pub enum Key {
     // --- panel: input ----------------------------------------------------
     /// Placeholder in the empty panel input.
     PanelPlaceholder,
+    /// Label for the model selector in the popup panel.
+    PanelModel,
     /// Accessible name for the generated answer surface.
     PanelResponse,
     /// Context chip label when the source app is known: `{}` = app name.
@@ -463,6 +465,7 @@ fn en(key: Key) -> &'static str {
         K::AppName => "aibo",
 
         K::PanelPlaceholder => "Ask, transform, or compute…",
+        K::PanelModel => "Model",
         K::PanelResponse => "Response",
         K::ContextChipFrom => "{}",
         K::ContextChipNone => "No context",
@@ -628,6 +631,7 @@ fn ja(key: Key) -> &'static str {
         K::AppName => "aibo",
 
         K::PanelPlaceholder => "質問・書き換え・計算…",
+        K::PanelModel => "モデル",
         K::PanelResponse => "応答",
         K::ContextChipFrom => "{}",
         K::ContextChipNone => "コンテキストなし",
@@ -898,6 +902,7 @@ mod tests {
             Key::SettingsPermissionAutostart,
             Key::PermissionRestricted,
             Key::PermissionNotApplicable,
+            Key::PanelModel,
             Key::PanelResponse,
             Key::SettingsHistorySetupTitle,
             Key::SettingsHistorySetupBody,

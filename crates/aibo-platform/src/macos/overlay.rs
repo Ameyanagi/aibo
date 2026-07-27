@@ -106,8 +106,20 @@ pub(crate) fn announce_accessibility(message: &str) {
     post_accessibility_announcement(as_any_object(&*application), notification, &user_info);
 }
 
+#[allow(unsafe_code)]
 fn install_backdrop(mtm: MainThreadMarker, host: &NSView) -> BackdropStatus {
-    if host.subviews().iter().any(|view| {
+    // The winit view is backed directly by the renderer's CAMetalLayer.
+    // Installing a visual-effect *subview* on it covers that layer even when
+    // the subview is ordered below every sibling, leaving an otherwise
+    // functional panel as a featureless grey rectangle. Install the effect as
+    // a sibling behind the render view in AppKit's frame view instead.
+    // SAFETY: `host` is a live AppKit view borrowed from the window handle,
+    // and `configure_panel_window` established that this code is running on
+    // the main thread. Reading its retained superview does not mutate either.
+    let Some(frame_view) = (unsafe { host.superview() }) else {
+        return BackdropStatus::Unavailable;
+    };
+    if frame_view.subviews().iter().any(|view| {
         view.identifier()
             .as_deref()
             .is_some_and(|identifier| identifier.to_string() == EFFECT_IDENTIFIER)
@@ -115,7 +127,7 @@ fn install_backdrop(mtm: MainThreadMarker, host: &NSView) -> BackdropStatus {
         return BackdropStatus::Applied;
     }
 
-    let effect = NSVisualEffectView::initWithFrame(mtm.alloc(), host.bounds());
+    let effect = NSVisualEffectView::initWithFrame(mtm.alloc(), host.frame());
     effect.setIdentifier(Some(&NSString::from_str(EFFECT_IDENTIFIER)));
     effect.setMaterial(NSVisualEffectMaterial::HUDWindow);
     effect.setBlendingMode(NSVisualEffectBlendingMode::BehindWindow);
@@ -125,7 +137,7 @@ fn install_backdrop(mtm: MainThreadMarker, host: &NSView) -> BackdropStatus {
     effect.setAutoresizingMask(
         NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
     );
-    host.addSubview_positioned_relativeTo(&effect, NSWindowOrderingMode::Below, None);
+    frame_view.addSubview_positioned_relativeTo(&effect, NSWindowOrderingMode::Below, Some(host));
     BackdropStatus::Applied
 }
 

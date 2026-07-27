@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use aibo_core::AiboError;
 use aibo_core::types::{
-    AgentStep, AppInfo, ClipboardItem, DisplayInfo, FieldContext, Health, Permission,
+    AgentStep, AppInfo, ClipboardItem, DisplayInfo, FieldContext, Health, ModelBinding, Permission,
     PermissionStatus, ProviderId, Role, StreamEvent, Surface, Usage,
 };
 use secrecy::SecretString;
@@ -47,6 +47,29 @@ pub const UI_EVENT_CHANNEL_CAPACITY: usize = 128;
 /// a session it has moved on from. Without this, a slow response from a
 /// cancelled request overwrites a fresh one.
 pub type SessionId = Uuid;
+
+/// One model the runtime permits the panel to select.
+///
+/// The backend, not the renderer, owns this list. That keeps provider-specific
+/// allowlists and configuration validation on the trusted side of the bridge.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelOption {
+    /// Concrete provider/model pair written to configuration.
+    pub binding: ModelBinding,
+    /// Human-readable model name.
+    pub display_name: String,
+    /// Measured first-token latency, when the shipped catalogue has one.
+    pub latency_ms: Option<u32>,
+}
+
+impl std::fmt::Display for ModelOption {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.latency_ms {
+            Some(latency) => write!(f, "{} · {latency} ms", self.display_name),
+            None => f.write_str(&self.display_name),
+        }
+    }
+}
 
 /// Something the UI asks the runtime to do.
 #[derive(Debug, Clone)]
@@ -175,6 +198,12 @@ pub enum UiRequest {
     /// Persist and apply a new UI language.
     SetLanguage(Lang),
 
+    /// Persist and immediately activate a model offered by [`UiEvent::ModelOptions`].
+    SetModel {
+        /// Provider/model pair selected in the panel.
+        binding: ModelBinding,
+    },
+
     /// Begin an orderly shutdown: cancel runs, reap children, close the
     /// database. §6 — child processes must not outlive aibo.
     Quit,
@@ -302,6 +331,15 @@ pub enum UiEvent {
         provider: ProviderId,
         /// Its health.
         health: Health,
+    },
+
+    /// Models the panel may select, plus the currently configured binding.
+    ModelOptions {
+        /// Backend-validated choices.
+        options: Vec<ModelOption>,
+        /// Active choice, including a previously configured future model that
+        /// is not yet part of the shipped catalogue.
+        selected: Option<ModelBinding>,
     },
 
     /// Persisted language loaded after the shell was already brought up.

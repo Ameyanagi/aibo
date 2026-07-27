@@ -26,11 +26,13 @@ use aibo_core::types::{
     Surface, validate_attachments,
 };
 use aibo_core::{AiboError, types::Usage};
-use iced::widget::{Space, column, container, image, row, text, text_editor, text_input};
+use iced::widget::{
+    Space, column, container, image, pick_list, row, text, text_editor, text_input,
+};
 use iced::{Alignment, Element, Length};
 use uuid::Uuid;
 
-use crate::bridge::SessionId;
+use crate::bridge::{ModelOption, SessionId};
 use crate::i18n::{self, Key};
 use crate::theme::{self, Severity, space, type_scale};
 use crate::widgets::{self, Action};
@@ -632,6 +634,10 @@ pub struct PanelState {
     attachments: Vec<Attached>,
     /// What is on the clipboard right now. Ambient; decides nothing.
     pub clipboard: ClipboardOffer,
+    /// Backend-validated models offered by the popup selector.
+    pub model_options: Vec<ModelOption>,
+    /// Model currently persisted in configuration.
+    pub selected_model: Option<ModelOption>,
     /// `↑`/`↓` recall over previous submissions.
     ///
     /// Session-local: §12's `messages` table is the eventual home, but the
@@ -661,6 +667,8 @@ impl PanelState {
             handed_off_to_task: false,
             attachments: Vec::new(),
             clipboard: ClipboardOffer::Unknown,
+            model_options: Vec::new(),
+            selected_model: None,
             // Constructed once at boot, not per session, so recall survives
             // closing and reopening the panel — which is the whole point.
             history: crate::history_ring::HistoryRing::new(),
@@ -675,7 +683,11 @@ impl PanelState {
     /// old response forward is how a rewrite of the wrong text gets pasted.
     pub fn reset(&mut self, session: SessionId) {
         let warm = !matches!(self.phase, Phase::WarmingUp { .. });
+        let model_options = std::mem::take(&mut self.model_options);
+        let selected_model = self.selected_model.take();
         *self = Self::new(session);
+        self.model_options = model_options;
+        self.selected_model = selected_model;
         if warm {
             self.phase = Phase::Idle;
         }
@@ -971,6 +983,8 @@ pub enum Message {
     InputChanged(String),
     /// `⏎` on the input.
     Submit,
+    /// Persist and activate a model chosen in the popup.
+    SelectModel(ModelOption),
     /// Insert the response into the source app.
     Accept,
     /// Copy the response.
@@ -1051,7 +1065,7 @@ pub fn view(state: &PanelState) -> Element<'_, Message> {
 }
 
 fn chip_row(state: &PanelState) -> Element<'_, Message> {
-    match &state.context {
+    let context = match &state.context {
         ContextState::Available { app, excerpt, .. } => widgets::context_chip(
             app.as_ref().map(|a| a.display_name.as_str()),
             excerpt.as_deref(),
@@ -1063,7 +1077,32 @@ fn chip_row(state: &PanelState) -> Element<'_, Message> {
         ContextState::PermissionDenied { .. } | ContextState::ImeActive => {
             widgets::context_chip(None, None)
         }
+    };
+
+    if state.model_options.is_empty() {
+        return context;
     }
+
+    row![
+        context,
+        Space::new().width(Length::Fill),
+        text(i18n::t(Key::PanelModel))
+            .size(type_scale::CHIP)
+            .style(theme::text_dim),
+        pick_list(
+            state.model_options.as_slice(),
+            state.selected_model.as_ref(),
+            Message::SelectModel,
+        )
+        .placeholder(i18n::t(Key::PanelModel))
+        .width(Length::Fixed(230.0))
+        .text_size(type_scale::CHIP)
+        .font(theme::MONO_FONT)
+        .padding([space(1.5), space(2.0)]),
+    ]
+    .spacing(space(1.5))
+    .align_y(Alignment::Center)
+    .into()
 }
 
 /// The row of attachment chips, or `None` when nothing is attached.
@@ -1530,6 +1569,17 @@ mod tests {
         }
     }
 
+    fn model_option(model: &str) -> ModelOption {
+        ModelOption {
+            binding: ModelBinding {
+                provider: ProviderId::CODEX,
+                model: model.to_owned(),
+            },
+            display_name: model.to_owned(),
+            latency_ms: Some(435),
+        }
+    }
+
     #[test]
     fn a_partial_response_is_never_acceptable() {
         let mut state = panel();
@@ -1721,6 +1771,20 @@ mod tests {
         assert_eq!(state.session, SessionId::from_u128(2));
         // Already warm: it must not warm up again, which would flash a frame.
         assert_eq!(state.phase, Phase::Idle);
+    }
+
+    #[test]
+    fn reset_preserves_the_users_model_selection() {
+        let mut state = panel();
+        let selected = model_option("gpt-5.6-terra");
+        state.model_options = vec![model_option("gpt-5.5"), selected.clone()];
+        state.selected_model = Some(selected.clone());
+
+        state.reset(SessionId::from_u128(2));
+
+        assert_eq!(state.selected_model, Some(selected));
+        assert_eq!(state.model_options.len(), 2);
+        let _ = view(&state);
     }
 
     // -----------------------------------------------------------------------

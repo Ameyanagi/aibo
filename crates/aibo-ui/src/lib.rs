@@ -60,7 +60,7 @@ pub mod tray;
 pub mod widgets;
 
 pub use app::{Message, UiConfig, UiHandles, run};
-pub use bridge::{SessionId, UiEvent, UiRequest};
+pub use bridge::{ModelOption, SessionId, UiEvent, UiRequest};
 pub use error::{Result, UiError};
 pub use i18n::Lang;
 pub use theme::Appearance;

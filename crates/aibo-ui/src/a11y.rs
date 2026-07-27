@@ -42,6 +42,7 @@ const SETTINGS_LANGUAGE_BASE: u64 = 120;
 
 const PANEL_INPUT: NodeId = NodeId(1_001);
 const PANEL_RESPONSE: NodeId = NodeId(1_002);
+const PANEL_MODEL: NodeId = NodeId(1_003);
 const PANEL_ACCEPT: NodeId = NodeId(1_010);
 const PANEL_COPY: NodeId = NodeId(1_011);
 const PANEL_DISMISS: NodeId = NodeId(1_012);
@@ -433,6 +434,29 @@ pub fn panel_tree(state: &PanelState, size: (f32, f32), scale: f32, focus: NodeI
     );
     root.set_transform(Affine::scale(f64::from(scale.max(0.5))));
 
+    if !state.model_options.is_empty() {
+        let mut model = semantic_node(
+            Role::ComboBox,
+            i18n::t(Key::PanelModel),
+            logical_rect(f64::from(width) - 246.0, 8.0, 230.0, 40.0),
+        );
+        if let Some(selected) = &state.selected_model {
+            model.set_value(selected.to_string());
+        }
+        model.set_description(
+            state
+                .model_options
+                .iter()
+                .map(|option| option.display_name.as_str())
+                .collect::<Vec<_>>()
+                .join(", "),
+        );
+        model.add_action(Action::Focus);
+        model.add_action(Action::SetValue);
+        nodes.push((PANEL_MODEL, model));
+        children.insert(0, PANEL_MODEL);
+    }
+
     let mut input = semantic_node(
         Role::TextInput,
         i18n::t(Key::PanelPlaceholder),
@@ -677,9 +701,22 @@ pub fn settings_message(
 }
 
 /// Translate a native panel action to the ordinary panel message path.
-pub fn panel_message(request: &ActionRequest) -> Option<panel::Message> {
+pub fn panel_message(state: &PanelState, request: &ActionRequest) -> Option<panel::Message> {
     match (request.target_node, request.action) {
         (PANEL_INPUT, Action::SetValue) => action_value(request).map(panel::Message::InputChanged),
+        (PANEL_MODEL, Action::SetValue) => {
+            let value = action_value(request)?;
+            state
+                .model_options
+                .iter()
+                .find(|option| {
+                    option.binding.model == value
+                        || option.display_name == value
+                        || option.to_string() == value
+                })
+                .cloned()
+                .map(panel::Message::SelectModel)
+        }
         (PANEL_ACCEPT, Action::Click) => Some(panel::Message::Accept),
         (PANEL_COPY, Action::Click) => Some(panel::Message::Copy),
         (PANEL_DISMISS, Action::Click) => Some(panel::Message::Dismiss),
@@ -893,8 +930,41 @@ mod tests {
         let mut request = request(PANEL_INPUT, Action::SetValue);
         request.data = Some(ActionData::Value("ユーザーの指示".into()));
         assert!(matches!(
-            panel_message(&request),
+            panel_message(&PanelState::new(uuid::Uuid::from_u128(1)), &request),
             Some(panel::Message::InputChanged(value)) if value == "ユーザーの指示"
         ));
+    }
+
+    #[test]
+    fn native_model_values_are_limited_to_offered_choices() {
+        let mut state = PanelState::new(uuid::Uuid::from_u128(1));
+        let option = crate::bridge::ModelOption {
+            binding: aibo_core::types::ModelBinding {
+                provider: ProviderId::CODEX,
+                model: "gpt-5.6-terra".to_owned(),
+            },
+            display_name: "GPT-5.6 Terra".to_owned(),
+            latency_ms: Some(446),
+        };
+        state.model_options.push(option.clone());
+        state.selected_model = Some(option.clone());
+
+        let tree = panel_tree(&state, (680.0, 240.0), 1.0, PANEL_MODEL);
+        assert!(tree.nodes.iter().any(|(id, node)| {
+            *id == PANEL_MODEL
+                && node.role() == Role::ComboBox
+                && node.value() == Some(option.to_string().as_str())
+        }));
+
+        let mut accepted = request(PANEL_MODEL, Action::SetValue);
+        accepted.data = Some(ActionData::Value("gpt-5.6-terra".into()));
+        assert!(matches!(
+            panel_message(&state, &accepted),
+            Some(panel::Message::SelectModel(selected)) if selected == option
+        ));
+
+        let mut refused = request(PANEL_MODEL, Action::SetValue);
+        refused.data = Some(ActionData::Value("unoffered-model".into()));
+        assert!(panel_message(&state, &refused).is_none());
     }
 }
