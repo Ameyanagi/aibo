@@ -2462,16 +2462,16 @@ mod tests {
         );
     }
 
-    /// Raycast holding `⌥Space` is invisible in every preference file; it shows
-    /// up only as a refused registration, and it must be classified rather than
-    /// reported as a raw string.
+    /// Another app holding an otherwise unreserved shortcut is invisible in
+    /// every preference file; it shows up only as a refused registration, and
+    /// it must be classified rather than reported as a raw string.
     #[test]
     fn another_app_holding_the_combination_is_found_by_the_probe() {
-        let map = measured_japanese_mac();
-        let raycast = combo(Modifiers::ALT, Code::Space);
-        let registrar = FakeRegistrar::refusing(&[raycast]);
+        let map = SymbolicHotkeyMap::empty();
+        let held = combo(Modifiers::CONTROL | Modifiers::SHIFT, Code::KeyK);
+        let registrar = FakeRegistrar::refusing(&[held]);
 
-        let report = check_candidate(&map, &registrar, raycast);
+        let report = check_candidate(&map, &registrar, held);
         assert!(!report.is_free());
         assert_eq!(
             report.conflict,
