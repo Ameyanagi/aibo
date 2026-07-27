@@ -49,10 +49,22 @@ const CF_LOCALE: u32 = 16;
 /// restore would silently downgrade the user's clipboard (§12).
 const RESTORABLE_FORMATS: [u32; 4] = [CF_UNICODETEXT, CF_TEXT, CF_OEMTEXT, CF_LOCALE];
 
+/// Maximum clipboard operations waiting behind the in-flight operation.
+///
+/// Normal insert/capture traffic has at most a save, write, and restore in
+/// sequence. Eight slots tolerate several concurrent callers while bounding
+/// retained clipboard text if the global clipboard lock stalls the worker.
+const CLIPBOARD_QUEUE_CAPACITY: usize = 8;
+
 /// What the worker was asked to do.
 enum ClipOp {
     /// Read the current contents, with hygiene flags.
-    Read(oneshot::Sender<WinResult<ClipboardItem>>),
+    Read {
+        /// The focused executable is a password manager. This is decided
+        /// before the worker touches payload bytes.
+        conceal_source: bool,
+        reply: oneshot::Sender<WinResult<ClipboardItem>>,
+    },
     /// Write text; replies with the resulting sequence number so the caller can
     /// later prove nothing else has written since.
     Write {
@@ -76,13 +88,13 @@ struct ClipJob {
 /// Handle to the clipboard worker thread.
 #[derive(Debug, Clone)]
 pub(crate) struct ClipboardHandle {
-    tx: mpsc::UnboundedSender<ClipJob>,
+    tx: mpsc::Sender<ClipJob>,
 }
 
 impl ClipboardHandle {
     /// Start the worker.
     pub(crate) fn spawn() -> WinResult<Self> {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(CLIPBOARD_QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("aibo-win-clipboard".into())
             .spawn(move || worker(rx))
@@ -93,15 +105,31 @@ impl ClipboardHandle {
     }
 
     fn submit(&self, deadline: Instant, op: ClipOp) -> WinResult<()> {
-        self.tx
-            .send(ClipJob { deadline, op })
-            .map_err(|_| WindowsPlatformError::ClipboardThreadGone)
+        match self.tx.try_send(ClipJob { deadline, op }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(WindowsPlatformError::WorkerBusy {
+                worker: "clipboard",
+            }),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                Err(WindowsPlatformError::ClipboardThreadGone)
+            }
+        }
     }
 
     /// Read the clipboard.
-    pub(crate) async fn read(&self, deadline: Instant) -> WinResult<ClipboardItem> {
+    pub(crate) async fn read(
+        &self,
+        deadline: Instant,
+        conceal_source: bool,
+    ) -> WinResult<ClipboardItem> {
         let (reply, rx) = oneshot::channel();
-        self.submit(deadline, ClipOp::Read(reply))?;
+        self.submit(
+            deadline,
+            ClipOp::Read {
+                conceal_source,
+                reply,
+            },
+        )?;
         rx.await
             .map_err(|_| WindowsPlatformError::ClipboardThreadGone)?
     }
@@ -142,7 +170,7 @@ impl ClipboardHandle {
     }
 }
 
-fn worker(mut rx: mpsc::UnboundedReceiver<ClipJob>) {
+fn worker(mut rx: mpsc::Receiver<ClipJob>) {
     while let Some(job) = rx.blocking_recv() {
         // The caller has already given up; doing the work would only take the
         // global clipboard lock for nothing.
@@ -151,8 +179,11 @@ fn worker(mut rx: mpsc::UnboundedReceiver<ClipJob>) {
             continue;
         }
         match job.op {
-            ClipOp::Read(reply) => {
-                let _ = reply.send(read_now());
+            ClipOp::Read {
+                conceal_source,
+                reply,
+            } => {
+                let _ = reply.send(read_now(conceal_source));
             }
             ClipOp::Write { text, reply } => {
                 let _ = reply.send(write_now(&text).map(|()| ClipboardHandle::sequence()));
@@ -189,11 +220,16 @@ fn write_now(text: &str) -> WinResult<()> {
         .map_err(|e| WindowsPlatformError::Clipboard(format!("set text: {e}")))
 }
 
-fn read_now() -> WinResult<ClipboardItem> {
+fn read_now(conceal_source: bool) -> WinResult<ClipboardItem> {
     let sequence = ClipboardHandle::sequence();
-    let hygiene = read_hygiene();
+    let mut hygiene = read_hygiene();
+    hygiene.concealed |= conceal_source;
 
-    let files = read_files();
+    let files = if hygiene.concealed {
+        Vec::new()
+    } else {
+        read_files()
+    };
     let text = if hygiene.concealed {
         // §12: concealed items are never recorded and never sent. Not read at
         // all, so there is nothing to leak into a log or a prompt.
@@ -340,4 +376,48 @@ fn read_files() -> Vec<std::path::PathBuf> {
         let _ = CloseClipboard();
     }
     out
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    fn read_op() -> ClipOp {
+        let (reply, _reply_rx) = oneshot::channel();
+        ClipOp::Read {
+            conceal_source: false,
+            reply,
+        }
+    }
+
+    #[test]
+    fn saturated_queue_fails_immediately_with_sanitized_error() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = ClipboardHandle { tx };
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+
+        handle.submit(deadline, read_op()).unwrap();
+        let error = handle.submit(deadline, read_op()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            WindowsPlatformError::WorkerBusy {
+                worker: "clipboard"
+            }
+        ));
+        assert_eq!(error.to_string(), "the clipboard worker queue is busy");
+        assert!(rx.try_recv().is_ok(), "the first queued job is preserved");
+    }
+
+    #[test]
+    fn closed_queue_reports_the_dead_worker() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let handle = ClipboardHandle { tx };
+
+        assert!(matches!(
+            handle.submit(Instant::now(), read_op()),
+            Err(WindowsPlatformError::ClipboardThreadGone)
+        ));
+    }
 }

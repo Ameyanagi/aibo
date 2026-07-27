@@ -28,6 +28,7 @@
 //! iced's own tray-icon integration PR is still open and unmerged (§6), so the
 //! event plumbing below is integration work rather than a drop-in.
 
+use std::collections::HashSet;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
@@ -35,9 +36,12 @@ use aibo_core::types::{DisplayInfo, StreamEvent};
 use iced::widget::operation;
 use iced::window::{self, Mode};
 use iced::{Element, Point, Size, Subscription, Task, Theme};
-use tokio::sync::mpsc::{UnboundedReceiver, UnboundedSender};
+use secrecy::ExposeSecret as _;
+use tokio::sync::mpsc::{Receiver, Sender, error::TrySendError};
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::bridge::UI_REQUEST_CHANNEL_CAPACITY;
 use crate::bridge::{SessionId, UiEvent, UiRequest};
 use crate::error::{Result, UiError};
 use crate::hotkey::{self, HotkeyAction, HotkeyStatus, Hotkeys};
@@ -80,11 +84,11 @@ impl Default for UiConfig {
 
 /// The two ends of the §6 bridge, handed to [`run`] by the binary.
 pub struct UiHandles {
-    /// UI → tokio. Unbounded: the UI thread must never block on a full queue,
-    /// and the message rate is bounded by human input.
-    pub requests: UnboundedSender<UiRequest>,
-    /// tokio → UI. Drained by a `Subscription`.
-    pub events: UnboundedReceiver<UiEvent>,
+    /// UI → tokio. Human-scale and bounded, with capacity reserved for
+    /// cancellation and lifecycle signals so the UI thread never blocks.
+    pub requests: Sender<UiRequest>,
+    /// tokio → UI. Bounded and drained by a `Subscription`.
+    pub events: Receiver<UiEvent>,
 }
 
 // ---------------------------------------------------------------------------
@@ -94,12 +98,25 @@ pub struct UiHandles {
 /// `Subscription::run` takes a bare `fn` pointer, so the receivers cannot be
 /// captured in a closure — they are parked here and taken exactly once by the
 /// subscription that owns them.
-static BACKEND_EVENTS: Mutex<Option<UnboundedReceiver<UiEvent>>> = Mutex::new(None);
-static SHELL_EVENTS: Mutex<Option<UnboundedReceiver<ShellEvent>>> = Mutex::new(None);
+static BACKEND_EVENTS: Mutex<Option<Receiver<UiEvent>>> = Mutex::new(None);
+static SHELL_EVENTS: Mutex<Option<Receiver<ShellEvent>>> = Mutex::new(None);
 
 /// The sender half of the shell channel, held for the process lifetime because
 /// `global-hotkey` and `tray-icon` install *global* handlers.
-static SHELL_SENDER: OnceLock<UnboundedSender<ShellEvent>> = OnceLock::new();
+static SHELL_SENDER: OnceLock<Sender<ShellEvent>> = OnceLock::new();
+
+/// Shell events are human/OS lifecycle signals, not model output. A modest
+/// bounded queue absorbs normal bursts and coalesces overload by dropping only
+/// events that arrive after the queue is already full.
+const SHELL_EVENT_CHANNEL_CAPACITY: usize = 32;
+/// A tray Quit must remain deliverable even if a hotkey source is noisy.
+const SHELL_EVENT_CRITICAL_RESERVE: usize = 1;
+
+/// Keep a tail of the UI request queue available for actions whose loss could
+/// leave work running or an approval unresolved. Ordinary clicks are declined
+/// before they can consume these slots; the queue itself remains the sole
+/// backlog, so overload cannot create an unbounded collection of retry tasks.
+const UI_REQUEST_CRITICAL_RESERVE: usize = 8;
 
 /// §6 requires single-instance behaviour across the machine; this only guards
 /// the far cheaper in-process case, which the global handlers make unavoidable.
@@ -112,6 +129,24 @@ enum ShellEvent {
     Hotkey(u32),
     /// A tray menu item was chosen.
     Tray(TrayCommand),
+}
+
+fn send_shell_event(sender: &Sender<ShellEvent>, event: ShellEvent) {
+    let critical = matches!(event, ShellEvent::Tray(TrayCommand::Quit));
+    if !critical && sender.capacity() <= SHELL_EVENT_CRITICAL_RESERVE {
+        tracing::debug!("shell queue busy; duplicate human input coalesced");
+        return;
+    }
+
+    match sender.try_send(event) {
+        Ok(()) => {}
+        Err(TrySendError::Closed(_)) => {
+            tracing::debug!("shell channel closed; event ignored");
+        }
+        Err(TrySendError::Full(event)) => {
+            tracing::warn!(critical, ?event, "shell event queue saturated");
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -153,6 +188,13 @@ pub enum Message {
     },
     /// Attached displays changed; re-clamp (§9).
     Displays(Vec<DisplayInfo>),
+    /// A keyboard action plus the window that received it (§16).
+    ///
+    /// The id is load-bearing in a multi-window daemon: `esc` in a task must
+    /// deny/close that task, never cancel a hidden panel session.
+    WindowKey(window::Id, WindowChord),
+    /// Whether this window currently holds non-empty IME preedit text.
+    ImePreedit(window::Id, bool),
     /// A message from the panel.
     Panel(panel::Message),
     /// A message from a task window.
@@ -163,6 +205,36 @@ pub enum Message {
     Backend(Box<UiEvent>),
     /// Nothing. Returned where a branch has no work, so `update` stays total.
     Ignored,
+}
+
+/// A keyboard action routed using the window that received it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WindowChord {
+    /// Dismiss the current transient state or window.
+    Escape,
+    /// Activate the state-dependent default action.
+    Enter {
+        /// Command/Control was held.
+        command: bool,
+        /// Shift was held.
+        shift: bool,
+    },
+    /// Copy the current surface's content.
+    Copy,
+    /// Retry the current panel request.
+    Retry,
+    /// Bring an agent task forward.
+    ShowTask,
+    /// Cancel an agent task.
+    CancelTask,
+    /// Recall an older panel instruction.
+    HistoryOlder,
+    /// Recall a newer panel instruction.
+    HistoryNewer,
+    /// [`panel::ATTACH_KEY`] — attach the image on the clipboard.
+    Attach,
+    /// [`panel::DETACH_KEY`] — remove the most recent attachment.
+    DetachLast,
 }
 
 // ---------------------------------------------------------------------------
@@ -184,7 +256,7 @@ enum Role {
 /// imposes no `Send` bound on `State`.
 pub struct Aibo {
     config: UiConfig,
-    requests: UnboundedSender<UiRequest>,
+    requests: Sender<UiRequest>,
 
     /// The pre-created hidden panel window (§6).
     panel_window: window::Id,
@@ -224,6 +296,10 @@ pub struct Aibo {
     displays: Vec<DisplayInfo>,
     /// Set once the first `update` tick has run the shell wiring.
     shell_started: bool,
+    /// The backend receives [`UiRequest::UiReady`] once the warm panel exists.
+    ui_ready_sent: bool,
+    /// Windows with an active uncommitted composition.
+    ime_preedit: HashSet<window::Id>,
 }
 
 impl std::fmt::Debug for Aibo {
@@ -234,6 +310,18 @@ impl std::fmt::Debug for Aibo {
             .field("hotkey_status", &self.hotkey_status)
             .finish_non_exhaustive()
     }
+}
+
+/// Requests that must still have room after ordinary UI input is throttled.
+fn is_critical_request(request: &UiRequest) -> bool {
+    matches!(
+        request,
+        UiRequest::Cancel { .. }
+            | UiRequest::DiscardSession { .. }
+            | UiRequest::Approve { .. }
+            | UiRequest::CancelTask { .. }
+            | UiRequest::Quit
+    )
 }
 
 impl Aibo {
@@ -251,11 +339,27 @@ impl Aibo {
     }
 
     fn send(&self, request: UiRequest) {
-        // A closed channel means the runtime is already shutting down. Nothing
-        // useful can be done about it from a view callback, so it is logged and
-        // dropped rather than propagated into `update`.
-        if self.requests.send(request).is_err() {
-            tracing::warn!("runtime channel closed; request dropped");
+        let critical = is_critical_request(&request);
+        if !critical && self.requests.capacity() <= UI_REQUEST_CRITICAL_RESERVE {
+            tracing::debug!("runtime queue busy; noncritical request coalesced");
+            return;
+        }
+
+        match self.requests.try_send(request) {
+            Ok(()) => {}
+            Err(TrySendError::Closed(_)) => {
+                // A closed channel means the runtime is already shutting down.
+                tracing::warn!("runtime channel closed; request dropped");
+            }
+            Err(TrySendError::Full(_)) => {
+                // Critical requests may consume the reserved tail, but there
+                // is deliberately no second, hidden overflow queue. Reaching
+                // this branch requires the reserve itself to be saturated.
+                tracing::warn!(
+                    critical,
+                    "runtime request queue saturated; request coalesced"
+                );
+            }
         }
     }
 
@@ -265,11 +369,14 @@ impl Aibo {
     /// `send` fires the instant it is called, which is fine for requests with
     /// no ordering constraint. `Insert` has one — §8 requires the panel to be
     /// hidden first — and only `chain` can express it.
-    fn deferred_send(&self, request: UiRequest) -> Task<Message> {
+    fn deferred_send(&self, pending: Vec<UiRequest>) -> Task<Message> {
         let requests = self.requests.clone();
         Task::future(async move {
-            if requests.send(request).is_err() {
-                tracing::warn!("runtime channel closed; request dropped");
+            for request in pending {
+                if requests.send(request).await.is_err() {
+                    tracing::warn!("runtime channel closed; request dropped");
+                    break;
+                }
             }
             Message::Ignored
         })
@@ -291,6 +398,13 @@ impl Aibo {
 
         #[cfg(not(test))]
         self.start_shell_inner();
+    }
+
+    fn notify_ui_ready(&mut self) {
+        if !self.ui_ready_sent {
+            self.send(UiRequest::UiReady);
+            self.ui_ready_sent = true;
+        }
     }
 
     /// The real shell wiring. Split out only so [`Aibo::start_shell`] can skip
@@ -369,6 +483,7 @@ impl Aibo {
         window::resize(self.panel_window, size)
             .chain(window::move_to(self.panel_window, position))
             .chain(window::set_mode(self.panel_window, Mode::Windowed))
+            .chain(configure_or_present_panel(self.panel_window, false))
             .chain(window::gain_focus(self.panel_window))
             .chain(operation::focus(panel::INPUT_ID))
     }
@@ -423,11 +538,15 @@ impl Aibo {
     /// **agent run** does not interrupt — the run continues in its task window
     /// and a fresh panel opens.
     fn open_panel(&mut self) -> Task<Message> {
+        let old_session = self.panel.session;
         if matches!(self.panel.phase, Phase::Loading | Phase::Streaming) {
             self.send(UiRequest::Cancel {
-                session: self.panel.session,
+                session: old_session,
             });
         }
+        self.send(UiRequest::DiscardSession {
+            session: old_session,
+        });
 
         let session: SessionId = Uuid::now_v7();
         self.panel.reset(session);
@@ -451,20 +570,25 @@ impl Aibo {
         }
     }
 
-    fn task_window_for(&self, id: Uuid) -> Option<window::Id> {
-        self.tasks
-            .iter()
-            .find(|(_, task)| task.id == id)
-            .map(|(window_id, _)| *window_id)
-    }
-
     fn refresh_tray(&mut self) {
         let Some(tray) = self.tray.as_mut() else {
             return;
         };
-        let state = if self.tasks.iter().any(|(_, t)| t.is_blocked()) {
+        let state = if self
+            .tasks
+            .iter()
+            .map(|(_, task)| task)
+            .chain(self.pending_tasks.iter())
+            .any(TaskState::is_blocked)
+        {
             TrayState::Attention
-        } else if self.tasks.iter().any(|(_, t)| t.is_running()) {
+        } else if self
+            .tasks
+            .iter()
+            .map(|(_, task)| task)
+            .chain(self.pending_tasks.iter())
+            .any(TaskState::is_running)
+        {
             TrayState::Busy
         } else {
             TrayState::Idle
@@ -511,15 +635,9 @@ fn panel_window_settings() -> window::Settings {
 
 #[cfg(target_os = "macos")]
 fn panel_platform_settings() -> window::settings::PlatformSpecific {
-    // SPIKE: S1 — three panel behaviours need the native `NSWindow` handle,
-    // which iced 0.14 does not expose directly:
-    //   * joining **all Spaces**, or the panel appears on the wrong desktop
-    //     when the user is in a fullscreen app (§9);
-    //   * `NSWindowStyleMaskNonactivatingPanel`, so showing the panel does not
-    //     steal activation from the app being edited (§8);
-    //   * `window-vibrancy` for the backdrop, which takes a
-    //     `raw-window-handle` 0.6 handle — the version iced 0.14 and
-    //     window-vibrancy 0.8 happen to agree on (§20).
+    // All-Spaces, fullscreen-auxiliary, non-activating presentation and HUD
+    // vibrancy are applied after `WindowOpened` through aibo-platform's native
+    // handle boundary. Nothing macOS-specific remains for iced to express.
     window::settings::PlatformSpecific::default()
 }
 
@@ -530,10 +648,9 @@ fn panel_platform_settings() -> window::settings::PlatformSpecific {
         window::settings::PlatformSpecific {
             // A hotkey overlay has no business in the taskbar or Alt-Tab.
             skip_taskbar: true,
-            // SPIKE: S1 — `WS_EX_NOACTIVATE` (so the panel does not steal focus
-            // from the app being edited, §8) and Per-Monitor-V2 DPI awareness
-            // in the manifest (§9) are both outside what
-            // `window::Settings` can express and need the raw `HWND`.
+            // Acrylic and non-activating presentation are applied after
+            // `WindowOpened` through aibo-platform. Per-Monitor-V2 DPI
+            // awareness is configured before the first window is created.
             ..Default::default()
         }
     }
@@ -568,7 +685,7 @@ fn settings_window_settings() -> window::Settings {
 // boot / update / view / subscription
 // ---------------------------------------------------------------------------
 
-fn boot(config: UiConfig, requests: UnboundedSender<UiRequest>) -> (Aibo, Task<Message>) {
+fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) {
     i18n::set_language(config.language);
 
     // §6: pre-create the panel hidden. This is the only window opened at boot;
@@ -593,6 +710,8 @@ fn boot(config: UiConfig, requests: UnboundedSender<UiRequest>) -> (Aibo, Task<M
         hotkey_status: None,
         displays: Vec::new(),
         shell_started: false,
+        ui_ready_sent: false,
+        ime_preedit: HashSet::new(),
     };
 
     (
@@ -635,26 +754,54 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
             if id == state.panel_window {
                 // The hidden window is now real: paint the throwaway frames…
                 state.panel.phase = Phase::WarmingUp { frames_left: 2 };
+                state.notify_ui_ready();
                 // …and ask where it is. §9's geometry is warmed up alongside
                 // the wgpu pipelines so the first hotkey has something to place
                 // against and never has to wait for a round trip.
-                probe_geometry(state.panel_window)
+                configure_or_present_panel(state.panel_window, true)
+                    .chain(probe_geometry(state.panel_window))
+            } else if matches!(state.role_of(id), Some(Role::Task(_))) {
+                let focus = window::gain_focus(id);
+                let needs_confirmation = state
+                    .tasks
+                    .iter()
+                    .find(|(window, _)| *window == id)
+                    .and_then(|(_, task)| task.pending_approval.as_ref())
+                    .is_some_and(|approval| approval.requires_typed_confirmation);
+                if needs_confirmation {
+                    focus.chain(operation::focus(task_window::CONFIRMATION_ID))
+                } else {
+                    focus
+                }
             } else {
                 Task::none()
             }
         }
 
         Message::WindowClosed(id) => {
+            state.ime_preedit.remove(&id);
             match state.role_of(id) {
                 // §6: the panel is never destroyed, only hidden. If the OS
                 // closed it anyway, the warm surface is gone and the next show
                 // will be slow — worth knowing about.
                 Some(Role::Panel) => tracing::warn!("the panel window was closed"),
-                Some(Role::Settings) => state.settings_window = None,
+                Some(Role::Settings) => {
+                    state.settings_window = None;
+                    // A newly generated history recovery code is a one-time
+                    // setup disclosure, not a value retained for later visits.
+                    state.settings.recovery_code = None;
+                }
                 Some(Role::Task(task_id)) => {
-                    // Closing the window does not cancel the run (§6); the run
-                    // continues and the tray keeps indicating activity.
-                    state.tasks.retain(|(_, task)| task.id != task_id);
+                    // A running task outlives its window. Retain its scrollback
+                    // and any pending approval so the tray or panel can recreate
+                    // the window later. Terminal tasks are genuinely dismissed.
+                    if let Some(index) = state.tasks.iter().position(|(_, task)| task.id == task_id)
+                    {
+                        let (_, task) = state.tasks.remove(index);
+                        if task.is_running() {
+                            state.pending_tasks.push(task);
+                        }
+                    }
                     state.refresh_tray();
                 }
                 None => {}
@@ -680,9 +827,7 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
             match action {
                 Some(HotkeyAction::TogglePanel) => {
                     if state.panel_visible {
-                        state.send(UiRequest::Cancel {
-                            session: state.panel.session,
-                        });
+                        discard_panel_session(state, true);
                         state.hide_panel()
                     } else {
                         state.open_panel()
@@ -753,6 +898,17 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
             }
         }
 
+        Message::WindowKey(id, chord) => window_shortcut(state, id, chord),
+
+        Message::ImePreedit(id, active) => {
+            if active {
+                state.ime_preedit.insert(id);
+            } else {
+                state.ime_preedit.remove(&id);
+            }
+            Task::none()
+        }
+
         Message::Panel(message) => panel_update(state, message),
         Message::Task(id, message) => task_update(state, id, message),
         Message::Settings(message) => settings_update(state, message),
@@ -777,13 +933,42 @@ fn probe_geometry(window: window::Id) -> Task<Message> {
 }
 
 fn focus_first_task(state: &mut Aibo) -> Task<Message> {
-    match state.tasks.first() {
-        Some((id, _)) => Task::batch([
-            window::set_mode(*id, Mode::Windowed),
-            window::gain_focus(*id),
-        ]),
-        None => Task::none(),
+    let task = state
+        .tasks
+        .iter()
+        .map(|(_, task)| task)
+        .chain(state.pending_tasks.iter())
+        .find(|task| task.is_blocked())
+        .or_else(|| {
+            state
+                .tasks
+                .first()
+                .map(|(_, task)| task)
+                .or_else(|| state.pending_tasks.first())
+        })
+        .map(|task| task.id);
+    task.map_or_else(Task::none, |task| focus_task(state, task))
+}
+
+fn focus_task(state: &mut Aibo, task: Uuid) -> Task<Message> {
+    if let Some((window_id, _)) = state.tasks.iter().find(|(_, state)| state.id == task) {
+        return Task::batch([
+            window::set_mode(*window_id, Mode::Windowed),
+            window::gain_focus(*window_id),
+        ]);
     }
+
+    let Some(index) = state
+        .pending_tasks
+        .iter()
+        .position(|state| state.id == task)
+    else {
+        return Task::none();
+    };
+    let task = state.pending_tasks.remove(index);
+    let (window_id, opened) = window::open(task_window_settings());
+    state.tasks.push((window_id, task));
+    opened.map(Message::WindowOpened)
 }
 
 fn open_settings(state: &mut Aibo) -> Task<Message> {
@@ -793,6 +978,102 @@ fn open_settings(state: &mut Aibo) -> Task<Message> {
     let (id, opened) = window::open(settings_window_settings());
     state.settings_window = Some(id);
     opened.map(Message::WindowOpened)
+}
+
+fn discard_panel_session(state: &Aibo, cancel: bool) {
+    let session = state.panel.session;
+    if cancel {
+        state.send(UiRequest::Cancel { session });
+    }
+    state.send(UiRequest::DiscardSession { session });
+}
+
+fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> Task<Message> {
+    match state.role_of(window) {
+        Some(Role::Panel) if state.panel_visible => {
+            let message = match chord {
+                WindowChord::Escape if state.panel.toast.is_some() => panel::Message::DismissToast,
+                WindowChord::Escape => panel::Message::Dismiss,
+                WindowChord::Enter { command: true, .. } => panel::Message::Escalate,
+                WindowChord::Enter { command: false, .. } => panel::Message::Submit,
+                WindowChord::Copy => {
+                    if state.panel.can_copy() {
+                        panel::Message::Copy
+                    } else if let Some(panel::ErrorAction::CopyDiagnostics) = state
+                        .panel
+                        .error
+                        .as_ref()
+                        .and_then(|error| error.action.clone())
+                    {
+                        panel::Message::Error(panel::ErrorAction::CopyDiagnostics)
+                    } else {
+                        return Task::none();
+                    }
+                }
+                WindowChord::Retry => {
+                    let Some(panel::ErrorAction::Retry) = state
+                        .panel
+                        .error
+                        .as_ref()
+                        .and_then(|error| error.action.clone())
+                    else {
+                        return Task::none();
+                    };
+                    panel::Message::Error(panel::ErrorAction::Retry)
+                }
+                WindowChord::ShowTask => panel::Message::ShowTask,
+                WindowChord::HistoryOlder => panel::Message::HistoryOlder,
+                WindowChord::HistoryNewer => panel::Message::HistoryNewer,
+                WindowChord::Attach if state.panel.clipboard.is_attachable() => {
+                    panel::Message::Attach
+                }
+                WindowChord::Attach => return Task::none(),
+                WindowChord::DetachLast
+                    if state.panel.input.is_empty() && !state.ime_preedit.contains(&window) =>
+                {
+                    panel::Message::DetachLast
+                }
+                WindowChord::DetachLast | WindowChord::CancelTask => return Task::none(),
+            };
+            panel_update(state, message)
+        }
+        Some(Role::Task(task)) => {
+            let message = match chord {
+                WindowChord::Escape => {
+                    if state
+                        .tasks
+                        .iter()
+                        .find(|(_, state)| state.id == task)
+                        .is_some_and(|(_, state)| state.is_blocked())
+                    {
+                        task_window::Message::Decide(aibo_core::types::ApprovalDecision::Deny)
+                    } else {
+                        task_window::Message::Close
+                    }
+                }
+                WindowChord::Enter {
+                    command: false,
+                    shift,
+                } => task_window::Message::Decide(if shift {
+                    aibo_core::types::ApprovalDecision::ApproveForSession
+                } else {
+                    aibo_core::types::ApprovalDecision::Approve
+                }),
+                WindowChord::Copy => task_window::Message::CopyTranscript,
+                WindowChord::CancelTask => task_window::Message::Cancel,
+                _ => return Task::none(),
+            };
+            task_update(state, task, message)
+        }
+        Some(Role::Settings) => match chord {
+            WindowChord::Escape => settings_update(state, settings::Message::Close),
+            WindowChord::Copy if state.settings.section == settings::Section::About => {
+                settings_update(state, settings::Message::CopyDiagnostics)
+            }
+            _ => Task::none(),
+        },
+        _ => Task::none(),
+    }
 }
 
 fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
@@ -805,11 +1086,54 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
         }
 
         M::Submit => {
+            // The focused input owns Enter, so the state-dependent default
+            // action must be resolved here rather than in the global listener.
+            if state.panel.can_accept() {
+                return panel_update(state, M::Accept);
+            }
+            if matches!(state.panel.context, ContextState::PermissionDenied { .. }) {
+                return panel_update(state, M::OpenSystemSettings);
+            }
+            if matches!(state.panel.phase, Phase::Failed)
+                && let Some(action @ (ErrorAction::SignIn(_) | ErrorAction::OpenSettings)) = state
+                    .panel
+                    .error
+                    .as_ref()
+                    .and_then(|error| error.action.clone())
+            {
+                return panel_update(state, M::Error(action));
+            }
+            if !matches!(state.panel.phase, Phase::Idle) {
+                return Task::none();
+            }
             if state.panel.input.trim().is_empty() {
                 return Task::none();
             }
+            // The one place the transport gap could turn into a lie. `UiRequest`
+            // has no attachment field yet (see `clipboard_offer`), so a panel
+            // that held an image here would show a chip, send a text-only
+            // request, and hand back an answer from a model that never saw the
+            // picture — worse than the defect this feature retires, because it
+            // is silent.
+            //
+            // It cannot happen: the same missing `bridge` change is what keeps
+            // `ClipboardOffer::image` `None`, so `attachments` is provably empty
+            // on this line, and `the_transport_gap_cannot_silently_drop_an_image`
+            // pins the coupling. This is the tripwire for whoever wires the
+            // bytes in and forgets to wire them back out.
+            debug_assert!(
+                !state.panel.has_attachments(),
+                "UiRequest::Submit must carry `attachments` before the panel can hold one"
+            );
+            if state.panel.has_attachments() {
+                tracing::error!(
+                    attachments = state.panel.attachments().len(),
+                    "dropping attachments: UiRequest::Submit does not carry them yet"
+                );
+            }
+            state.panel.history.record(&state.panel.input);
             state.panel.phase = Phase::Loading;
-            state.panel.response.clear();
+            state.panel.clear_response();
             state.panel.error = None;
             state.send(UiRequest::Submit {
                 session: state.panel.session,
@@ -817,6 +1141,73 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 surface: state.panel.surface,
                 role_override: None,
             });
+            Task::none()
+        }
+
+        // ↑ / ↓ recall. Only meaningful while the user is composing: once a
+        // request is in flight the input is not what the keys should move.
+        M::HistoryOlder => {
+            if matches!(state.panel.phase, Phase::Idle)
+                && let Some(text) = state.panel.history.older(&state.panel.input)
+            {
+                state.panel.input = text;
+                return operation::move_cursor_to_end(panel::INPUT_ID);
+            }
+            Task::none()
+        }
+
+        M::HistoryNewer => {
+            if matches!(state.panel.phase, Phase::Idle)
+                && let Some(text) = state.panel.history.newer()
+            {
+                state.panel.input = text;
+                return operation::move_cursor_to_end(panel::INPUT_ID);
+            }
+            Task::none()
+        }
+
+        // ⌘V. An attachment is an act, and this is the act: nothing else in the
+        // UI writes to `PanelState::attachments`, so nothing ambient can reach
+        // routing through it.
+        M::Attach => {
+            let panel::ClipboardOffer::Image { image, .. } = &state.panel.clipboard else {
+                // Nothing attachable. The action list already renders the entry
+                // disabled in this state, so silence here is what the panel
+                // promised rather than a dropped keypress.
+                return Task::none();
+            };
+
+            let Some(attachment) = image.as_deref().cloned() else {
+                // The pasteboard advertised an image it would not hand over.
+                // §13 toast: non-blocking, nothing is lost, and it is the truth
+                // — the alternative is a key that visibly does nothing.
+                state.panel.toast = Some(panel::ToastView {
+                    severity: ui_theme::Severity::Warning,
+                    body: i18n::t(crate::i18n::Key::ToastClipboardImageUnreadable).to_owned(),
+                    offer_diagnostics: false,
+                });
+                return resize_panel_if_visible(state);
+            };
+
+            // §14: the ceilings are enforced here, before dispatch. A rejection
+            // is rendered inline with one action, never swallowed.
+            if let Err(error) = state.panel.attach(attachment) {
+                state.panel.fail(&std::sync::Arc::new(error));
+            }
+            resize_panel_if_visible(state)
+        }
+
+        M::DetachLast => {
+            if state.panel.detach_last() {
+                return resize_panel_if_visible(state);
+            }
+            Task::none()
+        }
+
+        M::Detach(id) => {
+            if state.panel.detach(id) {
+                return resize_panel_if_visible(state);
+            }
             Task::none()
         }
 
@@ -841,7 +1232,12 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 session: state.panel.session,
                 text: state.panel.response.clone(),
             };
-            let dispatch = state.deferred_send(request);
+            let dispatch = state.deferred_send(vec![
+                request,
+                UiRequest::DiscardSession {
+                    session: state.panel.session,
+                },
+            ]);
             state.hide_panel().chain(dispatch)
         }
 
@@ -853,8 +1249,11 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
         }
 
         M::Escalate => {
+            if !matches!(state.panel.phase, Phase::Finished { .. } | Phase::Failed) {
+                return Task::none();
+            }
             state.panel.phase = Phase::Loading;
-            state.panel.response.clear();
+            state.panel.clear_response();
             state.send(UiRequest::Retry {
                 session: state.panel.session,
                 role: Some(aibo_core::types::Role::Smart),
@@ -865,14 +1264,21 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
         M::Dismiss => {
             // `esc` cancels in-flight work and closes the panel (§13). It never
             // cancels an agent run — that lives in its own window (§6).
-            state.send(UiRequest::Cancel {
-                session: state.panel.session,
-            });
+            discard_panel_session(state, true);
             state.hide_panel()
         }
 
         M::DismissToast => {
             state.panel.toast = None;
+            Task::none()
+        }
+
+        M::CopyDiagnostics => {
+            state.send(UiRequest::CopyDiagnostics);
+            Task::none()
+        }
+        M::ResponseAction(action) => {
+            state.panel.perform_response_action(action);
             Task::none()
         }
 
@@ -911,6 +1317,15 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                     open_settings(state)
                 }
                 ErrorAction::OpenSettings => open_settings(state),
+                // §13's one action, and it has to actually resolve the state:
+                // `detach_labelled` removes the image the error named and
+                // `PanelState` retires the error with it, so the user is left
+                // in a panel they can submit rather than staring at a complaint
+                // about something that is no longer there.
+                ErrorAction::RemoveAttachment { label } => {
+                    state.panel.detach_labelled(&label);
+                    resize_panel_if_visible(state)
+                }
                 ErrorAction::CopyDiagnostics => {
                     state.send(UiRequest::CopyDiagnostics);
                     Task::none()
@@ -954,13 +1369,20 @@ fn task_update(state: &mut Aibo, id: Uuid, message: task_window::Message) -> Tas
             Task::none()
         }
         M::Decide(decision) => {
+            if !task.decision_is_ready(decision) {
+                return Task::none();
+            }
             let Some(approval) = task.pending_approval.take() else {
                 return Task::none();
             };
+            let typed_confirmation = approval
+                .requires_typed_confirmation
+                .then(|| task.typed_confirmation.clone());
             state.send(UiRequest::Approve {
                 task: id,
                 approval: approval.id,
                 decision,
+                typed_confirmation,
             });
             state.refresh_tray();
             Task::none()
@@ -970,7 +1392,7 @@ fn task_update(state: &mut Aibo, id: Uuid, message: task_window::Message) -> Tas
             Task::none()
         }
         M::CopyTranscript => {
-            let transcript = task.instruction.clone();
+            let transcript = task.transcript();
             state.send(UiRequest::Copy { text: transcript });
             Task::none()
         }
@@ -995,6 +1417,20 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             state.send(UiRequest::OpenSystemSettings { permission });
             Task::none()
         }
+        // Copy the code exactly as the server issued it, hyphen included — the
+        // verification page expects that form, and a "helpfully" stripped or
+        // re-spaced version silently fails to match.
+        M::CopyDeviceCode(code) => iced::clipboard::write(code),
+        M::DeviceCodeAction(action) => {
+            state.settings.perform_device_code_action(action);
+            Task::none()
+        }
+        M::OpenDeviceUrl => {
+            state.send(UiRequest::OpenUrl {
+                url: settings::codex_text::VERIFICATION_URL.to_owned(),
+            });
+            Task::none()
+        }
         M::SetLanguage(lang) => {
             i18n::set_language(lang);
             state.settings.language = lang;
@@ -1016,10 +1452,26 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             state.send(UiRequest::CopyDiagnostics);
             Task::none()
         }
-        M::Close => match state.settings_window.take() {
-            Some(id) => window::close(id),
-            None => Task::none(),
-        },
+        M::InitializeHistory => {
+            state.settings.history_initializing = true;
+            state.settings.history_failed = false;
+            state.send(UiRequest::InitializeHistory);
+            Task::none()
+        }
+        M::CopyRecoveryCode => state
+            .settings
+            .recovery_code
+            .as_ref()
+            .map_or_else(Task::none, |code| {
+                iced::clipboard::write(code.expose_secret().to_owned())
+            }),
+        M::Close => {
+            state.settings.recovery_code = None;
+            match state.settings_window.take() {
+                Some(id) => window::close(id),
+                None => Task::none(),
+            }
+        }
     }
 }
 
@@ -1030,13 +1482,14 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             app,
             field,
             selection,
-            clipboard: _,
+            clipboard,
         } => {
             // §13: one panel, one session. An answer for a session the user has
             // moved on from is dropped, not rendered.
             if session != state.panel.session {
                 return Task::none();
             }
+            state.panel.clipboard = clipboard_offer(clipboard.as_deref());
             state.panel.context = match field.as_deref() {
                 // §9: while composing, aibo neither reads nor inserts.
                 Some(field) if field.ime_active => ContextState::ImeActive,
@@ -1099,7 +1552,7 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             match *event {
                 StreamEvent::Text(chunk) => {
                     state.panel.phase = Phase::Streaming;
-                    state.panel.response.push_str(&chunk);
+                    state.panel.append_response(&chunk);
                     // §16: reserve height in discrete steps so streaming never
                     // reflows. The estimate is deliberately coarse.
                     let estimated = 24.0 + (state.panel.response.len() as f32 / 64.0) * 20.0;
@@ -1119,6 +1572,7 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 }
                 StreamEvent::Done(reason) => {
                     state.panel.phase = Phase::Finished { reason };
+                    aibo_platform::announce_accessibility(i18n::t(crate::i18n::Key::TaskCompleted));
                     resize_panel_if_visible(state)
                 }
                 // Tool calls belong to an agent run and surface in the task
@@ -1154,6 +1608,9 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 return Task::none();
             }
             state.panel.fail(&error);
+            if let Some(error) = &state.panel.error {
+                aibo_platform::announce_accessibility(&error.headline);
+            }
             // §13: `NoProviderConfigured` is the only error allowed to
             // interrupt, and it opens settings.
             let opens_settings = matches!(
@@ -1178,15 +1635,26 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
         UiEvent::TaskStarted { task, instruction } => {
             // §6: the Do surface gets a real window that outlives the panel.
             state.panel.handed_off_to_task = true;
+            let task_state = match state
+                .pending_tasks
+                .iter()
+                .position(|pending| pending.id == task)
+            {
+                Some(index) => {
+                    let mut pending = state.pending_tasks.remove(index);
+                    pending.instruction = instruction;
+                    pending
+                }
+                None => TaskState::new(task, instruction),
+            };
             let (window_id, opened) = window::open(task_window_settings());
-            state
-                .tasks
-                .push((window_id, TaskState::new(task, instruction)));
+            state.tasks.push((window_id, task_state));
             state.refresh_tray();
             opened.map(Message::WindowOpened)
         }
 
         UiEvent::TaskStep { task, step } => {
+            let mut became_blocked = false;
             if let Some((_, existing)) = state.tasks.iter_mut().find(|(_, t)| t.id == task) {
                 let was_blocked = existing.is_blocked();
                 existing.push(*step);
@@ -1195,28 +1663,52 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 // window — it brings its own forward, once, on the transition.
                 let now_blocked = existing.is_blocked();
                 if now_blocked && !was_blocked {
-                    state.refresh_tray();
-                    if let Some(window_id) = state.task_window_for(task) {
-                        return Task::batch([
-                            window::set_mode(window_id, Mode::Windowed),
-                            window::gain_focus(window_id),
-                        ]);
-                    }
+                    became_blocked = true;
                 }
             } else {
-                // A step for a run whose window has not opened yet: keep it so
-                // the scrollback is complete when the window appears.
+                // A step for a run whose window is closed or has not opened yet:
+                // keep it so scrollback and approvals survive.
                 match state.pending_tasks.iter_mut().find(|t| t.id == task) {
-                    Some(pending) => pending.push(*step),
+                    Some(pending) => {
+                        let was_blocked = pending.is_blocked();
+                        pending.push(*step);
+                        became_blocked = pending.is_blocked() && !was_blocked;
+                    }
                     None => {
                         let mut pending = TaskState::new(task, String::new());
                         pending.push(*step);
+                        became_blocked = pending.is_blocked();
                         state.pending_tasks.push(pending);
                     }
                 }
             }
             state.refresh_tray();
-            Task::none()
+            if became_blocked {
+                aibo_platform::announce_accessibility(i18n::t(
+                    crate::i18n::Key::TaskAwaitingApproval,
+                ));
+                let needs_confirmation = state
+                    .tasks
+                    .iter()
+                    .find(|(_, current)| current.id == task)
+                    .and_then(|(_, current)| current.pending_approval.as_ref())
+                    .or_else(|| {
+                        state
+                            .pending_tasks
+                            .iter()
+                            .find(|current| current.id == task)
+                            .and_then(|current| current.pending_approval.as_ref())
+                    })
+                    .is_some_and(|approval| approval.requires_typed_confirmation);
+                let focus = focus_task(state, task);
+                if needs_confirmation {
+                    focus.chain(operation::focus(task_window::CONFIRMATION_ID))
+                } else {
+                    focus
+                }
+            } else {
+                Task::none()
+            }
         }
 
         UiEvent::DisplaysChanged { displays } => update(state, Message::Displays(displays)),
@@ -1253,12 +1745,48 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 .iter_mut()
                 .find(|row| row.id == provider)
             {
-                Some(row) => row.health = health,
+                Some(row) => row.health = health.clone(),
                 None => state.settings.providers.push(settings::ProviderRow {
-                    id: provider,
+                    id: provider.clone(),
                     configured: true,
-                    health,
+                    health: health.clone(),
                 }),
+            }
+            state.settings.sync_device_code();
+            if matches!(health, aibo_core::types::Health::Ok { .. }) {
+                state.settings.onboarding = false;
+            }
+
+            // A provider coming back healthy has to clear the panel's stale
+            // auth error, not just repaint the settings row.
+            //
+            // Observed 2026-07-26: after a successful sign-in the settings card
+            // read "Signed in. Codex is bound to the Smart and Ask surfaces."
+            // while the panel still showed "Your codex credentials are no longer
+            // valid" with a Sign in button — two windows disagreeing about the
+            // same fact, and the one the user works in was the wrong one.
+            //
+            // Scoped to auth errors on purpose: a `ContextTooLarge` or a
+            // `Timeout` is still true regardless of what health now says, and
+            // clearing those would hide a real failure behind an unrelated
+            // recovery.
+            if matches!(health, aibo_core::types::Health::Ok { .. })
+                && let Some(error) = &state.panel.error
+                && error.is_auth_for(&provider)
+            {
+                state.panel.error = None;
+            }
+            Task::none()
+        }
+
+        UiEvent::LanguageChanged { language } => {
+            i18n::set_language(language);
+            state.settings.language = language;
+            state.config.language = language;
+            if let Some(tray) = &state.tray
+                && let Err(error) = tray.relocalise()
+            {
+                tracing::warn!(%error, "could not relocalise the tray menu");
             }
             Task::none()
         }
@@ -1272,9 +1800,101 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             Task::none()
         }
 
-        // TODO(§6): "aibo restarted after an error" with a diagnostics link,
-        // shown once on the next launch.
-        UiEvent::RecoveredFromCrash => Task::none(),
+        UiEvent::RecoveredFromCrash => {
+            aibo_platform::announce_accessibility(i18n::t(
+                crate::i18n::Key::ToastRecoveredFromCrash,
+            ));
+            state.panel.toast = Some(panel::ToastView {
+                severity: ui_theme::Severity::Warning,
+                body: i18n::t(crate::i18n::Key::ToastRecoveredFromCrash).to_owned(),
+                offer_diagnostics: true,
+            });
+            resize_panel_if_visible(state)
+        }
+
+        UiEvent::DiagnosticsCopied => {
+            state.panel.toast = Some(panel::ToastView {
+                severity: ui_theme::Severity::Success,
+                body: i18n::t(crate::i18n::Key::ToastDiagnosticsCopied).to_owned(),
+                offer_diagnostics: false,
+            });
+            resize_panel_if_visible(state)
+        }
+
+        UiEvent::OnboardingRequired => {
+            aibo_platform::announce_accessibility(i18n::t(crate::i18n::Key::SettingsWelcomeTitle));
+            state.settings.onboarding = true;
+            state.settings.section = settings::Section::Providers;
+            open_settings(state)
+        }
+
+        UiEvent::OpenPanel => state.open_panel(),
+
+        UiEvent::HistoryReady { recovery_code } => {
+            state.settings.history_initializing = false;
+            state.settings.history_failed = false;
+            state.settings.history_ready = true;
+            state.settings.recovery_code = recovery_code;
+            state.settings.section = settings::Section::History;
+            aibo_platform::announce_accessibility(i18n::t(
+                if state.settings.recovery_code.is_some() {
+                    crate::i18n::Key::SettingsRecoveryTitle
+                } else {
+                    crate::i18n::Key::SettingsHistoryReady
+                },
+            ));
+            Task::none()
+        }
+
+        UiEvent::HistorySetupFailed => {
+            state.settings.history_initializing = false;
+            state.settings.history_failed = true;
+            state.settings.section = settings::Section::History;
+            aibo_platform::announce_accessibility(i18n::t(crate::i18n::Key::SettingsHistoryFailed));
+            Task::none()
+        }
+    }
+}
+
+/// What the panel may offer to attach, from the capture's clipboard snapshot.
+///
+/// **This is the one place ambient clipboard state enters the panel, and it
+/// produces an *offer*, never an attachment.** The distinction is the whole
+/// point of the feature: `RouteInput::has_image` used to be derived from
+/// whatever sat on the pasteboard, so taking any screenshot silently rerouted
+/// every request to the `Vision` role, and because nothing binds that role the
+/// failure surfaced as "No provider is configured yet" beside a signed-in,
+/// healthy provider. An offer only decides whether ⌘V is enabled; it takes a
+/// keypress to become an attachment and an attachment to change routing.
+fn clipboard_offer(item: Option<&aibo_core::types::ClipboardItem>) -> panel::ClipboardOffer {
+    use aibo_core::types::ClipboardKind;
+
+    let Some(item) = item else {
+        return panel::ClipboardOffer::Unknown;
+    };
+    // §12: concealed content is never recorded and never sent. That it happens
+    // to be an image does not exempt it, and offering it would invite the user
+    // to send exactly what the marker exists to withhold.
+    if item.concealed || item.kind != ClipboardKind::ImageRef {
+        return panel::ClipboardOffer::Nothing;
+    }
+
+    let label = match &item.source_app {
+        Some(app) => i18n::t1(crate::i18n::Key::AttachmentClipboardFrom, app),
+        None => i18n::t(crate::i18n::Key::AttachmentClipboardLabel).to_owned(),
+    };
+
+    panel::ClipboardOffer::Image {
+        label,
+        // TODO(§2, bridge): `ClipboardItem` describes the clipboard without
+        // inlining it — `ClipboardKind::ImageRef` is documented as "referenced
+        // rather than inlined" — so the capture that reaches the UI carries no
+        // pixels. Materialising them needs a request/event pair in
+        // `crate::bridge` plus a downscaling read in `aibo-platform`, neither
+        // of which this change owns. Until then ⌘V says so (§13 toast) instead
+        // of failing silently, and no path invents an attachment the user did
+        // not make.
+        image: None,
     }
 }
 
@@ -1287,8 +1907,32 @@ fn resize_panel_if_visible(state: &mut Aibo) -> Task<Message> {
         return Task::none();
     }
     let placement = state.placement();
-    let _ = state.config.motion;
+    let _duration = state.config.motion.duration(ui_theme::motion::FAST);
     state.show_panel(placement)
+}
+
+/// Apply the durable native overlay policy, or present the already-configured
+/// panel without activating the source application.
+fn configure_or_present_panel(id: window::Id, configure: bool) -> Task<Message> {
+    window::run(id, move |window| {
+        let result = window
+            .window_handle()
+            .map_err(|error| error.to_string())
+            .and_then(|handle| {
+                if configure {
+                    aibo_platform::configure_panel_window(handle)
+                        .map(|_| ())
+                        .map_err(|error| error.to_string())
+                } else {
+                    aibo_platform::present_panel_without_activation(handle)
+                        .map_err(|error| error.to_string())
+                }
+            });
+        if let Err(error) = result {
+            tracing::warn!(%error, configure, "native panel overlay operation failed");
+        }
+        Message::Ignored
+    })
 }
 
 fn view(state: &Aibo, window: window::Id) -> Element<'_, Message> {
@@ -1338,36 +1982,63 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
                     Message::Ignored
                 }
             }),
-        // §16: "every action has a key, shown". The action list has always
-        // *rendered* those keys — `⏎ Replace`, `⌘C Copy`, `esc Dismiss` — but
-        // nothing subscribed to keyboard events, so every one of them was a
-        // label for a binding that did not exist. The panel could not even be
-        // closed from the keyboard, in a keyboard-first tool.
-        //
-        // `text_input` consumes plain character keys before this sees them, so
-        // typing is unaffected; only the chorded and named keys below are
-        // claimed.
-        // `listen` delivers only keys no widget consumed, so `text_input`
-        // keeps ordinary typing and we claim just the named and chorded keys.
-        iced::keyboard::listen().map(|event| {
-            use iced::keyboard::key::Named;
+        // Window-aware keyboard routing. Ordinary shortcuts are handled only
+        // when the focused widget ignored them, preventing a focused button or
+        // text selection from firing twice. Attach and empty-input backspace are
+        // the two deliberate exceptions: the panel input consumes those before
+        // a normal listener sees them.
+        iced::event::listen_with(|event, status, window| {
             use iced::keyboard::Key;
+            use iced::keyboard::key::Named;
 
-            let iced::keyboard::Event::KeyPressed { key, modifiers, .. } = event else {
-                return Message::Ignored;
+            if let iced::Event::InputMethod(event) = event {
+                let active = match event {
+                    iced::advanced::input_method::Event::Preedit(text, _) => !text.is_empty(),
+                    iced::advanced::input_method::Event::Commit(_)
+                    | iced::advanced::input_method::Event::Closed => false,
+                    iced::advanced::input_method::Event::Opened => return None,
+                };
+                return Some(Message::ImePreedit(window, active));
+            }
+
+            let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                key,
+                physical_key,
+                modifiers,
+                ..
+            }) = event
+            else {
+                return None;
             };
 
-            match (key.as_ref(), modifiers.command()) {
-                // esc: cancel in-flight work and close (§13). Never a chord.
-                (Key::Named(Named::Escape), _) => Message::Panel(panel::Message::Dismiss),
-                // ⌘↩ escalates to the smart model, so the chord must be
-                // matched before bare ⏎ accepts (§4: escalation is explicit,
-                // never automatic).
-                (Key::Named(Named::Enter), true) => Message::Panel(panel::Message::Escalate),
-                (Key::Named(Named::Enter), false) => Message::Panel(panel::Message::Accept),
-                (Key::Character("c"), true) => Message::Panel(panel::Message::Copy),
-                _ => Message::Ignored,
+            if matches!(key.as_ref(), Key::Named(Named::Backspace)) && !modifiers.command() {
+                return Some(Message::WindowKey(window, WindowChord::DetachLast));
             }
+            if modifiers.command() && key.to_latin(physical_key) == Some('v') {
+                return Some(Message::WindowKey(window, WindowChord::Attach));
+            }
+            if status == iced::event::Status::Captured {
+                return None;
+            }
+
+            let chord = match key.as_ref() {
+                Key::Named(Named::Escape) => WindowChord::Escape,
+                Key::Named(Named::Enter) => WindowChord::Enter {
+                    command: modifiers.command(),
+                    shift: modifiers.shift(),
+                },
+                Key::Named(Named::ArrowUp) => WindowChord::HistoryOlder,
+                Key::Named(Named::ArrowDown) => WindowChord::HistoryNewer,
+                _ if modifiers.command() => match key.to_latin(physical_key) {
+                    Some('c') => WindowChord::Copy,
+                    Some('r') => WindowChord::Retry,
+                    Some('t') => WindowChord::ShowTask,
+                    Some('.') => WindowChord::CancelTask,
+                    _ => return None,
+                },
+                _ => return None,
+            };
+            Some(Message::WindowKey(window, chord))
         }),
     ];
 
@@ -1425,7 +2096,7 @@ pub fn run(config: UiConfig, handles: UiHandles) -> Result<()> {
 
     // The OS installs *global* handlers for hotkeys and tray menus, so their
     // sink lives for the process lifetime rather than in app state.
-    let (shell_tx, shell_rx) = tokio::sync::mpsc::unbounded_channel();
+    let (shell_tx, shell_rx) = tokio::sync::mpsc::channel(SHELL_EVENT_CHANNEL_CAPACITY);
     *SHELL_EVENTS
         .lock()
         .map_err(|_| UiError::Runtime("shell channel poisoned".to_owned()))? = Some(shell_rx);
@@ -1434,12 +2105,12 @@ pub fn run(config: UiConfig, handles: UiHandles) -> Result<()> {
     if let Some(sender) = SHELL_SENDER.get() {
         let hotkey_sink = sender.clone();
         hotkey::forward_events(move |id| {
-            let _ = hotkey_sink.send(ShellEvent::Hotkey(id));
+            send_shell_event(&hotkey_sink, ShellEvent::Hotkey(id));
         });
 
         let tray_sink = sender.clone();
         tray::forward_events(move |command| {
-            let _ = tray_sink.send(ShellEvent::Tray(command));
+            send_shell_event(&tray_sink, ShellEvent::Tray(command));
         });
     }
 
@@ -1482,10 +2153,10 @@ pub fn run(config: UiConfig, handles: UiHandles) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aibo_core::types::{AppInfo, AppRef, FieldContext};
+    use aibo_core::types::{AppInfo, AppRef, ClipboardKind, FieldContext};
 
     fn app() -> Aibo {
-        let (requests, _rx) = tokio::sync::mpsc::unbounded_channel();
+        let (requests, _rx) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
         let (state, _task) = boot(UiConfig::default(), requests);
         state
     }
@@ -1516,6 +2187,107 @@ mod tests {
     }
 
     #[test]
+    fn request_saturation_preserves_a_bounded_critical_tail() {
+        let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (state, _task) = boot(UiConfig::default(), requests);
+        let session = Uuid::now_v7();
+
+        for _ in 0..(UI_REQUEST_CHANNEL_CAPACITY * 4) {
+            state.send(UiRequest::UiReady);
+        }
+        state.send(UiRequest::Cancel { session });
+        for _ in 0..UI_REQUEST_CHANNEL_CAPACITY {
+            state.send(UiRequest::Cancel { session });
+        }
+
+        let mut queued = Vec::new();
+        while let Ok(request) = received.try_recv() {
+            queued.push(request);
+        }
+
+        assert_eq!(queued.len(), UI_REQUEST_CHANNEL_CAPACITY);
+        assert_eq!(
+            queued
+                .iter()
+                .filter(|request| matches!(request, UiRequest::UiReady))
+                .count(),
+            UI_REQUEST_CHANNEL_CAPACITY - UI_REQUEST_CRITICAL_RESERVE
+        );
+        assert!(
+            queued
+                .iter()
+                .any(|request| matches!(request, UiRequest::Cancel { session: queued } if *queued == session)),
+            "ordinary input must not consume the capacity reserved for cancellation"
+        );
+    }
+
+    #[test]
+    fn shell_saturation_keeps_quit_deliverable() {
+        let (sender, mut received) = tokio::sync::mpsc::channel(SHELL_EVENT_CHANNEL_CAPACITY);
+        for id in 0..(SHELL_EVENT_CHANNEL_CAPACITY * 4) {
+            send_shell_event(&sender, ShellEvent::Hotkey(id as u32));
+        }
+        send_shell_event(&sender, ShellEvent::Tray(TrayCommand::Quit));
+
+        let mut queued = Vec::new();
+        while let Ok(event) = received.try_recv() {
+            queued.push(event);
+        }
+
+        assert_eq!(queued.len(), SHELL_EVENT_CHANNEL_CAPACITY);
+        assert_eq!(
+            queued
+                .iter()
+                .filter(|event| matches!(event, ShellEvent::Hotkey(_)))
+                .count(),
+            SHELL_EVENT_CHANNEL_CAPACITY - SHELL_EVENT_CRITICAL_RESERVE
+        );
+        assert!(
+            queued
+                .iter()
+                .any(|event| matches!(event, ShellEvent::Tray(TrayCommand::Quit)))
+        );
+    }
+
+    #[test]
+    fn a_fresh_install_opens_the_functional_provider_setup() {
+        let mut state = app();
+        let task = backend_update(&mut state, UiEvent::OnboardingRequired);
+        assert!(state.settings.onboarding);
+        assert_eq!(state.settings.section, settings::Section::Providers);
+        assert!(state.settings_window.is_some());
+        assert!(task.units() > 0);
+    }
+
+    #[test]
+    fn a_history_recovery_code_is_discarded_when_settings_closes() {
+        let mut state = app();
+        let _ = open_settings(&mut state);
+        let settings_window = state.settings_window.expect("settings window");
+        let _ = backend_update(
+            &mut state,
+            UiEvent::HistoryReady {
+                recovery_code: Some(secrecy::SecretString::from(
+                    "alpha-bravo-charlie-delta".to_owned(),
+                )),
+            },
+        );
+        assert!(state.settings.recovery_code.is_some());
+
+        let _ = update(&mut state, Message::WindowClosed(settings_window));
+        assert!(state.settings.recovery_code.is_none());
+    }
+
+    #[test]
+    fn crash_recovery_offers_redacted_diagnostics() {
+        let mut state = app();
+        let _ = backend_update(&mut state, UiEvent::RecoveredFromCrash);
+        let toast = state.panel.toast.as_ref().expect("recovery toast");
+        assert!(toast.offer_diagnostics);
+        let _ = panel::view(&state.panel);
+    }
+
+    #[test]
     fn the_panel_is_created_hidden_and_warms_up() {
         let settings = panel_window_settings();
         assert!(
@@ -1533,6 +2305,21 @@ mod tests {
         let _ = update(&mut state, Message::FramePainted);
         assert_eq!(state.panel.phase, Phase::Hidden);
         assert!(!state.panel_visible);
+    }
+
+    #[test]
+    fn backend_is_notified_once_after_the_panel_window_exists() {
+        let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _boot) = boot(UiConfig::default(), requests);
+        let panel_window = state.panel_window;
+
+        let _ = update(&mut state, Message::WindowOpened(panel_window));
+        assert!(matches!(events.try_recv(), Ok(UiRequest::UiReady)));
+        let _ = update(&mut state, Message::WindowOpened(panel_window));
+        assert!(
+            events.try_recv().is_err(),
+            "UiReady is a one-shot lifecycle event"
+        );
     }
 
     #[test]
@@ -1608,6 +2395,115 @@ mod tests {
         );
     }
 
+    #[test]
+    fn closing_a_running_task_retains_it_and_show_task_reopens_it() {
+        let mut state = app();
+        let task = Uuid::now_v7();
+        let _ = backend_update(
+            &mut state,
+            UiEvent::TaskStarted {
+                task,
+                instruction: "rename the flag".to_owned(),
+            },
+        );
+        let window = state.tasks[0].0;
+
+        let _ = update(&mut state, Message::WindowClosed(window));
+        assert!(state.tasks.is_empty());
+        assert_eq!(state.pending_tasks.len(), 1);
+        assert_eq!(state.pending_tasks[0].id, task);
+
+        let reopen = focus_first_task(&mut state);
+        assert!(reopen.units() > 0);
+        assert_eq!(state.tasks.len(), 1);
+        assert!(state.pending_tasks.is_empty());
+        assert_eq!(state.tasks[0].1.id, task);
+    }
+
+    #[test]
+    fn a_closed_task_reopens_when_a_new_approval_arrives() {
+        use aibo_core::types::{ApprovalKind, ApprovalRequest};
+
+        let mut state = app();
+        let task = Uuid::now_v7();
+        let _ = backend_update(
+            &mut state,
+            UiEvent::TaskStarted {
+                task,
+                instruction: "clean the build".to_owned(),
+            },
+        );
+        let window = state.tasks[0].0;
+        let _ = update(&mut state, Message::WindowClosed(window));
+
+        let focus = backend_update(
+            &mut state,
+            UiEvent::TaskStep {
+                task,
+                step: Box::new(aibo_core::types::AgentStep::AwaitingApproval(
+                    ApprovalRequest {
+                        id: "approval-1".to_owned(),
+                        kind: ApprovalKind::Command,
+                        summary: "remove generated files".to_owned(),
+                        command: Some("rm -rf ./build".to_owned()),
+                        paths: Vec::new(),
+                        originating_instruction: "clean the build".to_owned(),
+                        requires_typed_confirmation: true,
+                    },
+                )),
+            },
+        );
+
+        assert!(focus.units() > 0);
+        assert_eq!(state.tasks.len(), 1);
+        assert!(state.tasks[0].1.is_blocked());
+        assert!(state.pending_tasks.is_empty());
+    }
+
+    #[test]
+    fn destructive_approval_preserves_the_typed_confirmation_on_the_bridge() {
+        use aibo_core::types::{ApprovalDecision, ApprovalKind, ApprovalRequest};
+
+        let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _boot) = boot(UiConfig::default(), requests);
+        let task = Uuid::now_v7();
+        let _ = backend_update(
+            &mut state,
+            UiEvent::TaskStarted {
+                task,
+                instruction: "clean the build".to_owned(),
+            },
+        );
+        state.tasks[0]
+            .1
+            .push(aibo_core::types::AgentStep::AwaitingApproval(
+                ApprovalRequest {
+                    id: "approval-1".to_owned(),
+                    kind: ApprovalKind::Command,
+                    summary: "remove generated files".to_owned(),
+                    command: Some("rm -rf ./build".to_owned()),
+                    paths: Vec::new(),
+                    originating_instruction: "clean the build".to_owned(),
+                    requires_typed_confirmation: true,
+                },
+            ));
+        state.tasks[0].1.typed_confirmation = "rm -rf ./build".to_owned();
+
+        let _ = task_update(
+            &mut state,
+            task,
+            task_window::Message::Decide(ApprovalDecision::Approve),
+        );
+        assert!(matches!(
+            events.try_recv(),
+            Ok(UiRequest::Approve {
+                decision: ApprovalDecision::Approve,
+                typed_confirmation: Some(typed),
+                ..
+            }) if typed == "rm -rf ./build"
+        ));
+    }
+
     /// Regression, F2. `Accept` used to call `send(UiRequest::Insert)` and
     /// return `Task::none()`, so the request reached the runtime while the
     /// panel was still on screen holding focus — inverting §8's ordered insert
@@ -1617,14 +2513,16 @@ mod tests {
     fn accept_hides_the_panel_before_the_insert_is_dispatched() {
         use aibo_core::types::StopReason;
 
-        let (requests, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
         let (mut state, _boot) = boot(UiConfig::default(), requests);
 
         state.panel_visible = true;
         state.panel.phase = Phase::Finished {
             reason: StopReason::EndTurn,
         };
-        state.panel.response = "the deployment should be reverted".to_owned();
+        state
+            .panel
+            .set_response("the deployment should be reverted");
         assert!(state.panel.can_accept());
 
         let task = panel_update(&mut state, panel::Message::Accept);
@@ -1647,13 +2545,48 @@ mod tests {
     /// The dismiss path has no insert to order, so it must stay a plain hide.
     #[test]
     fn dismiss_still_sends_immediately() {
-        let (requests, mut events) = tokio::sync::mpsc::unbounded_channel();
+        let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
         let (mut state, _boot) = boot(UiConfig::default(), requests);
         state.panel_visible = true;
 
         let _ = panel_update(&mut state, panel::Message::Dismiss);
         assert!(!state.panel_visible);
         assert!(matches!(events.try_recv(), Ok(UiRequest::Cancel { .. })));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(UiRequest::DiscardSession { .. })
+        ));
+    }
+
+    #[test]
+    fn resetting_the_panel_discards_the_previous_session() {
+        let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _boot) = boot(UiConfig::default(), requests);
+        let previous = state.panel.session;
+
+        let _ = state.open_panel();
+        assert!(matches!(
+            events.try_recv(),
+            Ok(UiRequest::DiscardSession { session }) if session == previous
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(UiRequest::CaptureContext { .. })
+        ));
+        assert_ne!(state.panel.session, previous);
+    }
+
+    #[test]
+    fn enter_is_ignored_during_a_stream_instead_of_resubmitting() {
+        let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _boot) = boot(UiConfig::default(), requests);
+        state.panel.phase = Phase::Streaming;
+        state.panel.input = "rewrite this".to_owned();
+
+        let task = panel_update(&mut state, panel::Message::Submit);
+        assert_eq!(task.units(), 0);
+        assert!(events.try_recv().is_err());
+        assert_eq!(state.panel.phase, Phase::Streaming);
     }
 
     #[test]
@@ -1916,7 +2849,7 @@ mod tests {
 
     /// §9: the position and size must reach the window server *before* it is
     /// made visible. `Task::batch` merges with `SelectAll` and makes no such
-    /// promise, so the show is a chain — five effects, in order.
+    /// promise, so the show is a chain — six effects, in order.
     #[test]
     fn the_show_sequence_is_ordered() {
         let mut state = app();
@@ -1925,9 +2858,269 @@ mod tests {
         let task = state.show_panel(placement);
         assert_eq!(
             task.units(),
-            5,
-            "resize, move, show, focus window, focus input"
+            6,
+            "resize, move, show, native present, focus window, focus input"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Attachments (§2, §4, §5, §14)
+    //
+    // The regression, observed 2026-07-26: `has_image` was derived from the
+    // clipboard, so taking a screenshot rerouted every subsequent request to
+    // the `Vision` role — which nothing binds — and surfaced as "No provider is
+    // configured yet" while settings showed a signed-in, healthy provider.
+    // -----------------------------------------------------------------------
+
+    fn clipboard(kind: aibo_core::types::ClipboardKind) -> aibo_core::types::ClipboardItem {
+        aibo_core::types::ClipboardItem {
+            kind,
+            text: None,
+            files: Vec::new(),
+            concealed: false,
+            transient: false,
+            source_app: Some("Chrome".to_owned()),
+            sequence: 1,
+            restorable: true,
+        }
+    }
+
+    fn capture_with(state: &mut Aibo, item: aibo_core::types::ClipboardItem) {
+        let session = state.panel.session;
+        let _ = backend_update(
+            state,
+            UiEvent::Context {
+                session,
+                app: Some(app_info()),
+                field: Some(Box::new(field(false))),
+                selection: None,
+                clipboard: Some(Box::new(item)),
+            },
+        );
+    }
+
+    /// The thesis, at the layer that used to break it. A screenshot on the
+    /// clipboard when the hotkey fires is *context*. It never attaches itself,
+    /// so it never reaches routing.
+    #[test]
+    fn a_screenshot_on_the_clipboard_does_not_attach_itself() {
+        let mut state = app();
+        capture_with(&mut state, clipboard(ClipboardKind::ImageRef));
+
+        assert!(
+            state.panel.clipboard.is_image(),
+            "it is offered, so ⌘V has something to do"
+        );
+        assert!(
+            !state.panel.has_attachments(),
+            "…and nothing is attached until the user says so"
+        );
+    }
+
+    #[test]
+    fn text_on_the_clipboard_is_not_offered_as_an_image() {
+        let mut state = app();
+        capture_with(&mut state, clipboard(ClipboardKind::Text));
+        assert!(!state.panel.clipboard.is_image());
+    }
+
+    /// §12: concealed content is never recorded and never sent. Being an image
+    /// is not an exemption, and offering it would invite the user to send
+    /// exactly what the marker exists to withhold.
+    #[test]
+    fn concealed_clipboard_content_is_never_offered() {
+        let mut state = app();
+        let mut item = clipboard(ClipboardKind::ImageRef);
+        item.concealed = true;
+        capture_with(&mut state, item);
+        assert!(!state.panel.clipboard.is_image());
+    }
+
+    /// ⌘V is claimed for the whole process, so it has to be scoped to the panel
+    /// by hand — pasting into a settings field must not attach anything.
+    #[test]
+    fn the_attach_chord_only_reaches_a_visible_panel() {
+        let mut state = app();
+        let panel_window = state.panel_window;
+        capture_with(&mut state, clipboard(ClipboardKind::ImageRef));
+
+        // Another window's ⌘V.
+        let elsewhere = window::Id::unique();
+        state.panel_visible = true;
+        let _ = update(
+            &mut state,
+            Message::WindowKey(elsewhere, WindowChord::Attach),
+        );
+        assert!(state.panel.toast.is_none(), "not ours to act on");
+
+        // The panel's own ⌘V, but the panel is not on screen.
+        state.panel_visible = false;
+        let _ = update(
+            &mut state,
+            Message::WindowKey(panel_window, WindowChord::Attach),
+        );
+        assert!(state.panel.toast.is_none());
+    }
+
+    /// An advertised image without bytes must not expose an enabled action.
+    ///
+    /// The bridge cannot materialise clipboard pixels yet, so every current
+    /// `ImageRef` lands here. Showing an enabled action that deterministically
+    /// fails is a false affordance.
+    #[test]
+    fn an_unreadable_clipboard_image_is_not_advertised_as_attachable() {
+        let mut state = app();
+        state.panel_visible = true;
+        capture_with(&mut state, clipboard(ClipboardKind::ImageRef));
+        assert!(state.panel.clipboard.is_image());
+        assert!(!state.panel.clipboard.is_attachable());
+
+        let panel_window = state.panel_window;
+        let _ = update(
+            &mut state,
+            Message::WindowKey(panel_window, WindowChord::Attach),
+        );
+        assert!(state.panel.toast.is_none());
+        assert!(!state.panel.has_attachments());
+    }
+
+    /// The two halves of the missing `bridge` change are the same change, and
+    /// that is what makes the gap safe rather than silent: an image cannot get
+    /// *into* the panel until `UiEvent` carries bytes, and the same edit is
+    /// what puts an `attachments` field on `UiRequest::Submit`. So there is no
+    /// window in which the panel shows a chip and submits a request that has
+    /// lost it.
+    ///
+    /// This test is the coupling, written down. It fails the moment someone
+    /// wires the bytes in without wiring them back out.
+    #[test]
+    fn the_transport_gap_cannot_silently_drop_an_image() {
+        let offer = clipboard_offer(Some(&clipboard(ClipboardKind::ImageRef)));
+        let panel::ClipboardOffer::Image { image, .. } = &offer else {
+            panic!("an image on the clipboard is still offered: {offer:?}");
+        };
+        assert!(
+            image.is_none(),
+            "`UiRequest::Submit` has no attachment field yet; until it does, \
+             `ClipboardOffer::image` must stay `None` or submit loses the image"
+        );
+    }
+
+    /// ⌘V attaches; ⌫ on an empty instruction takes it back off. Both through
+    /// the panel's own entry points, so the act stays deliberate at every step.
+    #[test]
+    fn the_attach_and_detach_chords_round_trip() {
+        use aibo_core::types::{Attachment, AttachmentSource};
+
+        let mut state = app();
+        state.panel_visible = true;
+        state.panel.clipboard = panel::ClipboardOffer::Image {
+            label: "Image from Chrome".to_owned(),
+            image: Some(Box::new(Attachment::image(
+                AttachmentSource::Clipboard,
+                vec![0x89, b'P', b'N', b'G'],
+                "image/png",
+                1200,
+                750,
+                "Image from Chrome",
+            ))),
+        };
+
+        let panel_window = state.panel_window;
+        let _ = update(
+            &mut state,
+            Message::WindowKey(panel_window, WindowChord::Attach),
+        );
+        assert_eq!(state.panel.attachments().len(), 1);
+        assert!(state.panel.toast.is_none());
+
+        // ⌫ with an instruction in the field belongs to the instruction. The
+        // panel and the focused `text_input` must never both act on one
+        // keystroke — the user would lose a character *and* an image.
+        state.panel.input = "what is this".to_owned();
+        let _ = update(
+            &mut state,
+            Message::WindowKey(panel_window, WindowChord::DetachLast),
+        );
+        assert_eq!(
+            state.panel.attachments().len(),
+            1,
+            "⌫ is the text's while there is text"
+        );
+
+        state.panel.input.clear();
+        let _ = update(&mut state, Message::ImePreedit(panel_window, true));
+        let _ = update(
+            &mut state,
+            Message::WindowKey(panel_window, WindowChord::DetachLast),
+        );
+        assert_eq!(
+            state.panel.attachments().len(),
+            1,
+            "uncommitted IME preedit owns backspace even while committed input is empty"
+        );
+
+        let _ = update(&mut state, Message::ImePreedit(panel_window, false));
+        let _ = update(
+            &mut state,
+            Message::WindowKey(panel_window, WindowChord::DetachLast),
+        );
+        assert!(!state.panel.has_attachments());
+    }
+
+    /// §13's one action has to resolve the state. After it runs the panel is
+    /// submittable again rather than stuck on a complaint about an image that
+    /// is no longer there.
+    #[test]
+    fn removing_the_image_the_error_named_leaves_a_usable_panel() {
+        use aibo_core::types::{Attachment, AttachmentSource, ModelBinding};
+
+        let mut state = app();
+        state.panel.input = "what is wrong with this chart".to_owned();
+        state
+            .panel
+            .attach(Attachment::image(
+                AttachmentSource::Clipboard,
+                vec![0x89, b'P', b'N', b'G'],
+                "image/png",
+                1200,
+                750,
+                "chart",
+            ))
+            .expect("valid");
+
+        let session = state.panel.session;
+        let _ = backend_update(
+            &mut state,
+            UiEvent::Failed {
+                session,
+                error: std::sync::Arc::new(aibo_core::AiboError::vision_unsupported(
+                    ModelBinding {
+                        provider: aibo_core::types::ProviderId::CEREBRAS,
+                        model: "gpt-oss-120b".to_owned(),
+                    },
+                    1,
+                    Vec::new(),
+                )),
+            },
+        );
+        assert_eq!(state.panel.phase, Phase::Failed);
+        assert!(
+            state.settings_window.is_none(),
+            "§13: inline, never the blocking treatment that opens settings"
+        );
+
+        let action = state
+            .panel
+            .error
+            .as_ref()
+            .and_then(|e| e.action.clone())
+            .expect("one action");
+        let _ = panel_update(&mut state, panel::Message::Error(action));
+
+        assert!(!state.panel.has_attachments());
+        assert_eq!(state.panel.phase, Phase::Idle);
+        assert_eq!(state.panel.input, "what is wrong with this chart");
     }
 
     /// The caret path, end to end through the panel's context state: a caret in

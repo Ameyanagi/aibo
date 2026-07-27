@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  format:
+    name: Format
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  native:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-14
+          - name: Windows
+            os: windows-2022
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+
+      - name: Check all features and targets
+        run: cargo check --workspace --all-features --all-targets --locked
+
+      # aibo-platform and aibo-ui intentionally use unsafe FFI on their
+      # supported targets. Keep those warnings visible in `cargo check`, while
+      # denying every other Clippy/rustc warning in this lint gate.
+      - name: Clippy
+        run: cargo clippy --workspace --all-features --all-targets --locked -- -D warnings -A unsafe-code
+
+      - name: Test
+        run: cargo test --workspace --all-targets --locked
+
+  cross-check:
+    name: Cross-check ${{ matrix.target }}
+    runs-on: macos-14
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-apple-darwin
+          - x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: ${{ matrix.target }}
+      - name: Install target
+        run: rustup target add ${{ matrix.target }}
+      - name: Check platform cfg
+        run: cargo check -p aibo-platform --target ${{ matrix.target }} --locked

@@ -41,6 +41,7 @@ windows = { workspace = true, features = [
     "Win32_Graphics_Dwm",                  # §8 DWMWA_SYSTEMBACKDROP_TYPE (panel chrome)
     "Win32_Graphics_Gdi",                  # §9 monitors: MonitorFromWindow, MONITORINFO
     "Win32_Security",                      # token elevation / uiAccess (UIPI, §8)
+    "Win32_Security_Cryptography",         # current-user DPAPI for oversize secrets
     "Win32_System_Com",                    # CoInitializeEx(MTA) for the UIA thread (§7)
     "Win32_System_DataExchange",           # clipboard + AddClipboardFormatListener (§12)
     "Win32_System_LibraryLoader",          # GetModuleHandleW / GetModuleFileNameW

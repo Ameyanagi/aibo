@@ -11,8 +11,9 @@
 //! The forms themselves are per-section product work.
 
 use aibo_core::types::{Health, Permission, PermissionStatus, ProviderId, Role};
-use iced::widget::{Space, button, column, container, row, scrollable, text};
+use iced::widget::{Space, button, column, container, row, scrollable, text, text_editor};
 use iced::{Element, Length};
+use secrecy::{ExposeSecret as _, SecretString};
 
 use crate::hotkey::{FailureReason, HotkeyStatus};
 use crate::i18n::{self, Key, Lang};
@@ -157,7 +158,7 @@ impl CodexPhase {
     /// `Degraded` so one could ride along would publish a *working* provider as
     /// degraded — a lie in the one field whose whole job is to say whether a
     /// provider works (§13). So the signed-in row reads
-    /// [`codex_text::SIGNED_IN`] and anything more specific (the account id,
+    /// [`Key::SettingsCodexSignedIn`] and anything more specific (the account id,
     /// §3a's plan-type claim) needs a channel that can carry it.
     ///
     /// TODO(bridge): a `UiEvent::CodexSignIn` variant would carry both, and is
@@ -195,58 +196,72 @@ impl CodexPhase {
     /// The reading for a health that carries no phase tag.
     fn from_health(health: &Health) -> (Self, String) {
         match health {
-            Health::Ok { .. } => (Self::SignedIn, codex_text::SIGNED_IN.to_owned()),
+            Health::Ok { .. } => (
+                Self::SignedIn,
+                codex_default_detail(Self::SignedIn).to_owned(),
+            ),
             Health::Degraded { reason, .. } | Health::Unavailable { reason } => {
                 (Self::Failed, reason.clone())
             }
-            Health::Unknown => (Self::SignedOut, codex_text::SIGNED_OUT.to_owned()),
+            Health::Unknown => (
+                Self::SignedOut,
+                codex_default_detail(Self::SignedOut).to_owned(),
+            ),
         }
     }
 }
 
-/// Copy for the Codex card.
-///
-/// Not in the i18n catalogue, on the same grounds as [`permission_label`]: these
-/// name a third-party product and a screen OpenAI serves in one wording
-/// (`auth.openai.com/codex/device` says "Codex"), and inventing a translation
-/// for the button that leads there would make it harder to follow, not easier.
-/// The *sentences* the backend supplies alongside them are ordinary strings and
-/// can be localised at the source.
-///
-/// TODO(i18n): move to `Key::` entries when `i18n.rs` is in scope.
+/// Non-localisable Codex endpoint copy shared with the application bridge.
 pub mod codex_text {
-    /// Card title.
-    pub const TITLE: &str = "ChatGPT subscription (Codex)";
-    /// Body when nothing is held.
-    pub const SIGNED_OUT: &str = "Use your ChatGPT plan instead of an API key. aibo runs its own device-code login and \
-         stores its own tokens in the keychain — it never reads or refreshes Codex's.";
-    /// Body when a token pair is held but the backend said nothing more.
-    pub const SIGNED_IN: &str = "Signed in. Codex is bound to the Smart and Ask surfaces.";
-    /// Button: start a login.
-    pub const SIGN_IN: &str = "Sign in with ChatGPT";
-    /// Button: abandon a login in flight.
-    pub const CANCEL: &str = "Cancel sign-in";
-    /// Button: forget the tokens and remove the provider.
-    pub const SIGN_OUT: &str = "Sign out";
-    /// Standing note under the button, from §3a's posture paragraph.
-    pub const CONSENT_NOTE: &str = "The approval page is OpenAI's own Codex consent screen; the tokens it issues are stored \
-         only by aibo.";
+    /// The page the user approves the code on (§3a).
+    ///
+    /// Duplicated from `aibo_provider::codex::VERIFICATION_URI` rather than
+    /// imported: `aibo-ui` does not depend on `aibo-provider`, and adding that
+    /// edge to reach one constant would invert the layering for the sake of a
+    /// string. The binary asserts the two agree.
+    pub const VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
 }
 
-/// The label on the Codex card's single button, for a given phase.
+/// The catalogue key on the Codex card's single button, for a given phase.
 ///
 /// Public because the backend owns the *action* that button triggers and this
 /// owns its *wording*, and the two must never disagree — a button that says
 /// "Sign in" while pressing it signs the user out is the failure mode of
 /// collapsing three actions into one control. The binary asserts the agreement.
-pub const fn codex_action_label(phase: CodexPhase) -> &'static str {
+pub const fn codex_action_key(phase: CodexPhase) -> Key {
     match phase {
-        CodexPhase::SignedIn => codex_text::SIGN_OUT,
+        CodexPhase::SignedIn => Key::SettingsCodexSignOut,
         CodexPhase::Starting | CodexPhase::AwaitingApproval | CodexPhase::Exchanging => {
-            codex_text::CANCEL
+            Key::SettingsCodexCancelSignIn
         }
-        CodexPhase::SignedOut | CodexPhase::Failed => codex_text::SIGN_IN,
+        CodexPhase::SignedOut | CodexPhase::Failed => Key::SettingsCodexSignIn,
     }
+}
+
+/// Localised label for [`codex_action_key`].
+pub fn codex_action_label(phase: CodexPhase) -> &'static str {
+    i18n::t(codex_action_key(phase))
+}
+
+/// Catalogue key for a Codex phase's default supporting sentence.
+pub const fn codex_default_detail_key(phase: CodexPhase) -> Key {
+    match phase {
+        CodexPhase::SignedOut => Key::SettingsCodexSignedOut,
+        CodexPhase::Starting => Key::SettingsCodexStarting,
+        CodexPhase::AwaitingApproval => Key::SettingsCodexAwaitingApproval,
+        CodexPhase::Exchanging => Key::SettingsCodexExchanging,
+        CodexPhase::SignedIn => Key::SettingsCodexSignedIn,
+        CodexPhase::Failed => Key::SettingsCodexFailed,
+    }
+}
+
+/// Localised default supporting sentence for a Codex phase.
+///
+/// A backend-provided failure or live device-code sentence should take
+/// precedence; this covers phase transitions before more specific detail
+/// arrives and keeps that bridge-owned copy out of hard-coded English.
+pub fn codex_default_detail(phase: CodexPhase) -> &'static str {
+    i18n::t(codex_default_detail_key(phase))
 }
 
 /// A provider as the settings list shows it.
@@ -288,6 +303,50 @@ pub struct SettingsState {
     pub hotkey: Option<HotkeyStatus>,
     /// The active UI language.
     pub language: Lang,
+    /// Whether this window is the first-run setup rather than a later visit.
+    pub onboarding: bool,
+    /// Current selectable Codex device code, when approval is pending.
+    device_code: Option<String>,
+    /// Read-only selection state for [`Self::device_code`].
+    device_code_editor: text_editor::Content,
+    /// Encrypted history is available to the session engine.
+    pub history_ready: bool,
+    /// A setup operation is in flight.
+    pub history_initializing: bool,
+    /// Setup failed; details remain in diagnostics.
+    pub history_failed: bool,
+    /// Newly generated recovery code. Kept redacted and shown only this run.
+    pub recovery_code: Option<SecretString>,
+}
+
+impl SettingsState {
+    /// Synchronize the selectable device-code surface after provider health
+    /// changes.
+    pub fn sync_device_code(&mut self) {
+        let next = self
+            .providers
+            .iter()
+            .find(|provider| provider.id == ProviderId::CODEX)
+            .and_then(|provider| {
+                let (phase, detail) = CodexPhase::read(&provider.health);
+                (phase == CodexPhase::AwaitingApproval)
+                    .then(|| device_code_in(&detail))
+                    .flatten()
+            });
+        if next != self.device_code {
+            self.device_code_editor =
+                text_editor::Content::with_text(next.as_deref().unwrap_or_default());
+            self.device_code = next;
+        }
+    }
+
+    /// Apply selection/cursor actions while keeping the server-issued code
+    /// immutable.
+    pub fn perform_device_code_action(&mut self, action: text_editor::Action) {
+        if !action.is_edit() {
+            self.device_code_editor.perform(action);
+        }
+    }
 }
 
 /// What the settings window emits.
@@ -304,8 +363,24 @@ pub enum Message {
     /// Rebind the panel hotkey. Opens the picker; §9 scopes it to one key plus
     /// modifiers, with no sequences and no double-taps.
     RebindHotkey,
+    /// Copy the device-code to the clipboard.
+    ///
+    /// §3a's code looks like `RJF3-XIERE`, and the verification page expects it
+    /// **exactly as issued, hyphen included**. Retyping a ten-character code is
+    /// where people slip, and the failure is silent: the page just says the code
+    /// is wrong, with no hint whether the code or the app is at fault.
+    CopyDeviceCode(String),
+    /// Selection, cursor, or an ignored edit attempt in the device code.
+    DeviceCodeAction(text_editor::Action),
+    /// Open `auth.openai.com/codex/device` in the browser, so the URL does not
+    /// have to be transcribed either.
+    OpenDeviceUrl,
     /// Copy a redacted diagnostics bundle (§19).
     CopyDiagnostics,
+    /// Enable local SQLCipher history after an explicit user gesture.
+    InitializeHistory,
+    /// Copy the one-time recovery code.
+    CopyRecoveryCode,
     /// Close the window.
     Close,
 }
@@ -336,17 +411,29 @@ fn navigation(state: &SettingsState) -> Element<'_, Message> {
         let selected = section == state.section;
         list = list.push(
             button(
-                text(i18n::t(section.title()))
-                    .size(type_scale::META)
-                    .style(if selected {
-                        theme::text_accent
-                    } else {
-                        theme::text_dim
-                    }),
+                row![
+                    text(selection_marker(selected))
+                        .width(Length::Fixed(space(3.0)))
+                        .size(type_scale::META)
+                        .style(theme::text_primary),
+                    text(i18n::t(section.title()))
+                        .size(type_scale::META)
+                        .style(if selected {
+                            theme::text_primary
+                        } else {
+                            theme::text_dim
+                        }),
+                ]
+                .align_y(iced::Alignment::Center),
             )
             .width(Length::Fill)
+            .height(Length::Fixed(theme::MIN_HIT_TARGET))
             .padding([space(1.5), space(2.0)])
-            .style(theme::action_button)
+            .style(if selected {
+                theme::selected_button
+            } else {
+                theme::action_button
+            })
             .on_press(Message::Select(section)),
         );
     }
@@ -361,10 +448,11 @@ fn section_body(state: &SettingsState) -> Element<'_, Message> {
         Section::Budgets => budgets(state),
         Section::Language => language(state),
         Section::About => about(state),
-        // TODO(§4, §12, §14): role chains, saved actions and the history
+        Section::History => history(state),
+        // TODO(§4, §12, §14): role chains and saved actions
         // browser are per-section product work. The IA slot exists so
         // navigation is complete and the sections cannot drift from §16.
-        Section::Roles | Section::Actions | Section::History => widgets::state_block(
+        Section::Roles | Section::Actions => widgets::state_block(
             Severity::Info,
             i18n::t(Key::StateEmptyTitle),
             Some(i18n::t(Key::StateEmptyBody)),
@@ -375,6 +463,68 @@ fn section_body(state: &SettingsState) -> Element<'_, Message> {
     column![heading, content].spacing(space(3.0)).into()
 }
 
+fn history(state: &SettingsState) -> Element<'_, Message> {
+    if let Some(code) = &state.recovery_code {
+        return column![
+            widgets::state_block(
+                Severity::Warning,
+                i18n::t(Key::SettingsRecoveryTitle),
+                Some(i18n::t(Key::SettingsRecoveryBody)),
+                Vec::new(),
+            ),
+            container(
+                text(code.expose_secret())
+                    .size(type_scale::BODY)
+                    .font(theme::MONO_FONT)
+                    .style(theme::text_primary)
+            )
+            .width(Length::Fill)
+            .padding(space(2.0))
+            .style(theme::raised),
+            widgets::action_list(vec![Action::new(
+                Key::ActionCopyRecoveryCode,
+                widgets::primary_shortcut("⌘C", "Ctrl+C"),
+                Message::CopyRecoveryCode,
+            )]),
+        ]
+        .spacing(space(2.0))
+        .into();
+    }
+
+    if state.history_ready {
+        return widgets::state_block(
+            Severity::Success,
+            i18n::t(Key::SettingsHistoryReady),
+            None,
+            Vec::new(),
+        );
+    }
+
+    let actions = if state.history_initializing {
+        Vec::new()
+    } else {
+        vec![Action::new(
+            Key::ActionEnableHistory,
+            "⏎",
+            Message::InitializeHistory,
+        )]
+    };
+    widgets::state_block(
+        if state.history_failed {
+            Severity::Danger
+        } else {
+            Severity::Info
+        },
+        i18n::t(if state.history_failed {
+            Key::SettingsHistoryFailed
+        } else {
+            Key::SettingsHistorySetupTitle
+        }),
+        Some(i18n::t(Key::SettingsHistorySetupBody)),
+        actions,
+    )
+}
+
 /// The Codex sign-in card (§3a).
 ///
 /// Always rendered, and rendered **first**, including on a fresh install with
@@ -382,6 +532,32 @@ fn section_body(state: &SettingsState) -> Element<'_, Message> {
 /// ChatGPT-subscription user has is not an API key, so a Providers tab that
 /// only shows already-configured rows offers them no way in at all — which is
 /// the state this card was added to end.
+/// Pull the device code out of the phase detail.
+///
+/// The backend reports progress as one human sentence ("Enter code ABCD-1234
+/// at https://…"), which is right for a log and wrong for a control: a code the
+/// user must copy has to be a *value*, not a substring of a paragraph. Parsed
+/// here rather than restructuring the bridge, and shaped so a format change
+/// degrades to "no copy button" instead of a wrong one.
+fn device_code_in(detail: &str) -> Option<String> {
+    detail
+        .split_whitespace()
+        .map(|word| word.trim_matches(|c: char| !c.is_ascii_alphanumeric() && c != '-'))
+        .find(|word| {
+            // XXXX-XXXX: two groups, one hyphen, uppercase alphanumerics.
+            let mut parts = word.split('-');
+            let (Some(a), Some(b), None) = (parts.next(), parts.next(), parts.next()) else {
+                return false;
+            };
+            a.len() >= 3
+                && b.len() >= 3
+                && a.chars()
+                    .chain(b.chars())
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit())
+        })
+        .map(str::to_owned)
+}
+
 fn codex_card(state: &SettingsState) -> Element<'_, Message> {
     let health = state
         .providers
@@ -404,22 +580,78 @@ fn codex_card(state: &SettingsState) -> Element<'_, Message> {
     // than by a second control the bridge cannot express.
     let label = codex_action_label(phase);
 
-    let body = column![
-        text(codex_text::TITLE)
+    let mut body = column![
+        text(i18n::t(Key::SettingsCodexTitle))
             .size(type_scale::BODY)
             .style(theme::text_primary),
-        text(detail)
+        text(detail.clone())
             .size(type_scale::META)
             .style(theme::text_severity(severity)),
-        text(codex_text::CONSENT_NOTE)
-            .size(type_scale::META)
-            .style(theme::text_dim),
-        button(text(label).size(type_scale::META).style(theme::text_accent))
-            .padding([space(1.5), space(2.0)])
-            .style(theme::action_button)
-            .on_press(Message::SignIn(ProviderId::CODEX)),
     ]
     .spacing(space(1.5));
+
+    // While waiting for approval the code is the only thing that matters, so it
+    // gets display scale and its own controls. This is the one screen where a
+    // transcription error costs a full 15-minute retry cycle.
+    if phase == CodexPhase::AwaitingApproval
+        && let Some(code) = device_code_in(&detail)
+    {
+        if state.device_code.as_deref() == Some(code.as_str()) {
+            body = body.push(
+                text_editor(&state.device_code_editor)
+                    .on_action(Message::DeviceCodeAction)
+                    .height(Length::Fixed(theme::MIN_HIT_TARGET))
+                    .padding(space(1.0))
+                    .size(type_scale::DISPLAY)
+                    .font(theme::MONO_FONT)
+                    .style(theme::answer_editor),
+            );
+        } else {
+            body = body.push(
+                text(code.clone())
+                    .size(type_scale::DISPLAY)
+                    .font(theme::MONO_FONT)
+                    .style(theme::text_accent),
+            );
+        }
+        body = body.push(
+            row![
+                button(
+                    text(format!("⧉ {}", i18n::t(Key::SettingsCopyDeviceCode)))
+                        .size(type_scale::META)
+                        .style(theme::text_accent)
+                )
+                .height(Length::Fixed(theme::MIN_HIT_TARGET))
+                .padding([space(1.0), space(2.0)])
+                .style(theme::action_button)
+                .on_press(Message::CopyDeviceCode(code)),
+                button(
+                    text(format!("↗ {}", i18n::t(Key::SettingsOpenDevicePage)))
+                        .size(type_scale::META)
+                        .style(theme::text_accent)
+                )
+                .height(Length::Fixed(theme::MIN_HIT_TARGET))
+                .padding([space(1.0), space(2.0)])
+                .style(theme::action_button)
+                .on_press(Message::OpenDeviceUrl),
+            ]
+            .spacing(space(1.0)),
+        );
+    }
+
+    let body = body
+        .push(
+            text(i18n::t(Key::SettingsCodexConsentNote))
+                .size(type_scale::META)
+                .style(theme::text_dim),
+        )
+        .push(
+            button(text(label).size(type_scale::META).style(theme::text_accent))
+                .height(Length::Fixed(theme::MIN_HIT_TARGET))
+                .padding([space(1.5), space(2.0)])
+                .style(theme::action_button)
+                .on_press(Message::SignIn(ProviderId::CODEX)),
+        );
 
     container(body)
         .width(Length::Fill)
@@ -429,7 +661,16 @@ fn codex_card(state: &SettingsState) -> Element<'_, Message> {
 }
 
 fn providers(state: &SettingsState) -> Element<'_, Message> {
-    let mut list = column![codex_card(state)].spacing(space(2.0));
+    let mut list = column![].spacing(space(2.0));
+    if state.onboarding {
+        list = list.push(widgets::state_block(
+            Severity::Info,
+            i18n::t(Key::SettingsWelcomeTitle),
+            Some(i18n::t(Key::SettingsWelcomeBody)),
+            Vec::new(),
+        ));
+    }
+    list = list.push(codex_card(state));
 
     // §13's blocking "no provider configured" still belongs here — but under
     // the card, not instead of it, because the card is the way out of it.
@@ -475,11 +716,6 @@ fn providers(state: &SettingsState) -> Element<'_, Message> {
                     text(status)
                         .size(type_scale::META)
                         .style(theme::text_severity(severity)),
-                    widgets::action_list(vec![Action::new(
-                        Key::ActionSignIn,
-                        "⏎",
-                        Message::SignIn(provider.id.clone()),
-                    )]),
                 ]
                 .spacing(space(2.0))
                 .align_y(iced::Alignment::Center),
@@ -532,7 +768,7 @@ fn permissions(state: &SettingsState) -> Element<'_, Message> {
     for row in &state.permissions {
         list = list.push(widgets::permission_banner(
             row.status,
-            permission_label(row.permission),
+            i18n::t(permission_key(row.permission)),
             Some(Message::OpenSystemSettings(row.permission)),
         ));
     }
@@ -552,24 +788,20 @@ fn failure_body(reason: &FailureReason) -> &str {
         FailureReason::ModifiersRejected => i18n::t(Key::HotkeyRejectedByOs),
         // "Another app has already claimed it. Pick a different shortcut."
         FailureReason::AlreadyOwned => i18n::t(Key::HotkeyFailedBody),
-        // Developer-facing and platform-specific, like `permission_label`.
+        // Developer-facing and platform-specific.
         FailureReason::BreaksOsShortcut(why) => why,
         FailureReason::Unclassified(raw) => raw,
     }
 }
 
-/// Developer-facing permission identifiers.
-///
-/// Not in the catalogue: these name OS concepts whose own UI is untranslated
-/// per-platform, and inventing a translation for "TCC Accessibility" would make
-/// the settings pane harder to follow, not easier.
-const fn permission_label(permission: Permission) -> &'static str {
+/// Catalogue key for a user-visible OS permission name.
+const fn permission_key(permission: Permission) -> Key {
     match permission {
-        Permission::Accessibility => "Accessibility",
-        Permission::PostEvents => "Input Monitoring",
-        Permission::ElevatedWindowAccess => "Elevated window access",
-        Permission::Notifications => "Notifications",
-        Permission::Autostart => "Launch at login",
+        Permission::Accessibility => Key::SettingsPermissionAccessibility,
+        Permission::PostEvents => Key::SettingsPermissionInputMonitoring,
+        Permission::ElevatedWindowAccess => Key::SettingsPermissionElevatedWindowAccess,
+        Permission::Notifications => Key::SettingsPermissionNotifications,
+        Permission::Autostart => Key::SettingsPermissionAutostart,
     }
 }
 
@@ -591,21 +823,37 @@ fn language(state: &SettingsState) -> Element<'_, Message> {
         let selected = *lang == state.language;
         list = list.push(
             button(
-                text(lang.endonym())
-                    .size(type_scale::BODY)
-                    .style(if selected {
-                        theme::text_accent
-                    } else {
-                        theme::text_dim
-                    }),
+                row![
+                    text(selection_marker(selected))
+                        .width(Length::Fixed(space(3.0)))
+                        .size(type_scale::BODY)
+                        .style(theme::text_primary),
+                    text(lang.endonym())
+                        .size(type_scale::BODY)
+                        .style(if selected {
+                            theme::text_primary
+                        } else {
+                            theme::text_dim
+                        }),
+                ]
+                .align_y(iced::Alignment::Center),
             )
             .width(Length::Fill)
+            .height(Length::Fixed(theme::MIN_HIT_TARGET))
             .padding([space(1.5), space(2.0)])
-            .style(theme::action_button)
+            .style(if selected {
+                theme::selected_button
+            } else {
+                theme::action_button
+            })
             .on_press(Message::SetLanguage(*lang)),
         );
     }
     list.into()
+}
+
+const fn selection_marker(selected: bool) -> &'static str {
+    if selected { "✓" } else { "" }
 }
 
 fn about<'a>(_state: &'a SettingsState) -> Element<'a, Message> {
@@ -618,7 +866,7 @@ fn about<'a>(_state: &'a SettingsState) -> Element<'a, Message> {
             .style(theme::text_dim),
         widgets::action_list(vec![Action::new(
             Key::ActionCopyDiagnostics,
-            "⌘C",
+            widgets::primary_shortcut("⌘C", "Ctrl+C"),
             Message::CopyDiagnostics,
         )]),
     ]
@@ -709,15 +957,15 @@ mod tests {
     /// is what distinguishes them.
     #[test]
     fn the_one_button_says_which_of_the_three_things_it_does() {
-        let labels = [
-            (CodexPhase::SignedOut, codex_text::SIGN_IN),
-            (CodexPhase::Starting, codex_text::CANCEL),
-            (CodexPhase::AwaitingApproval, codex_text::CANCEL),
-            (CodexPhase::Exchanging, codex_text::CANCEL),
-            (CodexPhase::SignedIn, codex_text::SIGN_OUT),
-            (CodexPhase::Failed, codex_text::SIGN_IN),
+        let keys = [
+            (CodexPhase::SignedOut, Key::SettingsCodexSignIn),
+            (CodexPhase::Starting, Key::SettingsCodexCancelSignIn),
+            (CodexPhase::AwaitingApproval, Key::SettingsCodexCancelSignIn),
+            (CodexPhase::Exchanging, Key::SettingsCodexCancelSignIn),
+            (CodexPhase::SignedIn, Key::SettingsCodexSignOut),
+            (CodexPhase::Failed, Key::SettingsCodexSignIn),
         ];
-        for (phase, expected) in labels {
+        for (phase, expected) in keys {
             let state = SettingsState {
                 providers: vec![ProviderRow {
                     id: ProviderId::CODEX,
@@ -728,14 +976,35 @@ mod tests {
             };
             let (read, _) = CodexPhase::read(&state.providers[0].health);
             assert_eq!(read, phase, "{phase:?} did not survive the health channel");
-            assert_eq!(codex_action_label(read), expected);
+            assert_eq!(codex_action_key(read), expected);
+            assert_eq!(codex_action_label(read), i18n::t(expected));
             let _ = codex_card(&state);
         }
         // …and the three labels are genuinely different strings, so "sign in"
         // can never be pressed when it would in fact sign the user out.
-        assert_ne!(codex_text::SIGN_IN, codex_text::SIGN_OUT);
-        assert_ne!(codex_text::SIGN_IN, codex_text::CANCEL);
-        assert_ne!(codex_text::CANCEL, codex_text::SIGN_OUT);
+        assert_ne!(Key::SettingsCodexSignIn, Key::SettingsCodexSignOut);
+        assert_ne!(Key::SettingsCodexSignIn, Key::SettingsCodexCancelSignIn);
+        assert_ne!(Key::SettingsCodexCancelSignIn, Key::SettingsCodexSignOut);
+    }
+
+    #[test]
+    fn every_codex_phase_has_localised_default_detail() {
+        for phase in [
+            CodexPhase::SignedOut,
+            CodexPhase::Starting,
+            CodexPhase::AwaitingApproval,
+            CodexPhase::Exchanging,
+            CodexPhase::SignedIn,
+            CodexPhase::Failed,
+        ] {
+            let key = codex_default_detail_key(phase);
+            assert!(!codex_default_detail(phase).is_empty());
+            assert_ne!(
+                i18n::lookup(key, Lang::En),
+                i18n::lookup(key, Lang::Ja),
+                "{phase:?} was left as hard-coded English"
+            );
+        }
     }
 
     /// The phase channel must round-trip the sentence the backend wrote,
@@ -799,7 +1068,7 @@ mod tests {
         assert_eq!(phase, CodexPhase::SignedIn);
         assert_eq!(
             detail,
-            codex_text::SIGNED_IN,
+            i18n::t(Key::SettingsCodexSignedIn),
             "Health::Ok has nowhere to put a sentence, so the canonical copy is what shows"
         );
         assert!(!detail.contains("acct_42"));
@@ -861,5 +1130,67 @@ mod tests {
             ..SettingsState::default()
         };
         let _ = permissions(&state);
+    }
+
+    #[test]
+    fn selected_choices_have_a_non_colour_marker() {
+        assert_eq!(selection_marker(true), "✓");
+        assert_eq!(selection_marker(false), "");
+    }
+
+    #[test]
+    fn permission_names_follow_the_active_language() {
+        for permission in [
+            Permission::Accessibility,
+            Permission::PostEvents,
+            Permission::ElevatedWindowAccess,
+            Permission::Notifications,
+            Permission::Autostart,
+        ] {
+            let key = permission_key(permission);
+            assert_ne!(
+                i18n::lookup(key, Lang::En),
+                i18n::lookup(key, Lang::Ja),
+                "{permission:?} was left as hard-coded English"
+            );
+        }
+    }
+
+    #[test]
+    fn device_code_is_selectable_but_not_editable() {
+        let mut state = SettingsState {
+            providers: vec![ProviderRow {
+                id: ProviderId::CODEX,
+                configured: false,
+                health: CodexPhase::AwaitingApproval
+                    .to_health("Enter code ABCD-1234 at the approval page"),
+            }],
+            ..SettingsState::default()
+        };
+        state.sync_device_code();
+        state.perform_device_code_action(text_editor::Action::SelectAll);
+        assert_eq!(
+            state.device_code_editor.selection().as_deref(),
+            Some("ABCD-1234")
+        );
+        state.perform_device_code_action(text_editor::Action::Edit(text_editor::Edit::Insert('X')));
+        assert_eq!(state.device_code_editor.text(), "ABCD-1234");
+    }
+
+    #[test]
+    fn history_recovery_code_is_redacted_from_debug_output() {
+        let secret = "alpha-bravo-charlie-delta";
+        let state = SettingsState {
+            section: Section::History,
+            history_ready: true,
+            recovery_code: Some(SecretString::from(secret.to_owned())),
+            ..SettingsState::default()
+        };
+
+        assert!(
+            !format!("{state:?}").contains(secret),
+            "a debug or panic report must not disclose a recovery code"
+        );
+        let _ = history(&state);
     }
 }

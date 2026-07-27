@@ -16,7 +16,7 @@
 
 use iced::border::Radius;
 use iced::theme::Base as _;
-use iced::widget::{button, container, rule, scrollable, text, text_input};
+use iced::widget::{button, container, rule, scrollable, text, text_editor, text_input};
 use iced::{Background, Border, Color, Font, Shadow, Theme, Vector};
 
 // ---------------------------------------------------------------------------
@@ -90,6 +90,12 @@ pub const ACTION_ROW_HEIGHT: f32 = 48.0;
 /// row alone still clipped it — the rows above it have to be counted too.
 pub const META_LINE_HEIGHT: f32 = 22.0;
 
+/// Minimum interactive target edge in logical points.
+///
+/// 44 pt is the platform-independent floor used for mouse, touchpad and touch
+/// accessibility. Visual chrome may remain smaller inside the target.
+pub const MIN_HIT_TARGET: f32 = 44.0;
+
 // ---------------------------------------------------------------------------
 // Type (§16)
 // ---------------------------------------------------------------------------
@@ -104,6 +110,13 @@ pub mod type_scale {
     pub const HEADING: f32 = 17.0;
     /// The context chip excerpt.
     pub const CHIP: f32 = 12.0;
+    /// Display scale, used in exactly one place: the device-code sign-in screen.
+    ///
+    /// A deliberate exception to "three text roles, not a continuum". That code
+    /// has to be read character by character and typed into a browser, and a
+    /// mistake costs a full 15-minute retry cycle — the only screen in the
+    /// product where transcription accuracy is the whole job.
+    pub const DISPLAY: f32 = 28.0;
 }
 
 /// The interface face.
@@ -227,10 +240,10 @@ impl Palette {
         surface_raised: rgb(0x1B, 0x1D, 0x24),
         border: rgb(0x2A, 0x2D, 0x36),
         accent: rgb(0x7C, 0x93, 0xFF),
-        accent_muted: rgba(0x7C, 0x93, 0xFF, 0.16),
+        accent_muted: rgba(0x7C, 0x93, 0xFF, 0.12),
         text: rgb(0xEC, 0xEE, 0xF4),
         text_dim: rgb(0x9A, 0xA1, 0xB2),
-        text_faint: rgb(0x66, 0x6D, 0x7E),
+        text_faint: rgb(0x82, 0x8A, 0x9C),
         danger: rgb(0xFF, 0x6B, 0x6B),
         warning: rgb(0xF2, 0xB0, 0x4A),
         success: rgb(0x5A, 0xD1, 0x9A),
@@ -243,12 +256,12 @@ impl Palette {
         surface_raised: rgb(0xF0, 0xF1, 0xF5),
         border: rgb(0xD8, 0xDA, 0xE2),
         accent: rgb(0x3B, 0x54, 0xE0),
-        accent_muted: rgba(0x3B, 0x54, 0xE0, 0.12),
+        accent_muted: rgba(0x3B, 0x54, 0xE0, 0.04),
         text: rgb(0x16, 0x18, 0x1F),
         text_dim: rgb(0x51, 0x57, 0x66),
-        text_faint: rgb(0x84, 0x8A, 0x99),
-        danger: rgb(0xC4, 0x2B, 0x2B),
-        warning: rgb(0x9A, 0x64, 0x0C),
+        text_faint: rgb(0x62, 0x69, 0x77),
+        danger: rgb(0xB2, 0x1F, 0x1F),
+        warning: rgb(0x8C, 0x57, 0x08),
         success: rgb(0x14, 0x6E, 0x50),
     };
 }
@@ -498,6 +511,20 @@ pub fn text_accent(theme: &Theme) -> text::Style {
     }
 }
 
+/// Text placed on the solid accent fill of a primary button.
+pub fn text_on_primary(theme: &Theme) -> text::Style {
+    text::Style {
+        color: Some(palette_of(theme).surface),
+    }
+}
+
+/// Destructive-button text, including its key hint.
+pub fn text_danger(theme: &Theme) -> text::Style {
+    text::Style {
+        color: Some(palette_of(theme).danger),
+    }
+}
+
 /// Text in a severity colour.
 pub fn text_severity(severity: Severity) -> impl Fn(&Theme) -> text::Style {
     move |theme: &Theme| text::Style {
@@ -520,6 +547,26 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
             radius: Radius::new(RADIUS_SMALL),
         },
         icon: p.text_faint,
+        placeholder: p.text_faint,
+        value: p.text,
+        selection: p.accent_muted,
+    }
+}
+
+/// A selectable, read-only answer surface.
+pub fn answer_editor(theme: &Theme, status: text_editor::Status) -> text_editor::Style {
+    let p = palette_of(theme);
+    let border_color = match status {
+        text_editor::Status::Focused { .. } => p.accent,
+        _ => p.border,
+    };
+    text_editor::Style {
+        background: Background::Color(p.surface_raised),
+        border: Border {
+            color: border_color,
+            width: 1.0,
+            radius: Radius::new(RADIUS_SMALL),
+        },
         placeholder: p.text_faint,
         value: p.text,
         selection: p.accent_muted,
@@ -549,17 +596,56 @@ pub fn action_button(theme: &Theme, status: button::Status) -> button::Style {
     }
 }
 
+/// A selected navigation or choice button.
+///
+/// Views also include a checkmark in their label, so selection never depends
+/// on perceiving this colour treatment. The stronger border is a redundant
+/// focus aid and preserves the selected row when the checkmark is clipped.
+pub fn selected_button(theme: &Theme, status: button::Status) -> button::Style {
+    let p = palette_of(theme);
+    let background = match status {
+        button::Status::Active => p.accent_muted,
+        button::Status::Hovered => Color {
+            a: 0.24,
+            ..p.accent
+        },
+        button::Status::Pressed => Color {
+            a: 0.32,
+            ..p.accent
+        },
+        button::Status::Disabled => Color {
+            a: 0.08,
+            ..p.accent
+        },
+    };
+    button::Style {
+        background: Some(Background::Color(background)),
+        text_color: if matches!(status, button::Status::Disabled) {
+            p.text_faint
+        } else {
+            p.text
+        },
+        border: Border {
+            color: p.accent,
+            width: 2.0,
+            radius: Radius::new(RADIUS_SMALL),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
 /// The one emphasised button per surface — "Sign in", "Approve", "Retry".
 pub fn primary_button(theme: &Theme, status: button::Status) -> button::Style {
     let p = palette_of(theme);
     let background = match status {
         button::Status::Active => p.accent,
         button::Status::Hovered => Color {
-            a: 0.88,
+            a: 0.92,
             ..p.accent
         },
         button::Status::Pressed => Color {
-            a: 0.76,
+            a: 0.88,
             ..p.accent
         },
         button::Status::Disabled => Color {
@@ -585,10 +671,10 @@ pub fn primary_button(theme: &Theme, status: button::Status) -> button::Style {
 pub fn danger_button(theme: &Theme, status: button::Status) -> button::Style {
     let p = palette_of(theme);
     let tint = match status {
-        button::Status::Active => 0.14,
-        button::Status::Hovered => 0.24,
-        button::Status::Pressed => 0.34,
-        button::Status::Disabled => 0.06,
+        button::Status::Active => 0.06,
+        button::Status::Hovered => 0.12,
+        button::Status::Pressed => 0.16,
+        button::Status::Disabled => 0.03,
     };
     button::Style {
         background: Some(Background::Color(Color {
@@ -648,31 +734,119 @@ pub fn scroller(theme: &Theme, status: scrollable::Status) -> scrollable::Style 
 mod tests {
     use super::*;
 
-    #[test]
-    fn body_text_passes_aa_on_both_surfaces() {
-        for p in [Palette::DARK, Palette::LIGHT] {
-            assert!(
-                contrast_ratio(p.text, p.surface) >= 4.5,
-                "primary text fails AA"
-            );
-            assert!(
-                contrast_ratio(p.text, p.surface_raised) >= 4.5,
-                "primary text fails AA on elevation 1"
-            );
-            assert!(
-                contrast_ratio(p.text_dim, p.surface) >= 4.5,
-                "secondary text fails AA"
-            );
+    fn composite_over(foreground: Color, background: Color) -> Color {
+        let alpha = foreground.a;
+        Color {
+            r: foreground.r * alpha + background.r * (1.0 - alpha),
+            g: foreground.g * alpha + background.g * (1.0 - alpha),
+            b: foreground.b * alpha + background.b * (1.0 - alpha),
+            a: 1.0,
+        }
+    }
+
+    fn style_background(background: Option<Background>, surface: Color) -> Color {
+        match background {
+            Some(Background::Color(color)) => composite_over(color, surface),
+            _ => surface,
         }
     }
 
     #[test]
-    fn semantic_colours_pass_aa_large_on_their_surface() {
-        // Severity colours are only ever used at >= 15 pt or as a fill tint,
-        // so AA-large (3.0) is the correct bar for them.
+    fn every_meaningful_text_colour_passes_aa_on_both_surfaces() {
         for p in [Palette::DARK, Palette::LIGHT] {
-            for c in [p.danger, p.warning, p.success, p.accent] {
-                assert!(contrast_ratio(c, p.surface) >= 3.0);
+            for foreground in [
+                p.text,
+                p.text_dim,
+                p.text_faint,
+                p.accent,
+                p.danger,
+                p.warning,
+                p.success,
+            ] {
+                for background in [p.surface, p.surface_raised] {
+                    assert!(
+                        contrast_ratio(foreground, background) >= 4.5,
+                        "{foreground:?} fails AA on {background:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn banner_text_passes_aa_on_the_actual_tinted_background() {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let theme = appearance.iced_theme();
+            let p = appearance.palette();
+            for surface in [p.surface, p.surface_raised] {
+                for severity in [
+                    Severity::Info,
+                    Severity::Warning,
+                    Severity::Danger,
+                    Severity::Success,
+                ] {
+                    let style = banner(severity)(&theme);
+                    let background = style_background(style.background, surface);
+                    for foreground in [p.text, p.text_dim, severity.color(&p)] {
+                        assert!(
+                            contrast_ratio(foreground, background) >= 4.5,
+                            "{appearance:?}/{severity:?}: {foreground:?} fails on {background:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn enabled_button_text_passes_aa_in_every_interaction_state() {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let theme = appearance.iced_theme();
+            let p = appearance.palette();
+            for surface in [p.surface, p.surface_raised] {
+                for style in [
+                    action_button,
+                    selected_button,
+                    primary_button,
+                    danger_button,
+                ] {
+                    for status in [
+                        button::Status::Active,
+                        button::Status::Hovered,
+                        button::Status::Pressed,
+                    ] {
+                        let style = style(&theme, status);
+                        let background = style_background(style.background, surface);
+                        assert!(
+                            contrast_ratio(style.text_color, background) >= 4.5,
+                            "{appearance:?}/{status:?}: {:?} fails on {background:?}",
+                            style.text_color
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn accent_action_labels_pass_aa_inside_every_banner() {
+        for appearance in [Appearance::Dark, Appearance::Light] {
+            let theme = appearance.iced_theme();
+            let p = appearance.palette();
+            for severity in [
+                Severity::Info,
+                Severity::Warning,
+                Severity::Danger,
+                Severity::Success,
+            ] {
+                let banner = banner(severity)(&theme);
+                let banner_background = style_background(banner.background, p.surface);
+                let action = action_button(&theme, button::Status::Pressed);
+                let action_background = style_background(action.background, banner_background);
+                assert!(
+                    contrast_ratio(p.accent, action_background) >= 4.5,
+                    "{appearance:?}/{severity:?}: accent action text fails on nested background"
+                );
             }
         }
     }
@@ -695,5 +869,10 @@ mod tests {
     fn panel_width_range_is_ordered() {
         const _: () = assert!(PANEL_WIDTH_MIN < PANEL_WIDTH_DEFAULT);
         const _: () = assert!(PANEL_WIDTH_DEFAULT < PANEL_WIDTH_MAX);
+    }
+
+    #[test]
+    fn interactive_targets_meet_the_platform_floor() {
+        const _: () = assert!(MIN_HIT_TARGET >= 44.0);
     }
 }

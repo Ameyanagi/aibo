@@ -64,7 +64,7 @@ fn ask() -> Submission {
     Submission::new(Uuid::now_v7(), "what changed in this release")
 }
 
-fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEvent>) -> Vec<SessionEvent> {
+fn drain(rx: &mut tokio::sync::mpsc::Receiver<SessionEvent>) -> Vec<SessionEvent> {
     let mut out = Vec::new();
     while let Ok(event) = rx.try_recv() {
         out.push(event);

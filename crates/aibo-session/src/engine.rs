@@ -35,16 +35,16 @@ use aibo_core::AiboError;
 use aibo_core::context::{Chars, Tokens};
 use aibo_core::cost::{
     BudgetStatus, Micros, MonthlyBudget, PriceTable, ProviderTier, RoleCaps, SpendMeter,
-    default_role_caps, estimate_request_cost,
+    default_role_caps, estimate_request_usage,
 };
 use aibo_core::prompts::{self, PromptInputs, attachable_clipboard_text};
-use aibo_core::roles::RoleBindings;
+use aibo_core::roles::{RoleBindings, vision_providers};
 use aibo_core::router::{
     DoVerbRegistry, Router, SurfaceInput, infer_surface, should_offer_escalation,
 };
 use aibo_core::types::{
-    Capabilities, ModelBinding, ProviderId, Role, RouteInput, StopReason, Surface,
-    Usage,
+    Capabilities, ChatRequest, ModelBinding, ProviderId, Role, RouteInput, StopReason, Surface,
+    Usage, validate_attachments,
 };
 use aibo_provider::ProviderRegistry;
 use tokio_util::sync::CancellationToken;
@@ -380,6 +380,20 @@ impl Engine {
             });
         }
 
+        // The same refusal, in the other unit. §13's cap is stated in
+        // characters and an image has none — `Chars` deliberately will not add
+        // to bytes, so attachments get their own ceiling rather than being
+        // laundered into the character count. `validate_attachments` owns it:
+        // per-item size, media type, count, and the summed-bytes cap that is
+        // what actually binds a multi-image request.
+        //
+        // Enforced here, before a request is built, for the reason §4 gives:
+        // aibo does not fall back on a 400, so discovering a provider's payload
+        // ceiling as a rejected request costs a round trip and then dead-ends.
+        if let Err(error) = validate_attachments(&submission.attachments) {
+            return failed(error);
+        }
+
         // §1: the surface, frozen. The panel usually supplies it; inferring it
         // here is the path a headless caller and the eval harness take.
         let surface = submission.surface.unwrap_or_else(|| {
@@ -411,7 +425,17 @@ impl Engine {
 
         let chain = self.config.bindings.dispatch_order(routed.role);
         if chain.is_empty() {
-            return failed(AiboError::NoProviderConfigured);
+            // The 2026-07-26 report, in one line: an empty chain is `Vision`'s
+            // *correct* state when no vision provider is configured (every
+            // entry in §4's chain is `Precondition::Configured`), and reporting
+            // it as `NoProviderConfigured` claims nothing works while the
+            // user's text setup is signed in and healthy — a contradiction the
+            // user cannot act on, and §13's only Blocking treatment to boot.
+            //
+            // With an attachment in hand the honest error names the modality
+            // and the fix: "attach needs a vision-capable provider; configure
+            // OpenAI, Anthropic or Vertex", Inline, session intact.
+            return failed(self.no_provider_for(&submission));
         }
         let primary = chain[0].provider.clone();
         let allow_crossing = self
@@ -582,10 +606,64 @@ impl Engine {
                 if all_degraded {
                     failed(AiboError::Offline)
                 } else {
-                    failed(AiboError::NoProviderConfigured)
+                    failed(self.no_provider_for(&submission))
                 }
             }
         }
+    }
+
+    /// "Nothing in the chain can serve this", named as specifically as the
+    /// submission allows.
+    ///
+    /// Without an attachment that is [`AiboError::NoProviderConfigured`] — the
+    /// one error §13 lets interrupt, because aibo genuinely cannot do anything.
+    /// With one it is [`AiboError::VisionUnsupported`] with no binding, which is
+    /// Inline: the user's text setup is fine and the fix is to configure a
+    /// vision provider or remove the image. Collapsing the second into the
+    /// first is the defect this whole feature exists to retire.
+    fn no_provider_for(&self, submission: &Submission) -> AiboError {
+        if submission.attachments.is_empty() {
+            return AiboError::NoProviderConfigured;
+        }
+        AiboError::no_vision_provider(
+            submission.attachments.len(),
+            // The chain's own entries when it has some (a provider was
+            // configured but every entry was skipped), otherwise §4's list of
+            // providers the user could configure. Either way the message ends
+            // in something to do.
+            match self.config.bindings.vision_alternatives() {
+                empty if empty.is_empty() => {
+                    vision_providers().iter().map(ToString::to_string).collect()
+                }
+                alternatives => alternatives,
+            },
+        )
+    }
+
+    /// §14's pre-dispatch reserve, **with attachments counted**.
+    ///
+    /// [`estimate_request_usage`] measures the assembled *messages*, and an
+    /// attachment is not one — it rides on [`ChatRequest::attachments`]. Left
+    /// at the zero that function returns, a screenshot reserves nothing while
+    /// billing as several thousand input tokens: on a model priced at $2.50/Mtok
+    /// a single retina capture is more than a whole Ask turn of text, and §14's
+    /// hard stop would let it straight through the ceiling it exists to hold.
+    ///
+    /// `Usage::image_tokens` is the field the price table already meters
+    /// (`ModelPrices::image`, falling back to `input`, which is what OpenAI and
+    /// Anthropic actually do), so the reconcile after the stream lands in the
+    /// same slot and replaces the estimate with the provider's real figure.
+    fn estimate_cost(
+        &self,
+        request: &ChatRequest,
+        binding: &ModelBinding,
+        tier: Option<&ProviderTier>,
+    ) -> Option<Micros> {
+        let mut usage = estimate_request_usage(request);
+        usage.image_tokens = request.estimated_attachment_tokens() as u64;
+        self.config
+            .prices
+            .cost(&binding.provider, &binding.model, tier, &usage)
     }
 
     /// Model capabilities for one binding, clamped by §14's per-role caps.
@@ -637,6 +715,44 @@ impl Engine {
     ) -> AttemptResult {
         let capabilities = self.capabilities_for(binding, provider, role);
 
+        // §10: capabilities are per model, so the gate is per binding — one
+        // provider routinely serves a vision model and a text-only one.
+        //
+        // **Refuse; never strip.** Sending the text with the image removed
+        // gets a fluent, confident answer about an image the model never saw,
+        // with nothing in the transcript to say so. `Capabilities::default()`
+        // has `vision: false`, so a model whose capabilities were never
+        // populated refuses rather than dropping.
+        //
+        // Before assembly, deliberately. The §5 budget would otherwise refuse
+        // the same request first with `ContextTooLarge`, and "this model cannot
+        // see" is the more actionable of the two — it names the binding, offers
+        // models that would work, and §13 spends its one Inline action on
+        // "switch model" rather than on "copy diagnostics". Before the reserve
+        // too: §14 must not charge for a request that was never going to go.
+        //
+        // Fatal, not `TryNext`: `VisionUnsupported::is_fallback_eligible()` is
+        // false, and walking the rest of the chain to rediscover the same
+        // refusal spends the user's money to learn nothing (§4, §14).
+        let unsupported = submission
+            .attachments
+            .iter()
+            .filter(|a| !capabilities.accepts(a))
+            .count();
+        if unsupported > 0 {
+            tracing::info!(
+                provider = %binding.provider,
+                model = %binding.model,
+                attachments = unsupported,
+                "binding cannot accept the attachments; refusing rather than dropping them (§10)"
+            );
+            return AttemptResult::Fatal(AiboError::vision_unsupported(
+                binding.clone(),
+                unsupported,
+                self.config.bindings.vision_alternatives(),
+            ));
+        }
+
         // §5: assembly applies the priority table and the middle-out
         // truncation. An oversized *instruction* is `ContextTooLarge`, which is
         // the user's problem to fix and never another provider's to absorb.
@@ -654,6 +770,9 @@ impl Engine {
         inputs.field = submission.capture.field.clone();
         inputs.selection = submission.capture.selection.clone();
         inputs.clipboard = submission.capture.clipboard.clone();
+        // The deliberate act, carried through. Assembly charges these against
+        // the §5 budget and frames them as quoted data; it never drops one.
+        inputs.attachments = submission.attachments.clone();
         inputs.history = submission.history.clone();
         inputs.verb = crate::verb::parse_leading_verb(&submission.instruction);
 
@@ -692,7 +811,7 @@ impl Engine {
         // on a cancelled or failed stream, so a meter that waits for it both
         // under-reports and cannot stop anything.
         let tier = self.config.tiers.get(&binding.provider);
-        let estimate = estimate_request_cost(&self.config.prices, &request, tier);
+        let estimate = self.estimate_cost(&request, binding, tier);
         let reserved = {
             let mut meter = self.spend.lock().unwrap_or_else(|e| e.into_inner());
             match meter.reserve(request_id, estimate) {
@@ -1049,8 +1168,8 @@ fn route_input(submission: &Submission, surface: Surface) -> RouteInput {
         || selection.contains("```");
 
     // §4 rule 2 routes `has_image` to `Vision`, so this flag decides the entire
-    // request. It must mean "the user attached an image", NOT "an image happens
-    // to be on the clipboard".
+    // request. It means "the user attached an image", and it must never again
+    // mean "an image happens to be on the clipboard".
     //
     // Deriving it from ambient clipboard content was a real defect, observed
     // 2026-07-26: taking any screenshot silently rerouted every subsequent
@@ -1058,12 +1177,13 @@ fn route_input(submission: &Submission, surface: Surface) -> RouteInput {
     // surfaced as "No provider is configured yet" while Settings simultaneously
     // showed Codex signed in and healthy — an unactionable contradiction.
     //
-    // §2 scopes v1 as text-only, with vision a post-v1 phase, so there is no
-    // attachment mechanism to gate this on yet. Until one exists the honest
-    // answer is `false`: ambient clipboard images are context (§5 budget
-    // priority 4), never a routing decision. Restore this when attachments
-    // ship, gated on the attachment and not the pasteboard.
-    let has_image = false;
+    // The fix is structural rather than a comment: `Submission::attachments`
+    // can only be populated by a gesture, and the flag is a fact about that
+    // list. Note that `clipboard` is read a few lines above for
+    // `payload_tokens` and is *not* read here — an ambient clipboard image
+    // stays context at §5's budget priority 4, and context is never a routing
+    // decision.
+    let has_image = submission.has_image_attachment();
 
     RouteInput {
         surface,
@@ -1133,7 +1253,18 @@ mod tests {
     use super::*;
     use crate::event::Capture;
     use aibo_core::router::Router;
-    use aibo_core::types::{ClipboardItem, ClipboardKind};
+    use aibo_core::types::{Attachment, AttachmentSource, ClipboardItem, ClipboardKind};
+
+    fn screenshot() -> Attachment {
+        Attachment::image(
+            AttachmentSource::ScreenRegion,
+            vec![0u8; 1024],
+            "image/png",
+            1568,
+            882,
+            "Screenshot 14:32",
+        )
+    }
 
     fn clipboard(text: &str) -> ClipboardItem {
         ClipboardItem {
@@ -1226,6 +1357,52 @@ mod tests {
             Surface::Transform,
         );
         assert_eq!(input.payload_tokens, 100);
+    }
+
+    /// §4 rule 2: `has_image` is a fact about what the user attached.
+    #[test]
+    fn has_image_is_true_exactly_when_something_was_attached() {
+        let plain = Submission::new(Uuid::now_v7(), "what is this");
+        assert!(!route_input(&plain, Surface::Ask).has_image);
+
+        let attached = plain.clone().with_attachment(screenshot());
+        assert!(route_input(&attached, Surface::Ask).has_image);
+    }
+
+    /// **The regression this whole feature exists for.** An image sitting on
+    /// the pasteboard is ambient state: taking a screenshot must not reroute
+    /// the next typed question to `Vision`, which nothing binds, and surface as
+    /// "No provider is configured yet" beside a healthy provider.
+    ///
+    /// Note the deliberate asymmetry with the test above: the *same* image, in
+    /// the clipboard, changes nothing; attached, it changes everything.
+    #[test]
+    fn an_image_on_the_clipboard_is_not_an_attachment() {
+        let mut item = clipboard("");
+        item.kind = ClipboardKind::ImageRef;
+        let s = submission(Capture {
+            clipboard: Some(item),
+            ..Capture::default()
+        });
+
+        let input = route_input(&s, Surface::Ask);
+        assert!(
+            !input.has_image,
+            "ambient clipboard content is context (§5 priority 4), never a routing decision"
+        );
+        assert_eq!(
+            Router::with_defaults().route(&input).role,
+            Role::Smart,
+            "an Ask with nothing attached belongs on Smart, not Vision"
+        );
+    }
+
+    /// …and with the attachment made deliberately, §4 rule 2 does fire.
+    #[test]
+    fn an_attached_image_routes_to_vision() {
+        let s = Submission::new(Uuid::now_v7(), "what is in this").with_attachment(screenshot());
+        let routed = Router::with_defaults().route(&route_input(&s, Surface::Ask));
+        assert_eq!(routed.role, Role::Vision, "rule {}", routed.rule);
     }
 
     /// §13's cap and §4's estimate now share a definition of "character", and

@@ -15,6 +15,7 @@
 #![forbid(unsafe_code)]
 
 pub mod anthropic;
+pub mod attachment;
 pub mod auth;
 pub mod azure;
 pub mod bedrock;

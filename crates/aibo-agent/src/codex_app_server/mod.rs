@@ -39,9 +39,9 @@
 //!
 //! # Process lifetime
 //!
-//! The child is spawned into its **own process group** so it cannot outlive
-//! aibo, plus `kill_on_drop`. See [`spawn_in_process_group`] for what that does
-//! and does not guarantee on each platform.
+//! The child is spawned into a managed Unix process group or Windows Job Object
+//! so cancellation and bounded shutdown include its delegated descendants. See
+//! [`spawn_in_process_group`].
 //!
 //! SPIKE: S5 — every method name and payload shape used here is unverified
 //! against a real binary. §20 defines S5 as: "Spawn `codex` over stdio,
@@ -52,10 +52,11 @@
 pub mod protocol;
 
 use std::collections::HashMap;
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use aibo_core::error::{AiboError, Result};
@@ -65,15 +66,22 @@ use aibo_core::types::{
     ApprovalRequest, BoxStream, BudgetKind, SandboxKind, ToolTier,
 };
 use async_trait::async_trait;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
+#[cfg(windows)]
+use process_wrap::tokio::{CreationFlags, JobObject};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{ChildStdin, Command};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
+#[cfg(windows)]
+use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::limits::LimitTracker;
 use crate::native_loop::fenced_context;
-use crate::permission_gate::ApprovalUi;
+use crate::permission_gate::{ApprovalResponse, ApprovalUi, verify_approval_response};
 use protocol::{
     AccountRead, ExecApprovalParams, Inbound, InitializeParams, InitializeResult, InterruptParams,
     OutboundNotification, OutboundRequest, OutboundResponse, PatchApprovalParams,
@@ -149,6 +157,10 @@ pub enum CodexError {
         method: &'static str,
     },
 
+    /// The process tree did not terminate and reap in time.
+    #[error("timed out shutting down the codex app-server process tree")]
+    ShutdownTimeout,
+
     /// A response did not have the expected shape.
     #[error("unexpected response to `{method}` from codex app-server: {detail}")]
     Malformed {
@@ -203,6 +215,8 @@ pub struct CodexConfig {
     pub startup_timeout: Duration,
     /// Per-request timeout for ordinary RPCs.
     pub request_timeout: Duration,
+    /// Time allowed to terminate and reap the app-server process tree.
+    pub shutdown_timeout: Duration,
     /// Refuse to run against a protocol version newer than [`protocol::MAX_TESTED`].
     ///
     /// Off by default: §3 makes permissive parsing the strategy, and a hard
@@ -230,6 +244,7 @@ impl Default for CodexConfig {
             env: Vec::new(),
             startup_timeout: Duration::from_secs(20),
             request_timeout: Duration::from_secs(60),
+            shutdown_timeout: Duration::from_secs(5),
             strict_version: false,
             approval_policy: None,
             sandbox_policy: None,
@@ -241,30 +256,71 @@ impl Default for CodexConfig {
 // Process spawning
 // ---------------------------------------------------------------------------
 
-/// Spawn a child in its **own process group**, so it cannot outlive aibo.
+// A child inherits only the small set needed to locate binaries, its profile,
+// locale, and temporary directory. In particular, ambient provider/cloud
+// credentials do not cross the process boundary. Configured `env` entries
+// below remain explicit opt-ins.
+#[cfg(not(windows))]
+const SAFE_CHILD_ENVIRONMENT: &[&str] = &[
+    "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+];
+
+#[cfg(windows)]
+const SAFE_CHILD_ENVIRONMENT: &[&str] = &[
+    "PATH",
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+];
+
+fn safe_child_environment_from(
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    environment
+        .into_iter()
+        .filter(|(key, _)| {
+            SAFE_CHILD_ENVIRONMENT
+                .iter()
+                .any(|allowed| env_key_eq(key, OsStr::new(allowed)))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn env_key_eq(left: &OsStr, right: &OsStr) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn env_key_eq(left: &OsStr, right: &OsStr) -> bool {
+    left == right
+}
+
+/// Spawn a child in a Unix process group or Windows Job Object.
 ///
-/// - **Unix**: `process_group(0)` makes the child a group leader, so a signal
-///   sent to the group reaches everything the child spawns — Codex starts MCP
-///   servers and shell commands of its own, and killing only the leader orphans
-///   them. Combined with `kill_on_drop`, dropping the [`Connection`] kills the
-///   leader immediately.
-/// - **Windows**: `CREATE_NEW_PROCESS_GROUP` plus `CREATE_NO_WINDOW` (no console
-///   flash from a GUI app).
-///
-/// SPIKE: S5 — **what this does not do.** Killing the *whole group* needs
-/// `killpg(2)` on Unix and a Job Object with
-/// `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` on Windows. Both require `unsafe`
-/// platform calls, and this crate is `#![forbid(unsafe_code)]` by design — that
-/// helper belongs in `aibo-platform`, the one crate the plan allows platform
-/// code in (§6, §7). Until it exists, a grandchild that ignores the leader's
-/// death can survive; treat orphan cleanup as an open item, not as done.
-fn spawn_in_process_group(config: &CodexConfig, cwd: Option<&PathBuf>) -> std::io::Result<Child> {
+/// `process-wrap` supplies the platform implementation without weakening this
+/// crate's `unsafe_code = "forbid"` boundary. Its child wrapper kills and waits
+/// for the entire group/job, including Codex-spawned MCP servers and commands.
+fn spawn_in_process_group(
+    config: &CodexConfig,
+    cwd: Option<&PathBuf>,
+) -> std::io::Result<Box<dyn ChildWrapper>> {
     let mut cmd = Command::new(&config.program);
     cmd.args(&config.args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    cmd.env_clear();
+    cmd.envs(safe_child_environment_from(std::env::vars_os()));
 
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -276,18 +332,15 @@ fn spawn_in_process_group(config: &CodexConfig, cwd: Option<&PathBuf>) -> std::i
         cmd.env(k, v);
     }
 
+    let mut cmd = CommandWrap::from(cmd);
+    cmd.wrap(KillOnDrop);
     #[cfg(unix)]
-    {
-        // 0 == "make the child its own group leader".
-        cmd.process_group(0);
-    }
+    cmd.wrap(ProcessGroup::leader());
     #[cfg(windows)]
     {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        cmd.wrap(CreationFlags(CREATE_NO_WINDOW));
+        cmd.wrap(JobObject);
     }
-
     cmd.spawn()
 }
 
@@ -309,13 +362,16 @@ type RpcResult = std::result::Result<Value, RpcError>;
 
 /// One live `codex app-server` child and its framing.
 struct Connection {
-    stdin: tokio::sync::Mutex<ChildStdin>,
+    stdin: tokio::sync::Mutex<Option<ChildStdin>>,
     next_id: AtomicI64,
     /// Shared with the reader task, which is the only other owner.
     pending: Pending,
     inbound: broadcast::Sender<Arc<Inbound>>,
-    /// Held so `kill_on_drop` fires when the connection is dropped.
-    _child: Child,
+    /// `None` after the first shutdown; keeping this behind its own lock lets
+    /// shutdown terminate the process even while turns still hold an `Arc`.
+    child: tokio::sync::Mutex<Option<Box<dyn ChildWrapper>>>,
+    request_timeout: Duration,
+    closed: AtomicBool,
     protocol_version: Version,
 }
 
@@ -336,9 +392,9 @@ impl Connection {
             }
         })?;
 
-        let stdin = child.stdin.take().ok_or(CodexError::EarlyExit)?;
-        let stdout = child.stdout.take().ok_or(CodexError::EarlyExit)?;
-        let stderr = child.stderr.take().ok_or(CodexError::EarlyExit)?;
+        let stdin = child.stdin().take().ok_or(CodexError::EarlyExit)?;
+        let stdout = child.stdout().take().ok_or(CodexError::EarlyExit)?;
+        let stderr = child.stderr().take().ok_or(CodexError::EarlyExit)?;
 
         let (inbound, _) = broadcast::channel(INBOUND_CAPACITY);
         let pending: Pending = Arc::new(std::sync::Mutex::new(HashMap::new()));
@@ -355,11 +411,13 @@ impl Connection {
         Self::spawn_reader(stdout, Arc::clone(&pending), inbound.clone());
 
         Ok(Self {
-            stdin: tokio::sync::Mutex::new(stdin),
+            stdin: tokio::sync::Mutex::new(Some(stdin)),
             next_id: AtomicI64::new(1),
             pending,
             inbound,
-            _child: child,
+            child: tokio::sync::Mutex::new(Some(child)),
+            request_timeout: config.request_timeout,
+            closed: AtomicBool::new(false),
             // Replaced by `handshake`.
             protocol_version: Version::new(0, 0, 0),
         })
@@ -438,8 +496,13 @@ impl Connection {
         self.inbound.subscribe()
     }
 
-    async fn write_line(&self, line: String) -> std::result::Result<(), CodexError> {
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    async fn write_line_unbounded(&self, line: String) -> std::result::Result<(), CodexError> {
         let mut stdin = self.stdin.lock().await;
+        let stdin = stdin.as_mut().ok_or(CodexError::TransportClosed)?;
         stdin.write_all(line.as_bytes()).await?;
         stdin.write_all(b"\n").await?;
         stdin.flush().await?;
@@ -453,6 +516,9 @@ impl Connection {
         params: Option<Value>,
         timeout: Duration,
     ) -> std::result::Result<Value, CodexError> {
+        if self.is_closed() {
+            return Err(CodexError::TransportClosed);
+        }
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = oneshot::channel();
         self.pending
@@ -470,15 +536,18 @@ impl Connection {
             detail: format!("could not encode request: {e}"),
         })?;
 
-        if let Err(e) = self.write_line(frame).await {
-            self.pending
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .remove(&id);
-            return Err(e);
-        }
-
-        match tokio::time::timeout(timeout, rx).await {
+        let operation = async {
+            self.write_line_unbounded(frame).await?;
+            match rx.await {
+                Err(_) => Err(CodexError::TransportClosed),
+                Ok(Err(source)) => Err(CodexError::Rpc {
+                    method: method_name,
+                    source,
+                }),
+                Ok(Ok(value)) => Ok(value),
+            }
+        };
+        match tokio::time::timeout(timeout, operation).await {
             Err(_) => {
                 self.pending
                     .lock()
@@ -488,12 +557,15 @@ impl Connection {
                     method: method_name,
                 })
             }
-            Ok(Err(_)) => Err(CodexError::TransportClosed),
-            Ok(Ok(Err(source))) => Err(CodexError::Rpc {
-                method: method_name,
-                source,
-            }),
-            Ok(Ok(Ok(value))) => Ok(value),
+            Ok(result) => {
+                if result.is_err() {
+                    self.pending
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&id);
+                }
+                result
+            }
         }
     }
 
@@ -501,6 +573,16 @@ impl Connection {
         &self,
         method_name: &'static str,
         params: Option<Value>,
+    ) -> std::result::Result<(), CodexError> {
+        self.notify_with_timeout(method_name, params, self.request_timeout)
+            .await
+    }
+
+    async fn notify_with_timeout(
+        &self,
+        method_name: &'static str,
+        params: Option<Value>,
+        timeout: Duration,
     ) -> std::result::Result<(), CodexError> {
         let frame = serde_json::to_string(&OutboundNotification {
             method: method_name,
@@ -510,7 +592,11 @@ impl Connection {
             method: method_name,
             detail: format!("could not encode notification: {e}"),
         })?;
-        self.write_line(frame).await
+        tokio::time::timeout(timeout, self.write_line_unbounded(frame))
+            .await
+            .map_err(|_| CodexError::RequestTimeout {
+                method: method_name,
+            })?
     }
 
     /// Answer a server → client request.
@@ -527,7 +613,30 @@ impl Connection {
                     detail: format!("could not encode response: {e}"),
                 }
             })?;
-        self.write_line(frame).await
+        tokio::time::timeout(self.request_timeout, self.write_line_unbounded(frame))
+            .await
+            .map_err(|_| CodexError::RequestTimeout { method: "response" })?
+    }
+
+    /// Kill the full process group/job and wait for it to be reaped. Taking the
+    /// child makes repeated or concurrent shutdown calls harmless.
+    async fn shutdown(&self, timeout: Duration) -> std::result::Result<(), CodexError> {
+        self.closed.store(true, Ordering::Release);
+        self.stdin.lock().await.take();
+        let child = self.child.lock().await.take();
+        let Some(mut child) = child else {
+            return Ok(());
+        };
+
+        if let Err(error) = child.start_kill()
+            && child.try_wait()?.is_none()
+        {
+            return Err(CodexError::Io(error));
+        }
+        tokio::time::timeout(timeout, child.wait())
+            .await
+            .map_err(|_| CodexError::ShutdownTimeout)??;
+        Ok(())
     }
 
     /// The handshake, with version-floor detection (§3, S5).
@@ -582,7 +691,8 @@ impl Connection {
         }
         self.protocol_version = found;
 
-        self.notify(method::INITIALIZED, None).await?;
+        self.notify_with_timeout(method::INITIALIZED, None, config.startup_timeout)
+            .await?;
         Ok(())
     }
 }
@@ -676,25 +786,35 @@ impl CodexAppServer {
 
     /// Shut the child down. Idempotent.
     ///
-    /// Dropping the connection also kills it (`kill_on_drop`); this exists so
-    /// shutdown is deterministic rather than tied to when the last `Arc` goes.
+    /// The connection may still be held by an in-flight turn; its internal
+    /// child slot is drained here so shutdown remains deterministic.
     pub async fn shutdown(&self) {
         let taken = self.connection.lock().await.take();
-        drop(taken);
+        if let Some(connection) = taken
+            && let Err(error) = connection.shutdown(self.config.shutdown_timeout).await
+        {
+            tracing::warn!(%error, "codex app-server shutdown was incomplete");
+        }
     }
 
     /// Get or open the shared connection.
     async fn connect(&self, cwd: Option<&PathBuf>) -> Result<Arc<Connection>> {
         let mut guard = self.connection.lock().await;
         if let Some(existing) = guard.as_ref() {
-            return Ok(Arc::clone(existing));
+            if !existing.is_closed() {
+                return Ok(Arc::clone(existing));
+            }
+            guard.take();
         }
         let mut conn = Connection::open(&self.config, cwd)
             .await
             .map_err(CodexError::into_aibo)?;
-        conn.handshake(&self.config)
-            .await
-            .map_err(CodexError::into_aibo)?;
+        if let Err(error) = conn.handshake(&self.config).await {
+            if let Err(shutdown_error) = conn.shutdown(self.config.shutdown_timeout).await {
+                tracing::warn!(%shutdown_error, "could not reap codex after failed initialization");
+            }
+            return Err(error.into_aibo());
+        }
         let conn = Arc::new(conn);
         *guard = Some(Arc::clone(&conn));
         Ok(conn)
@@ -756,6 +876,7 @@ impl AgentBackend for CodexAppServer {
             approvals: Arc::clone(&self.approvals),
             rate_limits: Arc::clone(&self.rate_limits),
             request_timeout: self.config.request_timeout,
+            shutdown_timeout: self.config.shutdown_timeout,
             thread_id,
             instruction: task.instruction.clone(),
             tracker: LimitTracker::new(limits),
@@ -810,6 +931,7 @@ struct Turn {
     approvals: Arc<dyn ApprovalUi>,
     rate_limits: Arc<std::sync::Mutex<RateLimitSnapshot>>,
     request_timeout: Duration,
+    shutdown_timeout: Duration,
     thread_id: String,
     /// The user's own typed instruction, carried so every approval prompt can
     /// show what the action traces back to (§5 rule 3).
@@ -849,6 +971,9 @@ impl Turn {
 
                 () = cancel.cancelled() => {
                     self.interrupt().await;
+                    if let Err(error) = self.conn.shutdown(self.shutdown_timeout).await {
+                        tracing::warn!(%error, "could not reap codex after cancellation");
+                    }
                     self.finish(AgentStatus::Cancelled).await;
                     return;
                 }
@@ -857,6 +982,9 @@ impl Turn {
                     // §14: mandatory, not advisory. Codex's own limits apply
                     // too, but aibo must not depend on them.
                     self.interrupt().await;
+                    if let Err(error) = self.conn.shutdown(self.shutdown_timeout).await {
+                        tracing::warn!(%error, "could not reap codex after wall-clock timeout");
+                    }
                     self.budget_stop(BudgetKind::Steps).await;
                     return;
                 }
@@ -1076,15 +1204,22 @@ impl Turn {
         // §13: `esc` must abort in-flight work. A pending approval that is
         // cancelled resolves to Deny — the safe answer, and the only one that
         // does not leave the child blocked.
-        let decision = tokio::select! {
-            () = cancel.cancelled() => ApprovalDecision::Deny,
-            answered = self.approvals.request(request) => match answered {
+        let response = tokio::select! {
+            () = cancel.cancelled() => ApprovalResponse::deny(),
+            answered = self.approvals.request(request.clone()) => match answered {
                 Ok(d) => d,
                 Err(e) => {
                     tracing::warn!(error = %e, "approval UI failed; denying");
-                    ApprovalDecision::Deny
+                    ApprovalResponse::deny()
                 }
             },
+        };
+        let decision = match verify_approval_response(&request, response) {
+            Ok(decision) => decision,
+            Err(reason) => {
+                tracing::warn!(%reason, "invalid destructive approval; denying");
+                ApprovalDecision::Deny
+            }
         };
 
         if let Err(e) = self
@@ -1212,7 +1347,16 @@ fn map_item(item: &ThreadItem, started: bool) -> Option<AgentStep> {
 mod tests {
     use super::*;
     use aibo_core::types::{ContentOrigin, UntrustedBlock};
+    use futures::StreamExt;
     use uuid::Uuid;
+
+    #[cfg(unix)]
+    fn process_is_alive(pid: u32) -> bool {
+        std::process::Command::new("/bin/kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .is_ok_and(|status| status.success())
+    }
 
     fn item(kind: &str, text: Option<&str>) -> ThreadItem {
         ThreadItem {
@@ -1277,5 +1421,156 @@ mod tests {
             err,
             AiboError::AgentBackendMissing { which: "codex" }
         ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn initialization_timeout_terminates_the_app_server_tree() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pid_file = temp.path().join("grandchild.pid");
+        let config = CodexConfig {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_owned(),
+                "sleep 120 & echo $! > \"$PID_FILE\"; wait".to_owned(),
+            ],
+            env: vec![("PID_FILE".to_owned(), pid_file.display().to_string())],
+            startup_timeout: Duration::from_millis(100),
+            shutdown_timeout: Duration::from_secs(2),
+            ..CodexConfig::default()
+        };
+        let backend = CodexAppServer::new(config, Arc::new(crate::permission_gate::DenyAll));
+
+        let started = std::time::Instant::now();
+        assert!(backend.account().await.is_err());
+        assert!(started.elapsed() < Duration::from_secs(3));
+
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("grandchild pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        for _ in 0..100 {
+            if !process_is_alive(pid) {
+                backend.shutdown().await;
+                backend.shutdown().await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("grandchild {pid} survived Codex initialization timeout");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn ordinary_rpc_timeout_covers_the_entire_request() {
+        let config = CodexConfig {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_owned(),
+                concat!(
+                    "IFS= read -r initialize\n",
+                    "printf '%s\\n' '{\"id\":1,\"result\":",
+                    "{\"protocolVersion\":\"0.63.0\"}}'\n",
+                    "IFS= read -r initialized\n",
+                    "IFS= read -r account\n",
+                    "sleep 120"
+                )
+                .to_owned(),
+            ],
+            startup_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_millis(100),
+            shutdown_timeout: Duration::from_secs(2),
+            ..CodexConfig::default()
+        };
+        let backend = CodexAppServer::new(config, Arc::new(crate::permission_gate::DenyAll));
+
+        let started = std::time::Instant::now();
+        assert!(backend.account().await.is_err());
+        assert!(started.elapsed() < Duration::from_secs(2));
+        backend.shutdown().await;
+        // The second call exercises both the outer connection slot and the
+        // inner process slot's idempotent shutdown path.
+        tokio::time::timeout(Duration::from_millis(100), backend.shutdown())
+            .await
+            .expect("second shutdown must return immediately");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn turn_cancellation_terminates_the_delegated_process_tree() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pid_file = temp.path().join("grandchild.pid");
+        let config = CodexConfig {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_owned(),
+                format!(
+                    concat!(
+                        "IFS= read -r initialize\n",
+                        "printf '%s\\n' '{{\"id\":1,\"result\":",
+                        "{{\"protocolVersion\":\"0.63.0\"}}}}'\n",
+                        "IFS= read -r initialized\n",
+                        "IFS= read -r thread_start\n",
+                        "printf '%s\\n' '{{\"id\":2,\"result\":",
+                        "{{\"threadId\":\"t1\"}}}}'\n",
+                        "IFS= read -r send_message\n",
+                        "sleep 120 & echo $! > '{}'\n",
+                        "wait"
+                    ),
+                    pid_file.display()
+                ),
+            ],
+            startup_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(10),
+            shutdown_timeout: Duration::from_secs(2),
+            ..CodexConfig::default()
+        };
+        let backend = CodexAppServer::new(config, Arc::new(crate::permission_gate::DenyAll));
+        let cancel = CancellationToken::new();
+        let task = AgentTask {
+            id: Uuid::now_v7(),
+            instruction: "run".to_owned(),
+            workspace: None,
+            context: Vec::new(),
+            binding: None,
+            conversation_id: None,
+        };
+        let mut stream = backend
+            .run(task, AgentLimits::default(), cancel.clone())
+            .await
+            .expect("start turn");
+        for _ in 0..500 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(pid_file.exists(), "fake Codex never spawned its child");
+
+        cancel.cancel();
+        let item = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .expect("cancellation must be bounded")
+            .expect("terminal item")
+            .expect("terminal step");
+        let AgentStep::Done(outcome) = item else {
+            panic!("expected Done after cancellation, got {item:?}");
+        };
+        assert_eq!(outcome.status, AgentStatus::Cancelled);
+
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("grandchild pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        for _ in 0..100 {
+            if !process_is_alive(pid) {
+                backend.shutdown().await;
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("grandchild {pid} survived Codex turn cancellation");
     }
 }

@@ -128,17 +128,14 @@ pub enum StoreError {
 
     /// The secret does not fit in the platform credential store (§12).
     ///
-    /// Windows caps a credential blob at 2560 bytes and `keyring` UTF-16
-    /// doubles first, so `set_password` tops out near 1280 ASCII characters.
-    /// A 32-byte database key is fine; a multi-kilobyte OAuth JWT is not.
-    #[error(
-        "secret for `{account}` is {utf16_bytes} bytes as UTF-16, over the {limit}-byte platform cap"
-    )]
+    /// Windows caps a raw credential blob at 2560 bytes. Larger values need the
+    /// DPAPI-protected file backend.
+    #[error("secret for `{account}` is {secret_bytes} bytes, over the {limit}-byte platform cap")]
     SecretTooLarge {
         /// Keychain account name. Never the secret.
         account: String,
-        /// Size after UTF-16 doubling, which is what the platform counts.
-        utf16_bytes: usize,
+        /// Raw secret size.
+        secret_bytes: usize,
         /// The platform cap.
         limit: usize,
     },

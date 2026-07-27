@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use thiserror::Error;
 
-use crate::types::{BudgetKind, ProviderId};
+use crate::types::{BudgetKind, ModelBinding, ProviderId};
 
 /// Convenience alias used throughout the workspace.
 pub type Result<T, E = AiboError> = std::result::Result<T, E>;
@@ -123,6 +123,54 @@ impl std::fmt::Display for SandboxFailure {
             SandboxFailure::OutOfMemory => "out of memory",
             SandboxFailure::Trap => "trapped",
         })
+    }
+}
+
+/// Why an attachment was refused before dispatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum AttachmentRejection {
+    /// One item exceeds [`crate::types::MAX_ATTACHMENT_BYTES`].
+    TooLarge {
+        /// Actual raw size.
+        bytes: usize,
+        /// The cap.
+        limit: usize,
+    },
+    /// The whole set exceeds [`crate::types::MAX_TOTAL_ATTACHMENT_BYTES`].
+    TotalTooLarge {
+        /// Summed raw size.
+        bytes: usize,
+        /// The cap.
+        limit: usize,
+    },
+    /// More items than [`crate::types::MAX_ATTACHMENTS`].
+    TooMany {
+        /// Actual count.
+        count: usize,
+        /// The cap.
+        limit: usize,
+    },
+    /// Not one of [`crate::types::SUPPORTED_IMAGE_MEDIA_TYPES`].
+    UnsupportedMediaType,
+    /// Zero bytes — a failed capture or a decode that produced nothing.
+    Empty,
+}
+
+impl std::fmt::Display for AttachmentRejection {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AttachmentRejection::TooLarge { bytes, limit } => {
+                write!(f, "{bytes} bytes exceeds the {limit} byte limit")
+            }
+            AttachmentRejection::TotalTooLarge { bytes, limit } => {
+                write!(f, "{bytes} bytes total exceeds the {limit} byte limit")
+            }
+            AttachmentRejection::TooMany { count, limit } => {
+                write!(f, "{count} attachments exceeds the limit of {limit}")
+            }
+            AttachmentRejection::UnsupportedMediaType => f.write_str("unsupported media type"),
+            AttachmentRejection::Empty => f.write_str("empty"),
+        }
     }
 }
 
@@ -254,6 +302,70 @@ pub enum AiboError {
         alternatives: Vec<String>,
     },
 
+    /// An image was attached, and the request cannot be served with vision.
+    ///
+    /// Two shapes, one user-facing fact and one action:
+    ///
+    /// - `binding: Some(_)` — the bound model's [`crate::types::Capabilities::vision`]
+    ///   is `false`. Action: **switch model** (offer `alternatives`), or remove
+    ///   the attachment.
+    /// - `binding: None` — [`crate::types::Role::Vision`] has no chain at all,
+    ///   because no vision-capable provider is configured. Action: **configure
+    ///   one** (`alternatives` names §4's — OpenAI, Anthropic, Vertex).
+    ///
+    /// Deliberately **not** [`AiboError::Internal`]. §13 renders `Internal` as
+    /// an opaque "something went wrong" plus "copy diagnostics", which is the
+    /// exact dead end this error exists to replace — it would discard the model
+    /// id, the attachment count and the list of models that *would* work, at the
+    /// moment the user needs all three to fix it in one click.
+    ///
+    /// Deliberately **not** [`AiboError::NoProviderConfigured`] in the `None`
+    /// case either, despite the resemblance. That variant is §13's only
+    /// `Blocking` treatment: it interrupts and opens settings, which is correct
+    /// for "aibo cannot do anything at all" and wrong here — the user has a
+    /// working text setup and one attachment too many. [`Treatment::Inline`]
+    /// keeps their session, their typed instruction and their attachment intact
+    /// while offering the fix. Sending it as `NoProviderConfigured` reproduces
+    /// the 2026-07-26 defect this whole feature was built to retire.
+    ///
+    /// Never falls back and never auto-retries: no other entry in the chain is
+    /// reached by retrying, and §14 forbids spending the user's money to
+    /// discover that.
+    #[error(
+        "{} cannot accept image input ({attachments} attached)",
+        match binding {
+            Some(b) => format!("{}/{}", b.provider, b.model),
+            None => "no configured model".to_string(),
+        }
+    )]
+    VisionUnsupported {
+        /// The binding that would have served the request, or `None` when the
+        /// `Vision` role has no chain.
+        binding: Option<ModelBinding>,
+        /// How many attachments would have to be dropped to proceed. Never
+        /// dropped — this is the count the message quotes.
+        attachments: usize,
+        /// What to offer instead, best first: `provider/model` ids when a
+        /// binding is known to work, otherwise the provider ids §4's `Vision`
+        /// chain draws on. Empty only when nothing is known.
+        alternatives: Vec<String>,
+    },
+
+    /// An attachment was refused before dispatch (size, count, media type).
+    ///
+    /// `Inline` with one action — remove the attachment. Caught in `aibo-core`
+    /// rather than at the provider because §4 forbids falling back on a 400, so
+    /// discovering a cap as a rejected request costs a round trip and dead-ends.
+    #[error("attachment `{label}` ({media_type}) rejected: {reason}")]
+    AttachmentRejected {
+        /// The chip label, so the panel can name which one.
+        label: String,
+        /// Its media type. Empty when the rejection is about the whole set.
+        media_type: String,
+        /// Why.
+        reason: AttachmentRejection,
+    },
+
     /// An unexpected internal failure.
     ///
     /// **Never shown raw** (§13): the UI renders a generic message plus a "copy
@@ -281,6 +393,35 @@ pub enum Treatment {
 }
 
 impl AiboError {
+    /// Build [`AiboError::VisionUnsupported`] for a bound model that cannot see.
+    ///
+    /// `alternatives` should be `provider/model` ids known to accept images —
+    /// `RoleBindings::vision_alternatives` produces them from §4's chain.
+    pub fn vision_unsupported(
+        binding: ModelBinding,
+        attachments: usize,
+        alternatives: Vec<String>,
+    ) -> Self {
+        AiboError::VisionUnsupported {
+            binding: Some(binding),
+            attachments,
+            alternatives,
+        }
+    }
+
+    /// Build [`AiboError::VisionUnsupported`] for the case where
+    /// [`crate::types::Role::Vision`] has no chain at all.
+    ///
+    /// `alternatives` should be the provider ids §4's `Vision` chain draws on —
+    /// `roles::vision_providers` produces them.
+    pub fn no_vision_provider(attachments: usize, alternatives: Vec<String>) -> Self {
+        AiboError::VisionUnsupported {
+            binding: None,
+            attachments,
+            alternatives,
+        }
+    }
+
     /// The treatment this error gets (§13).
     ///
     /// `RateLimited` and `ProviderUnavailable` map to
@@ -301,6 +442,11 @@ impl AiboError {
             | AiboError::Sandbox { .. }
             | AiboError::AgentBackendMissing { .. }
             | AiboError::ModelRejected { .. }
+            // §13 Inline: one sentence, one action ("Switch model" /
+            // "Remove image"). See the variant docs for why neither of these is
+            // `Internal` and why `VisionUnsupported` is not `Blocking`.
+            | AiboError::VisionUnsupported { .. }
+            | AiboError::AttachmentRejected { .. }
             | AiboError::Internal(_) => Treatment::Inline,
             AiboError::InsertFailed { .. } | AiboError::CaptureFailed { .. } => Treatment::Toast,
             AiboError::NoProviderConfigured => Treatment::Blocking,
@@ -469,6 +615,85 @@ mod tests {
             .treatment(),
             Treatment::Inline
         );
+    }
+
+    // -- vision (§10, §13) --------------------------------------------------
+
+    fn binding() -> ModelBinding {
+        ModelBinding {
+            provider: ProviderId::CEREBRAS,
+            model: "llama-3.3-70b".into(),
+        }
+    }
+
+    #[test]
+    fn vision_unsupported_is_inline_with_one_action() {
+        // §13: not `Internal` (opaque "something went wrong" + copy
+        // diagnostics), and not `Blocking` — the user has a working text setup
+        // and one attachment too many, so their session must survive the error.
+        let err = AiboError::vision_unsupported(binding(), 1, vec!["openai/gpt-5".into()]);
+        assert_eq!(err.treatment(), Treatment::Inline);
+        assert_eq!(
+            AiboError::no_vision_provider(1, vec!["openai".into()]).treatment(),
+            Treatment::Inline
+        );
+    }
+
+    #[test]
+    fn vision_unsupported_never_falls_back_and_never_retries() {
+        // No other entry in the chain is reached by retrying, and §14 forbids
+        // spending the user's money to discover that.
+        let err = AiboError::vision_unsupported(binding(), 2, Vec::new());
+        assert!(!err.is_fallback_eligible());
+        assert!(!err.is_retryable());
+    }
+
+    #[test]
+    fn vision_unsupported_names_the_model_or_says_none_is_configured() {
+        let bound = AiboError::vision_unsupported(binding(), 1, Vec::new()).to_string();
+        assert!(bound.contains("cerebras/llama-3.3-70b"), "{bound}");
+        assert!(bound.contains('1'), "{bound}");
+
+        let unbound = AiboError::no_vision_provider(3, Vec::new()).to_string();
+        assert!(unbound.contains("no configured model"), "{unbound}");
+        assert!(unbound.contains('3'), "{unbound}");
+    }
+
+    #[test]
+    fn vision_unsupported_carries_what_the_one_action_needs() {
+        // The panel's single §13 action has to offer something that works; the
+        // error is the only thing it gets.
+        let err = AiboError::vision_unsupported(
+            binding(),
+            1,
+            vec!["openai/gpt-5".into(), "anthropic/claude-sonnet-4-5".into()],
+        );
+        let AiboError::VisionUnsupported {
+            binding: b,
+            attachments,
+            alternatives,
+        } = err
+        else {
+            panic!("wrong variant");
+        };
+        assert_eq!(b.unwrap().model, "llama-3.3-70b");
+        assert_eq!(attachments, 1);
+        assert_eq!(alternatives.first().unwrap(), "openai/gpt-5");
+    }
+
+    #[test]
+    fn attachment_rejected_is_inline_and_terminal() {
+        let err = AiboError::AttachmentRejected {
+            label: "Screenshot".into(),
+            media_type: "image/gif".into(),
+            reason: AttachmentRejection::UnsupportedMediaType,
+        };
+        assert_eq!(err.treatment(), Treatment::Inline);
+        assert!(!err.is_fallback_eligible());
+        assert!(!err.is_retryable());
+        let rendered = err.to_string();
+        assert!(rendered.contains("Screenshot"), "{rendered}");
+        assert!(rendered.contains("unsupported media type"), "{rendered}");
     }
 
     #[test]

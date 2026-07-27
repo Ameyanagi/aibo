@@ -6,13 +6,12 @@
 //!
 //! ## The Windows cap, which decides the shape of this module
 //!
-//! §12, verbatim: "**Windows Credential Manager caps a secret at 2560 bytes**
-//! (`CRED_MAX_CREDENTIAL_BLOB_SIZE`), and `keyring` UTF-16-doubles first — so
-//! `set_password` tops out around **1280 ASCII characters**. A 32-byte database
-//! key is fine; **a multi-kilobyte OAuth JWT is not**, and OpenAI hit exactly
-//! this in Codex. Anything token-shaped needs either DPAPI-encrypted file
-//! storage or chunking across entries. Decide before P1, since it changes the
-//! storage interface."
+//! Windows Credential Manager caps a secret at 2560 bytes
+//! (`CRED_MAX_CREDENTIAL_BLOB_SIZE`). Older `keyring::set_password` wiring
+//! UTF-16-expanded strings first, reducing the practical ASCII limit to 1280.
+//! This module uses `keyring` 4's raw-byte API instead: the measured 1652-byte
+//! OAuth token fits, while a genuinely larger blob is routed to an injected
+//! protected-file backend.
 //!
 //! The decision is made here: **route by size and fall back to a
 //! DPAPI-encrypted file**, not chunking. Chunking across entries means a
@@ -24,10 +23,11 @@
 //! crate is `#![forbid(unsafe_code)]`. [`Protector`] is the seam; the Windows
 //! implementation belongs in `aibo-platform`.
 //!
-//! SPIKE: S8 — measure a real ChatGPT OAuth token against the 2560-byte cap and
-//! confirm the DPAPI file path end-to-end on Windows before P1.
+//! The Windows implementation lives in `aibo-platform` and includes a native
+//! multi-kilobyte round-trip test.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -45,24 +45,39 @@ pub const DB_KEY_ACCOUNT: &str = "database-key";
 /// `CRED_MAX_CREDENTIAL_BLOB_SIZE`. The hard Windows limit, in bytes.
 pub const WINDOWS_CREDENTIAL_BLOB_MAX_BYTES: usize = 2560;
 
-/// The practical ASCII-character limit once `keyring` UTF-16-doubles: 1280.
+/// The legacy ASCII-character limit when using `keyring::set_password`.
 pub const WINDOWS_MAX_ASCII_CHARS: usize = WINDOWS_CREDENTIAL_BLOB_MAX_BYTES / 2;
+
+/// Maximum protected-file payload accepted on read.
+///
+/// Provider credentials should be measured in kilobytes. A bounded read keeps
+/// a corrupt or attacker-replaced file from causing an unbounded allocation.
+const MAX_PROTECTED_FILE_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Identifies this crate's protected-file envelope.
+const PROTECTED_FILE_MAGIC: &[u8] = b"AIBO-SECRET\x00\x01";
 
 /// The keychain account name for a provider's credential.
 pub fn provider_account(provider: &str) -> String {
     format!("provider:{provider}")
 }
 
-/// Whether a secret fits in Windows Credential Manager.
+/// Whether a secret fit through the legacy password-oriented keyring API.
 ///
-/// Counts UTF-16 code units and doubles, which is what the platform counts —
-/// not `str::len()`. A Japanese token is over the cap sooner than its UTF-8
-/// byte length suggests, and an astral-plane one sooner still.
+/// New writes use [`raw_fits_in_credential_manager`] instead.
 pub fn fits_in_credential_manager(secret: &str) -> bool {
     utf16_bytes(secret) <= WINDOWS_CREDENTIAL_BLOB_MAX_BYTES
 }
 
-/// The size the platform will see, in bytes.
+/// Whether raw secret bytes fit in a Windows Credential Manager blob.
+///
+/// `keyring` 4 exposes a byte-oriented API, so new writes no longer need the
+/// legacy UTF-16 doubling assumed by [`fits_in_credential_manager`].
+pub fn raw_fits_in_credential_manager(secret: &[u8]) -> bool {
+    secret.len() <= WINDOWS_CREDENTIAL_BLOB_MAX_BYTES
+}
+
+/// The byte size of a string encoded as UTF-16.
 pub fn utf16_bytes(secret: &str) -> usize {
     secret.encode_utf16().count() * 2
 }
@@ -87,14 +102,59 @@ pub trait SecretStore: Send + Sync {
 /// Credential Manager. Both calls are `unsafe`, so the implementation lives in
 /// `aibo-platform` and is injected here.
 ///
-/// SPIKE: S8 — confirm DPAPI round-trips a multi-kilobyte token, and decide
-/// whether to pass an entropy parameter (a second factor kept in Credential
-/// Manager, which does fit).
 pub trait Protector: Send + Sync {
     /// Encrypt. The output is opaque and machine/user-bound.
     fn protect(&self, plaintext: &[u8]) -> Result<Vec<u8>>;
     /// Decrypt something [`Protector::protect`] produced.
     fn unprotect(&self, ciphertext: &[u8]) -> Result<Vec<u8>>;
+}
+
+/// No encryption. Owner-only file permissions are the whole protection.
+///
+/// This protector is intentionally limited to local development. Production
+/// callers should use [`Keychain`] or inject an OS-bound [`Protector`] (DPAPI
+/// on Windows) into [`FileSecretStore`].
+#[derive(Debug, Clone, Copy)]
+pub struct PlaintextProtector {
+    _private: (),
+}
+
+/// Explicit acknowledgement required to construct a plaintext development
+/// store through the supported API.
+///
+/// The marker makes plaintext storage difficult to enable accidentally in
+/// production wiring and straightforward to find in code review.
+#[derive(Debug, Clone, Copy)]
+pub struct DevelopmentOnlyPlaintext {
+    _private: (),
+}
+
+impl DevelopmentOnlyPlaintext {
+    /// Acknowledge that credentials will be readable by the current user and
+    /// any process able to access their account.
+    #[must_use]
+    pub const fn acknowledge_risk() -> Self {
+        Self { _private: () }
+    }
+}
+
+impl PlaintextProtector {
+    /// Construct the plaintext protector after an explicit development-only
+    /// risk acknowledgement.
+    #[must_use]
+    pub const fn development_only(_acknowledgement: DevelopmentOnlyPlaintext) -> Self {
+        Self { _private: () }
+    }
+}
+
+impl Protector for PlaintextProtector {
+    fn protect(&self, plaintext: &[u8]) -> Result<Vec<u8>> {
+        Ok(plaintext.to_vec())
+    }
+
+    fn unprotect(&self, ciphertext: &[u8]) -> Result<Vec<u8>> {
+        Ok(ciphertext.to_vec())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -134,25 +194,37 @@ impl Keychain {
 
 impl SecretStore for Keychain {
     fn get(&self, account: &str) -> Result<Option<Zeroizing<String>>> {
-        match self.entry(account)?.get_password() {
-            Ok(secret) => Ok(Some(Zeroizing::new(secret))),
+        match self.entry(account)?.get_secret() {
+            Ok(secret) => {
+                let secret = Zeroizing::new(secret);
+                let text = String::from_utf8(secret.to_vec()).map_err(|_| {
+                    StoreError::Keychain(KeychainError {
+                        service: self.service.clone(),
+                        account: account.to_owned(),
+                        kind: KeychainErrorKind::BadData,
+                        detail: "keychain secret is not UTF-8".to_owned(),
+                    })
+                })?;
+                Ok(Some(Zeroizing::new(text)))
+            }
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(map_keyring(e, &self.service, account).into()),
         }
     }
 
     fn set(&self, account: &str, secret: &str) -> Result<()> {
-        // Fail with the specific error rather than letting the platform report
-        // a generic one — this is the exact case §12 says to design for.
-        if !fits_in_credential_manager(secret) {
+        // Credential Manager applies its cap to the raw blob. `keyring` 4's
+        // byte-oriented API avoids the older set_password UTF-16 expansion.
+        #[cfg(windows)]
+        if !raw_fits_in_credential_manager(secret.as_bytes()) {
             return Err(StoreError::SecretTooLarge {
                 account: account.to_owned(),
-                utf16_bytes: utf16_bytes(secret),
+                secret_bytes: secret.len(),
                 limit: WINDOWS_CREDENTIAL_BLOB_MAX_BYTES,
             });
         }
         self.entry(account)?
-            .set_password(secret)
+            .set_secret(secret.as_bytes())
             .map_err(|e| map_keyring(e, &self.service, account).into())
     }
 
@@ -215,9 +287,20 @@ impl FileSecretStore {
 
     /// Where a given account's file lives.
     ///
-    /// Account names are sanitised to `[A-Za-z0-9._-]`, so a provider id can
-    /// never escape the directory.
+    /// The UTF-8 account bytes are hex encoded. Unlike lossy sanitisation this
+    /// is both traversal-safe and collision-free (`a/b` and `a_b` cannot name
+    /// the same credential).
     pub fn path_for(&self, account: &str) -> PathBuf {
+        let mut encoded = String::with_capacity(account.len() * 2);
+        for byte in account.as_bytes() {
+            use std::fmt::Write as _;
+            write!(&mut encoded, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        self.dir.join(format!("v2-{encoded}.secret"))
+    }
+
+    /// The path used by pre-v2 builds. It is consulted only for migration.
+    fn legacy_path_for(&self, account: &str) -> PathBuf {
         let safe: String = account
             .chars()
             .map(|c| {
@@ -230,17 +313,67 @@ impl FileSecretStore {
             .collect();
         self.dir.join(format!("{safe}.secret"))
     }
-}
 
-impl SecretStore for FileSecretStore {
-    fn get(&self, account: &str) -> Result<Option<Zeroizing<String>>> {
-        let path = self.path_for(account);
-        let ciphertext = match fs::read(&path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(StoreError::io(&path, e)),
+    fn validate_account(&self, account: &str) -> Result<()> {
+        // Most filesystems cap a component at 255 bytes. `v2-` + hex + suffix
+        // consumes 10 bytes, leaving room for 120 account bytes.
+        if account.is_empty() || account.len() > 120 {
+            return Err(StoreError::io(
+                self.path_for(account),
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "secret account must contain 1 to 120 UTF-8 bytes",
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    fn read_file(&self, path: &Path, account: &str) -> Result<Option<Zeroizing<String>>> {
+        let mut file = match open_read_nofollow(path) {
+            Ok(file) => file,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(StoreError::io(path, e)),
         };
-        let plaintext = Zeroizing::new(self.protector.unprotect(&ciphertext)?);
+        let metadata = file.metadata().map_err(|e| StoreError::io(path, e))?;
+        if !metadata.is_file() {
+            return Err(StoreError::io(
+                path,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "secret path is not a regular file",
+                ),
+            ));
+        }
+        if metadata.len() > MAX_PROTECTED_FILE_BYTES {
+            return Err(StoreError::io(
+                path,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "protected secret file is too large",
+                ),
+            ));
+        }
+
+        let mut stored = Zeroizing::new(Vec::with_capacity(metadata.len() as usize));
+        (&mut file)
+            .take(MAX_PROTECTED_FILE_BYTES + 1)
+            .read_to_end(&mut stored)
+            .map_err(|e| StoreError::io(path, e))?;
+        if stored.len() as u64 > MAX_PROTECTED_FILE_BYTES {
+            return Err(StoreError::io(
+                path,
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "protected secret file grew beyond its size limit",
+                ),
+            ));
+        }
+        let ciphertext = stored
+            .strip_prefix(PROTECTED_FILE_MAGIC)
+            // Pre-v2 files contained only protector output.
+            .unwrap_or(&stored);
+        let plaintext = Zeroizing::new(self.protector.unprotect(ciphertext)?);
         let text = String::from_utf8(plaintext.to_vec()).map_err(|_| {
             StoreError::Keychain(KeychainError {
                 service: self.dir.display().to_string(),
@@ -252,34 +385,232 @@ impl SecretStore for FileSecretStore {
         Ok(Some(Zeroizing::new(text)))
     }
 
-    fn set(&self, account: &str, secret: &str) -> Result<()> {
-        fs::create_dir_all(&self.dir).map_err(|e| StoreError::io(&self.dir, e))?;
-        let ciphertext = self.protector.protect(secret.as_bytes())?;
-        let path = self.path_for(account);
-        let tmp = path.with_extension("tmp");
-        fs::write(&tmp, &ciphertext).map_err(|e| StoreError::io(&tmp, e))?;
-        restrict_permissions(&tmp)?;
-        fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e))?;
-        Ok(())
-    }
-
-    fn delete(&self, account: &str) -> Result<()> {
-        let path = self.path_for(account);
-        match fs::remove_file(&path) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(StoreError::io(&path, e)),
+    fn remove_if_present(&self, path: &Path) -> Result<bool> {
+        match fs::remove_file(path) {
+            Ok(()) => Ok(true),
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+            Err(e) => Err(StoreError::io(path, e)),
         }
     }
 }
 
-/// Owner-only permissions on Unix. On Windows the DPAPI blob is already
-/// user-bound, and ACLs are inherited from the app-support directory.
-fn restrict_permissions(path: &Path) -> Result<()> {
+impl SecretStore for FileSecretStore {
+    fn get(&self, account: &str) -> Result<Option<Zeroizing<String>>> {
+        self.validate_account(account)?;
+        if !validate_existing_directory(&self.dir)? {
+            return Ok(None);
+        }
+        let path = self.path_for(account);
+        if let Some(secret) = self.read_file(&path, account)? {
+            return Ok(Some(secret));
+        }
+        self.read_file(&self.legacy_path_for(account), account)
+    }
+
+    fn set(&self, account: &str, secret: &str) -> Result<()> {
+        self.validate_account(account)?;
+        ensure_secure_directory(&self.dir)?;
+        let ciphertext = Zeroizing::new(self.protector.protect(secret.as_bytes())?);
+        let path = self.path_for(account);
+        if ciphertext.len() as u64
+            > MAX_PROTECTED_FILE_BYTES.saturating_sub(PROTECTED_FILE_MAGIC.len() as u64)
+        {
+            return Err(StoreError::io(
+                &path,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "protected secret exceeds the file-store size limit",
+                ),
+            ));
+        }
+        let (tmp, mut file) = create_random_temp_file(&path)?;
+        let write_result: Result<()> = (|| {
+            file.write_all(PROTECTED_FILE_MAGIC)
+                .and_then(|()| file.write_all(&ciphertext))
+                .and_then(|()| file.sync_all())
+                .map_err(|e| StoreError::io(&tmp, e))?;
+            drop(file);
+            fs::rename(&tmp, &path).map_err(|e| StoreError::io(&path, e))?;
+            sync_directory(&self.dir)?;
+            Ok(())
+        })();
+        if write_result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        write_result?;
+
+        // A successful v2 write is the migration boundary. Delete the legacy
+        // name only after the new file and directory entry are durable.
+        if self.remove_if_present(&self.legacy_path_for(account))? {
+            sync_directory(&self.dir)?;
+        }
+        Ok(())
+    }
+
+    fn delete(&self, account: &str) -> Result<()> {
+        self.validate_account(account)?;
+        if !validate_existing_directory(&self.dir)? {
+            return Ok(());
+        }
+        let removed = self.remove_if_present(&self.path_for(account))?
+            | self.remove_if_present(&self.legacy_path_for(account))?;
+        if removed {
+            sync_directory(&self.dir)?;
+        }
+        Ok(())
+    }
+}
+
+fn ensure_secure_directory(path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+        let mut builder = fs::DirBuilder::new();
+        builder.recursive(true).mode(0o700);
+        builder.create(path).map_err(|e| StoreError::io(path, e))?;
+
+        let metadata = fs::symlink_metadata(path).map_err(|e| StoreError::io(path, e))?;
+        if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+            return Err(StoreError::io(
+                path,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "secret directory is not a real directory",
+                ),
+            ));
+        }
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))
+            .map_err(|e| StoreError::io(path, e))?;
+    }
+    #[cfg(not(unix))]
+    {
+        fs::create_dir_all(path).map_err(|e| StoreError::io(path, e))?;
+        let metadata = fs::symlink_metadata(path).map_err(|e| StoreError::io(path, e))?;
+        if !metadata.is_dir() {
+            return Err(StoreError::io(
+                path,
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "secret path is not a directory",
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_existing_directory(path: &Path) -> Result<bool> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(StoreError::io(path, e)),
+    };
+    if !metadata.file_type().is_dir() || metadata.file_type().is_symlink() {
+        return Err(StoreError::io(
+            path,
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "secret directory is not a real directory",
+            ),
+        ));
+    }
+    Ok(true)
+}
+
+fn open_read_nofollow(path: &Path) -> io::Result<File> {
+    let mut options = OpenOptions::new();
+    options.read(true);
+    add_nofollow(&mut options);
+    options.open(path)
+}
+
+fn create_random_temp_file(destination: &Path) -> Result<(PathBuf, File)> {
+    let parent = destination.parent().ok_or_else(|| {
+        StoreError::io(
+            destination,
+            io::Error::new(io::ErrorKind::InvalidInput, "secret path has no parent"),
+        )
+    })?;
+    let stem = destination
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("secret");
+
+    for _ in 0..32 {
+        let mut random = [0_u8; 16];
+        getrandom::fill(&mut random).map_err(|e| {
+            StoreError::io(
+                destination,
+                io::Error::other(format!("could not randomize temporary filename: {e}")),
+            )
+        })?;
+        let mut suffix = String::with_capacity(random.len() * 2);
+        for byte in random {
+            use std::fmt::Write as _;
+            write!(&mut suffix, "{byte:02x}").expect("writing to String cannot fail");
+        }
+        let path = parent.join(format!(".{stem}.tmp-{suffix}"));
+        let mut options = OpenOptions::new();
+        options.write(true).create_new(true);
+        add_create_permissions(&mut options);
+        add_nofollow(&mut options);
+        match options.open(&path) {
+            Ok(file) => return Ok((path, file)),
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(StoreError::io(&path, e)),
+        }
+    }
+
+    Err(StoreError::io(
+        destination,
+        io::Error::new(
+            io::ErrorKind::AlreadyExists,
+            "could not reserve a unique temporary secret file",
+        ),
+    ))
+}
+
+fn add_create_permissions(options: &mut OpenOptions) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = options;
+    }
+}
+
+fn add_nofollow(options: &mut OpenOptions) {
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Linux O_NOFOLLOW.
+        options.custom_flags(0x20_000);
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Darwin O_NOFOLLOW.
+        options.custom_flags(0x100);
+    }
+    #[cfg(not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios"
+    )))]
+    {
+        let _ = options;
+    }
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        File::open(path)
+            .and_then(|dir| dir.sync_all())
             .map_err(|e| StoreError::io(path, e))?;
     }
     #[cfg(not(unix))]
@@ -293,6 +624,55 @@ fn restrict_permissions(path: &Path) -> Result<()> {
 // Size-routing façade
 // ---------------------------------------------------------------------------
 
+/// Result of moving one secret between storage backends.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MigrationOutcome {
+    /// The source did not contain this account.
+    Missing,
+    /// The destination was written, verified, then the source was removed.
+    Migrated,
+    /// Both stores held the same secret, so the redundant source was removed.
+    RedundantSourceRemoved,
+    /// Both stores held different secrets. Neither was changed.
+    Conflict,
+}
+
+/// Safely move one account from `source` to `destination`.
+///
+/// The source is never deleted until the destination has returned the exact
+/// value from a read-after-write. A conflicting destination is preserved and
+/// reported for the caller to resolve rather than overwritten.
+pub fn migrate_secret(
+    account: &str,
+    source: &dyn SecretStore,
+    destination: &dyn SecretStore,
+) -> Result<MigrationOutcome> {
+    let Some(source_secret) = source.get(account)? else {
+        return Ok(MigrationOutcome::Missing);
+    };
+    if let Some(destination_secret) = destination.get(account)? {
+        if *destination_secret == *source_secret {
+            source.delete(account)?;
+            return Ok(MigrationOutcome::RedundantSourceRemoved);
+        }
+        return Ok(MigrationOutcome::Conflict);
+    }
+
+    destination.set(account, &source_secret)?;
+    match destination.get(account)? {
+        Some(stored) if *stored == *source_secret => {
+            source.delete(account)?;
+            Ok(MigrationOutcome::Migrated)
+        }
+        _ => Err(StoreError::Keychain(KeychainError {
+            service: "secret-migration".to_owned(),
+            account: account.to_owned(),
+            kind: KeychainErrorKind::BadData,
+            detail: "destination failed read-after-write verification".to_owned(),
+        })),
+    }
+}
+
 /// The storage interface the rest of aibo uses.
 ///
 /// Small secrets (the 32-byte database key, an API key) go to the OS keychain.
@@ -302,6 +682,8 @@ fn restrict_permissions(path: &Path) -> Result<()> {
 pub struct SecretStorage {
     keychain: Box<dyn SecretStore>,
     oversize: Option<Box<dyn SecretStore>>,
+    /// Raw byte limit used when this façade has an oversize fallback.
+    primary_limit: Option<usize>,
 }
 
 impl std::fmt::Debug for SecretStorage {
@@ -313,12 +695,48 @@ impl std::fmt::Debug for SecretStorage {
 }
 
 impl SecretStorage {
-    /// Keychain only. Correct on macOS, where Keychain Services has no
-    /// comparable cap.
+    /// Development-only plaintext credential files.
+    ///
+    /// Production wiring should prefer [`Self::os_keychain`] or
+    /// [`Self::with_oversize`] with an OS-bound protector.
+    pub fn development_plaintext_files(
+        dir: impl Into<PathBuf>,
+        acknowledgement: DevelopmentOnlyPlaintext,
+    ) -> Self {
+        tracing::warn!("using development-only plaintext credential storage");
+        let protector = PlaintextProtector::development_only(acknowledgement);
+        let store = FileSecretStore::new(dir, Arc::new(protector));
+        Self {
+            keychain: Box::new(store),
+            oversize: None,
+            primary_limit: None,
+        }
+    }
+
+    /// Compatibility shim for existing development wiring.
+    ///
+    /// New callers must use [`Self::development_plaintext_files`] and make the
+    /// risk acknowledgement visible at the call site.
+    #[deprecated(
+        note = "plaintext credentials are development-only; use development_plaintext_files with DevelopmentOnlyPlaintext::acknowledge_risk(), or os_keychain in production"
+    )]
+    pub fn file_only(dir: impl Into<std::path::PathBuf>) -> Self {
+        Self::development_plaintext_files(dir, DevelopmentOnlyPlaintext::acknowledge_risk())
+    }
+
+    /// The platform's OS-backed credential store.
+    pub fn os_keychain() -> Self {
+        Self::keychain_only(Keychain::default())
+    }
+
+    /// One primary secret backend with no façade-level size routing.
+    ///
+    /// The real [`Keychain`] still enforces the platform cap on Windows.
     pub fn keychain_only(keychain: impl SecretStore + 'static) -> Self {
         Self {
             keychain: Box::new(keychain),
             oversize: None,
+            primary_limit: None,
         }
     }
 
@@ -331,6 +749,7 @@ impl SecretStorage {
         Self {
             keychain: Box::new(keychain),
             oversize: Some(Box::new(oversize)),
+            primary_limit: Some(WINDOWS_CREDENTIAL_BLOB_MAX_BYTES),
         }
     }
 
@@ -351,7 +770,10 @@ impl SecretStorage {
     /// cap (or grew above it) does not leave a stale second copy for `get` to
     /// resurrect later.
     pub fn set(&self, account: &str, secret: &str) -> Result<()> {
-        if fits_in_credential_manager(secret) {
+        let Some(primary_limit) = self.primary_limit else {
+            return self.keychain.set(account, secret);
+        };
+        if secret.len() <= primary_limit {
             self.keychain.set(account, secret)?;
             if let Some(store) = &self.oversize {
                 store.delete(account)?;
@@ -366,8 +788,8 @@ impl SecretStorage {
             // Refuse rather than silently truncating or writing plaintext.
             None => Err(StoreError::SecretTooLarge {
                 account: account.to_owned(),
-                utf16_bytes: utf16_bytes(secret),
-                limit: WINDOWS_CREDENTIAL_BLOB_MAX_BYTES,
+                secret_bytes: secret.len(),
+                limit: primary_limit,
             }),
         }
     }
@@ -407,6 +829,30 @@ impl SecretStorage {
         self.set_db_key(&key)?;
         Ok((key, true))
     }
+
+    /// Migrate an account into this configured storage, with read-after-write
+    /// verification before the old copy is removed.
+    pub fn migrate_from(
+        &self,
+        account: &str,
+        source: &dyn SecretStore,
+    ) -> Result<MigrationOutcome> {
+        migrate_secret(account, source, self)
+    }
+}
+
+impl SecretStore for SecretStorage {
+    fn get(&self, account: &str) -> Result<Option<Zeroizing<String>>> {
+        SecretStorage::get(self, account)
+    }
+
+    fn set(&self, account: &str, secret: &str) -> Result<()> {
+        SecretStorage::set(self, account, secret)
+    }
+
+    fn delete(&self, account: &str) -> Result<()> {
+        SecretStorage::delete(self, account)
+    }
 }
 
 #[cfg(test)]
@@ -444,10 +890,10 @@ mod tests {
                 .map(Zeroizing::new))
         }
         fn set(&self, account: &str, secret: &str) -> Result<()> {
-            if self.enforce_cap && !fits_in_credential_manager(secret) {
+            if self.enforce_cap && !raw_fits_in_credential_manager(secret.as_bytes()) {
                 return Err(StoreError::SecretTooLarge {
                     account: account.to_owned(),
-                    utf16_bytes: utf16_bytes(secret),
+                    secret_bytes: secret.len(),
                     limit: WINDOWS_CREDENTIAL_BLOB_MAX_BYTES,
                 });
             }
@@ -477,6 +923,26 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct LyingDestination {
+        writes: Mutex<usize>,
+    }
+
+    impl SecretStore for LyingDestination {
+        fn get(&self, _account: &str) -> Result<Option<Zeroizing<String>>> {
+            Ok(None)
+        }
+
+        fn set(&self, _account: &str, _secret: &str) -> Result<()> {
+            *self.writes.lock().expect("lock") += 1;
+            Ok(())
+        }
+
+        fn delete(&self, _account: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[test]
     fn the_documented_cap_matches_the_platform_constant() {
         assert_eq!(WINDOWS_CREDENTIAL_BLOB_MAX_BYTES, 2560);
@@ -500,6 +966,22 @@ mod tests {
         let key = DbKey::generate().expect("key");
         assert!(fits_in_credential_manager(&key.to_hex()));
         assert_eq!(utf16_bytes(&key.to_hex()), 128);
+    }
+
+    #[test]
+    fn raw_keyring_api_avoids_legacy_utf16_expansion() {
+        let token = "x".repeat(1652);
+        assert!(!fits_in_credential_manager(&token));
+        assert!(raw_fits_in_credential_manager(token.as_bytes()));
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let fallback =
+            FileSecretStore::new(dir.path().join("fallback"), Arc::new(ReversingProtector));
+        let fallback_path = fallback.path_for("token");
+        let storage = SecretStorage::with_oversize(FakeKeychain::capped(), fallback);
+        storage.set("token", &token).expect("store in primary");
+        assert!(!fallback_path.exists());
+        assert_eq!(*storage.get("token").expect("get").expect("present"), token);
     }
 
     #[test]
@@ -561,9 +1043,147 @@ mod tests {
     #[test]
     fn account_names_cannot_escape_the_secret_directory() {
         let store = FileSecretStore::new("/tmp/aibo-secrets", Arc::new(ReversingProtector));
+        let path = store.path_for("../../etc/passwd");
+        assert_eq!(path.parent(), Some(Path::new("/tmp/aibo-secrets")));
         assert_eq!(
-            store.path_for("../../etc/passwd"),
-            PathBuf::from("/tmp/aibo-secrets/.._.._etc_passwd.secret")
+            path.file_name().and_then(|name| name.to_str()),
+            Some("v2-2e2e2f2e2e2f6574632f706173737764.secret")
+        );
+    }
+
+    #[test]
+    fn account_file_names_do_not_collide() {
+        let store = FileSecretStore::new("/tmp/aibo-secrets", Arc::new(ReversingProtector));
+        assert_ne!(store.path_for("a/b"), store.path_for("a_b"));
+    }
+
+    #[test]
+    fn legacy_file_is_read_and_removed_on_next_write() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileSecretStore::new(dir.path().join("secrets"), Arc::new(ReversingProtector));
+        ensure_secure_directory(&store.dir).expect("directory");
+        let legacy_path = store.legacy_path_for("provider:old");
+        let legacy_ciphertext: Vec<u8> = b"old-secret".iter().rev().copied().collect();
+        fs::write(&legacy_path, legacy_ciphertext).expect("legacy write");
+
+        assert_eq!(
+            *store
+                .get("provider:old")
+                .expect("legacy read")
+                .expect("present"),
+            "old-secret"
+        );
+        store
+            .set("provider:old", "new-secret")
+            .expect("migrating write");
+        assert!(!legacy_path.exists());
+        assert_eq!(
+            *store.get("provider:old").expect("read").expect("present"),
+            "new-secret"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn protected_files_are_created_with_owner_only_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret_dir = dir.path().join("secrets");
+        let store = FileSecretStore::new(&secret_dir, Arc::new(ReversingProtector));
+        store.set("token", "secret").expect("write");
+
+        let dir_mode = fs::metadata(&secret_dir)
+            .expect("dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = fs::metadata(store.path_for("token"))
+            .expect("file metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+        assert!(fs::read_dir(&secret_dir).expect("read dir").all(|entry| {
+            !entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .contains(".tmp-")
+        }));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_secret_files_are_not_followed() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let secret_dir = dir.path().join("secrets");
+        let store = FileSecretStore::new(&secret_dir, Arc::new(ReversingProtector));
+        ensure_secure_directory(&secret_dir).expect("directory");
+        let target = dir.path().join("target");
+        fs::write(&target, b"terces").expect("target");
+        symlink(&target, store.path_for("token")).expect("symlink");
+
+        assert!(store.get("token").is_err());
+    }
+
+    #[test]
+    fn migration_verifies_before_deleting_source() {
+        let source = FakeKeychain::default();
+        source.set("token", "secret").expect("source write");
+        let destination = FakeKeychain::default();
+
+        assert_eq!(
+            migrate_secret("token", &source, &destination).expect("migration"),
+            MigrationOutcome::Migrated
+        );
+        assert!(source.get("token").expect("source read").is_none());
+        assert_eq!(
+            *destination
+                .get("token")
+                .expect("destination read")
+                .expect("present"),
+            "secret"
+        );
+    }
+
+    #[test]
+    fn failed_migration_verification_preserves_source() {
+        let source = FakeKeychain::default();
+        source.set("token", "secret").expect("source write");
+        let destination = LyingDestination::default();
+
+        assert!(migrate_secret("token", &source, &destination).is_err());
+        assert_eq!(
+            *source.get("token").expect("source read").expect("present"),
+            "secret"
+        );
+    }
+
+    #[test]
+    fn migration_conflict_preserves_both_values() {
+        let source = FakeKeychain::default();
+        source.set("token", "old").expect("source write");
+        let destination = FakeKeychain::default();
+        destination.set("token", "new").expect("destination write");
+
+        assert_eq!(
+            migrate_secret("token", &source, &destination).expect("migration"),
+            MigrationOutcome::Conflict
+        );
+        assert_eq!(
+            *source.get("token").expect("source read").expect("present"),
+            "old"
+        );
+        assert_eq!(
+            *destination
+                .get("token")
+                .expect("destination read")
+                .expect("present"),
+            "new"
         );
     }
 }

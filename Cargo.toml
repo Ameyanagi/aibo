@@ -37,6 +37,7 @@ aibo-platform = { path = "crates/aibo-platform" }
 aibo-store = { path = "crates/aibo-store" }
 aibo-agent = { path = "crates/aibo-agent" }
 aibo-tools = { path = "crates/aibo-tools" }
+aibo-agent-tools-adapter = { path = "crates/aibo-agent-tools-adapter" }
 aibo-ui = { path = "crates/aibo-ui" }
 
 # --- async runtime and streams ---------------------------------------------
@@ -47,6 +48,7 @@ async-trait = "0.1"
 futures = "0.3"
 futures-core = "0.3"
 futures-util = "0.3"
+process-wrap = { version = "9.1.0", features = ["tokio1"] }
 
 # --- errors, logging, serialisation ----------------------------------------
 thiserror = "2"                      # libraries (all crates/*)
@@ -71,6 +73,14 @@ reqwest = { version = "0.12", default-features = false, features = ["json", "str
 eventsource-stream = "0.2"
 http = "1"
 base64 = "0.22"
+# §2 image attachments: decode + downscale before an image goes on the wire.
+# `default-features = false` is load-bearing. The default set pulls `ravif`,
+# which drags in a whole AVIF encoder aibo never uses; these three formats are
+# exactly `SUPPORTED_IMAGE_MEDIA_TYPES` and every one of their codecs is pure
+# Rust (`png`+`miniz_oxide`, `zune-jpeg`, `image-webp`), so nothing here
+# compiles C. The crate is already in the tree via `iced`'s `image` feature, so
+# this adds no new build.
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp"] }
 
 # --- storage ----------------------------------------------------------------
 rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl", "uuid", "backup"] }  # §12, §20
@@ -81,15 +91,14 @@ rusqlite = { version = "0.40", features = ["bundled-sqlcipher-vendored-openssl",
 fend-core = "1.5.8"                  # §1 Compute
 wasmtime = "47"                      # §11 tier 1, downloaded-on-demand CPython
 wasmtime-wasi = "47"
-rmcp = "2.2"                         # §11 tier 2 [plan note: 3.0 beta exists; migration expected]
+rmcp = { version = "2.2", default-features = false } # §11 tier 2 client only
 
 # --- ui / shell -------------------------------------------------------------
-iced = { version = "0.14", features = ["wgpu", "advanced", "tokio", "image", "svg"] }
+iced = { version = "0.14", default-features = false, features = ["wgpu", "advanced", "crisp", "tokio", "image-without-codecs", "svg"] }
 global-hotkey = "0.8"                # §8
 tray-icon = "0.24"                   # §8
 muda = "0.19"                        # §8
-window-vibrancy = "0.8"              # §8
-raw-window-handle = "0.6"            # §20 S1 — iced 0.14 and window-vibrancy 0.8 agree on 0.6
+raw-window-handle = "0.6"            # native panel configuration in aibo-platform
 arboard = "3"
 enigo = "0.6"                        # §8 [plan note: self-described early alpha]
 
@@ -161,6 +170,8 @@ aibo-session = { workspace = true }
 # both process-entry concerns: they decide what the engine is *built with*.
 aibo-store = { workspace = true }
 aibo-ui = { workspace = true }
+aibo-agent = { workspace = true }
+aibo-agent-tools-adapter = { workspace = true }
 
 # `SessionId` is a uuid, and the binary mints one per agent task.
 uuid = { workspace = true }

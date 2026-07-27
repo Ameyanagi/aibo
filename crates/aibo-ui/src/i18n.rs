@@ -112,6 +112,15 @@ pub enum Key {
     /// Context chip when no context could be captured at all.
     ContextChipNone,
 
+    // --- panel: attachments (§2 vision, §14 cost) -------------------------
+    /// Chip label for a clipboard image whose source app is known: `{}` = app.
+    AttachmentClipboardFrom,
+    /// Chip label for a clipboard image with no known source app.
+    AttachmentClipboardLabel,
+    /// Marker on a chip whose pixels were downscaled before sending, so
+    /// "why is my screenshot blurry" has an answer (§14).
+    AttachmentDownscaled,
+
     // --- panel: states (§16 "every state, not just the happy path") ------
     /// Shown between submit and the first token.
     StateLoading,
@@ -139,6 +148,12 @@ pub enum Key {
     FootnoteFallback,
     /// Truncated-input marker (§5 middle-out truncation).
     FootnoteInputTruncated,
+    /// What the attached images add to this turn — `{}` = estimated tokens.
+    ///
+    /// §14: BYOK means the user pays for every image, and an attachment is the
+    /// one thing on the panel that can multiply a turn's cost without changing
+    /// a visible word of the instruction.
+    FootnoteImageTokens,
 
     // --- actions (every one has a key hint, §16) -------------------------
     /// Insert the response into the source app.
@@ -176,6 +191,14 @@ pub enum Key {
     /// Switch the failed binding to a model the provider does accept (§13's
     /// one action for `ModelRejected`).
     ActionSwitchModel,
+    /// Attach the image on the clipboard. A deliberate act, never inferred.
+    ActionAttachImage,
+    /// Detach an image, by key or by clicking its chip.
+    ActionRemoveImage,
+    /// Enable encrypted history.
+    ActionEnableHistory,
+    /// Copy the one-time recovery code.
+    ActionCopyRecoveryCode,
 
     // --- error treatments (§13) ------------------------------------------
     /// `NoProviderConfigured` — the only blocking error.
@@ -207,8 +230,35 @@ pub enum Key {
     ErrModelRejectedUse,
     /// `ModelRejected` when nothing is known to work — `{}` = refused model id.
     ErrModelRejected,
+    /// `VisionUnsupported` with a bound model and a replacement that can see —
+    /// `{}` = the bound model, `{}` = the one to use instead.
+    ErrVisionUnsupportedUse,
+    /// `VisionUnsupported` with a bound model and nothing to switch to —
+    /// `{}` = the bound model. The remaining action is to detach the image.
+    ErrVisionUnsupported,
+    /// `VisionUnsupported` with no `Vision` chain at all, and a provider worth
+    /// naming — `{}` = that provider.
+    ErrVisionNoProviderUse,
+    /// `VisionUnsupported` with no `Vision` chain and nothing to name.
+    ErrVisionNoProvider,
+    /// `AttachmentRejected`/`TooMany` — `{}` = the per-request limit.
+    ErrAttachmentTooMany,
+    /// `AttachmentRejected`/`TooLarge` and `TotalTooLarge` — `{}` = chip label,
+    /// empty when the whole set is what overflowed.
+    ErrAttachmentTooLarge,
+    /// `AttachmentRejected`/`UnsupportedMediaType` and `Empty` — `{}` = label.
+    ErrAttachmentUnusable,
     /// `Internal` — never rendered raw (§13).
     ErrInternal,
+
+    // --- toasts (§13 non-blocking) ---------------------------------------
+    /// ⌘V found an image the pasteboard would not hand over.
+    ToastClipboardImageUnreadable,
+    /// Startup recovered persisted state after a crash; names the diagnostics
+    /// action so the user has a concrete next step if it repeats.
+    ToastRecoveredFromCrash,
+    /// Confirmation after copying a redacted diagnostics bundle.
+    ToastDiagnosticsCopied,
 
     // --- tray ------------------------------------------------------------
     /// Tray tooltip.
@@ -275,6 +325,58 @@ pub enum Key {
     SettingsAbout,
     /// Section: language.
     SettingsLanguage,
+    /// First-run setup heading.
+    SettingsWelcomeTitle,
+    /// First-run setup explanation.
+    SettingsWelcomeBody,
+    /// Encrypted history has not been enabled.
+    SettingsHistorySetupTitle,
+    /// Explanation of encrypted history and recovery.
+    SettingsHistorySetupBody,
+    /// Encrypted history is ready.
+    SettingsHistoryReady,
+    /// A newly generated recovery code must be saved now.
+    SettingsRecoveryTitle,
+    /// Recovery-code handling guidance.
+    SettingsRecoveryBody,
+    /// History setup failed.
+    SettingsHistoryFailed,
+    /// Codex provider-card title.
+    SettingsCodexTitle,
+    /// Codex provider-card body before sign-in.
+    SettingsCodexSignedOut,
+    /// Codex provider-card body after sign-in.
+    SettingsCodexSignedIn,
+    /// Codex device-code request is starting.
+    SettingsCodexStarting,
+    /// Codex device-code request is waiting for approval.
+    SettingsCodexAwaitingApproval,
+    /// Codex authorization code is being exchanged for tokens.
+    SettingsCodexExchanging,
+    /// Generic Codex sign-in failure when no detail is available.
+    SettingsCodexFailed,
+    /// Start Codex device-code sign-in.
+    SettingsCodexSignIn,
+    /// Cancel an in-flight Codex sign-in.
+    SettingsCodexCancelSignIn,
+    /// Forget Codex tokens and remove the provider.
+    SettingsCodexSignOut,
+    /// Codex consent/storage posture note.
+    SettingsCodexConsentNote,
+    /// Copy a Codex device code.
+    SettingsCopyDeviceCode,
+    /// Open the Codex device approval page.
+    SettingsOpenDevicePage,
+    /// OS permission: Accessibility.
+    SettingsPermissionAccessibility,
+    /// OS permission: Input Monitoring.
+    SettingsPermissionInputMonitoring,
+    /// OS permission: elevated-window access.
+    SettingsPermissionElevatedWindowAccess,
+    /// OS permission: notifications.
+    SettingsPermissionNotifications,
+    /// OS permission: launch at login.
+    SettingsPermissionAutostart,
 
     // --- misc -------------------------------------------------------------
     /// Spend meter label — `{}` = formatted amount.
@@ -350,6 +452,10 @@ fn en(key: Key) -> &'static str {
         K::ContextChipFrom => "{}",
         K::ContextChipNone => "No context",
 
+        K::AttachmentClipboardFrom => "Image from {}",
+        K::AttachmentClipboardLabel => "Clipboard image",
+        K::AttachmentDownscaled => "resized",
+
         K::StateLoading => "Thinking…",
         K::StateEmptyTitle => "Nothing to show yet",
         K::StateEmptyBody => "Type an instruction, or press ↩ to continue where you left off.",
@@ -367,6 +473,7 @@ fn en(key: Key) -> &'static str {
 
         K::FootnoteFallback => "Answered by {} instead.",
         K::FootnoteInputTruncated => "Input was shortened to fit the context budget.",
+        K::FootnoteImageTokens => "Attached images add about {} tokens to this request.",
 
         K::ActionReplace => "Replace",
         K::ActionCopy => "Copy",
@@ -385,6 +492,10 @@ fn en(key: Key) -> &'static str {
         K::ActionOpenSystemSettings => "Open system settings",
         K::ActionShowTask => "Show task",
         K::ActionSwitchModel => "Switch model",
+        K::ActionAttachImage => "Attach image",
+        K::ActionRemoveImage => "Remove image",
+        K::ActionEnableHistory => "Enable encrypted history",
+        K::ActionCopyRecoveryCode => "Copy recovery code",
 
         K::ErrNoProvider => "No provider is configured yet.",
         K::ErrAuth => "Your {} credentials are no longer valid.",
@@ -400,7 +511,20 @@ fn en(key: Key) -> &'static str {
         K::ErrBudgetExceeded => "This run reached its budget.",
         K::ErrModelRejectedUse => "{} is not available on this account — use {} instead.",
         K::ErrModelRejected => "{} is not available on this account.",
+        K::ErrVisionUnsupportedUse => "{} cannot read images — use {} instead.",
+        K::ErrVisionUnsupported => "{} cannot read images.",
+        K::ErrVisionNoProviderUse => "No model here can read images — sign in to {}.",
+        K::ErrVisionNoProvider => "No model here can read images.",
+        K::ErrAttachmentTooMany => "aibo sends at most {} images at a time.",
+        K::ErrAttachmentTooLarge => "{} is too large to send.",
+        K::ErrAttachmentUnusable => "{} is not an image aibo can send.",
         K::ErrInternal => "Something went wrong inside aibo.",
+
+        K::ToastClipboardImageUnreadable => "aibo could not read the image on the clipboard.",
+        K::ToastRecoveredFromCrash => {
+            "aibo recovered from a previous crash. Copy diagnostics if this keeps happening."
+        }
+        K::ToastDiagnosticsCopied => "Diagnostics copied.",
 
         K::TrayTooltip => "aibo",
         K::TrayOpenPanel => "Open aibo",
@@ -436,6 +560,42 @@ fn en(key: Key) -> &'static str {
         K::SettingsHistory => "History",
         K::SettingsAbout => "About",
         K::SettingsLanguage => "Language",
+        K::SettingsWelcomeTitle => "Welcome to aibo",
+        K::SettingsWelcomeBody => {
+            "Sign in to a provider, then review Permissions so aibo can read and replace text only when you ask."
+        }
+        K::SettingsHistorySetupTitle => "Encrypted history is off",
+        K::SettingsHistorySetupBody => {
+            "Enable it to save conversations in a local SQLCipher database. The encryption key stays in your OS credential store."
+        }
+        K::SettingsHistoryReady => "Encrypted history is ready.",
+        K::SettingsRecoveryTitle => "Save this recovery code now",
+        K::SettingsRecoveryBody => {
+            "aibo shows this code only once. Anyone with it can decrypt your local history."
+        }
+        K::SettingsHistoryFailed => "aibo could not enable encrypted history.",
+        K::SettingsCodexTitle => "ChatGPT subscription (Codex)",
+        K::SettingsCodexSignedOut => {
+            "Use your ChatGPT plan instead of an API key. aibo runs its own device-code login and stores its own tokens in the keychain — it never reads or refreshes Codex's."
+        }
+        K::SettingsCodexSignedIn => "Signed in. Codex is bound to the Smart and Ask surfaces.",
+        K::SettingsCodexStarting => "Starting ChatGPT sign-in…",
+        K::SettingsCodexAwaitingApproval => "Enter the device code on OpenAI's approval page.",
+        K::SettingsCodexExchanging => "Approved. Finishing sign-in…",
+        K::SettingsCodexFailed => "Sign-in failed. Try again.",
+        K::SettingsCodexSignIn => "Sign in with ChatGPT",
+        K::SettingsCodexCancelSignIn => "Cancel sign-in",
+        K::SettingsCodexSignOut => "Sign out",
+        K::SettingsCodexConsentNote => {
+            "The approval page is OpenAI's own Codex consent screen; the tokens it issues are stored only by aibo."
+        }
+        K::SettingsCopyDeviceCode => "Copy code",
+        K::SettingsOpenDevicePage => "Open the page",
+        K::SettingsPermissionAccessibility => "Accessibility",
+        K::SettingsPermissionInputMonitoring => "Input Monitoring",
+        K::SettingsPermissionElevatedWindowAccess => "Elevated window access",
+        K::SettingsPermissionNotifications => "Notifications",
+        K::SettingsPermissionAutostart => "Launch at login",
 
         K::SpendThisMonth => "{} this month",
         K::PermissionGranted => "Granted",
@@ -454,6 +614,10 @@ fn ja(key: Key) -> &'static str {
         K::ContextChipFrom => "{}",
         K::ContextChipNone => "コンテキストなし",
 
+        K::AttachmentClipboardFrom => "{} の画像",
+        K::AttachmentClipboardLabel => "クリップボードの画像",
+        K::AttachmentDownscaled => "縮小済み",
+
         K::StateLoading => "考えています…",
         K::StateEmptyTitle => "まだ表示するものがありません",
         K::StateEmptyBody => "指示を入力するか、↩ で続きから始めます。",
@@ -469,6 +633,7 @@ fn ja(key: Key) -> &'static str {
 
         K::FootnoteFallback => "代わりに {} が応答しました。",
         K::FootnoteInputTruncated => "コンテキスト上限に合わせて入力を短縮しました。",
+        K::FootnoteImageTokens => "添付画像でおよそ {} トークン増えます。",
 
         K::ActionReplace => "置換",
         K::ActionCopy => "コピー",
@@ -487,6 +652,10 @@ fn ja(key: Key) -> &'static str {
         K::ActionOpenSystemSettings => "システム設定を開く",
         K::ActionShowTask => "タスクを表示",
         K::ActionSwitchModel => "モデルを切り替える",
+        K::ActionAttachImage => "画像を添付",
+        K::ActionRemoveImage => "画像を削除",
+        K::ActionEnableHistory => "暗号化履歴を有効にする",
+        K::ActionCopyRecoveryCode => "復旧コードをコピー",
 
         K::ErrNoProvider => "プロバイダーが設定されていません。",
         K::ErrAuth => "{} の認証情報が無効になりました。",
@@ -504,7 +673,22 @@ fn ja(key: Key) -> &'static str {
             "{} はこのアカウントでは利用できません。代わりに {} を使用してください。"
         }
         K::ErrModelRejected => "{} はこのアカウントでは利用できません。",
+        K::ErrVisionUnsupportedUse => "{} は画像を読み取れません。代わりに {} を使用してください。",
+        K::ErrVisionUnsupported => "{} は画像を読み取れません。",
+        K::ErrVisionNoProviderUse => {
+            "画像を読み取れるモデルがありません。{} にサインインしてください。"
+        }
+        K::ErrVisionNoProvider => "画像を読み取れるモデルがありません。",
+        K::ErrAttachmentTooMany => "画像は一度に最大 {} 枚までです。",
+        K::ErrAttachmentTooLarge => "{} はサイズが大きすぎて送信できません。",
+        K::ErrAttachmentUnusable => "{} は aibo が送信できる画像形式ではありません。",
         K::ErrInternal => "aibo の内部で問題が発生しました。",
+
+        K::ToastClipboardImageUnreadable => "クリップボードの画像を読み取れませんでした。",
+        K::ToastRecoveredFromCrash => {
+            "前回のクラッシュから復旧しました。繰り返す場合は診断情報をコピーしてください。"
+        }
+        K::ToastDiagnosticsCopied => "診断情報をコピーしました。",
 
         K::TrayTooltip => "aibo",
         K::TrayOpenPanel => "aibo を開く",
@@ -542,6 +726,46 @@ fn ja(key: Key) -> &'static str {
         K::SettingsHistory => "履歴",
         K::SettingsAbout => "情報",
         K::SettingsLanguage => "言語",
+        K::SettingsWelcomeTitle => "aibo へようこそ",
+        K::SettingsWelcomeBody => {
+            "プロバイダーにサインインした後、「権限」を確認してください。aibo は、あなたが指示したときだけテキストを読み取り、置き換えます。"
+        }
+        K::SettingsHistorySetupTitle => "暗号化履歴はオフです",
+        K::SettingsHistorySetupBody => {
+            "会話をローカルの SQLCipher データベースに保存するには有効にしてください。暗号化キーは OS の資格情報ストアに保管されます。"
+        }
+        K::SettingsHistoryReady => "暗号化履歴を使用できます。",
+        K::SettingsRecoveryTitle => "今すぐ復旧コードを保存してください",
+        K::SettingsRecoveryBody => {
+            "このコードが表示されるのは一度だけです。コードを知る人はローカル履歴を復号できます。"
+        }
+        K::SettingsHistoryFailed => "暗号化履歴を有効にできませんでした。",
+        K::SettingsCodexTitle => "ChatGPT サブスクリプション（Codex）",
+        K::SettingsCodexSignedOut => {
+            "API キーの代わりに ChatGPT プランを使用します。aibo は専用のデバイスコードでサインインし、トークンをキーチェーンに保存します。Codex のトークンを読み取ったり更新したりすることはありません。"
+        }
+        K::SettingsCodexSignedIn => {
+            "サインイン済みです。Codex は「高性能」と「質問」に割り当てられています。"
+        }
+        K::SettingsCodexStarting => "ChatGPT へのサインインを開始しています…",
+        K::SettingsCodexAwaitingApproval => {
+            "OpenAI の承認ページにデバイスコードを入力してください。"
+        }
+        K::SettingsCodexExchanging => "承認済みです。サインインを完了しています…",
+        K::SettingsCodexFailed => "サインインに失敗しました。もう一度お試しください。",
+        K::SettingsCodexSignIn => "ChatGPT でサインイン",
+        K::SettingsCodexCancelSignIn => "サインインをキャンセル",
+        K::SettingsCodexSignOut => "サインアウト",
+        K::SettingsCodexConsentNote => {
+            "承認ページは OpenAI の Codex 同意画面です。発行されたトークンは aibo だけが保存します。"
+        }
+        K::SettingsCopyDeviceCode => "コードをコピー",
+        K::SettingsOpenDevicePage => "承認ページを開く",
+        K::SettingsPermissionAccessibility => "アクセシビリティ",
+        K::SettingsPermissionInputMonitoring => "入力監視",
+        K::SettingsPermissionElevatedWindowAccess => "昇格されたウィンドウへのアクセス",
+        K::SettingsPermissionNotifications => "通知",
+        K::SettingsPermissionAutostart => "ログイン時に起動",
 
         K::SpendThisMonth => "今月 {}",
         K::PermissionGranted => "許可済み",
@@ -592,6 +816,137 @@ mod tests {
         assert_eq!(t2(Key::ActionCopy, "a", "b"), "Copy");
     }
 
+    /// §9: every new key ships translated, or the Japanese market gets an
+    /// English panel. The attachment work added a whole surface at once, which
+    /// is exactly when a language is quietly left behind.
+    #[test]
+    fn the_attachment_strings_ship_in_every_language() {
+        const ADDED: &[Key] = &[
+            Key::AttachmentClipboardFrom,
+            Key::AttachmentClipboardLabel,
+            Key::AttachmentDownscaled,
+            Key::FootnoteImageTokens,
+            Key::ActionAttachImage,
+            Key::ActionRemoveImage,
+            Key::ErrVisionUnsupportedUse,
+            Key::ErrVisionUnsupported,
+            Key::ErrVisionNoProviderUse,
+            Key::ErrVisionNoProvider,
+            Key::ErrAttachmentTooMany,
+            Key::ErrAttachmentTooLarge,
+            Key::ErrAttachmentUnusable,
+            Key::ToastClipboardImageUnreadable,
+        ];
+        for key in ADDED {
+            for lang in Lang::ALL {
+                assert!(!lookup(*key, *lang).is_empty(), "{key:?} / {lang:?}");
+            }
+            assert_ne!(
+                lookup(*key, Lang::En),
+                lookup(*key, Lang::Ja),
+                "{key:?} was left untranslated"
+            );
+        }
+    }
+
+    #[test]
+    fn the_settings_strings_ship_in_every_language() {
+        const SETTINGS: &[Key] = &[
+            Key::SettingsCodexTitle,
+            Key::SettingsCodexSignedOut,
+            Key::SettingsCodexSignedIn,
+            Key::SettingsCodexStarting,
+            Key::SettingsCodexAwaitingApproval,
+            Key::SettingsCodexExchanging,
+            Key::SettingsCodexFailed,
+            Key::SettingsCodexSignIn,
+            Key::SettingsCodexCancelSignIn,
+            Key::SettingsCodexSignOut,
+            Key::SettingsCodexConsentNote,
+            Key::SettingsCopyDeviceCode,
+            Key::SettingsOpenDevicePage,
+            Key::SettingsPermissionAccessibility,
+            Key::SettingsPermissionInputMonitoring,
+            Key::SettingsPermissionElevatedWindowAccess,
+            Key::SettingsPermissionNotifications,
+            Key::SettingsPermissionAutostart,
+            Key::SettingsHistorySetupTitle,
+            Key::SettingsHistorySetupBody,
+            Key::SettingsHistoryReady,
+            Key::SettingsRecoveryTitle,
+            Key::SettingsRecoveryBody,
+            Key::SettingsHistoryFailed,
+            Key::ActionEnableHistory,
+            Key::ActionCopyRecoveryCode,
+        ];
+        for key in SETTINGS {
+            assert!(!lookup(*key, Lang::En).is_empty(), "{key:?} / en");
+            assert!(!lookup(*key, Lang::Ja).is_empty(), "{key:?} / ja");
+            assert_ne!(
+                lookup(*key, Lang::En),
+                lookup(*key, Lang::Ja),
+                "{key:?} was left untranslated"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_toasts_ship_in_every_language() {
+        for key in [Key::ToastRecoveredFromCrash, Key::ToastDiagnosticsCopied] {
+            assert!(!lookup(key, Lang::En).is_empty());
+            assert!(!lookup(key, Lang::Ja).is_empty());
+            assert_ne!(lookup(key, Lang::En), lookup(key, Lang::Ja));
+        }
+        assert!(
+            lookup(Key::ToastRecoveredFromCrash, Lang::En)
+                .contains(lookup(Key::ActionCopyDiagnostics, Lang::En))
+        );
+        assert!(
+            lookup(Key::ToastRecoveredFromCrash, Lang::Ja)
+                .contains(lookup(Key::ActionCopyDiagnostics, Lang::Ja))
+        );
+    }
+
+    /// The vision refusal is §13's one sentence, and it is only actionable if
+    /// it names both the model that cannot see and one that can. A translation
+    /// that drops the second placeholder silently removes the way out.
+    #[test]
+    fn the_vision_refusal_names_both_models_in_every_language() {
+        for lang in Lang::ALL {
+            assert_eq!(
+                lookup(Key::ErrVisionUnsupportedUse, *lang)
+                    .matches("{}")
+                    .count(),
+                2,
+                "{lang:?}"
+            );
+        }
+        for key in [
+            Key::ErrVisionUnsupported,
+            Key::ErrVisionNoProviderUse,
+            Key::ErrAttachmentTooMany,
+            Key::ErrAttachmentTooLarge,
+            Key::ErrAttachmentUnusable,
+            Key::FootnoteImageTokens,
+            Key::AttachmentClipboardFrom,
+        ] {
+            for lang in Lang::ALL {
+                assert_eq!(
+                    lookup(key, *lang).matches("{}").count(),
+                    1,
+                    "{key:?} / {lang:?}"
+                );
+            }
+        }
+        // These carry no argument, and a stray placeholder would render as
+        // literal braces in the panel.
+        for key in [Key::ErrVisionNoProvider, Key::ToastClipboardImageUnreadable] {
+            for lang in Lang::ALL {
+                assert_eq!(lookup(key, *lang).matches("{}").count(), 0, "{key:?}");
+            }
+        }
+    }
+
     #[test]
     fn tags_round_trip_and_ignore_region() {
         assert_eq!(Lang::from_tag("ja-JP"), Some(Lang::Ja));
@@ -612,6 +967,8 @@ mod tests {
             Key::TrayQuit,
             Key::TaskAwaitingApproval,
             Key::SettingsProviders,
+            Key::SettingsWelcomeTitle,
+            Key::SettingsWelcomeBody,
         ];
         for key in SAMPLE {
             for lang in Lang::ALL {

@@ -46,10 +46,12 @@
 
 mod clipboard;
 mod display;
+mod dpapi;
 pub mod error;
 mod ime;
 mod input;
 mod msgwin;
+pub(crate) mod overlay;
 mod permissions;
 mod uia;
 
@@ -72,6 +74,7 @@ use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextW, GetWindowThreadPro
 use windows_core::PWSTR;
 
 use self::clipboard::ClipboardHandle;
+pub use self::dpapi::DpapiProtector;
 pub use self::error::{WinResult, WindowsPlatformError};
 use self::uia::UiaHandle;
 
@@ -117,6 +120,29 @@ const CODE_APPS: &[&str] = &[
     "alacritty",
     "wezterm-gui",
 ];
+
+/// Executable stems whose clipboard payload is treated as concealed even when
+/// the application does not publish Windows' opt-out formats.
+const CLIPBOARD_DENYLIST: &[&str] = &[
+    "1password",
+    "bitwarden",
+    "dashlane",
+    "enpass",
+    "keepass",
+    "keepassxc",
+    "lastpass",
+    "nordpass",
+    "proton pass",
+    "protonpass",
+    "roboform",
+];
+
+fn is_clipboard_denylisted(executable_stem: &str) -> bool {
+    let normalized = executable_stem.trim().to_ascii_lowercase();
+    CLIPBOARD_DENYLIST.iter().any(|candidate| {
+        normalized == *candidate || normalized.starts_with(&format!("{candidate}-"))
+    })
+}
 
 /// The Windows [`PlatformBackend`].
 ///
@@ -167,7 +193,7 @@ impl WindowsBackend {
     /// foreground. The caller must therefore only reach this while the capture
     /// target is still frontmost — see [`PlatformBackend::selected_text`].
     async fn selected_text_via_copy(&self, deadline: Instant) -> WinResult<Option<String>> {
-        let saved = self.clipboard.read(deadline).await.ok();
+        let saved = self.clipboard.read(deadline, false).await.ok();
         let before = ClipboardHandle::sequence();
         // Subscribe *before* sending the chord, so the notification cannot be
         // missed in the gap.
@@ -196,7 +222,7 @@ impl WindowsBackend {
             return Ok(None);
         }
 
-        let copied = self.clipboard.read(deadline).await?;
+        let copied = self.clipboard.read(deadline, false).await?;
         let after = ClipboardHandle::sequence();
 
         if let Some(previous) = saved {
@@ -218,7 +244,7 @@ impl WindowsBackend {
         let deadline = Instant::now() + INSERT_BUDGET;
 
         let saved = if restore_previous {
-            self.clipboard.read(deadline).await.ok()
+            self.clipboard.read(deadline, false).await.ok()
         } else {
             None
         };
@@ -387,7 +413,9 @@ impl PlatformBackend for WindowsBackend {
 
     async fn clipboard(&self, owner_hint: &AppRef, timeout: Duration) -> Result<ClipboardItem> {
         let deadline = Instant::now() + timeout;
-        let mut item = tokio::time::timeout(timeout, self.clipboard.read(deadline))
+        let source_app = process_image_name(owner_hint.pid as u32);
+        let conceal_source = source_app.as_deref().is_some_and(is_clipboard_denylisted);
+        let mut item = tokio::time::timeout(timeout, self.clipboard.read(deadline, conceal_source))
             .await
             .map_err(|_| WindowsPlatformError::Deadline(timeout))??;
         // §12 attribution. `GetClipboardOwner` is frequently NULL (delayed
@@ -396,11 +424,7 @@ impl PlatformBackend for WindowsBackend {
         // the *only* one that can ever match a denylist, because by capture time
         // the frontmost app is aibo.
         //
-        // TODO(§12): the macOS side then runs `is_clipboard_denylisted` over
-        // this identifier. Windows has no equivalent executable-stem list yet,
-        // so attribution is recorded but the denylist half is still missing on
-        // this platform — see the report.
-        item.source_app = process_image_name(owner_hint.pid as u32);
+        item.source_app = source_app;
         Ok(item)
     }
 
@@ -581,4 +605,24 @@ pub(crate) fn text_hash(text: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     text.hash(&mut hasher);
     hasher.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_clipboard_denylisted;
+
+    #[test]
+    fn password_manager_executables_are_clipboard_denylisted() {
+        for executable in [
+            "1Password",
+            "Bitwarden",
+            "KeePassXC",
+            "ProtonPass",
+            "RoboForm",
+        ] {
+            assert!(is_clipboard_denylisted(executable), "{executable}");
+        }
+        assert!(!is_clipboard_denylisted("Code"));
+        assert!(!is_clipboard_denylisted("Safari"));
+    }
 }

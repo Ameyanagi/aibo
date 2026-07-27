@@ -20,7 +20,7 @@
 //! never shown.
 
 use std::sync::OnceLock;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicIsize, AtomicU32, Ordering};
 
 use aibo_core::types::PowerEvent;
 use tokio::sync::broadcast;
@@ -59,6 +59,12 @@ static HUB: OnceLock<Hub> = OnceLock::new();
 /// selection fallback to detect that the copy actually landed rather than
 /// polling blindly (§8).
 static LAST_SEQUENCE: AtomicU32 = AtomicU32::new(0);
+
+/// Native handle of the process-wide notification window.
+///
+/// Stored as an integer because `HWND` is an opaque pointer wrapper and is not
+/// `Sync`; the window is never destroyed during normal process lifetime.
+static WINDOW_HANDLE: AtomicIsize = AtomicIsize::new(0);
 
 fn hub() -> &'static Hub {
     HUB.get_or_init(|| {
@@ -103,6 +109,14 @@ pub(crate) fn last_clipboard_sequence() -> u32 {
     LAST_SEQUENCE.load(Ordering::Acquire)
 }
 
+/// The process-wide notification window, once its worker has created it.
+///
+/// Used as the provider identity for best-effort UI Automation announcements.
+pub(crate) fn notification_window() -> Option<HWND> {
+    let raw = WINDOW_HANDLE.load(Ordering::Acquire);
+    (raw != 0).then_some(HWND(raw as *mut std::ffi::c_void))
+}
+
 fn message_loop() {
     let Some(hwnd) = create_window() else {
         tracing::error!(
@@ -110,6 +124,7 @@ fn message_loop() {
         );
         return;
     };
+    WINDOW_HANDLE.store(hwnd.0 as isize, Ordering::Release);
 
     // SAFETY: `hwnd` was just created by this thread and is still alive.
     if let Err(e) = unsafe { AddClipboardFormatListener(hwnd) } {

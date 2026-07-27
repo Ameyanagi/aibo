@@ -29,8 +29,16 @@ use std::time::{Duration, Instant, SystemTime};
 
 use aibo_core::types::{ToolSchema, ToolTier};
 use async_trait::async_trait;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
+#[cfg(windows)]
+use process_wrap::tokio::{CreationFlags, JobObject};
 use serde_json::json;
+use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio_util::sync::CancellationToken;
+#[cfg(windows)]
+use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::args::{invalid, str_arg};
 use crate::{DenyReason, Tool, ToolError, ToolOutput, ToolResult};
@@ -489,43 +497,140 @@ impl ShellExecutor {
             // Without this a cancelled run leaves an orphan holding the pipes.
             .kill_on_drop(true);
 
-        let child = command.spawn()?;
-        let wait = child.wait_with_output();
-
-        let output = tokio::select! {
-            biased;
-            () = cancel.cancelled() => return Err(ToolError::Cancelled),
-            result = tokio::time::timeout(request.timeout, wait) => result,
+        let mut command = CommandWrap::from(command);
+        command.wrap(KillOnDrop);
+        #[cfg(unix)]
+        command.wrap(ProcessGroup::leader());
+        #[cfg(windows)]
+        {
+            command.wrap(CreationFlags(CREATE_NO_WINDOW));
+            command.wrap(JobObject);
         }
-        .map_err(|_| ToolError::Sandbox {
-            tier: 3,
-            reason: aibo_core::error::SandboxFailure::Timeout,
-        })??;
 
-        let (stdout, out_cut) = truncate_capture(&output.stdout);
-        let (stderr, err_cut) = truncate_capture(&output.stderr);
+        let mut child = command.spawn()?;
+        let stdout = child.stdout().take().ok_or_else(|| {
+            std::io::Error::other("spawned command did not expose its stdout pipe")
+        })?;
+        let stderr = child.stderr().take().ok_or_else(|| {
+            std::io::Error::other("spawned command did not expose its stderr pipe")
+        })?;
+
+        // Both pipes must be drained while the process runs. Waiting first can
+        // deadlock as soon as either OS pipe buffer fills; collecting the whole
+        // body fixes the deadlock but lets an untrusted command exhaust memory.
+        enum WaitOutcome {
+            Complete(std::io::Result<(std::process::ExitStatus, CapturedOutput, CapturedOutput)>),
+            Cancelled,
+            TimedOut,
+        }
+
+        // Keep the future in this block so its mutable borrow of `child` is
+        // definitely released before the cancellation cleanup below.
+        let outcome = {
+            let wait_and_drain = async {
+                let (status, stdout, stderr) =
+                    tokio::try_join!(child.wait(), drain_capture(stdout), drain_capture(stderr))?;
+                Ok::<_, std::io::Error>((status, stdout, stderr))
+            };
+
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => WaitOutcome::Cancelled,
+                result = tokio::time::timeout(request.timeout, wait_and_drain) => match result {
+                    Ok(result) => WaitOutcome::Complete(result),
+                    Err(_) => WaitOutcome::TimedOut,
+                },
+            }
+        };
+
+        let output = match outcome {
+            WaitOutcome::Complete(result) => result?,
+            WaitOutcome::Cancelled => {
+                kill_and_reap(&mut *child, Duration::from_secs(5)).await;
+                return Err(ToolError::Cancelled);
+            }
+            WaitOutcome::TimedOut => {
+                kill_and_reap(&mut *child, Duration::from_secs(5)).await;
+                return Err(ToolError::Sandbox {
+                    tier: 3,
+                    reason: aibo_core::error::SandboxFailure::Timeout,
+                });
+            }
+        };
+
+        let (status, stdout, stderr) = output;
+        let out_cut = stdout.truncated;
+        let err_cut = stderr.truncated;
         Ok(ShellOutcome {
-            exit_code: output.status.code(),
-            stdout,
-            stderr,
+            exit_code: status.code(),
+            stdout: stdout.text,
+            stderr: stderr.text,
             truncated: out_cut || err_cut,
             duration: started.elapsed(),
         })
     }
 }
 
-fn truncate_capture(bytes: &[u8]) -> (String, bool) {
-    let cut = bytes.len() > MAX_CAPTURE_BYTES;
-    let slice = if cut {
-        &bytes[..MAX_CAPTURE_BYTES]
-    } else {
-        bytes
-    };
-    let mut text = String::from_utf8_lossy(slice).into_owned();
-    if cut {
-        text.push_str("\n[truncated by aibo]");
+/// Terminate the process group/job and reap its direct child. The
+/// `process-wrap` implementation also waits for every member visible to the
+/// operating system, so a shell command cannot leave descendants running after
+/// cancellation or timeout.
+async fn kill_and_reap(child: &mut dyn ChildWrapper, timeout: Duration) {
+    if let Err(error) = child.start_kill()
+        && child.try_wait().ok().flatten().is_none()
+    {
+        tracing::warn!(%error, "could not terminate shell process tree");
     }
-    (text, cut)
+    if tokio::time::timeout(timeout, child.wait()).await.is_err() {
+        tracing::warn!("shell process tree did not exit before the reap timeout");
+    }
+}
+
+const TRUNCATION_MARKER: &str = "\n[truncated by aibo]";
+
+#[derive(Debug)]
+struct CapturedOutput {
+    text: String,
+    truncated: bool,
+}
+
+async fn drain_capture<R>(mut reader: R) -> std::io::Result<CapturedOutput>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut retained = Vec::with_capacity(MAX_CAPTURE_BYTES);
+    let mut buffer = [0_u8; 8 << 10];
+    let mut truncated = false;
+
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        let remaining = MAX_CAPTURE_BYTES.saturating_sub(retained.len());
+        let take = remaining.min(read);
+        retained.extend_from_slice(&buffer[..take]);
+        truncated |= take < read;
+        // Keep draining after the capture fills so the child can never block
+        // trying to write the bytes we deliberately decline to retain.
+    }
+
+    let mut text = String::from_utf8_lossy(&retained).into_owned();
+    truncated |= text.len() > MAX_CAPTURE_BYTES;
+    if truncated {
+        let content_limit = MAX_CAPTURE_BYTES.saturating_sub(TRUNCATION_MARKER.len());
+        truncate_utf8(&mut text, content_limit);
+        text.push_str(TRUNCATION_MARKER);
+    }
+    Ok(CapturedOutput { text, truncated })
+}
+
+fn truncate_utf8(text: &mut String, limit: usize) {
+    let mut boundary = limit.min(text.len());
+    while !text.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    text.truncate(boundary);
 }
 
 // ---------------------------------------------------------------------------
@@ -1203,6 +1308,29 @@ mod tests {
         assert!(outcome.stdout.contains("hi"));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn noisy_commands_are_drained_without_unbounded_capture_or_pipe_blockage() {
+        let f = fixture();
+        let exec = ShellExecutor::new(f.scope.clone());
+        let request = ShellRequest::new(
+            "yes o | head -c 1048576; yes e | head -c 1048576 >&2",
+            &f.root,
+        );
+        let approval = CommandApproval::granted(&request);
+        let outcome = exec
+            .run(&request, &approval, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(outcome.succeeded());
+        assert!(outcome.truncated);
+        assert!(outcome.stdout.len() <= MAX_CAPTURE_BYTES);
+        assert!(outcome.stderr.len() <= MAX_CAPTURE_BYTES);
+        assert!(outcome.stdout.ends_with(TRUNCATION_MARKER));
+        assert!(outcome.stderr.ends_with(TRUNCATION_MARKER));
+    }
+
     #[tokio::test]
     async fn an_approval_for_a_different_command_is_refused() {
         let f = fixture();
@@ -1290,19 +1418,46 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn cancellation_stops_a_running_command() {
+    async fn cancellation_stops_and_reaps_a_running_process_tree() {
         let f = fixture();
         let exec = ShellExecutor::new(f.scope.clone());
-        let request = ShellRequest::new("sleep 30", &f.root);
+        let pid_file = f.root.join("grandchild.pid");
+        let request = ShellRequest::new(
+            format!("sleep 30 & echo $! > {}; wait", pid_file.display()),
+            &f.root,
+        );
         let approval = CommandApproval::granted(&request);
         let cancel = CancellationToken::new();
         let probe = cancel.clone();
+        let probe_file = pid_file.clone();
         tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            for _ in 0..100 {
+                if probe_file.exists() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
             probe.cancel();
         });
         let err = exec.run(&request, &approval, cancel).await.unwrap_err();
         assert!(matches!(err, ToolError::Cancelled), "{err:?}");
+
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("grandchild pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        for _ in 0..100 {
+            let alive = std::process::Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("grandchild {pid} survived shell cancellation");
     }
 
     // -- snapshots ----------------------------------------------------------

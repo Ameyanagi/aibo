@@ -31,9 +31,10 @@
 //! Per §20 these are unverified and the code marks them `// SPIKE: Sx` rather
 //! than assuming an outcome:
 //!
-//! * **S1** — the native window handle on both platforms: `NSPanel` /
-//!   non-activating style, joining all Spaces, `WS_EX_NOACTIVATE`,
-//!   `window-vibrancy`, and caret bounds from AX/UIA.
+//! * **S1** — native overlay configuration now crosses an audited
+//!   `raw-window-handle` boundary in `aibo-platform`; the remaining unverified
+//!   part is whether AX/UIA caret bounds stay correct across mixed-DPI
+//!   multi-display layouts.
 //! * **S3** — the ≤ 80 ms hotkey-to-visible budget the cold-start trick exists
 //!   to meet (§15). The mechanism is sound; the number is not yet measured.
 //! * **S7** — IME composition detection, which has no clean cross-process API

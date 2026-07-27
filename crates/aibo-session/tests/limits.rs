@@ -62,7 +62,7 @@ fn engine_with(entries: Vec<ModelBinding>, providers: &[&Mock], config: EngineCo
     Engine::new(registry, EngineConfig { bindings, ..config })
 }
 
-fn drain(rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEvent>) -> Vec<SessionEvent> {
+fn drain(rx: &mut tokio::sync::mpsc::Receiver<SessionEvent>) -> Vec<SessionEvent> {
     let mut out = Vec::new();
     while let Ok(event) = rx.try_recv() {
         out.push(event);

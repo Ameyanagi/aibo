@@ -19,11 +19,24 @@
 //! No user-visible string literal appears here; everything routes through
 //! [`crate::i18n`].
 
-use iced::widget::{Space, button, column, container, row, rule, scrollable, text};
-use iced::{Alignment, Background, Element, Length};
+use aibo_core::types::{Attachment, AttachmentKind};
+use iced::widget::{
+    Space, button, column, container, image, row, rule, scrollable, text, text_editor,
+};
+use iced::{Alignment, Background, ContentFit, Element, Length};
+use unicode_segmentation::UnicodeSegmentation as _;
 
 use crate::i18n::{self, Key};
 use crate::theme::{self, Severity, space, type_scale};
+
+/// Render a shortcut using the platform's primary-modifier convention.
+pub const fn primary_shortcut(macos: &'static str, other: &'static str) -> &'static str {
+    if cfg!(target_os = "macos") {
+        macos
+    } else {
+        other
+    }
+}
 
 /// One action offered on a surface, with the key that triggers it (§16).
 #[derive(Debug, Clone)]
@@ -117,6 +130,122 @@ pub fn context_chip<'a, Message: 'a>(
         .into()
 }
 
+/// Edge of the square thumbnail on an attachment chip, in points.
+///
+/// Small enough to remain a thumbnail inside the chip's 44 pt remove target.
+const THUMBNAIL_EDGE: f32 = 20.0;
+
+/// One attached image, as a chip beside the context chip (§16, §2).
+///
+/// Everything the user needs in order to explain a surprising answer or a
+/// surprising bill is on this chip: *what* is attached (the thumbnail, so it is
+/// recognisable at a glance rather than by a label they have to trust), how big
+/// it is in pixels and in bytes, whether aibo resampled it, and how to take it
+/// off again. An attachment the user cannot see is an attachment they cannot
+/// reason about.
+///
+/// `thumbnail` is an already-built handle rather than raw bytes on purpose:
+/// [`iced::widget::image::Handle::from_bytes`] mints a **fresh id on every
+/// call**, so building one here would defeat the renderer's cache and re-upload
+/// megabytes of pixels on every frame the panel draws (§15). It is built once,
+/// at attach time.
+///
+/// `key` is the shortcut that removes *this* chip, or `None` when the chip is
+/// only removable by click. §16 wants every action to show its key; with more
+/// than one image attached only the most recent has an unambiguous one.
+pub fn attachment_chip<'a, Message: Clone + 'a>(
+    thumbnail: &image::Handle,
+    attachment: &Attachment,
+    key: Option<&'static str>,
+    on_remove: Message,
+) -> Element<'a, Message> {
+    let mut line = row![
+        // `ContentFit::Cover` crops rather than letterboxes: a chip is 20 pt of
+        // recognition, and a letterboxed wide screenshot spends most of that on
+        // empty bars.
+        image(thumbnail.clone())
+            .width(Length::Fixed(THUMBNAIL_EDGE))
+            .height(Length::Fixed(THUMBNAIL_EDGE))
+            .content_fit(ContentFit::Cover),
+        // The label is *display text the attachment carried in* — from the
+        // clipboard's source app or a file name — so it is elided rather than
+        // trusted to be short, and it is never rendered as anything but text.
+        text(elide(&attachment.label, 24))
+            .size(type_scale::CHIP)
+            .style(theme::text_primary),
+        text(format!(
+            "{}×{} · {}",
+            attachment.width,
+            attachment.height,
+            format_bytes(attachment.byte_len())
+        ))
+        .size(type_scale::CHIP)
+        .font(theme::MONO_FONT)
+        .style(theme::text_dim),
+    ]
+    .spacing(space(1.5))
+    .align_y(Alignment::Center);
+
+    // §14: the bytes on the wire are a re-encoding, and the original resolution
+    // is not recoverable from them. Saying so here is the answer to "why is my
+    // screenshot blurry".
+    if matches!(attachment.kind, AttachmentKind::Image { downscaled: true }) {
+        line = line.push(
+            text(i18n::t(Key::AttachmentDownscaled))
+                .size(type_scale::CHIP)
+                .style(theme::text_faint),
+        );
+    }
+
+    let mut remove = row![].spacing(space(1.0)).align_y(Alignment::Center);
+    if let Some(key) = key {
+        remove = remove.push(
+            text(key)
+                .size(type_scale::META)
+                .font(theme::MONO_FONT)
+                .style(theme::text_accent),
+        );
+    }
+    remove = remove.push(
+        text(format!("× {}", i18n::t(Key::ActionRemoveImage)))
+            .size(type_scale::CHIP)
+            .style(theme::text_dim),
+    );
+
+    line = line.push(
+        button(remove)
+            .height(Length::Fixed(theme::MIN_HIT_TARGET))
+            .padding([0.0, space(1.5)])
+            .style(theme::action_button)
+            .on_press(on_remove),
+    );
+
+    container(line)
+        .padding([space(1.0), space(2.0)])
+        .style(theme::chip)
+        .into()
+}
+
+/// A byte count in the largest unit that keeps it under four digits.
+///
+/// Display-only, and deliberately decimal rather than binary: providers meter
+/// their per-image ceilings in decimal megabytes, so a chip that reads `3.6 MB`
+/// against a documented `5 MB` limit has to mean the same MB the limit does.
+pub fn format_bytes(n: usize) -> String {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "display rounding; the value is capped at a few megabytes"
+    )]
+    let bytes = n as f64;
+    if n < 1_000 {
+        format!("{n} B")
+    } else if n < 1_000_000 {
+        format!("{:.0} KB", bytes / 1_000.0)
+    } else {
+        format!("{:.1} MB", bytes / 1_000_000.0)
+    }
+}
+
 /// The metadata line: model, latency, cost (§16, §14).
 ///
 /// Cost is shown from the first token because BYOK means the user pays for
@@ -146,18 +275,25 @@ pub fn action_list<'a, Message: Clone + 'a>(actions: Vec<Action<Message>>) -> El
     let mut line = row![].spacing(space(2.0)).align_y(Alignment::Center);
     for action in actions {
         let enabled = action.on_press.is_some();
+        let key_style = if !enabled {
+            theme::text_faint
+        } else if action.primary {
+            theme::text_on_primary
+        } else if action.destructive {
+            theme::text_danger
+        } else {
+            theme::text_accent
+        };
         let label = row![
-            text(action.key).size(type_scale::META).style(if enabled {
-                theme::text_accent
-            } else {
-                theme::text_faint
-            }),
+            text(action.key).size(type_scale::META).style(key_style),
             text(i18n::t(action.label)).size(type_scale::META),
         ]
         .spacing(space(1.5))
         .align_y(Alignment::Center);
 
-        let mut widget = button(label).padding([space(1.0), space(2.0)]);
+        let mut widget = button(label)
+            .height(Length::Fixed(theme::MIN_HIT_TARGET))
+            .padding([space(1.0), space(3.0)]);
         widget = if action.destructive {
             widget.style(theme::danger_button)
         } else if action.primary {
@@ -245,6 +381,40 @@ pub fn answer<'a, Message: 'a>(
     if truncated {
         // §13: a partial stream is never auto-inserted; it stays in the panel
         // marked truncated with retry and copy actions.
+        stack = stack.push(
+            text(i18n::t(Key::StateTruncated))
+                .size(type_scale::META)
+                .style(theme::text_severity(Severity::Warning)),
+        );
+    }
+
+    stack.into()
+}
+
+/// A selectable, read-only answer area.
+///
+/// The caller receives selection/cursor actions so the editor remains fully
+/// keyboard- and mouse-selectable, but must reject editing actions.
+pub fn selectable_answer<'a, Message: Clone + 'a>(
+    content: &'a text_editor::Content,
+    reserved_height: f32,
+    truncated: bool,
+    on_action: impl Fn(text_editor::Action) -> Message + 'a,
+) -> Element<'a, Message> {
+    let mut stack = column![
+        text_editor(content)
+            .on_action(on_action)
+            .height(Length::Fixed(
+                reserved_height.max(theme::ANSWER_BOX_MIN_HEIGHT)
+            ))
+            .padding(space(2.0))
+            .size(type_scale::BODY)
+            .font(theme::UI_FONT)
+            .style(theme::answer_editor),
+    ]
+    .spacing(space(1.5));
+
+    if truncated {
         stack = stack.push(
             text(i18n::t(Key::StateTruncated))
                 .size(type_scale::META)
@@ -417,21 +587,26 @@ pub fn section<'a, Message: 'a>(title: Key) -> Element<'a, Message> {
     .into()
 }
 
-/// Shorten `s` to `max` characters with an ellipsis, on a character boundary.
+/// Shorten `s` to `max` grapheme clusters with an ellipsis.
 ///
-/// Character-based rather than byte-based so a Japanese excerpt is not cut mid
-/// code point. Grapheme-cluster-correct truncation lives in `aibo-core` (§5);
-/// this is display-only chrome and does not need it.
+/// A Unicode scalar boundary is not enough: emoji families use zero-width
+/// joiners, flags use paired regional indicators and accented letters may use
+/// combining marks. Every visible elision in the shell lands on the same
+/// user-perceived-character boundaries as §5's context truncation.
 pub fn elide(s: &str, max: usize) -> String {
     let flattened: String = s
         .chars()
         .map(|c| if c.is_control() { ' ' } else { c })
         .collect();
     let trimmed = flattened.trim();
-    if trimmed.chars().count() <= max {
+    if max == 0 {
+        return String::new();
+    }
+    let graphemes: Vec<&str> = trimmed.graphemes(true).collect();
+    if graphemes.len() <= max {
         return trimmed.to_owned();
     }
-    let mut out: String = trimmed.chars().take(max.saturating_sub(1)).collect();
+    let mut out = graphemes[..max - 1].concat();
     out.push('…');
     out
 }
@@ -441,13 +616,29 @@ mod tests {
     use super::*;
 
     #[test]
-    fn elide_is_char_safe_and_flattens_newlines() {
+    fn elide_is_grapheme_safe_and_flattens_newlines() {
         assert_eq!(elide("hello", 10), "hello");
         assert_eq!(elide("a\nb", 10), "a b");
         let ja = "これは長い日本語のテキストです";
         let out = elide(ja, 5);
-        assert_eq!(out.chars().count(), 5);
+        assert_eq!(out.graphemes(true).count(), 5);
         assert!(out.ends_with('…'));
+
+        assert_eq!(elide("👨‍👩‍👧‍👦abcdef", 3), "👨‍👩‍👧‍👦a…");
+        assert_eq!(elide("e\u{301}abcdef", 3), "e\u{301}a…");
+        assert_eq!(elide("🇯🇵abcdef", 2), "🇯🇵…");
+        assert_eq!(elide("anything", 0), "");
+    }
+
+    #[test]
+    fn byte_counts_read_in_the_unit_providers_meter() {
+        assert_eq!(format_bytes(0), "0 B");
+        assert_eq!(format_bytes(999), "999 B");
+        assert_eq!(format_bytes(1_000), "1 KB");
+        assert_eq!(format_bytes(412_000), "412 KB");
+        // The §10 per-image ceiling is documented as 5 decimal MB, so the chip
+        // has to speak in the same MB or the comparison the user makes is wrong.
+        assert_eq!(format_bytes(3_750_000), "3.8 MB");
     }
 
     #[test]

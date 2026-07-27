@@ -63,14 +63,90 @@ use async_trait::async_trait;
 /// approval protocol into aibo's UI, per §11 tier 4).
 ///
 /// Implementations must be cancellable: if the run is cancelled while an
-/// approval is pending, returning [`ApprovalDecision::Deny`] is the correct and
+/// approval is pending, returning [`ApprovalResponse::deny`] is the correct and
 /// safe answer.
 #[async_trait]
 pub trait ApprovalUi: Send + Sync {
     /// Block the run on the user. The request is already fully populated,
     /// including [`ApprovalRequest::originating_instruction`] so the user can
     /// see the action did not come from a selection (§5 rule 3).
-    async fn request(&self, req: ApprovalRequest) -> Result<ApprovalDecision>;
+    ///
+    /// Typed confirmation is returned separately from the decision so this
+    /// crate, not a particular view, verifies destructive approvals. A UI-only
+    /// disabled button is not a security boundary.
+    async fn request(&self, req: ApprovalRequest) -> Result<ApprovalResponse>;
+}
+
+/// The complete answer to an [`ApprovalRequest`].
+///
+/// [`ApprovalDecision`] remains the wire/persistence shape. The typed value is
+/// deliberately carried only across the in-process UI seam and is verified by
+/// [`verify_approval_response`] before either the native loop or a delegated
+/// backend acts on the decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ApprovalResponse {
+    /// Allow once, allow for the session, or deny.
+    pub decision: ApprovalDecision,
+    /// What the user typed for a destructive command, when requested.
+    pub typed_confirmation: Option<String>,
+}
+
+impl ApprovalResponse {
+    /// A safe response for cancellation, UI failure, and headless operation.
+    pub const fn deny() -> Self {
+        Self {
+            decision: ApprovalDecision::Deny,
+            typed_confirmation: None,
+        }
+    }
+
+    /// Build an answer without typed confirmation.
+    pub const fn decision(decision: ApprovalDecision) -> Self {
+        Self {
+            decision,
+            typed_confirmation: None,
+        }
+    }
+
+    /// Attach the exact destructive command the user typed.
+    #[must_use]
+    pub fn with_typed_confirmation(mut self, typed: impl Into<String>) -> Self {
+        self.typed_confirmation = Some(typed.into());
+        self
+    }
+}
+
+/// Verify an approval at the backend boundary.
+///
+/// Both one-shot and session approvals require the exact command when
+/// [`ApprovalRequest::requires_typed_confirmation`] is set. Session approval is
+/// not a bypass around destructive confirmation.
+pub fn verify_approval_response(
+    request: &ApprovalRequest,
+    response: ApprovalResponse,
+) -> std::result::Result<ApprovalDecision, DenyReason> {
+    if response.decision == ApprovalDecision::Deny {
+        return Ok(ApprovalDecision::Deny);
+    }
+    if request.requires_typed_confirmation {
+        let Some(expected) = request.command.as_deref() else {
+            return Err(DenyReason::TypedConfirmationRequired);
+        };
+        let matches = response
+            .typed_confirmation
+            .as_deref()
+            .is_some_and(|typed| typed.trim() == expected.trim());
+        if !matches {
+            return Err(DenyReason::TypedConfirmationRequired);
+        }
+        // Destructive consent is one-shot even if the UI offered its generic
+        // session action. This also prevents a delegated backend from turning
+        // one typed confirmation into a standing command grant.
+        if response.decision == ApprovalDecision::ApproveForSession {
+            return Ok(ApprovalDecision::Approve);
+        }
+    }
+    Ok(response.decision)
 }
 
 /// An [`ApprovalUi`] that denies everything, for headless contexts and tests.
@@ -82,8 +158,8 @@ pub struct DenyAll;
 
 #[async_trait]
 impl ApprovalUi for DenyAll {
-    async fn request(&self, _req: ApprovalRequest) -> Result<ApprovalDecision> {
-        Ok(ApprovalDecision::Deny)
+    async fn request(&self, _req: ApprovalRequest) -> Result<ApprovalResponse> {
+        Ok(ApprovalResponse::deny())
     }
 }
 
@@ -97,8 +173,14 @@ pub struct ApproveAll;
 
 #[async_trait]
 impl ApprovalUi for ApproveAll {
-    async fn request(&self, _req: ApprovalRequest) -> Result<ApprovalDecision> {
-        Ok(ApprovalDecision::Approve)
+    async fn request(&self, req: ApprovalRequest) -> Result<ApprovalResponse> {
+        let response = ApprovalResponse::decision(ApprovalDecision::Approve);
+        Ok(match req.command {
+            Some(command) if req.requires_typed_confirmation => {
+                response.with_typed_confirmation(command)
+            }
+            _ => response,
+        })
     }
 }
 
@@ -234,6 +316,8 @@ pub enum DenyReason {
     UserDenied,
     /// A destructive command was not confirmed by typing (§11).
     TypedConfirmationRequired,
+    /// A path resolved somewhere different between approval and execution.
+    PathChangedAfterApproval,
 }
 
 impl std::fmt::Display for DenyReason {
@@ -259,6 +343,9 @@ impl std::fmt::Display for DenyReason {
             DenyReason::UserDenied => f.write_str("refused by the user"),
             DenyReason::TypedConfirmationRequired => {
                 f.write_str("refused: this command class needs typed confirmation")
+            }
+            DenyReason::PathChangedAfterApproval => {
+                f.write_str("refused: a scoped path changed after it was approved")
             }
         }
     }
@@ -448,7 +535,11 @@ impl PermissionGate {
             originating_instruction: call.instruction.clone(),
             requires_typed_confirmation: destructive,
         };
-        let decision = self.ui.request(request).await?;
+        let response = self.ui.request(request.clone()).await?;
+        let decision = match verify_approval_response(&request, response) {
+            Ok(decision) => decision,
+            Err(reason) => return Ok(Authorisation::Denied(reason)),
+        };
 
         match decision {
             ApprovalDecision::Deny => Ok(Authorisation::Denied(DenyReason::UserDenied)),
@@ -721,6 +812,22 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    #[derive(Debug)]
+    struct SessionApprover {
+        typed: Option<&'static str>,
+    }
+
+    #[async_trait]
+    impl ApprovalUi for SessionApprover {
+        async fn request(&self, _req: ApprovalRequest) -> Result<ApprovalResponse> {
+            let response = ApprovalResponse::decision(ApprovalDecision::ApproveForSession);
+            Ok(match self.typed {
+                Some(typed) => response.with_typed_confirmation(typed),
+                None => response,
+            })
+        }
+    }
+
     fn call(command: &str) -> GatedCall {
         GatedCall {
             call_id: "c1".into(),
@@ -769,10 +876,70 @@ mod tests {
     async fn destructive_commands_are_never_remembered() {
         let gate = PermissionGate::new(Arc::new(ApproveAll), []);
         let c = call("rm -rf build");
-        // ApproveAll answers ApproveForSession-equivalent (Approve), and the
-        // memory must stay empty either way.
+        // ApproveAll supplies the typed proof required at the backend boundary,
+        // and the memory must stay empty.
         assert!(gate.authorise(&c).await.unwrap().is_allowed());
         assert!(gate.memory.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_approval_cannot_bypass_destructive_confirmation() {
+        let gate = PermissionGate::new(Arc::new(SessionApprover { typed: None }), []);
+        assert_eq!(
+            gate.authorise(&call("rm -rf build")).await.unwrap(),
+            Authorisation::Denied(DenyReason::TypedConfirmationRequired)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_confirmed_destructive_session_approval_is_one_shot() {
+        let gate = PermissionGate::new(
+            Arc::new(SessionApprover {
+                typed: Some("rm -rf build"),
+            }),
+            [],
+        );
+        assert!(
+            gate.authorise(&call("rm -rf build"))
+                .await
+                .unwrap()
+                .is_allowed()
+        );
+        assert!(gate.memory.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn destructive_session_response_is_downgraded_to_one_shot() {
+        let request = ApprovalRequest {
+            id: "c1".into(),
+            kind: ApprovalKind::Command,
+            summary: "remove build output".into(),
+            command: Some("rm -rf build".into()),
+            paths: Vec::new(),
+            originating_instruction: "clean".into(),
+            requires_typed_confirmation: true,
+        };
+        let response = ApprovalResponse::decision(ApprovalDecision::ApproveForSession)
+            .with_typed_confirmation("rm -rf build");
+        assert_eq!(
+            verify_approval_response(&request, response).unwrap(),
+            ApprovalDecision::Approve
+        );
+    }
+
+    #[tokio::test]
+    async fn captured_content_cannot_reuse_remembered_consent() {
+        let gate = PermissionGate::new(Arc::new(SessionApprover { typed: None }), []);
+        let direct = call("ls");
+        assert!(gate.authorise(&direct).await.unwrap().is_allowed());
+        assert!(!gate.memory.lock().unwrap().is_empty());
+
+        let mut injected = direct;
+        injected.origin = ContentOrigin::ToolResult;
+        assert_eq!(
+            gate.authorise(&injected).await.unwrap(),
+            Authorisation::Denied(DenyReason::CaptureOrigin(ContentOrigin::ToolResult))
+        );
     }
 
     #[tokio::test]

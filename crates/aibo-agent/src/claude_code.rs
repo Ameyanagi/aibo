@@ -20,8 +20,9 @@
 //!    rather than fatal, and anything carrying text that this module does not
 //!    recognise degrades to [`AgentStep::Message`] instead of vanishing. A
 //!    silent gap in an agent run is worse than an ugly one.
-//! 3. **The child runs in its own process group.** Same rule and the same
-//!    caveat as the Codex backend — see [`spawn_in_process_group`].
+//! 3. **The child runs in a managed process tree.** Unix uses a process group
+//!    and Windows a Job Object, so cancellation reaches delegated descendants;
+//!    see [`spawn_in_process_group`].
 //!
 //! # Two capabilities this backend honestly does not have
 //!
@@ -45,6 +46,7 @@
 //! [`parse_line`] never fails — a rename degrades the transcript, it does not
 //! break the run.
 
+use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -56,12 +58,19 @@ use aibo_core::types::{
     SandboxKind, ToolTier, Usage,
 };
 use async_trait::async_trait;
+#[cfg(unix)]
+use process_wrap::tokio::ProcessGroup;
+use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
+#[cfg(windows)]
+use process_wrap::tokio::{CreationFlags, JobObject};
 use serde::Deserialize;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::process::{Child, ChildStdout, Command};
+use tokio::process::{ChildStdout, Command};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+#[cfg(windows)]
+use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::limits::LimitTracker;
 use crate::native_loop::fenced_context;
@@ -188,17 +197,60 @@ impl Default for ClaudeCodeConfig {
 // Process spawning
 // ---------------------------------------------------------------------------
 
-/// Spawn a child in its **own process group**, so it cannot outlive aibo.
-///
-/// Identical in intent to [`crate::codex_app_server`]'s helper, and identical in
-/// its limitation: `process_group(0)` plus `kill_on_drop` reliably kills the
-/// *leader*, and killing the whole group needs `killpg(2)` / a Windows Job
-/// Object, both of which require `unsafe` and therefore belong in
-/// `aibo-platform` (§6, §7) rather than this `#![forbid(unsafe_code)]` crate.
-/// Claude Code starts MCP servers and shell commands of its own, so until that
-/// helper exists a grandchild that ignores the leader's death can survive.
-/// Treat orphan cleanup as an open item, not as done.
-fn spawn_in_process_group(config: &ClaudeCodeConfig, task: &AgentTask) -> std::io::Result<Child> {
+// A child inherits only the small set needed to locate binaries, its profile,
+// locale, and temporary directory. Ambient provider/cloud credentials do not
+// cross the boundary; `ClaudeCodeConfig::env` remains an explicit opt-in.
+#[cfg(not(windows))]
+const SAFE_CHILD_ENVIRONMENT: &[&str] = &[
+    "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
+];
+
+#[cfg(windows)]
+const SAFE_CHILD_ENVIRONMENT: &[&str] = &[
+    "PATH",
+    "SystemRoot",
+    "WINDIR",
+    "COMSPEC",
+    "PATHEXT",
+    "TEMP",
+    "TMP",
+    "USERPROFILE",
+    "APPDATA",
+    "LOCALAPPDATA",
+    "PROGRAMDATA",
+];
+
+fn safe_child_environment_from(
+    environment: impl IntoIterator<Item = (OsString, OsString)>,
+) -> Vec<(OsString, OsString)> {
+    environment
+        .into_iter()
+        .filter(|(key, _)| {
+            SAFE_CHILD_ENVIRONMENT
+                .iter()
+                .any(|allowed| env_key_eq(key, OsStr::new(allowed)))
+        })
+        .collect()
+}
+
+#[cfg(windows)]
+fn env_key_eq(left: &OsStr, right: &OsStr) -> bool {
+    left.to_string_lossy()
+        .eq_ignore_ascii_case(&right.to_string_lossy())
+}
+
+#[cfg(not(windows))]
+fn env_key_eq(left: &OsStr, right: &OsStr) -> bool {
+    left == right
+}
+
+/// Spawn a child in a Unix process group or Windows Job Object. The managed
+/// child kills and waits for the whole tree, including delegated shell/MCP
+/// children.
+fn spawn_in_process_group(
+    config: &ClaudeCodeConfig,
+    task: &AgentTask,
+) -> std::io::Result<Box<dyn ChildWrapper>> {
     let mut cmd = Command::new(&config.program);
     cmd.args(&config.args);
 
@@ -223,6 +275,8 @@ fn spawn_in_process_group(config: &ClaudeCodeConfig, task: &AgentTask) -> std::i
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    cmd.env_clear();
+    cmd.envs(safe_child_environment_from(std::env::vars_os()));
 
     if let Some(dir) = &task.workspace {
         cmd.current_dir(dir);
@@ -231,18 +285,15 @@ fn spawn_in_process_group(config: &ClaudeCodeConfig, task: &AgentTask) -> std::i
         cmd.env(k, v);
     }
 
+    let mut cmd = CommandWrap::from(cmd);
+    cmd.wrap(KillOnDrop);
     #[cfg(unix)]
-    {
-        // 0 == "make the child its own group leader".
-        cmd.process_group(0);
-    }
+    cmd.wrap(ProcessGroup::leader());
     #[cfg(windows)]
     {
-        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        cmd.creation_flags(CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW);
+        cmd.wrap(CreationFlags(CREATE_NO_WINDOW));
+        cmd.wrap(JobObject);
     }
-
     cmd.spawn()
 }
 
@@ -307,17 +358,17 @@ impl AgentBackend for ClaudeCodeCli {
             .map_err(ClaudeCodeError::into_aibo)?;
 
         let stdout = child
-            .stdout
+            .stdout()
             .take()
             .ok_or(ClaudeCodeError::NoPipe { stream: "output" })
             .map_err(ClaudeCodeError::into_aibo)?;
         let stderr = child
-            .stderr
+            .stderr()
             .take()
             .ok_or(ClaudeCodeError::NoPipe { stream: "error" })
             .map_err(ClaudeCodeError::into_aibo)?;
         let mut stdin = child
-            .stdin
+            .stdin()
             .take()
             .ok_or(ClaudeCodeError::NoPipe { stream: "input" })
             .map_err(ClaudeCodeError::into_aibo)?;
@@ -349,7 +400,7 @@ impl AgentBackend for ClaudeCodeCli {
 
         let (tx, rx) = mpsc::channel::<Result<AgentStep>>(64);
         let run = Run {
-            child,
+            child: Some(child),
             tracker: LimitTracker::new(limits),
             exit_grace: self.config.exit_grace,
             tx,
@@ -682,10 +733,21 @@ enum Flow {
 }
 
 struct Run {
-    child: Child,
+    child: Option<Box<dyn ChildWrapper>>,
     tracker: LimitTracker,
     exit_grace: Duration,
     tx: mpsc::Sender<Result<AgentStep>>,
+}
+
+async fn kill_and_reap(child: &mut dyn ChildWrapper, timeout: Duration) {
+    if let Err(error) = child.start_kill()
+        && child.try_wait().ok().flatten().is_none()
+    {
+        tracing::warn!(%error, "could not terminate claude process tree");
+    }
+    if tokio::time::timeout(timeout, child.wait()).await.is_err() {
+        tracing::warn!("claude process tree did not exit before the reap timeout");
+    }
 }
 
 impl Run {
@@ -786,7 +848,10 @@ impl Run {
 
     /// stdout closed without a terminal `result` event.
     async fn exited_without_result(&mut self) {
-        let detail = match tokio::time::timeout(self.exit_grace, self.child.wait()).await {
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        let detail = match tokio::time::timeout(self.exit_grace, child.wait()).await {
             Ok(Ok(status)) if status.success() => {
                 "`claude` exited without reporting a result".to_owned()
             }
@@ -795,22 +860,20 @@ impl Run {
                 None => "`claude` was killed by a signal".to_owned(),
             },
             Ok(Err(e)) => format!("could not wait for `claude`: {e}"),
-            Err(_) => "`claude` closed its output but did not exit".to_owned(),
+            Err(_) => {
+                kill_and_reap(&mut *child, self.exit_grace).await;
+                "`claude` closed its output but did not exit".to_owned()
+            }
         };
         self.fail(ClaudeCodeError::Exited { detail }.into_aibo())
             .await;
     }
 
     async fn kill(&mut self) {
-        if let Err(e) = self.child.start_kill() {
-            tracing::debug!(error = %e, "could not signal the claude child");
-        }
-        if tokio::time::timeout(self.exit_grace, self.child.wait())
-            .await
-            .is_err()
-        {
-            tracing::warn!("claude did not exit after being killed");
-        }
+        let Some(mut child) = self.child.take() else {
+            return;
+        };
+        kill_and_reap(&mut *child, self.exit_grace).await;
     }
 
     async fn emit(&self, step: AgentStep) -> bool {
@@ -1182,9 +1245,14 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn cancellation_stops_the_run_and_kills_the_child() {
+    async fn cancellation_stops_the_run_and_kills_the_process_tree() {
         // §13: `esc` must abort in-flight work immediately.
-        let program = fake::binary("cat >/dev/null\nsleep 120");
+        let temp = tempfile::tempdir().expect("temp dir");
+        let pid_file = temp.path().join("grandchild.pid");
+        let program = fake::binary(&format!(
+            "sleep 120 & echo $! > '{}'\ncat >/dev/null\nwait",
+            pid_file.display()
+        ));
         let cli = ClaudeCodeCli::new(ClaudeCodeConfig {
             program: program.path(),
             exit_grace: Duration::from_secs(2),
@@ -1196,6 +1264,13 @@ mod tests {
             .await
             .expect("spawn");
 
+        for _ in 0..500 {
+            if pid_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(pid_file.exists(), "fake claude never spawned its child");
         cancel.cancel();
         let step = tokio::time::timeout(Duration::from_secs(10), stream.next())
             .await
@@ -1206,6 +1281,23 @@ mod tests {
             panic!("expected a terminal step, got {step:?}");
         };
         assert_eq!(outcome.status, AgentStatus::Cancelled);
+
+        let pid: u32 = std::fs::read_to_string(&pid_file)
+            .expect("grandchild pid")
+            .trim()
+            .parse()
+            .expect("numeric pid");
+        for _ in 0..100 {
+            let alive = std::process::Command::new("/bin/kill")
+                .args(["-0", &pid.to_string()])
+                .status()
+                .is_ok_and(|status| status.success());
+            if !alive {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("grandchild {pid} survived Claude cancellation");
     }
 
     #[cfg(unix)]

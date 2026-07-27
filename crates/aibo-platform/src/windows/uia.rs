@@ -64,6 +64,13 @@ const SUFFIX_CHARS: i32 = 400;
 /// out of the target app before deciding it is too long.
 const SELECTION_MAX_CHARS: i32 = 200_000;
 
+/// Maximum UIA operations waiting behind an in-flight provider call.
+///
+/// A single capture can request selection, context, and focused-element
+/// identity. Eight slots allow two overlapping captures plus validation while
+/// bounding retained context if a third-party UIA provider hangs.
+const UIA_QUEUE_CAPACITY: usize = 8;
+
 /// Every capture op carries the [`AppRef`] snapshotted on hotkey-down (§7).
 /// The UIA thread reads from *that* application; "the focused element" without
 /// a subject means aibo's own panel by the time these jobs run.
@@ -97,13 +104,13 @@ struct UiaJob {
 /// A channel handle to the UIA thread. Cheap to clone, `Send + Sync`.
 #[derive(Clone, Debug)]
 pub(crate) struct UiaHandle {
-    tx: mpsc::UnboundedSender<UiaJob>,
+    tx: mpsc::Sender<UiaJob>,
 }
 
 impl UiaHandle {
     /// Start the UIA thread.
     pub(crate) fn spawn() -> WinResult<Self> {
-        let (tx, rx) = mpsc::unbounded_channel();
+        let (tx, rx) = mpsc::channel(UIA_QUEUE_CAPACITY);
         std::thread::Builder::new()
             .name("aibo-win-uia".into())
             .spawn(move || worker(rx))
@@ -114,9 +121,13 @@ impl UiaHandle {
     }
 
     fn submit(&self, deadline: Instant, op: UiaOp) -> WinResult<()> {
-        self.tx
-            .send(UiaJob { deadline, op })
-            .map_err(|_| WindowsPlatformError::UiaThreadGone)
+        match self.tx.try_send(UiaJob { deadline, op }) {
+            Ok(()) => Ok(()),
+            Err(mpsc::error::TrySendError::Full(_)) => Err(WindowsPlatformError::WorkerBusy {
+                worker: "UI Automation",
+            }),
+            Err(mpsc::error::TrySendError::Closed(_)) => Err(WindowsPlatformError::UiaThreadGone),
+        }
     }
 
     /// Read the selection inside `of` (§8 primary path).
@@ -189,7 +200,7 @@ impl UiaHandle {
     }
 }
 
-fn worker(mut rx: mpsc::UnboundedReceiver<UiaJob>) {
+fn worker(mut rx: mpsc::Receiver<UiaJob>) {
     // SAFETY: initialising COM for this thread as MTA, exactly once, and
     // uninitialising it when the loop ends. No pointers are passed in.
     let hr = unsafe { CoInitializeEx(None, COINIT_MULTITHREADED) };
@@ -244,10 +255,7 @@ fn worker(mut rx: mpsc::UnboundedReceiver<UiaJob>) {
 
 /// Answer every queued and future job with an error rather than leaving callers
 /// to time out on a dead channel.
-fn drain_with_error(
-    mut rx: mpsc::UnboundedReceiver<UiaJob>,
-    error: impl Fn() -> WindowsPlatformError,
-) {
+fn drain_with_error(mut rx: mpsc::Receiver<UiaJob>, error: impl Fn() -> WindowsPlatformError) {
     while let Some(job) = rx.blocking_recv() {
         match job.op {
             UiaOp::SelectedText { reply, .. } => {
@@ -628,4 +636,51 @@ fn validate_target(automation: &UIAutomation, target: &InsertTarget) -> WinResul
     }
 
     Ok(true)
+}
+
+#[cfg(test)]
+mod queue_tests {
+    use super::*;
+
+    fn selected_text_op() -> UiaOp {
+        let (reply, _reply_rx) = oneshot::channel();
+        UiaOp::SelectedText {
+            of: AppRef {
+                pid: 1,
+                window: None,
+            },
+            reply,
+        }
+    }
+
+    #[test]
+    fn saturated_queue_fails_immediately_with_sanitized_error() {
+        let (tx, mut rx) = mpsc::channel(1);
+        let handle = UiaHandle { tx };
+        let deadline = Instant::now() + std::time::Duration::from_secs(1);
+
+        handle.submit(deadline, selected_text_op()).unwrap();
+        let error = handle.submit(deadline, selected_text_op()).unwrap_err();
+
+        assert!(matches!(
+            error,
+            WindowsPlatformError::WorkerBusy {
+                worker: "UI Automation"
+            }
+        ));
+        assert_eq!(error.to_string(), "the UI Automation worker queue is busy");
+        assert!(rx.try_recv().is_ok(), "the first queued job is preserved");
+    }
+
+    #[test]
+    fn closed_queue_reports_the_dead_worker() {
+        let (tx, rx) = mpsc::channel(1);
+        drop(rx);
+        let handle = UiaHandle { tx };
+
+        assert!(matches!(
+            handle.submit(Instant::now(), selected_text_op()),
+            Err(WindowsPlatformError::UiaThreadGone)
+        ));
+    }
 }

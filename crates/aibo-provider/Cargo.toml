@@ -15,6 +15,7 @@ eventsource-stream = { workspace = true }
 futures = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
+image = { workspace = true }
 reqwest = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
@@ -28,6 +29,8 @@ url = { workspace = true }
 [dev-dependencies]
 insta = { workspace = true }
 tokio = { workspace = true, features = ["test-util"] }
+# `ChatRequest::id` in the attachment fixtures.
+uuid = { workspace = true }
 
 [lints.rust]
 unsafe_code = "forbid"

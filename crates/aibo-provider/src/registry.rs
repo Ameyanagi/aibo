@@ -347,6 +347,14 @@ pub const CODEX_ACCOUNT_CONSTRAINT: &str = "not supported when using Codex with 
 /// from `Fast` — the constraint enforced in `aibo_core::roles`.
 pub const CODEX_TTFT_FLOOR_MS: u32 = 435;
 
+/// Whether §3a's Codex allowlist has **verified** image-input support.
+///
+/// `false`, and it is a measurement gap rather than a finding: §3a sent text and
+/// only text. Named as a constant so the claim has one home — `codex_models`
+/// asserts against it, `codex::default_capabilities` carries the same `SPIKE`
+/// note, and a future probe flips one place.
+pub const CODEX_VISION_UNVERIFIED: bool = true;
+
 /// The allowlist as ids, best (fastest) first — [`AiboError::ModelRejected`]'s
 /// `alternatives`, and the order the model picker offers them in.
 pub fn codex_alternatives() -> Vec<String> {
@@ -541,6 +549,39 @@ impl ModelCatalogue {
             Some(m) => Resolution::Current(m.clone()),
             None => Resolution::Unknown,
         }
+    }
+
+    /// Whether the catalogue knows this binding accepts image input.
+    ///
+    /// `None` means *the catalogue has never heard of this id* — which is not
+    /// the same as "it cannot see" and must not be rendered as one. §10 makes
+    /// `Provider::models()` the runtime fallback for exactly this case, and
+    /// `Capabilities::default()` supplies the conservative floor once an entry
+    /// does exist. Returning `Option` rather than `bool` is what stops a stale
+    /// catalogue from silently becoming a refusal.
+    pub fn supports_vision(&self, binding: &ModelBinding) -> Option<bool> {
+        self.entries
+            .iter()
+            .find(|e| e.provider == binding.provider && e.id == binding.model)
+            .map(|e| e.capabilities.vision)
+    }
+
+    /// Every live `provider/model` in the catalogue that declares image input.
+    ///
+    /// Feeds [`AiboError::VisionUnsupported::alternatives`] so the panel's one
+    /// §13 action can offer a model that actually works. Deprecated entries are
+    /// excluded: suggesting a retired id trades one dead end for another.
+    ///
+    /// Complements `RoleBindings::vision_alternatives`, which answers the same
+    /// question from §4's *configured* chain. This one answers it from what the
+    /// catalogue knows exists, which is the better list when the user has a
+    /// working provider but has bound a text-only model on it.
+    pub fn vision_alternatives(&self) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|e| !e.deprecated && e.capabilities.vision)
+            .map(|e| format!("{}/{}", e.provider, e.id))
+            .collect()
     }
 
     /// The closest live model from the same provider, by shared id prefix.
@@ -823,6 +864,66 @@ mod tests {
         let before = cat.entries().len();
         cat.merge(Vec::new());
         assert_eq!(cat.entries().len(), before);
+    }
+
+    // -- vision truthfulness (§10) ------------------------------------------
+
+    #[test]
+    fn every_codex_allowlist_entry_declares_no_vision() {
+        // SPIKE: §3a measured text only. Declaring `vision: true` here would
+        // cost a 400 after a multi-megabyte upload, and §4 does not fall back on
+        // a 400 — so the honest value is the unverified one.
+        // The constant and the provider's own declaration are two statements of
+        // one fact; a probe that verifies vision has to flip both.
+        assert_eq!(
+            CODEX_VISION_UNVERIFIED,
+            !crate::codex::default_capabilities().vision
+        );
+        for m in codex_models() {
+            assert!(
+                !m.capabilities.vision,
+                "{} must not claim unmeasured image input",
+                m.id
+            );
+        }
+    }
+
+    #[test]
+    fn the_shipped_catalogue_offers_no_vision_alternative_it_cannot_stand_behind() {
+        // Codex is the only shipped catalogue, and none of it can see. An empty
+        // list is the correct answer; a populated one would be an invention.
+        assert!(ModelCatalogue::shipped().vision_alternatives().is_empty());
+    }
+
+    #[test]
+    fn vision_alternatives_are_live_entries_only() {
+        let seeing = Capabilities {
+            vision: true,
+            ..Capabilities::default()
+        };
+        let cat = ModelCatalogue::new(vec![
+            ModelInfo {
+                capabilities: seeing.clone(),
+                ..model("sees", false, None)
+            },
+            ModelInfo {
+                capabilities: seeing,
+                ..model("saw", true, Some("sees"))
+            },
+            model("blind", false, None),
+        ]);
+        // A retired id is not an alternative: it trades one dead end for another.
+        assert_eq!(cat.vision_alternatives(), ["cerebras/sees"]);
+    }
+
+    #[test]
+    fn an_id_the_catalogue_never_heard_of_is_unknown_not_blind() {
+        // The distinction the `Option` exists for: §10 makes `Provider::models()`
+        // the runtime fallback for a stale catalogue, so `None` must not be
+        // rendered as "this model cannot see".
+        let cat = ModelCatalogue::new(vec![model("blind", false, None)]);
+        assert_eq!(cat.supports_vision(&binding("blind")), Some(false));
+        assert_eq!(cat.supports_vision(&binding("who-knows")), None);
     }
 
     /// A `Provider` that panics if anything actually dispatches to it. The

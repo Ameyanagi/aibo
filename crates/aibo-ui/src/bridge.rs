@@ -1,10 +1,12 @@
 //! The UI ↔ tokio bridge (§6).
 //!
 //! §6 fixes the shape: "Bridge tokio → UI with `iced::Subscription::run` over an
-//! mpsc receiver; UI → tokio with an unbounded sender in app state." This module
-//! is the *vocabulary* that crosses that boundary, and it is deliberately the
-//! only coupling between `aibo-ui` and the rest of the workspace beyond
-//! `aibo-core`'s domain types.
+//! mpsc receiver." Both directions are bounded: provider output applies async
+//! backpressure all the way to the session driver, while the UI uses
+//! non-blocking delivery for human input and reserves part of its fixed queue
+//! for cancellation and lifecycle signals. This module is the *vocabulary* that
+//! crosses that boundary, and it is deliberately the only coupling between
+//! `aibo-ui` and the rest of the workspace beyond `aibo-core`'s domain types.
 //!
 //! Two properties are load-bearing:
 //!
@@ -23,9 +25,19 @@ use aibo_core::types::{
     AgentStep, AppInfo, ClipboardItem, DisplayInfo, FieldContext, Health, Permission,
     PermissionStatus, ProviderId, Role, StreamEvent, Surface, Usage,
 };
+use secrecy::SecretString;
 use uuid::Uuid;
 
 use crate::i18n::Lang;
+
+/// Human-scale UI requests allowed to wait for the runtime.
+pub const UI_REQUEST_CHANNEL_CAPACITY: usize = 64;
+
+/// Runtime events allowed to wait for iced's subscription.
+///
+/// Stream and agent pumps await capacity, so this is a hard memory boundary,
+/// not a threshold after which model content is dropped.
+pub const UI_EVENT_CHANNEL_CAPACITY: usize = 128;
 
 /// Correlates a panel invocation with the work it started.
 ///
@@ -40,6 +52,16 @@ pub type SessionId = Uuid;
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum UiRequest {
+    /// The tray and pre-created panel window are ready.
+    ///
+    /// Provider prewarming waits for this signal so startup work cannot delay
+    /// the shell becoming visible.
+    UiReady,
+
+    /// Create the encrypted history key and database after an explicit setup
+    /// gesture.
+    InitializeHistory,
+
     /// The hotkey fired. Capture context for the frontmost app.
     ///
     /// §8 splits capture in two: the cheap synchronous part (app ref, displays)
@@ -66,6 +88,16 @@ pub enum UiRequest {
     /// Cancel in-flight work for a session (`esc`, or a new submission).
     Cancel {
         /// Session.
+        session: SessionId,
+    },
+
+    /// Forget all backend state for a panel session.
+    ///
+    /// Cancellation stops active generation; discard additionally retires the
+    /// captured insertion target and rejects capture results that arrive after
+    /// the panel has moved on.
+    DiscardSession {
+        /// Session whose capture, replay and insertion state is no longer live.
         session: SessionId,
     },
 
@@ -107,6 +139,18 @@ pub enum UiRequest {
         permission: Permission,
     },
 
+    /// Open a URL in the user's browser.
+    ///
+    /// Exists for the device-code sign-in screen (§3a): the verification page
+    /// is the one place aibo sends the user out of the app, and asking them to
+    /// transcribe `auth.openai.com/codex/device` alongside a ten-character code
+    /// is two chances to mistype instead of one.
+    OpenUrl {
+        /// The URL. Only ever a constant from the provider crate — never
+        /// anything derived from a model response or captured content (§5).
+        url: String,
+    },
+
     /// Answer a blocking approval request (§11).
     Approve {
         /// Task the approval belongs to.
@@ -115,6 +159,8 @@ pub enum UiRequest {
         approval: String,
         /// The user's answer.
         decision: aibo_core::types::ApprovalDecision,
+        /// Exact destructive-command confirmation, when the prompt required it.
+        typed_confirmation: Option<String>,
     },
 
     /// Cancel an agent run.
@@ -258,6 +304,12 @@ pub enum UiEvent {
         health: Health,
     },
 
+    /// Persisted language loaded after the shell was already brought up.
+    LanguageChanged {
+        /// Language now in force.
+        language: Lang,
+    },
+
     /// Spend against the configured cap, for the meter (§14).
     Spend {
         /// Formatted amount.
@@ -268,4 +320,22 @@ pub enum UiEvent {
 
     /// aibo restarted after a panic (§6). Shown once, with a diagnostics link.
     RecoveredFromCrash,
+
+    /// A redacted diagnostics bundle reached the clipboard.
+    DiagnosticsCopied,
+
+    /// No usable provider is configured; open the functional setup surface.
+    OnboardingRequired,
+
+    /// A second process launch asked this instance to show its panel.
+    OpenPanel,
+
+    /// Encrypted history setup finished.
+    HistoryReady {
+        /// Present only when a new key was generated. `Debug` stays redacted.
+        recovery_code: Option<SecretString>,
+    },
+
+    /// Encrypted history setup failed; details remain diagnostics-only.
+    HistorySetupFailed,
 }

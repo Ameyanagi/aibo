@@ -40,6 +40,17 @@ pub enum WindowsPlatformError {
     #[error("the clipboard thread is not running")]
     ClipboardThreadGone,
 
+    /// A bounded native worker queue is already full.
+    ///
+    /// `worker` is always a compile-time platform label, never request
+    /// content. Keeping this typed avoids formatting a rejected queue job,
+    /// which could contain clipboard text or captured context.
+    #[error("the {worker} worker queue is busy")]
+    WorkerBusy {
+        /// Sanitized worker label (`"UI Automation"` or `"clipboard"`).
+        worker: &'static str,
+    },
+
     /// The call did not answer inside its deadline (§8: 120 ms for UIA, 250 ms
     /// including the clipboard fallback).
     #[error("the platform call exceeded its {0:?} deadline")]

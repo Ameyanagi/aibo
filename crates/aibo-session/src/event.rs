@@ -14,8 +14,8 @@ use aibo_core::context::Chars;
 use aibo_core::cost::Micros;
 use aibo_core::prompts::attachable_clipboard_text;
 use aibo_core::types::{
-    AppInfo, ClipboardItem, FieldContext, Health, ProviderId, Role, StopReason, StreamEvent,
-    Surface, Usage,
+    AppInfo, Attachment, ClipboardItem, FieldContext, Health, ProviderId, Role, StopReason,
+    StreamEvent, Surface, Usage,
 };
 use uuid::Uuid;
 
@@ -115,6 +115,29 @@ pub struct Submission {
     pub role_override: Option<Role>,
     /// What §8 managed to read.
     pub capture: Capture,
+    /// What the user **deliberately attached** (§2 modalities).
+    ///
+    /// # This field, and not [`Capture`], decides §4 rule 2
+    ///
+    /// [`crate::engine`]'s `has_image` is
+    /// `attachments.iter().any(Attachment::is_image)` and nothing else. It is
+    /// separate from `capture` because `capture` is *ambient* — whatever
+    /// happened to be on screen and on the pasteboard when the hotkey fired —
+    /// and ambient state must never make a routing decision. Deriving
+    /// `has_image` from the clipboard meant taking any screenshot silently
+    /// rerouted every later request to [`Role::Vision`], which nothing binds,
+    /// and the user saw "No provider is configured yet" beside a signed-in,
+    /// healthy provider.
+    ///
+    /// A clipboard image is still context; it reaches the prompt through
+    /// `capture` at §5's priority 4. Putting it *here* requires a gesture.
+    ///
+    /// # Untrusted (§5)
+    ///
+    /// Attacker-controlled on exactly the terms a selection is, and harder to
+    /// filter — see [`aibo_core::types::AttachmentSource::origin`]. Nothing
+    /// derived from one may authorise a tool call.
+    pub attachments: Vec<Attachment>,
     /// Conversation to append to, for Ask.
     pub conversation_id: Option<Uuid>,
     /// Prior turns, oldest first. The §5 budget drops whole turns from the
@@ -132,9 +155,38 @@ impl Submission {
             surface: None,
             role_override: None,
             capture: Capture::default(),
+            attachments: Vec::new(),
             conversation_id: None,
             history: Vec::new(),
         }
+    }
+
+    /// Attach an item — the deliberate act, in builder form.
+    #[must_use]
+    pub fn with_attachment(mut self, attachment: Attachment) -> Self {
+        self.attachments.push(attachment);
+        self
+    }
+
+    /// Whether the user attached an image. **The only** source of §4 rule 2's
+    /// `has_image`.
+    pub fn has_image_attachment(&self) -> bool {
+        self.attachments.iter().any(Attachment::is_image)
+    }
+
+    /// Summed raw bytes of every attachment.
+    ///
+    /// A second unit alongside [`Submission::total_chars`], and deliberately
+    /// **not** added to it. Bytes and characters are different units; summing
+    /// them is the exact bug class [`Chars`] exists to end, and 3 MB of PNG is
+    /// not "3 million characters" of anything. §13's payload cap is enforced in
+    /// characters over the text and in bytes over the attachments — see
+    /// [`aibo_core::types::validate_attachments`], which owns the byte ceiling.
+    pub fn attachment_bytes(&self) -> usize {
+        self.attachments
+            .iter()
+            .map(Attachment::byte_len)
+            .fold(0usize, usize::saturating_add)
     }
 
     /// Everything §13's large-selection cap measures, in **characters**.
@@ -247,47 +299,87 @@ pub enum SessionEvent {
     Failed(Arc<AiboError>),
 }
 
+/// Default number of session events allowed to wait for the UI event pump.
+///
+/// Provider chunks are untrusted-volume input. A finite queue makes a slow UI
+/// apply backpressure at the stream boundary instead of turning token cadence
+/// into unbounded heap growth.
+pub const DEFAULT_EVENT_CHANNEL_CAPACITY: usize = 64;
+
 /// Where [`SessionEvent`]s go.
 ///
-/// Unbounded and non-blocking in both directions: §6 is explicit that the UI
-/// thread never waits on the runtime and the runtime never waits on the UI. A
-/// closed channel means the panel went away, which is normal — the send is
-/// dropped and the request carries on to its reconcile and persist steps
-/// rather than aborting halfway through §14's accounting.
+/// Provider-driven [`SessionEvent::Stream`] events use
+/// [`EventSink::emit_stream`], which waits for capacity while also observing
+/// cancellation. Low-volume lifecycle events use [`EventSink::emit`], a
+/// non-blocking best-effort send: a full or closed queue means the panel is not
+/// keeping up, and accounting/persistence must still finish without waiting on
+/// UI work.
 #[derive(Debug, Clone)]
 pub struct EventSink {
-    tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>,
+    tx: tokio::sync::mpsc::Sender<SessionEvent>,
 }
 
 impl EventSink {
     /// Wrap an existing sender.
-    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>) -> Self {
+    pub fn new(tx: tokio::sync::mpsc::Sender<SessionEvent>) -> Self {
         Self { tx }
     }
 
     /// A sink and its receiver. What tests use.
-    pub fn channel() -> (Self, tokio::sync::mpsc::UnboundedReceiver<SessionEvent>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    pub fn channel() -> (Self, tokio::sync::mpsc::Receiver<SessionEvent>) {
+        Self::channel_with_capacity(DEFAULT_EVENT_CHANNEL_CAPACITY)
+    }
+
+    /// A sink and receiver with an explicit positive queue capacity.
+    ///
+    /// Small capacities are useful for embedding and for deterministic
+    /// backpressure tests. Tokio rejects zero-capacity channels.
+    pub fn channel_with_capacity(
+        capacity: usize,
+    ) -> (Self, tokio::sync::mpsc::Receiver<SessionEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         (Self::new(tx), rx)
     }
 
     /// A sink whose events go nowhere.
     pub fn null() -> Self {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
         // Keeping the receiver alive would leak; dropping it makes every send a
         // no-op, which is exactly the intent.
         drop(rx);
         Self::new(tx)
     }
 
-    /// Emit one event.
-    pub fn emit(&self, event: SessionEvent) {
-        let _ = self.tx.send(event);
+    /// Emit one low-volume lifecycle event without waiting on the UI.
+    ///
+    /// Returns `false` if the bounded queue is full or its receiver has closed.
+    /// Either case is deliberately non-fatal: the engine must still reconcile
+    /// spend and persist the exchange.
+    pub(crate) fn emit(&self, event: SessionEvent) -> bool {
+        self.tx.try_send(event).is_ok()
+    }
+
+    /// Emit provider-driven output with bounded, cancellation-aware
+    /// backpressure.
+    ///
+    /// A closed receiver returns immediately so a vanished panel cannot stall
+    /// the request's accounting tail. Cancellation wins over queue capacity so
+    /// a slow-but-live UI cannot make `esc` hang behind a full channel.
+    pub(crate) async fn emit_stream(
+        &self,
+        event: SessionEvent,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => false,
+            result = self.tx.send(event) => result.is_ok(),
+        }
     }
 }
 
-impl From<tokio::sync::mpsc::UnboundedSender<SessionEvent>> for EventSink {
-    fn from(tx: tokio::sync::mpsc::UnboundedSender<SessionEvent>) -> Self {
+impl From<tokio::sync::mpsc::Sender<SessionEvent>> for EventSink {
+    fn from(tx: tokio::sync::mpsc::Sender<SessionEvent>) -> Self {
         Self::new(tx)
     }
 }
@@ -397,6 +489,7 @@ impl Outcome {
 mod tests {
     use super::*;
     use aibo_core::types::{ClipboardKind, FieldContext};
+    use tokio_util::sync::CancellationToken;
 
     /// 100 kana. 300 bytes, 100 characters — the three-to-one ratio §13 names.
     fn japanese(chars: usize) -> String {
@@ -427,6 +520,86 @@ mod tests {
             sequence: 1,
             restorable: true,
         }
+    }
+
+    #[tokio::test]
+    async fn provider_events_backpressure_until_capacity_is_available() {
+        let (sink, mut rx) = EventSink::channel_with_capacity(1);
+        assert!(sink.emit(SessionEvent::Stream(Box::new(StreamEvent::Text(
+            "queued".into(),
+        )))));
+
+        let cancel = CancellationToken::new();
+        let blocked = {
+            let sink = sink.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                sink.emit_stream(
+                    SessionEvent::Stream(Box::new(StreamEvent::Text("next".into()))),
+                    &cancel,
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked.is_finished(),
+            "a full channel must push back on provider output"
+        );
+
+        assert!(rx.recv().await.is_some());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), blocked)
+                .await
+                .expect("capacity release must wake the producer")
+                .unwrap()
+        );
+        assert!(rx.recv().await.is_some());
+    }
+
+    #[tokio::test]
+    async fn cancellation_and_receiver_closure_release_a_blocked_provider() {
+        let (sink, mut rx) = EventSink::channel_with_capacity(1);
+        assert!(sink.emit(SessionEvent::Stream(Box::new(StreamEvent::Text(
+            "queued".into(),
+        )))));
+
+        let cancel = CancellationToken::new();
+        let blocked = {
+            let sink = sink.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move {
+                sink.emit_stream(
+                    SessionEvent::Stream(Box::new(StreamEvent::Text("blocked".into()))),
+                    &cancel,
+                )
+                .await
+            })
+        };
+        tokio::task::yield_now().await;
+        assert!(!blocked.is_finished());
+        cancel.cancel();
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(1), blocked)
+                .await
+                .expect("cancellation must not wait for UI capacity")
+                .unwrap()
+        );
+
+        // Closing a receiver is normal when a panel disappears. It must be as
+        // prompt as cancellation and must not require draining queued events.
+        rx.close();
+        assert!(
+            !tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                sink.emit_stream(
+                    SessionEvent::Stream(Box::new(StreamEvent::Text("closed".into()))),
+                    &CancellationToken::new(),
+                ),
+            )
+            .await
+            .expect("receiver closure must release the producer")
+        );
     }
 
     #[test]
@@ -508,6 +681,39 @@ mod tests {
         let mut submission = Submission::new(Uuid::now_v7(), japanese(10));
         submission.capture.selection = Some(japanese(90));
         assert_eq!(submission.total_chars(), Chars::new(100));
+    }
+
+    /// Bytes and characters are different units, and §13's cap is stated in
+    /// characters. Laundering 3 MB of PNG into the character count would report
+    /// "3,000,000 characters" for an image that has none — the exact class of
+    /// confusion [`Chars`] exists to end.
+    #[test]
+    fn attachment_bytes_are_counted_separately_from_characters() {
+        let s = Submission::new(Uuid::now_v7(), japanese(10)).with_attachment(
+            aibo_core::types::Attachment::image(
+                aibo_core::types::AttachmentSource::Clipboard,
+                vec![0u8; 3_000_000],
+                "image/png",
+                1568,
+                882,
+                "Screenshot",
+            ),
+        );
+        assert_eq!(s.total_chars(), Chars::new(10));
+        assert_eq!(s.attachment_bytes(), 3_000_000);
+        assert!(s.has_image_attachment());
+    }
+
+    #[test]
+    fn a_submission_with_nothing_attached_has_no_image() {
+        // Including one whose clipboard holds an image: that is ambient state,
+        // and ambient state is never an attachment.
+        let mut s = Submission::new(Uuid::now_v7(), "hello");
+        let mut item = clipboard("");
+        item.kind = ClipboardKind::ImageRef;
+        s.capture.clipboard = Some(item);
+        assert!(!s.has_image_attachment());
+        assert_eq!(s.attachment_bytes(), 0);
     }
 
     #[test]

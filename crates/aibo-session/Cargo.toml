@@ -26,6 +26,7 @@ async-trait = { workspace = true }
 futures = { workspace = true }
 secrecy = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -36,7 +37,6 @@ uuid = { workspace = true }
 
 [dev-dependencies]
 futures = { workspace = true }
-serde_json = { workspace = true }
 # `test-util` is what makes §13's wall-clock ceiling testable: `start_paused`
 # auto-advances the clock when the runtime goes idle, so a 60 s deadline against
 # a stream that never yields is asserted in microseconds instead of a minute.

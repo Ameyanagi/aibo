@@ -60,7 +60,7 @@ use aibo_provider::codex::AttestationPolicy;
 use aibo_provider::registry::{ProviderKind, ProviderSpec, check_codex_model};
 use secrecy::SecretString;
 use serde::Deserialize;
-use url::Url;
+use url::{Host, Url};
 
 use crate::engine::{DEFAULT_MAX_PAYLOAD_CHARS, DEFAULT_REQUEST_DEADLINE, EngineConfig};
 use crate::health::{
@@ -455,10 +455,20 @@ pub struct Config {
     pub budget: Option<BudgetConfig>,
     /// Offline hysteresis (§13).
     pub health: HealthConfig,
+    /// Non-secret desktop-shell preferences.
+    pub ui: UiSettings,
     /// Wall-clock ceiling for one request, in seconds.
     pub request_deadline_secs: Option<u64>,
     /// §13's large-selection refusal, in characters.
     pub max_payload_chars: Option<usize>,
+}
+
+/// Persisted desktop-shell preferences.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct UiSettings {
+    /// BCP-47 language tag. Unsupported tags fall back in the UI layer.
+    pub language: Option<String>,
 }
 
 impl Config {
@@ -528,6 +538,17 @@ impl Config {
 
             if let Some(t) = provider.trust {
                 trust.set(id.clone(), t.into());
+            } else if provider.backend == Backend::Ollama
+                && provider
+                    .base_url
+                    .as_deref()
+                    .and_then(|raw| Url::parse(raw).ok())
+                    .is_some_and(|url| !Self::endpoint_is_loopback(&url))
+            {
+                // A remote Ollama is not automatically the user's machine.
+                // Classify it conservatively unless the user explicitly marks
+                // administered infrastructure as private.
+                trust.set(id.clone(), TrustBoundary::Public);
             }
             if let Some(tier) = &provider.tier {
                 tiers.insert(id.clone(), ProviderTier::new(tier.clone()));
@@ -570,6 +591,15 @@ impl Config {
                     .unwrap_or(DEFAULT_REQUEST_DEADLINE),
             },
         ))
+    }
+
+    fn endpoint_is_loopback(url: &Url) -> bool {
+        match url.host() {
+            Some(Host::Ipv4(address)) => address.is_loopback(),
+            Some(Host::Ipv6(address)) => address.is_loopback(),
+            Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+            None => false,
+        }
     }
 
     fn spec_for(
@@ -1164,6 +1194,40 @@ mod tests {
         let (_, engine) = config.build(&FixedKey, PriceTable::empty()).unwrap();
         assert_eq!(
             engine.trust.boundary(&ProviderId::new("self-hosted")),
+            TrustBoundary::Private
+        );
+    }
+
+    #[test]
+    fn remote_ollama_is_public_unless_explicitly_overridden() {
+        let remote = Config::from_toml_str(
+            r#"
+            [[providers]]
+            backend = "ollama"
+            base_url = "https://ollama.example.test/v1"
+            "#,
+        )
+        .unwrap();
+        let (_, engine) = remote.build(&NoCredentials, PriceTable::empty()).unwrap();
+        assert_eq!(
+            engine.trust.boundary(&ProviderId::OLLAMA),
+            TrustBoundary::Public
+        );
+
+        let administered = Config::from_toml_str(
+            r#"
+            [[providers]]
+            backend = "ollama"
+            base_url = "https://ollama.internal.example/v1"
+            trust = "private"
+            "#,
+        )
+        .unwrap();
+        let (_, engine) = administered
+            .build(&NoCredentials, PriceTable::empty())
+            .unwrap();
+        assert_eq!(
+            engine.trust.boundary(&ProviderId::OLLAMA),
             TrustBoundary::Private
         );
     }

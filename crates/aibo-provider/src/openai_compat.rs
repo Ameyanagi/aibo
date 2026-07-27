@@ -48,7 +48,10 @@ use url::Url;
 
 use crate::auth::{AuthStyle, apply_credential};
 use crate::http::{HttpConfig, build_client, map_transport_error};
-use crate::sse::{DONE_SENTINEL, Flow, SseDecoder, decode, events_from_response};
+use crate::sse::{
+    DONE_SENTINEL, Flow, MAX_BUFFERED_TOOL_BYTES, MAX_TOOL_CALLS_PER_RESPONSE, SseDecoder, decode,
+    events_from_response, read_error_body,
+};
 use crate::wire::{
     ErrorShape, OpenAiUsage, Unimplemented, data_uri, flatten_text, has_image, map_status,
     parse_retry_after, parse_tool_args, render_untrusted, role_name,
@@ -391,10 +394,9 @@ impl OpenAiCompat {
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after);
-        // Bounded read: an error body is small, and an unbounded read of a
-        // hostile endpoint is a memory bug.
-        let body = response.text().await.unwrap_or_default();
-        let body: String = body.chars().take(4096).collect();
+        let body = read_error_body(response, &self.id)
+            .await
+            .unwrap_or_default();
         Err(map_status(
             &self.id,
             status.as_u16(),
@@ -415,11 +417,25 @@ impl Provider for OpenAiCompat {
         self.capabilities.clone()
     }
 
+    async fn prewarm(&self) {
+        OpenAiCompat::prewarm(self).await;
+    }
+
     async fn chat(
         &self,
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+        // Refuse before spending anything, and never by stripping the image
+        // (§10). The authoritative per-model check runs in dispatch with real
+        // `ModelInfo` capabilities and real alternatives; this is the last line
+        // of defence, so it can only offer what the provider itself declares.
+        crate::attachment::guard(&self.capabilities, &req, Vec::new())?;
+        // Downscale before the bytes are base64'd into the body (§14): a 4 MB
+        // retina capture is billed as ~19k image tokens and may be refused
+        // outright, and §4 does not fall back on a 400.
+        let req = crate::attachment::prepare(req).await?;
+
         let (url, body) = match self.quirks.wire {
             WireFormat::ChatCompletions => (
                 self.quirks.op_url(&self.base_url, Op::Chat)?,
@@ -548,10 +564,17 @@ const fn effort_str(e: ReasoningEffort) -> &'static str {
 ///
 /// Pure, so `tests/request_shape.rs` can pin it against a golden file: a
 /// silently renamed field is a 400 in production and a diff here.
+///
+/// [`ChatRequest::attachments`] are folded into the last user message by
+/// [`crate::attachment::fold_into_messages`] and encoded as `image_url` parts
+/// carrying a `data:` URL — the shape every OpenAI-compatible endpoint takes.
+/// The pixels are used as attached, so call [`crate::attachment::prepare`]
+/// first; `Provider::chat` does.
 pub fn build_chat_completions_body(req: &ChatRequest, q: &Quirks) -> Value {
+    let messages = crate::attachment::fold_into_messages(req);
     let mut body = json!({
         "model": req.binding.model,
-        "messages": req.messages.iter().map(chat_message).collect::<Vec<_>>(),
+        "messages": messages.iter().map(chat_message).collect::<Vec<_>>(),
         "stream": true,
         "temperature": req.params.temperature,
     });
@@ -652,11 +675,19 @@ fn chat_message(msg: &Message) -> Value {
 ///
 /// `store: false` is deliberate: aibo keeps its own encrypted history (§12) and
 /// has no reason to leave a server-side copy.
+///
+/// [`ChatRequest::attachments`] become `input_image` content parts whose
+/// `image_url` is a `data:` URL — the Responses spelling, which differs from
+/// Chat Completions (an object, not a string) and from Anthropic (a `source`
+/// block). §10 keeps the three implementations separate for exactly this reason.
+/// Call [`crate::attachment::prepare`] first so the bytes are the downscaled
+/// ones; `Provider::chat` does.
 pub fn build_responses_body(req: &ChatRequest, q: &Quirks) -> Value {
     let mut instructions = String::new();
     let mut input: Vec<Value> = Vec::new();
 
-    for msg in &req.messages {
+    let messages = crate::attachment::fold_into_messages(req);
+    for msg in messages.iter() {
         if msg.role == MessageRole::System {
             if !instructions.is_empty() {
                 instructions.push_str("\n\n");
@@ -858,6 +889,29 @@ impl ChatCompletionsDecoder {
         }
     }
 
+    fn buffered_tool_bytes(&self) -> usize {
+        self.tool_calls.iter().fold(0, |total, call| {
+            total
+                .saturating_add(call.id.len())
+                .saturating_add(call.name.len())
+                .saturating_add(call.args.len())
+        })
+    }
+
+    fn reject_tool_volume(
+        &mut self,
+        out: &mut Vec<Result<StreamEvent>>,
+        message: &'static str,
+    ) -> Flow {
+        self.emitted_terminal = true;
+        self.tool_calls.clear();
+        out.push(Err(AiboError::Internal(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        )))));
+        Flow::Stop
+    }
+
     fn finish(&mut self, out: &mut Vec<Result<StreamEvent>>) {
         if self.emitted_terminal {
             return;
@@ -952,6 +1006,10 @@ impl SseDecoder for ChatCompletionsDecoder {
                 out.push(Ok(StreamEvent::Reasoning(r)));
             }
             for tc in choice.delta.tool_calls {
+                if tc.index >= MAX_TOOL_CALLS_PER_RESPONSE {
+                    return self
+                        .reject_tool_volume(out, "provider exceeded the tool-call count limit");
+                }
                 if self.tool_calls.len() <= tc.index {
                     self.tool_calls
                         .resize(tc.index + 1, PartialToolCall::default());
@@ -967,6 +1025,10 @@ impl SseDecoder for ChatCompletionsDecoder {
                     if let Some(args) = f.arguments {
                         slot.args.push_str(&args);
                     }
+                }
+                if self.buffered_tool_bytes() > MAX_BUFFERED_TOOL_BYTES {
+                    return self
+                        .reject_tool_volume(out, "provider exceeded the buffered tool-call limit");
                 }
             }
             if let Some(reason) = choice.finish_reason {
@@ -1050,6 +1112,7 @@ struct IncompleteDetails {
 #[derive(Debug, Default)]
 pub struct ResponsesDecoder {
     saw_tool_call: bool,
+    tool_calls_seen: usize,
     stop: Option<StopReason>,
     emitted_terminal: bool,
 }
@@ -1110,6 +1173,15 @@ impl SseDecoder for ResponsesDecoder {
                 if let Some(item) = parsed.item
                     && item.kind == "function_call"
                 {
+                    if self.tool_calls_seen >= MAX_TOOL_CALLS_PER_RESPONSE {
+                        self.emitted_terminal = true;
+                        out.push(Err(AiboError::Internal(Box::new(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "provider exceeded the tool-call count limit",
+                        )))));
+                        return Flow::Stop;
+                    }
+                    self.tool_calls_seen += 1;
                     self.saw_tool_call = true;
                     let raw = item.arguments.unwrap_or_default();
                     match parse_tool_args(&raw) {
@@ -1220,6 +1292,7 @@ pub fn boxed(p: OpenAiCompat) -> Arc<dyn Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures_util::StreamExt as _;
 
     fn base() -> Url {
         Url::parse("https://api.example.com/v1").unwrap()
@@ -1262,5 +1335,73 @@ mod tests {
             q.op_url(&base, Op::Chat).unwrap().as_str(),
             "https://api.example.com/v1/chat/completions"
         );
+    }
+
+    #[tokio::test]
+    async fn a_hostile_tool_index_cannot_resize_the_decoder_without_bound() {
+        let body = format!(
+            "data: {}\n\n",
+            json!({
+                "choices": [{
+                    "delta": {
+                        "tool_calls": [{
+                            "index": MAX_TOOL_CALLS_PER_RESPONSE,
+                            "id": "call-hostile",
+                            "function": {"name": "run", "arguments": "{}"}
+                        }]
+                    }
+                }]
+            })
+        );
+        let out: Vec<_> = decode(
+            crate::sse::events_from_bytes(body),
+            ChatCompletionsDecoder::new(Quirks::chat_completions()),
+            ProviderId::OPENAI,
+            CancellationToken::new(),
+        )
+        .collect()
+        .await;
+
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], Err(AiboError::Internal(_))));
+    }
+
+    #[test]
+    fn responses_tool_call_fan_out_has_a_per_response_ceiling() {
+        let mut decoder = ResponsesDecoder::default();
+        let mut out = Vec::new();
+
+        for index in 0..MAX_TOOL_CALLS_PER_RESPONSE {
+            let event = Event {
+                data: json!({
+                    "type": "response.output_item.done",
+                    "item": {
+                        "type": "function_call",
+                        "call_id": format!("call-{index}"),
+                        "name": "run",
+                        "arguments": "{}"
+                    }
+                })
+                .to_string(),
+                ..Event::default()
+            };
+            assert_eq!(decoder.on_event(&event, &mut out), Flow::Continue);
+        }
+
+        let overflow = Event {
+            data: json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call-overflow",
+                    "name": "run",
+                    "arguments": "{}"
+                }
+            })
+            .to_string(),
+            ..Event::default()
+        };
+        assert_eq!(decoder.on_event(&overflow, &mut out), Flow::Stop);
+        assert!(matches!(out.last(), Some(Err(AiboError::Internal(_)))));
     }
 }

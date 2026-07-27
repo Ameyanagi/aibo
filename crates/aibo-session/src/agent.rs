@@ -80,26 +80,54 @@ pub enum AgentEvent {
 }
 
 /// Where [`AgentEvent`]s go.
+///
+/// Agent steps come from a delegate and are therefore untrusted-volume input.
+/// They are sent with bounded, cancellation-aware backpressure. The few
+/// lifecycle events are best-effort and non-blocking so a closed task window
+/// cannot prevent the run from retiring its cancellation token.
 #[derive(Debug, Clone)]
 pub struct AgentSink {
-    tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>,
+    tx: tokio::sync::mpsc::Sender<AgentEvent>,
 }
+
+/// Default number of agent events allowed to wait for the task-window pump.
+pub const DEFAULT_AGENT_CHANNEL_CAPACITY: usize = 64;
 
 impl AgentSink {
     /// Wrap an existing sender.
-    pub fn new(tx: tokio::sync::mpsc::UnboundedSender<AgentEvent>) -> Self {
+    pub fn new(tx: tokio::sync::mpsc::Sender<AgentEvent>) -> Self {
         Self { tx }
     }
 
     /// A sink and its receiver.
-    pub fn channel() -> (Self, tokio::sync::mpsc::UnboundedReceiver<AgentEvent>) {
-        let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    pub fn channel() -> (Self, tokio::sync::mpsc::Receiver<AgentEvent>) {
+        Self::channel_with_capacity(DEFAULT_AGENT_CHANNEL_CAPACITY)
+    }
+
+    /// A sink and receiver with an explicit positive queue capacity.
+    pub fn channel_with_capacity(
+        capacity: usize,
+    ) -> (Self, tokio::sync::mpsc::Receiver<AgentEvent>) {
+        let (tx, rx) = tokio::sync::mpsc::channel(capacity);
         (Self::new(tx), rx)
     }
 
-    /// Emit one event.
-    pub fn emit(&self, event: AgentEvent) {
-        let _ = self.tx.send(event);
+    /// Emit one low-volume lifecycle event without waiting on the UI.
+    pub(crate) fn emit(&self, event: AgentEvent) -> bool {
+        self.tx.try_send(event).is_ok()
+    }
+
+    /// Emit one delegate-driven step with bounded backpressure.
+    async fn emit_step(
+        &self,
+        event: AgentEvent,
+        cancel: &tokio_util::sync::CancellationToken,
+    ) -> bool {
+        tokio::select! {
+            biased;
+            () = cancel.cancelled() => false,
+            result = self.tx.send(event) => result.is_ok(),
+        }
     }
 }
 
@@ -136,7 +164,7 @@ impl Engine {
                 task: task_id,
                 error: error.clone(),
             }),
-        }
+        };
         result
     }
 
@@ -194,7 +222,13 @@ impl Engine {
                 tracker.on_usage(&done.usage, None).map_err(Arc::new)?;
             }
 
-            events.emit(AgentEvent::Step(Box::new(step.clone())));
+            if !events
+                .emit_step(AgentEvent::Step(Box::new(step.clone())), cancel)
+                .await
+                && cancel.is_cancelled()
+            {
+                return Ok(outcome(&tracker, AgentStatus::Cancelled));
+            }
 
             if let AgentStep::Done(done) = step {
                 return Ok(done);
@@ -207,5 +241,55 @@ impl Engine {
             // own. One yield per step costs nothing at §14's 25-step default.
             tokio::task::yield_now().await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn step() -> AgentEvent {
+        AgentEvent::Step(Box::new(AgentStep::Thought("thinking".into())))
+    }
+
+    #[tokio::test]
+    async fn agent_steps_backpressure_and_cancellation_releases_them() {
+        let (sink, _rx) = AgentSink::channel_with_capacity(1);
+        assert!(sink.emit(step()));
+
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let blocked = {
+            let sink = sink.clone();
+            let cancel = cancel.clone();
+            tokio::spawn(async move { sink.emit_step(step(), &cancel).await })
+        };
+        tokio::task::yield_now().await;
+        assert!(
+            !blocked.is_finished(),
+            "a full task-window queue must push back on delegate steps"
+        );
+
+        cancel.cancel();
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(1), blocked)
+                .await
+                .expect("agent cancellation must not wait for UI capacity")
+                .unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_closed_agent_receiver_never_stalls_the_run() {
+        let (sink, rx) = AgentSink::channel_with_capacity(1);
+        drop(rx);
+
+        assert!(
+            !tokio::time::timeout(
+                std::time::Duration::from_secs(1),
+                sink.emit_step(step(), &tokio_util::sync::CancellationToken::new()),
+            )
+            .await
+            .expect("receiver closure must release the agent producer")
+        );
     }
 }

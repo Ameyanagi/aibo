@@ -56,7 +56,7 @@ fn engine(mock: &Mock) -> Engine {
     )
 }
 
-fn events_of(rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEvent>) -> Vec<SessionEvent> {
+fn events_of(rx: &mut tokio::sync::mpsc::Receiver<SessionEvent>) -> Vec<SessionEvent> {
     let mut out = Vec::new();
     while let Ok(event) = rx.try_recv() {
         out.push(event);

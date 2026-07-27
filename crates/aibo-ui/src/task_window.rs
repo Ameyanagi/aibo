@@ -30,6 +30,9 @@ use crate::i18n::{self, Key};
 use crate::theme::{self, Severity, space, type_scale};
 use crate::widgets::{self, Action};
 
+/// Destructive approval confirmation input, focused when the prompt appears.
+pub const CONFIRMATION_ID: &str = "aibo.task.approval.confirmation";
+
 /// One entry in the scrollback.
 ///
 /// A flattened mirror of [`AgentStep`] rather than the enum itself: the UI
@@ -129,6 +132,88 @@ impl TaskState {
                 self.typed_confirmation.trim() == expected.trim()
             }
         }
+    }
+
+    /// Whether `decision` may be sent for the current prompt.
+    ///
+    /// Denying is always safe while a prompt exists. A one-shot approval must
+    /// pass the typed-confirmation gate, while destructive prompts never offer
+    /// the broader "approve for session" decision.
+    pub fn decision_is_ready(&self, decision: ApprovalDecision) -> bool {
+        let Some(request) = &self.pending_approval else {
+            return false;
+        };
+        match decision {
+            ApprovalDecision::Deny => true,
+            ApprovalDecision::Approve => self.approval_is_ready(),
+            // Destructive approvals are intentionally one-shot even after the
+            // command has been typed exactly. A generic session grant is too
+            // broad for an operation classified as destructive.
+            ApprovalDecision::ApproveForSession => {
+                !request.requires_typed_confirmation && self.approval_is_ready()
+            }
+        }
+    }
+
+    /// The complete user-visible transcript, in display order.
+    pub fn transcript(&self) -> String {
+        use std::fmt::Write as _;
+
+        let mut out = self.instruction.clone();
+        for entry in &self.entries {
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+            out.push('\n');
+            match &entry.step {
+                AgentStep::Thought(body) => {
+                    let _ = writeln!(out, "{}:", i18n::t(Key::TaskThinking));
+                    out.push_str(body);
+                }
+                AgentStep::ToolUse { name, .. } => {
+                    out.push_str(&i18n::t1(Key::TaskRunningTool, name));
+                }
+                AgentStep::FileDiff { path, unified_diff } => {
+                    let _ = writeln!(
+                        out,
+                        "{} {}",
+                        i18n::t(Key::TaskFileChanged),
+                        path.to_string_lossy()
+                    );
+                    out.push_str(unified_diff);
+                }
+                AgentStep::Message(body) => out.push_str(body),
+                // Folded into `pending_approval` / `outcome` by `push`.
+                AgentStep::AwaitingApproval(_) | AgentStep::Done(_) => {}
+            }
+        }
+
+        if let Some(request) = &self.pending_approval {
+            let _ = write!(
+                out,
+                "\n\n{}\n{}",
+                i18n::t(Key::TaskAwaitingApproval),
+                request.summary
+            );
+            if let Some(command) = &request.command {
+                let _ = write!(out, "\n{command}");
+            }
+            for path in &request.paths {
+                let _ = write!(out, "\n{}", path.to_string_lossy());
+            }
+        }
+
+        if let Some(outcome) = &self.outcome {
+            let status = match &outcome.status {
+                AgentStatus::Completed => i18n::t(Key::TaskCompleted).to_owned(),
+                AgentStatus::Cancelled => i18n::t(Key::TaskCancelled).to_owned(),
+                AgentStatus::Failed(message) => message.clone(),
+                AgentStatus::BudgetExceeded(_) => i18n::t(Key::ErrBudgetExceeded).to_owned(),
+            };
+            let _ = write!(out, "\n\n{status}");
+        }
+
+        out
     }
 }
 
@@ -331,6 +416,7 @@ fn approval_view<'a>(state: &'a TaskState, request: &'a ApprovalRequest) -> Elem
     if request.requires_typed_confirmation {
         stack = stack.push(
             text_input("", &state.typed_confirmation)
+                .id(CONFIRMATION_ID)
                 .on_input(Message::ConfirmationChanged)
                 .size(type_scale::META)
                 .font(theme::MONO_FONT)
@@ -349,13 +435,18 @@ fn approval_view<'a>(state: &'a TaskState, request: &'a ApprovalRequest) -> Elem
         approve = approve.disabled();
     }
 
+    let mut approve_session = Action::new(
+        Key::ActionApproveSession,
+        "⇧⏎",
+        Message::Decide(ApprovalDecision::ApproveForSession),
+    );
+    if !state.decision_is_ready(ApprovalDecision::ApproveForSession) {
+        approve_session = approve_session.disabled();
+    }
+
     stack = stack.push(widgets::action_list(vec![
         approve,
-        Action::new(
-            Key::ActionApproveSession,
-            "⇧⏎",
-            Message::Decide(ApprovalDecision::ApproveForSession),
-        ),
+        approve_session,
         Action::new(
             Key::ActionDeny,
             "esc",
@@ -372,9 +463,20 @@ fn approval_view<'a>(state: &'a TaskState, request: &'a ApprovalRequest) -> Elem
 }
 
 fn footer(state: &TaskState) -> Element<'_, Message> {
-    let mut actions = vec![Action::new(Key::ActionCopy, "⌘C", Message::CopyTranscript)];
+    let mut actions = vec![Action::new(
+        Key::ActionCopy,
+        widgets::primary_shortcut("⌘C", "Ctrl+C"),
+        Message::CopyTranscript,
+    )];
     if state.is_running() {
-        actions.push(Action::new(Key::ActionCancel, "⌘.", Message::Cancel).destructive());
+        actions.push(
+            Action::new(
+                Key::ActionCancel,
+                widgets::primary_shortcut("⌘.", "Ctrl+."),
+                Message::Cancel,
+            )
+            .destructive(),
+        );
     }
     actions.push(Action::new(Key::ActionDismiss, "esc", Message::Close));
 
@@ -430,6 +532,42 @@ mod tests {
         assert!(!state.approval_is_ready());
         state.typed_confirmation = "rm -rf ./build".to_owned();
         assert!(state.approval_is_ready());
+        assert!(state.decision_is_ready(ApprovalDecision::Approve));
+        assert!(
+            !state.decision_is_ready(ApprovalDecision::ApproveForSession),
+            "destructive grants are one-shot even after exact confirmation"
+        );
+        assert!(state.decision_is_ready(ApprovalDecision::Deny));
+    }
+
+    #[test]
+    fn non_destructive_approval_can_be_granted_for_the_session() {
+        let mut state = task();
+        state.push(AgentStep::AwaitingApproval(approval(false)));
+        assert!(state.decision_is_ready(ApprovalDecision::Approve));
+        assert!(state.decision_is_ready(ApprovalDecision::ApproveForSession));
+    }
+
+    #[test]
+    fn transcript_contains_the_visible_run_not_only_the_instruction() {
+        let mut state = task();
+        state.push(AgentStep::Message("I updated the flag.".to_owned()));
+        state.push(AgentStep::FileDiff {
+            path: "src/config.rs".into(),
+            unified_diff: "-old\n+new".to_owned(),
+        });
+        state.push(AgentStep::Done(AgentOutcome {
+            status: AgentStatus::Completed,
+            usage: Usage::default(),
+            steps: 2,
+        }));
+
+        let transcript = state.transcript();
+        assert!(transcript.contains("rename the feature flag"));
+        assert!(transcript.contains("I updated the flag."));
+        assert!(transcript.contains("src/config.rs"));
+        assert!(transcript.contains("-old\n+new"));
+        assert!(transcript.contains(i18n::t(Key::TaskCompleted)));
     }
 
     #[test]

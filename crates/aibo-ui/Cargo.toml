@@ -9,18 +9,19 @@ publish = false
 
 [dependencies]
 aibo-core = { workspace = true }
+aibo-platform = { workspace = true }
 global-hotkey = { workspace = true }
 iced = { workspace = true }
 muda = { workspace = true }
 nucleo-matcher = { workspace = true }
-raw-window-handle = { workspace = true }
+secrecy = { workspace = true }
 serde = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
+unicode-segmentation = { workspace = true }
 tracing = { workspace = true }
 tray-icon = { workspace = true }
 uuid = { workspace = true }
-window-vibrancy = { workspace = true }
 
 [lints.rust]
 unsafe_code = "warn"

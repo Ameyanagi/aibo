@@ -57,7 +57,8 @@ use unicode_segmentation::UnicodeSegmentation;
 
 use crate::error::{AiboError, Result};
 use crate::types::{
-    Capabilities, ContentOrigin, ContentPart, Message, MessageRole, RequestBudget, UntrustedBlock,
+    Attachment, Capabilities, ContentOrigin, ContentPart, Message, MessageRole, RequestBudget,
+    UntrustedBlock,
 };
 
 // ---------------------------------------------------------------------------
@@ -288,6 +289,42 @@ pub const COMPLETE_SUFFIX_CHARS: Chars = Chars::new(400);
 /// default and a calibration target for the S9 eval harness, not a measured
 /// value.
 pub const CLIPBOARD_CAP_TOKENS: Tokens = Tokens::new(2_048);
+
+/// The share of the input budget an image attachment set may occupy, as a
+/// divisor: `1/4` of [`ContextBudget::max_context_tokens`].
+///
+/// # Why images need an allowance at all
+///
+/// An image consumes no *text* tokens, which is exactly why it is easy to
+/// forget — and then most providers bill it as a block of input tokens derived
+/// from its dimensions (see [`Attachment::estimated_image_tokens`]). A budget
+/// that ignores that under-counts a request by thousands of tokens: four
+/// attachments at [`crate::types::ATTACHMENT_DOWNSCALE_MAX_EDGE`] square are
+/// ~13k tokens, more than the entire context of several models in §10's matrix
+/// and more than most text turns cost.
+///
+/// # Why it is a *ceiling* and not just an accounting line
+///
+/// Every other §5 priority can be shortened: a selection is truncated
+/// middle-out, a clipboard head-only, history by dropping whole turns. **An
+/// attachment cannot.** By the time assembly runs the bytes are fixed, and the
+/// one thing dispatch must never do is drop the image and answer anyway — that
+/// is the failure [`crate::types::Capabilities::vision`] documents at length.
+/// So the allowance is enforced by *refusing* ([`AiboError::ContextTooLarge`]),
+/// which the user can act on by removing an attachment, rather than by
+/// silently shrinking something.
+///
+/// # Why a divisor rather than a field on [`ContextBudget`]
+///
+/// Derived from `max_context_tokens`, so [`crate::cost::RoleCaps::clamp`]
+/// clamps the image allowance for free when it clamps the context — §14's
+/// per-role caps then bound image spend as well as text spend without a second
+/// knob that could drift out of step with the first.
+///
+/// A quarter, not a half: the payload already claims up to 50% of the model's
+/// context, and images arrive *with* an instruction that has to fit beside
+/// them.
+pub const IMAGE_ALLOWANCE_DIVISOR: usize = 4;
 
 /// Fraction of the model's context reserved for output when a caller does not
 /// state one. Deliberately generous: running out of output budget mid-answer
@@ -922,6 +959,15 @@ impl ContextBudget {
         Tokens::new(self.max_output_tokens as usize)
     }
 
+    /// The ceiling on image-attachment tokens for this request.
+    ///
+    /// Derived from the context rather than stored, so §14's per-role clamp
+    /// applies to it automatically — see [`IMAGE_ALLOWANCE_DIVISOR`] for why
+    /// that matters and why exceeding it refuses instead of truncating.
+    pub const fn images(&self) -> Tokens {
+        Tokens::new(self.max_context_tokens / IMAGE_ALLOWANCE_DIVISOR)
+    }
+
     /// [`ContextBudget::from_capabilities`] with the default output reserve.
     pub fn for_model(caps: &Capabilities) -> Self {
         let reserve = ((caps.max_context.max(2) as f64) * DEFAULT_OUTPUT_RESERVE_FRACTION) as u32;
@@ -957,11 +1003,17 @@ impl ContextBudget {
     ///   [`ContextBudget::max_payload_tokens`].
     /// * 4 clipboard is head-truncated at a hard cap.
     /// * 5 history drops whole turns, oldest first.
+    ///
+    /// **Image attachments are charged between 2 and 3**, and are neither
+    /// truncated nor dropped — see [`IMAGE_ALLOWANCE_DIVISOR`]. Charging them
+    /// before the payload is what makes the truncatable content yield to the
+    /// untruncatable content rather than the other way round.
     pub fn fit(&self, inputs: ContextInputs) -> Result<FittedContext> {
         let ContextInputs {
             system,
             preamble,
             instruction,
+            attachments,
             payload,
             clipboard,
             history,
@@ -1001,6 +1053,28 @@ impl ContextBudget {
             });
         }
         used += fixed;
+
+        // -- between 2 and 3: image attachments, never truncated -------------
+        // §5's table has no row for these because §2 scoped v1 as text-only.
+        // They are charged here, ahead of the payload, for one reason: an
+        // attachment is the only content in the request that *cannot* be made
+        // smaller. Charging it after the payload would let a large selection
+        // eat the room an image needs and then leave nothing to do about it —
+        // the payload can absorb the squeeze, the image cannot.
+        //
+        // Refusing rather than dropping is the same rule as `Capabilities::
+        // vision`: a model that answers about an image it never received is
+        // fluently, invisibly wrong. `ContextTooLarge` names both numbers and
+        // the user can remove an attachment.
+        report.image_tokens = attachment_tokens(&attachments);
+        let image_allowance = self.images().min(max_context.saturating_sub(used));
+        if report.image_tokens > image_allowance {
+            return Err(AiboError::ContextTooLarge {
+                limit: image_allowance.get(),
+                actual: report.image_tokens.get(),
+            });
+        }
+        used += report.image_tokens;
 
         // -- priority 3: selection / field prefix, middle-out ----------------
         // The payload shares one budget: the smaller of what is left and the
@@ -1087,12 +1161,32 @@ impl ContextBudget {
             system,
             preamble,
             instruction,
+            // Returned exactly as they arrived. There is no code path here that
+            // removes one, and that is the invariant `fit` is asserting: the
+            // budget may refuse a request carrying an image, but it may never
+            // hand back a request that quietly lost one.
+            attachments,
             payload: fitted_payload,
             clipboard: fitted_clipboard,
             history: kept,
             report,
         })
     }
+}
+
+/// Estimated image-input tokens of an attachment set (§14).
+///
+/// Sums [`Attachment::estimated_image_tokens`], which is `w × h / 750` — the
+/// closest thing to a portable formula across §10's matrix. An estimate, and
+/// deliberately the same one the pre-dispatch cost reserve uses, so the budget
+/// and the meter can never disagree about how big an image is.
+pub fn attachment_tokens(attachments: &[Attachment]) -> Tokens {
+    Tokens::new(
+        attachments
+            .iter()
+            .map(Attachment::estimated_image_tokens)
+            .sum(),
+    )
 }
 
 /// Tokens a fence costs on top of its content.
@@ -1121,6 +1215,15 @@ pub struct ContextInputs {
     pub preamble: Option<String>,
     /// Priority 2. The user's own typed instruction, verbatim.
     pub instruction: Option<String>,
+    /// Items the user deliberately attached (§2 modalities).
+    ///
+    /// Charged between priorities 2 and 3, never truncated and never dropped —
+    /// see [`IMAGE_ALLOWANCE_DIVISOR`]. They are **untrusted content** on
+    /// exactly the terms the fenced blocks are: rendered text inside a
+    /// screenshot defeats every textual filter, so nothing derived from one may
+    /// authorise a tool call (§5 rule 2, and
+    /// [`crate::types::AttachmentSource::origin`]).
+    pub attachments: Vec<Attachment>,
     /// Priority 3, in the order they should be fitted (selection first, then
     /// field prefix, then field suffix).
     pub payload: Vec<UntrustedBlock>,
@@ -1139,6 +1242,9 @@ pub struct FittedContext {
     pub preamble: Option<String>,
     /// Priority 2, untouched.
     pub instruction: Option<String>,
+    /// Every attachment that came in, untouched — the budget refuses rather
+    /// than dropping one.
+    pub attachments: Vec<Attachment>,
     /// Priority 3, possibly middle-out truncated.
     pub payload: Vec<UntrustedBlock>,
     /// Priority 4, possibly head-truncated.
@@ -1163,6 +1269,12 @@ pub struct BudgetReport {
     pub preamble_tokens: Tokens,
     /// Priority 2, the user's instruction.
     pub instruction_tokens: Tokens,
+    /// Estimated image-input tokens of the attachment set (§14).
+    ///
+    /// Included in [`BudgetReport::total_tokens`]: an image costs no *text*
+    /// tokens but is billed as input, and a total that omits it is a total that
+    /// lies at exactly the moment the request got expensive.
+    pub image_tokens: Tokens,
     /// Priority 3, fences included.
     pub payload_tokens: Tokens,
     /// Priority 4, fences included.
@@ -1657,6 +1769,130 @@ mod tests {
         }
     }
 
+    // -- image attachments (§5, §14) ----------------------------------------
+
+    fn image(w: u32, h: u32) -> Attachment {
+        Attachment::image(
+            crate::types::AttachmentSource::ScreenRegion,
+            vec![0u8; 4_096],
+            "image/png",
+            w,
+            h,
+            "Screenshot",
+        )
+    }
+
+    #[test]
+    fn an_attachment_is_charged_to_the_budget_and_shows_in_the_report() {
+        // The point of the whole change: an image costs no *text* tokens, so a
+        // budget that only measures strings reports a total that is thousands
+        // of tokens short of what the provider will bill.
+        let b = budget(64_000);
+        let one = image(1568, 882); // ~1.38 Mpx -> 1844 tokens
+        let expected = Tokens::new(one.estimated_image_tokens());
+        assert!(expected > Tokens::new(1_800), "{expected}");
+
+        let bare = b
+            .fit(ContextInputs {
+                system: "system".into(),
+                instruction: Some("what is in this".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        let with = b
+            .fit(ContextInputs {
+                system: "system".into(),
+                instruction: Some("what is in this".into()),
+                attachments: vec![one],
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(bare.report.image_tokens, Tokens::ZERO);
+        assert_eq!(with.report.image_tokens, expected);
+        assert_eq!(
+            with.report.total_tokens,
+            bare.report.total_tokens + expected
+        );
+    }
+
+    #[test]
+    fn attachments_are_never_dropped_or_truncated_to_fit() {
+        // Every other priority yields: the payload is truncated middle-out, the
+        // clipboard head-only, history by whole turns. An image cannot be, so
+        // what gives is the *payload* — and the attachment set comes back
+        // exactly as it went in.
+        let b = budget(64_000);
+        let fitted = b
+            .fit(ContextInputs {
+                system: "system".into(),
+                instruction: Some("what is in this".into()),
+                attachments: vec![image(1568, 1568), image(1568, 1568)],
+                payload: vec![block(ContentOrigin::Selection, &"あ".repeat(60_000))],
+                ..Default::default()
+            })
+            .unwrap();
+
+        assert_eq!(fitted.attachments.len(), 2);
+        assert!(
+            fitted.report.payload_truncated,
+            "the truncatable content is what yields, not the image"
+        );
+        assert!(fitted.report.total_tokens <= b.context());
+    }
+
+    #[test]
+    fn an_attachment_set_over_the_allowance_refuses_rather_than_dropping_one() {
+        // A model that can see but cannot see *this much*. Refusing is the
+        // whole doctrine: an answer about an image the model never received is
+        // fluent, confident and wrong, with nothing in the transcript to say
+        // so. `ContextTooLarge` names both numbers and the user can remove one.
+        let b = budget(8_000);
+        let allowance = b.images();
+        let attachments = vec![image(1568, 1568); 2];
+        assert!(attachment_tokens(&attachments) > allowance);
+
+        let err = b
+            .fit(ContextInputs {
+                system: "system".into(),
+                instruction: Some("what is in this".into()),
+                attachments,
+                ..Default::default()
+            })
+            .unwrap_err();
+        match err {
+            AiboError::ContextTooLarge { limit, actual } => {
+                assert_eq!(limit, allowance.get());
+                assert!(actual > limit, "{actual} !> {limit}");
+            }
+            other => panic!("expected ContextTooLarge, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_image_allowance_is_a_quarter_of_the_context_and_clamps_with_it() {
+        // Derived rather than stored, which is what makes §14's per-role clamp
+        // apply to image spend for free — shrink the context and the image
+        // allowance shrinks with it, with no second knob to drift out of step.
+        let big = budget(128_000);
+        let small = budget(8_000);
+        assert_eq!(
+            big.images(),
+            Tokens::new(big.max_context_tokens / IMAGE_ALLOWANCE_DIVISOR)
+        );
+        assert!(big.images() > small.images());
+
+        let clamped = crate::cost::RoleCaps {
+            max_output_tokens: 4_096,
+            max_context_tokens: 16_000,
+        }
+        .clamp(big);
+        assert!(
+            clamped.images() < big.images(),
+            "clamping the context must clamp the image allowance"
+        );
+    }
+
     #[test]
     fn a_fitted_context_stays_within_budget() {
         let b = budget(4_096);
@@ -1671,6 +1907,7 @@ mod tests {
                 ],
                 clipboard: Some(block(ContentOrigin::Clipboard, &"clip ".repeat(10_000))),
                 history: (0..10).map(|i| Turn::pair(format!("q{i}"), "a")).collect(),
+                ..Default::default()
             })
             .unwrap();
         assert!(

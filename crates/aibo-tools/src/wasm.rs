@@ -273,6 +273,9 @@ mod tests {
         // sandbox genuinely does.
         let wasm = WasmLimits::default();
         assert!(wasm.fuel > 0, "wasmtime fuel metering must be configured");
-        assert!(wasm.epoch_deadline > Duration::ZERO, "epoch deadline must be set");
+        assert!(
+            wasm.epoch_deadline > Duration::ZERO,
+            "epoch deadline must be set"
+        );
     }
 }

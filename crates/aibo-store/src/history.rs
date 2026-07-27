@@ -56,6 +56,21 @@ pub struct NewMessage {
     pub latency_ms: Option<i64>,
 }
 
+/// One user/assistant exchange to commit as an indivisible history update.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewExchange {
+    /// Append to this conversation, or create one inside the transaction.
+    pub conversation_id: Option<Uuid>,
+    /// Surface for a newly-created conversation.
+    pub surface: Surface,
+    /// Source application for a newly-created conversation.
+    pub source_app: Option<String>,
+    /// The user's typed instruction. `None` records only the assistant result.
+    pub instruction: Option<String>,
+    /// The completed assistant message.
+    pub assistant: NewMessage,
+}
+
 impl Default for NewMessage {
     /// A user message with no body. `aibo-core`'s `MessageRole` has no
     /// `Default` — deliberately, since "which role" is never a safe guess — so
@@ -122,10 +137,44 @@ pub fn create_conversation(
 /// Both statements run in one transaction: a message whose conversation still
 /// claims to be untouched sorts wrongly in the history list forever.
 pub fn insert_message(conn: &mut Connection, conv_id: Uuid, msg: &NewMessage) -> Result<Uuid> {
+    let tx = conn.transaction()?;
+    let id = insert_message_statements(&tx, conv_id, msg)?;
+    tx.commit()?;
+    Ok(id)
+}
+
+/// Commit conversation creation and both sides of an exchange atomically.
+///
+/// A failed assistant write must not leave an empty conversation or a
+/// user-only exchange behind. Existing conversations receive the same atomic
+/// guarantee for the two new messages.
+pub fn insert_exchange(conn: &mut Connection, exchange: &NewExchange) -> Result<Uuid> {
+    let tx = conn.transaction()?;
+    let conv_id = match exchange.conversation_id {
+        Some(id) => id,
+        None => create_conversation(&tx, exchange.surface, exchange.source_app.as_deref())?,
+    };
+
+    if let Some(instruction) = exchange.instruction.as_deref() {
+        insert_message_statements(
+            &tx,
+            conv_id,
+            &NewMessage {
+                role: MessageRole::User,
+                content: instruction.to_owned(),
+                ..Default::default()
+            },
+        )?;
+    }
+    insert_message_statements(&tx, conv_id, &exchange.assistant)?;
+    tx.commit()?;
+    Ok(conv_id)
+}
+
+fn insert_message_statements(conn: &Connection, conv_id: Uuid, msg: &NewMessage) -> Result<Uuid> {
     let id = Uuid::now_v7();
     let now = now_unix();
-    let tx = conn.transaction()?;
-    tx.execute(
+    conn.execute(
         "INSERT INTO messages
            (id, conv_id, role, content, provider, model,
             usage_in, usage_out, cost_micros, latency_ms, created_at)
@@ -144,11 +193,10 @@ pub fn insert_message(conn: &mut Connection, conv_id: Uuid, msg: &NewMessage) ->
             now,
         ],
     )?;
-    tx.execute(
+    conn.execute(
         "UPDATE conversations SET updated_at = ?1 WHERE id = ?2",
         params![now, conv_id],
     )?;
-    tx.commit()?;
     Ok(id)
 }
 
@@ -499,6 +547,82 @@ mod tests {
             .expect("present");
         assert!(c.updated_at >= c.created_at);
         assert_eq!(c.surface, Surface::Ask);
+    }
+
+    #[test]
+    fn inserting_an_exchange_commits_both_messages_together() {
+        let db = Db::open_in_memory().expect("open");
+        let conv = db
+            .with_conn(|conn| {
+                insert_exchange(
+                    conn,
+                    &NewExchange {
+                        conversation_id: None,
+                        surface: Surface::Ask,
+                        source_app: Some("com.example.Editor".into()),
+                        instruction: Some("summarize this".into()),
+                        assistant: NewMessage {
+                            role: MessageRole::Assistant,
+                            content: "summary".into(),
+                            provider: Some("test".into()),
+                            model: Some("test-model".into()),
+                            ..Default::default()
+                        },
+                    },
+                )
+            })
+            .expect("exchange");
+
+        let stored = db.with_conn(|conn| messages(conn, conv)).expect("messages");
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].role, MessageRole::User);
+        assert_eq!(stored[1].role, MessageRole::Assistant);
+    }
+
+    #[test]
+    fn failed_assistant_insert_rolls_back_the_whole_exchange() {
+        let db = Db::open_in_memory().expect("open");
+        db.with_conn(|conn| {
+            conn.execute_batch(
+                "CREATE TRIGGER reject_assistant
+                 BEFORE INSERT ON messages
+                 WHEN NEW.role = 'assistant'
+                 BEGIN
+                     SELECT RAISE(ABORT, 'injected assistant failure');
+                 END;",
+            )?;
+            Ok(())
+        })
+        .expect("failure trigger");
+
+        let result = db.with_conn(|conn| {
+            insert_exchange(
+                conn,
+                &NewExchange {
+                    conversation_id: None,
+                    surface: Surface::Transform,
+                    source_app: None,
+                    instruction: Some("private instruction".into()),
+                    assistant: NewMessage {
+                        role: MessageRole::Assistant,
+                        content: "will fail".into(),
+                        ..Default::default()
+                    },
+                },
+            )
+        });
+        assert!(result.is_err());
+
+        let (conversations, messages): (i64, i64) = db
+            .with_conn(|conn| {
+                Ok((
+                    conn.query_row("SELECT count(*) FROM conversations", [], |row| row.get(0))?,
+                    conn.query_row("SELECT count(*) FROM messages", [], |row| row.get(0))?,
+                ))
+            })
+            .expect("counts");
+        assert_eq!(conversations, 0);
+        assert_eq!(messages, 0);
     }
 
     #[test]

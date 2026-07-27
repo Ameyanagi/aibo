@@ -94,13 +94,11 @@ pub fn build_client(cfg: &HttpConfig) -> Result<Client> {
 /// Open a connection so the first real request does not pay for DNS + TCP +
 /// TLS.
 ///
-/// Called at tray start and again on [`PowerEvent::DidWake`] — after a lid
-/// close every pooled connection is dead and the first hotkey of the day misses
-/// the latency budget unless the pool is re-warmed (§13, §15).
+/// Called once after the tray shell reports ready. Wake handling deliberately
+/// advances health probes without generating background network traffic.
 ///
 /// Failure is not an error: a cold pool is a slow request, not a broken one.
 ///
-/// [`PowerEvent::DidWake`]: aibo_core::types::PowerEvent::DidWake
 pub async fn prewarm(client: &Client, url: &Url) {
     let mut origin = url.clone();
     origin.set_path("/");

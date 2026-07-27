@@ -19,7 +19,7 @@
 //! 2. `tokio::time::timeout` on the reply channel here, so the caller is never
 //!    blocked past its §8 budget even if step 1 is not honoured.
 
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, SyncSender};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -28,16 +28,23 @@ use super::worker::{MacosConfig, Worker};
 
 type Job = Box<dyn FnOnce(&mut Worker) + Send + 'static>;
 
+/// Maximum AX operations waiting behind the in-flight operation.
+///
+/// A capture fans out to only a handful of AX reads. Eight buffered jobs absorb
+/// overlapping hotkeys without retaining an unbounded number of captured app
+/// references when a foreign accessibility tree stalls.
+const PLATFORM_QUEUE_CAPACITY: usize = 8;
+
 /// A `Send + Sync` handle to the thread that owns the AX objects.
 pub(crate) struct PlatformThread {
-    tx: Sender<Job>,
+    tx: SyncSender<Job>,
     handle: Option<JoinHandle<()>>,
 }
 
 impl PlatformThread {
     /// Start the thread.
     pub(crate) fn spawn(config: MacosConfig) -> Self {
-        let (tx, rx) = mpsc::channel::<Job>();
+        let (tx, rx) = mpsc::sync_channel::<Job>(PLATFORM_QUEUE_CAPACITY);
         let handle = std::thread::Builder::new()
             .name("aibo-macos-ax".to_owned())
             .spawn(move || {
@@ -55,6 +62,14 @@ impl PlatformThread {
         }
     }
 
+    fn submit(&self, job: Job) -> MacosResult<()> {
+        match self.tx.try_send(job) {
+            Ok(()) => Ok(()),
+            Err(mpsc::TrySendError::Full(_)) => Err(MacosError::WorkerBusy),
+            Err(mpsc::TrySendError::Disconnected(_)) => Err(MacosError::ThreadGone),
+        }
+    }
+
     /// Run `f` on the platform thread and await its result within `deadline`.
     ///
     /// A deadline expiry does **not** cancel the work — AX has no cancellation
@@ -67,11 +82,9 @@ impl PlatformThread {
         T: Send + 'static,
     {
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.tx
-            .send(Box::new(move |worker| {
-                let _ = reply_tx.send(f(worker));
-            }))
-            .map_err(|_| MacosError::ThreadGone)?;
+        self.submit(Box::new(move |worker| {
+            let _ = reply_tx.send(f(worker));
+        }))?;
 
         match tokio::time::timeout(deadline, reply_rx).await {
             Ok(Ok(result)) => result,
@@ -84,10 +97,44 @@ impl PlatformThread {
 impl Drop for PlatformThread {
     fn drop(&mut self) {
         // Dropping the sender ends the worker's `recv` loop.
-        let (dead, _) = mpsc::channel::<Job>();
+        let (dead, _) = mpsc::sync_channel::<Job>(1);
         let _ = std::mem::replace(&mut self.tx, dead);
         if let Some(handle) = self.handle.take() {
             let _ = handle.join();
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn no_op() -> Job {
+        Box::new(|_| {})
+    }
+
+    #[test]
+    fn saturated_queue_fails_immediately_with_sanitized_error() {
+        let (tx, rx) = mpsc::sync_channel::<Job>(1);
+        let thread = PlatformThread { tx, handle: None };
+
+        thread.submit(no_op()).unwrap();
+        let error = thread.submit(no_op()).unwrap_err();
+
+        assert!(matches!(error, MacosError::WorkerBusy));
+        assert_eq!(error.to_string(), "the macOS platform worker queue is busy");
+        assert!(rx.try_recv().is_ok(), "the first queued job is preserved");
+    }
+
+    #[test]
+    fn closed_queue_reports_the_dead_worker() {
+        let (tx, rx) = mpsc::sync_channel::<Job>(1);
+        drop(rx);
+        let thread = PlatformThread { tx, handle: None };
+
+        assert!(matches!(
+            thread.submit(no_op()),
+            Err(MacosError::ThreadGone)
+        ));
     }
 }

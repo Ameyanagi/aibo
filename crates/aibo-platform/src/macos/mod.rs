@@ -44,6 +44,7 @@ mod clipboard;
 mod display;
 mod error;
 mod keys;
+pub(crate) mod overlay;
 mod permissions;
 mod thread;
 mod worker;

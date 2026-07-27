@@ -15,7 +15,7 @@
 
 use aibo_core::error::{AiboError, Result};
 use aibo_core::types::{Capabilities, Credential, MultiCandidate, ProviderId};
-use url::Url;
+use url::{Host, Url};
 
 use crate::http::HttpConfig;
 use crate::openai_compat::{OpenAiCompat, Quirks, UsagePlacement};
@@ -70,6 +70,11 @@ pub fn provider(base_url: Option<Url>) -> Result<OpenAiCompat> {
         Some(u) => u,
         None => Url::parse(DEFAULT_BASE_URL).map_err(|e| AiboError::Internal(Box::new(e)))?,
     };
+    if url.scheme() == "http" && !is_loopback(&url) {
+        return Err(AiboError::Internal(Box::new(InsecureOllamaEndpoint {
+            endpoint: url.to_string(),
+        })));
+    }
     Ok(OpenAiCompat::new(
         ProviderId::OLLAMA,
         url.clone(),
@@ -78,6 +83,21 @@ pub fn provider(base_url: Option<Url>) -> Result<OpenAiCompat> {
         HttpConfig::local(),
     )?
     .with_capabilities(default_capabilities()))
+}
+
+fn is_loopback(url: &Url) -> bool {
+    match url.host() {
+        Some(Host::Ipv4(address)) => address.is_loopback(),
+        Some(Host::Ipv6(address)) => address.is_loopback(),
+        Some(Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        None => false,
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("plaintext Ollama endpoint `{endpoint}` is not loopback; use HTTPS for remote servers")]
+struct InsecureOllamaEndpoint {
+    endpoint: String,
 }
 
 #[cfg(test)]
@@ -94,9 +114,21 @@ mod tests {
     }
 
     #[test]
-    fn a_custom_endpoint_is_honoured() {
-        let u = Url::parse("http://192.168.1.10:8080/v1").unwrap();
+    fn a_secure_custom_endpoint_is_honoured() {
+        let u = Url::parse("https://ollama.example.test/v1").unwrap();
         let p = provider(Some(u.clone())).unwrap();
         assert_eq!(p.base_url(), &u);
+    }
+
+    #[test]
+    fn plaintext_is_allowed_only_on_loopback() {
+        for endpoint in [
+            "http://localhost:11434/v1",
+            "http://127.0.0.1:11434/v1",
+            "http://[::1]:11434/v1",
+        ] {
+            assert!(provider(Some(Url::parse(endpoint).unwrap())).is_ok());
+        }
+        assert!(provider(Some(Url::parse("http://192.168.1.10:8080/v1").unwrap())).is_err());
     }
 }

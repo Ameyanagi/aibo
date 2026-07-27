@@ -33,6 +33,13 @@ pub trait Provider: Send + Sync {
     /// [`ModelInfo::capabilities`]: crate::types::ModelInfo::capabilities
     fn capabilities(&self) -> Capabilities;
 
+    /// Best-effort connection-pool warmup after the desktop shell is visible.
+    ///
+    /// Providers without an HTTP pool keep the default no-op. Failure is
+    /// intentionally not surfaced: it changes first-request latency, not
+    /// correctness or health.
+    async fn prewarm(&self) {}
+
     /// Start a streaming completion.
     ///
     /// The token is not optional and not an afterthought: `esc` must abort

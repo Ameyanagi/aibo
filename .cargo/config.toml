@@ -32,16 +32,14 @@
 # ## Why this is safe
 #
 # `[env]` entries are **not** forced by default (`force = false` is the
-# default), so an explicit `CC=...` already in the environment still wins. This
-# is a default, not an override — CI, a cross-compile with its own toolchain, or
-# a developer testing another compiler are all unaffected.
+# default), so explicit target-qualified compiler variables already in the
+# environment still win. This is a default, not an override.
 #
-# This is deliberately *not* target-scoped. Cargo's `[env]` has no per-target
-# form, and nothing in this workspace's graph compiles C for a non-Apple target
-# — the Windows backend is cross-*checked* only
-# (`cargo check -p aibo-platform --target x86_64-pc-windows-msvc`), which runs
-# no C compiler at all. If that ever changes, set `CC_x86_64-pc-windows-msvc`
-# rather than removing this.
+# cc-rs recognizes target-qualified variables with underscores. Scoping these
+# defaults to Apple targets preserves the local macOS fix without injecting
+# `/usr/bin/clang` into native Windows builds.
 [env]
-CC = "/usr/bin/clang"
-CXX = "/usr/bin/clang++"
+CC_aarch64_apple_darwin = "/usr/bin/clang"
+CXX_aarch64_apple_darwin = "/usr/bin/clang++"
+CC_x86_64_apple_darwin = "/usr/bin/clang"
+CXX_x86_64_apple_darwin = "/usr/bin/clang++"

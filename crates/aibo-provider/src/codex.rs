@@ -101,7 +101,7 @@ use crate::auth::{
 };
 use crate::http::{HttpConfig, build_client, map_transport_error};
 use crate::openai_compat::{Quirks, ResponsesDecoder, build_responses_body};
-use crate::sse::{decode, events_from_response};
+use crate::sse::{decode, events_from_response, read_error_body, read_json_body};
 use crate::wire::{ErrorShape, map_status, parse_retry_after};
 
 // ---------------------------------------------------------------------------
@@ -439,8 +439,10 @@ impl DeviceAuthClient {
             .map_err(|e| map_transport_error(&ProviderId::CODEX, &e))?;
 
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
+            let body = read_error_body(response, &ProviderId::CODEX)
+                .await
+                .unwrap_or_default();
             return Err(map_status(
                 &ProviderId::CODEX,
                 status.as_u16(),
@@ -449,6 +451,7 @@ impl DeviceAuthClient {
                 &body,
             ));
         }
+        let body = read_json_body(response, &ProviderId::CODEX).await?;
 
         let parsed: UserCodeResponse =
             serde_json::from_str(&body).map_err(|e| AiboError::Internal(Box::new(e)))?;
@@ -498,7 +501,6 @@ impl DeviceAuthClient {
             .map_err(|e| map_transport_error(&ProviderId::CODEX, &e))?;
 
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
 
         // 403 == not approved yet. 429 == back off.
         if status.as_u16() == 403 {
@@ -508,6 +510,9 @@ impl DeviceAuthClient {
             return Ok(PollOutcome::SlowDown);
         }
         if !status.is_success() {
+            let body = read_error_body(response, &ProviderId::CODEX)
+                .await
+                .unwrap_or_default();
             return Err(map_status(
                 &ProviderId::CODEX,
                 status.as_u16(),
@@ -516,6 +521,7 @@ impl DeviceAuthClient {
                 &body,
             ));
         }
+        let body = read_json_body(response, &ProviderId::CODEX).await?;
 
         let parsed: DeviceApprovalResponse =
             serde_json::from_str(&body).map_err(|e| AiboError::Internal(Box::new(e)))?;
@@ -557,8 +563,10 @@ impl DeviceAuthClient {
             .map_err(|e| map_transport_error(&ProviderId::CODEX, &e))?;
 
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
         if !status.is_success() {
+            let body = read_error_body(response, &ProviderId::CODEX)
+                .await
+                .unwrap_or_default();
             return Err(map_status(
                 &ProviderId::CODEX,
                 status.as_u16(),
@@ -567,6 +575,7 @@ impl DeviceAuthClient {
                 &body,
             ));
         }
+        let body = read_json_body(response, &ProviderId::CODEX).await?;
 
         let parsed: TokenResponse =
             serde_json::from_str(&body).map_err(|e| AiboError::Internal(Box::new(e)))?;
@@ -687,7 +696,13 @@ impl TokenRefresh for ChatGptRefresh {
             .map_err(|e| map_transport_error(&ProviderId::CODEX, &e))?;
 
         let status = response.status();
-        let body = response.text().await.unwrap_or_default();
+        let body = if status.is_success() {
+            read_json_body(response, &ProviderId::CODEX).await?
+        } else {
+            read_error_body(response, &ProviderId::CODEX)
+                .await
+                .unwrap_or_default()
+        };
         let parsed: TokenResponse = serde_json::from_str(&body).unwrap_or(TokenResponse {
             access_token: None,
             refresh_token: None,
@@ -763,10 +778,32 @@ pub fn token_provider(
 // ---------------------------------------------------------------------------
 
 /// Provider defaults. Per-model values come from the §19 manifest.
+///
+/// # SPIKE: `vision` is `false` because nothing measured it
+///
+/// §3a exercised this endpoint end-to-end and its measurements covered **text
+/// only** — five model ids, TTFT, and the account-constraint 400. No image input
+/// was ever sent, so image support here is unknown, and unknown is not a reason
+/// to declare a capability. `false` costs a refusal the user can act on ("switch
+/// model"); `true` costs a 400 *after* a multi-megabyte upload has been paid for,
+/// and §4 does not fall back on a 400 — so the wrong guess is not recoverable in
+/// the direction that matters.
+///
+/// This also keeps the provider's own statement consistent with §4, which
+/// already refuses to bind `Role::Vision` to Codex —
+/// `aibo_core::roles::assert_vision_never_binds_codex` makes that a compile
+/// error. A provider declaring `vision: true` while the routing table refuses to
+/// route vision to it is a contradiction of exactly the kind the attachment work
+/// exists to retire.
+///
+/// Revisit with a real probe — one `input_image` part against one allowlist id —
+/// not with an assumption. Flip this and
+/// [`crate::registry::CODEX_VISION_UNVERIFIED`] together.
 pub fn default_capabilities() -> Capabilities {
     Capabilities {
         tools: true,
-        vision: true,
+        // SPIKE: unmeasured; see the doc comment above before changing this.
+        vision: false,
         streaming: true,
         reasoning_effort: true,
         json_schema: true,
@@ -879,6 +916,10 @@ impl Provider for CodexProvider {
         self.capabilities.clone()
     }
 
+    async fn prewarm(&self) {
+        CodexProvider::prewarm(self).await;
+    }
+
     async fn chat(
         &self,
         req: ChatRequest,
@@ -930,8 +971,9 @@ impl Provider for CodexProvider {
                 .get("retry-after")
                 .and_then(|v| v.to_str().ok())
                 .and_then(parse_retry_after);
-            let body = response.text().await.unwrap_or_default();
-            let body: String = body.chars().take(4096).collect();
+            let body = read_error_body(response, &self.id)
+                .await
+                .unwrap_or_default();
             return Err(map_status(
                 &self.id,
                 status.as_u16(),

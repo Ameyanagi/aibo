@@ -34,7 +34,10 @@ use url::Url;
 
 use crate::auth::{AuthStyle, apply_credential};
 use crate::http::{HttpConfig, build_client, map_transport_error};
-use crate::sse::{Flow, SseDecoder, decode, events_from_response};
+use crate::sse::{
+    Flow, MAX_BUFFERED_TOOL_BYTES, MAX_TOOL_CALLS_PER_RESPONSE, SseDecoder, decode,
+    events_from_response, read_error_body,
+};
 use crate::wire::{ErrorShape, flatten_text, map_status, parse_retry_after, parse_tool_args};
 
 /// Anthropic's API base URL.
@@ -46,6 +49,13 @@ pub const BASE_URL: &str = "https://api.anthropic.com/v1";
 pub const API_VERSION: &str = "2023-06-01";
 
 /// Provider defaults. Per-model values come from the §19 manifest.
+///
+/// `vision: true` is a statement about the whole current catalogue on this
+/// endpoint, not a guess: every model `GET /v1/models` returns accepts an
+/// `image` content block. It is still only the *fallback* — §10 puts
+/// capabilities on [`ModelInfo`] because one provider routinely serves a vision
+/// model and a text-only one, and if Anthropic ships a text-only model this must
+/// become a per-model value rather than staying true by inertia.
 pub fn default_capabilities() -> Capabilities {
     Capabilities {
         tools: true,
@@ -118,8 +128,9 @@ impl Anthropic {
             .get("retry-after")
             .and_then(|v| v.to_str().ok())
             .and_then(parse_retry_after);
-        let body = response.text().await.unwrap_or_default();
-        let body: String = body.chars().take(4096).collect();
+        let body = read_error_body(response, &self.id)
+            .await
+            .unwrap_or_default();
         Err(map_status(
             &self.id,
             status.as_u16(),
@@ -140,11 +151,20 @@ impl Provider for Anthropic {
         self.capabilities.clone()
     }
 
+    async fn prewarm(&self) {
+        Anthropic::prewarm(self).await;
+    }
+
     async fn chat(
         &self,
         req: ChatRequest,
         cancel: CancellationToken,
     ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+        // Refuse, never strip (§10) — then downscale before the pixels are
+        // base64'd into the body (§14). See `crate::attachment`.
+        crate::attachment::guard(&self.capabilities, &req, Vec::new())?;
+        let req = crate::attachment::prepare(req).await?;
+
         let body = build_messages_body(&req);
         let rb = self
             .client
@@ -247,11 +267,27 @@ impl Provider for Anthropic {
 /// Build a `POST /v1/messages` body.
 ///
 /// Pure, so it can be pinned by a golden file.
+///
+/// # Images are a fourth difference from the OpenAI-compatible path
+///
+/// Anthropic takes an image as `{"type": "image", "source": {"type": "base64",
+/// "media_type": …, "data": …}}` — the bytes are a bare base64 string in a
+/// nested `source` object, with the media type as its own field. The Responses
+/// format wants an `input_image` part whose `image_url` is a `data:` URL, and
+/// Chat Completions wants an `image_url` *object*. Three shapes for one image is
+/// precisely why §10 keeps per-provider implementations instead of a
+/// lowest-common-denominator layer.
+///
+/// [`ChatRequest::attachments`] are folded onto the last user message by
+/// [`crate::attachment::fold_into_messages`], which is also what guarantees they
+/// never land in `system` — Anthropic rejects a `system`-role message outright,
+/// and §5 would have an image in the instructions authorising things.
 pub fn build_messages_body(req: &ChatRequest) -> Value {
     let mut system = String::new();
     let mut messages: Vec<Value> = Vec::new();
 
-    for msg in &req.messages {
+    let folded = crate::attachment::fold_into_messages(req);
+    for msg in folded.iter() {
         match msg.role {
             MessageRole::System => {
                 if !system.is_empty() {
@@ -424,6 +460,8 @@ pub struct MessagesDecoder {
     /// straight through; only tool blocks have to be buffered, because
     /// `input_json_delta` fragments are not parseable until the block closes.
     tool_blocks: std::collections::BTreeMap<usize, ToolBlock>,
+    buffered_tool_bytes: usize,
+    tool_calls_seen: usize,
     usage: Usage,
     saw_usage: bool,
     stop: Option<StopReason>,
@@ -431,6 +469,21 @@ pub struct MessagesDecoder {
 }
 
 impl MessagesDecoder {
+    fn reject_tool_volume(
+        &mut self,
+        out: &mut Vec<Result<StreamEvent>>,
+        message: &'static str,
+    ) -> Flow {
+        self.emitted_terminal = true;
+        self.tool_blocks.clear();
+        self.buffered_tool_bytes = 0;
+        out.push(Err(AiboError::Internal(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            message,
+        )))));
+        Flow::Stop
+    }
+
     fn finish(&mut self, out: &mut Vec<Result<StreamEvent>>) {
         if self.emitted_terminal {
             return;
@@ -489,11 +542,30 @@ impl SseDecoder for MessagesDecoder {
                 if let Some(block) = parsed.content_block
                     && block.kind == "tool_use"
                 {
+                    if self.tool_calls_seen >= MAX_TOOL_CALLS_PER_RESPONSE
+                        || self.tool_blocks.contains_key(&parsed.index)
+                    {
+                        return self.reject_tool_volume(
+                            out,
+                            "provider exceeded the tool-call count limit",
+                        );
+                    }
+                    self.tool_calls_seen += 1;
+                    let id = block.id.unwrap_or_default();
+                    let name = block.name.unwrap_or_default();
+                    let added = id.len().saturating_add(name.len());
+                    if self.buffered_tool_bytes.saturating_add(added) > MAX_BUFFERED_TOOL_BYTES {
+                        return self.reject_tool_volume(
+                            out,
+                            "provider exceeded the buffered tool-call limit",
+                        );
+                    }
+                    self.buffered_tool_bytes += added;
                     self.tool_blocks.insert(
                         parsed.index,
                         ToolBlock {
-                            id: block.id.unwrap_or_default(),
-                            name: block.name.unwrap_or_default(),
+                            id,
+                            name,
                             args: String::new(),
                         },
                     );
@@ -513,9 +585,22 @@ impl SseDecoder for MessagesDecoder {
                             }
                         }
                         "input_json_delta" => {
-                            if let Some(block) = self.tool_blocks.get_mut(&parsed.index)
-                                && let Some(frag) = delta.partial_json
+                            if let Some(frag) = delta.partial_json
+                                && self.tool_blocks.contains_key(&parsed.index)
                             {
+                                if self.buffered_tool_bytes.saturating_add(frag.len())
+                                    > MAX_BUFFERED_TOOL_BYTES
+                                {
+                                    return self.reject_tool_volume(
+                                        out,
+                                        "provider exceeded the buffered tool-argument limit",
+                                    );
+                                }
+                                self.buffered_tool_bytes += frag.len();
+                                let block = self
+                                    .tool_blocks
+                                    .get_mut(&parsed.index)
+                                    .expect("presence checked above");
                                 block.args.push_str(&frag);
                             }
                         }
@@ -527,6 +612,12 @@ impl SseDecoder for MessagesDecoder {
             }
             "content_block_stop" => {
                 if let Some(block) = self.tool_blocks.remove(&parsed.index) {
+                    let released = block
+                        .id
+                        .len()
+                        .saturating_add(block.name.len())
+                        .saturating_add(block.args.len());
+                    self.buffered_tool_bytes = self.buffered_tool_bytes.saturating_sub(released);
                     match parse_tool_args(&block.args) {
                         Ok(args) => out.push(Ok(StreamEvent::ToolCall {
                             id: block.id,
@@ -571,5 +662,57 @@ impl SseDecoder for MessagesDecoder {
 
     fn on_end(&mut self, out: &mut Vec<Result<StreamEvent>>) {
         self.finish(out);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn event(value: Value) -> Event {
+        Event {
+            data: value.to_string(),
+            ..Event::default()
+        }
+    }
+
+    #[test]
+    fn fragmented_tool_arguments_have_a_cumulative_memory_bound() {
+        let fragment = "x".repeat((MAX_BUFFERED_TOOL_BYTES / 2) + 1);
+        let mut decoder = MessagesDecoder::default();
+        let mut out = Vec::new();
+        assert_eq!(
+            decoder.on_event(
+                &event(json!({
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {
+                        "type": "tool_use",
+                        "id": "call-1",
+                        "name": "run"
+                    }
+                })),
+                &mut out,
+            ),
+            Flow::Continue
+        );
+        for expected in [Flow::Continue, Flow::Stop] {
+            assert_eq!(
+                decoder.on_event(
+                    &event(json!({
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": &fragment
+                        }
+                    })),
+                    &mut out,
+                ),
+                expected
+            );
+        }
+        assert_eq!(out.len(), 1);
+        assert!(matches!(out[0], Err(AiboError::Internal(_))));
     }
 }

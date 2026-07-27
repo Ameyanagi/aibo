@@ -30,6 +30,10 @@ pub enum MacosError {
     #[error("the macOS platform thread is not running")]
     ThreadGone,
 
+    /// The bounded AX queue is full because the worker is still occupied.
+    #[error("the macOS platform worker queue is busy")]
+    WorkerBusy,
+
     /// The app exposes no usable accessibility tree, or the specific attribute
     /// is unsupported (`kAXErrorAttributeUnsupported`).
     #[error("accessibility read failed: {0}")]

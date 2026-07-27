@@ -95,43 +95,25 @@ impl SessionStore for SqliteStore {
         let id = self
             .db
             .call(move |conn| {
-                let conv = match exchange.conversation_id {
-                    Some(id) => id,
-                    None => aibo_store::history::create_conversation(
-                        conn,
-                        exchange.surface,
-                        exchange.source_app.as_deref(),
-                    )?,
-                };
-
-                if let Some(instruction) = exchange.instruction.as_deref() {
-                    aibo_store::history::insert_message(
-                        conn,
-                        conv,
-                        &aibo_store::history::NewMessage {
-                            role: MessageRole::User,
-                            content: instruction.to_owned(),
-                            ..Default::default()
-                        },
-                    )?;
-                }
-
-                aibo_store::history::insert_message(
+                aibo_store::history::insert_exchange(
                     conn,
-                    conv,
-                    &aibo_store::history::NewMessage {
-                        role: MessageRole::Assistant,
-                        content: exchange.assistant,
-                        provider: Some(exchange.provider.as_str().to_owned()),
-                        model: Some(exchange.model),
-                        usage_in: i64::try_from(exchange.usage.input_tokens).ok(),
-                        usage_out: i64::try_from(exchange.usage.output_tokens).ok(),
-                        cost_micros: exchange.cost_micros.and_then(|c| i64::try_from(c).ok()),
-                        latency_ms: i64::try_from(exchange.latency_ms).ok(),
+                    &aibo_store::history::NewExchange {
+                        conversation_id: exchange.conversation_id,
+                        surface: exchange.surface,
+                        source_app: exchange.source_app,
+                        instruction: exchange.instruction,
+                        assistant: aibo_store::history::NewMessage {
+                            role: MessageRole::Assistant,
+                            content: exchange.assistant,
+                            provider: Some(exchange.provider.as_str().to_owned()),
+                            model: Some(exchange.model),
+                            usage_in: i64::try_from(exchange.usage.input_tokens).ok(),
+                            usage_out: i64::try_from(exchange.usage.output_tokens).ok(),
+                            cost_micros: exchange.cost_micros.and_then(|c| i64::try_from(c).ok()),
+                            latency_ms: i64::try_from(exchange.latency_ms).ok(),
+                        },
                     },
-                )?;
-
-                Ok(conv)
+                )
             })
             .await
             .map_err(|e| aibo_core::AiboError::Internal(Box::new(PersistFailed(e))))?;

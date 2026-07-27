@@ -21,8 +21,10 @@ pub use claude_code::{ClaudeCodeCli, ClaudeCodeConfig, ClaudeCodeError};
 pub use codex_app_server::{CodexAppServer, CodexConfig, CodexError};
 pub use limits::LimitTracker;
 pub use native_loop::{
-    NativeLoop, NativeLoopConfig, NoTools, ToolExecutor, ToolIntent, ToolInvocation, ToolOutput,
+    AuthorizedToolInvocation, NativeLoop, NativeLoopConfig, NoTools, ToolExecutor, ToolIntent,
+    ToolInvocation, ToolOutput,
 };
 pub use permission_gate::{
-    ApprovalUi, Authorisation, DenyReason, GatedCall, PermissionGate, TierTable,
+    ApprovalResponse, ApprovalUi, Authorisation, DenyReason, GatedCall, PermissionGate, TierTable,
+    verify_approval_response,
 };

@@ -175,6 +175,26 @@ pub const CHEAP_CHAIN: &[DefaultEntry] = &[
 ];
 
 /// `Vision`: OpenAI → Anthropic → Vertex (§4).
+///
+/// # Codex is absent, and that is a measurement, not an oversight
+///
+/// §3a's allowlist for the ChatGPT-subscription endpoint is exactly five ids —
+/// `gpt-5.5`, `gpt-5.6-terra`, `gpt-5.3-codex-spark`, `gpt-5.6-luna`,
+/// `gpt-5.6-sol` — and **none of them has verified image-input support**. Adding
+/// Codex here would be a guess, and §4 does not fall back on a 400, so the guess
+/// would surface as a hard failure on the user's first screenshot rather than as
+/// a quiet retry elsewhere. Enforced by [`assert_vision_never_binds_codex`] at
+/// compile time and by [`RoleBindings::validate`] for user-supplied chains.
+///
+/// # An empty chain is a correct state
+///
+/// Every entry is [`Precondition::Configured`], so with no vision provider set
+/// up the seeded chain is **empty** rather than populated with something that
+/// will fail. Callers must render that as
+/// [`crate::AiboError::VisionUnsupported`] with `binding: None` — "attach needs
+/// a vision-capable provider; configure OpenAI, Anthropic or Vertex" — and not
+/// as `NoProviderConfigured`, which claims nothing is configured at all and is
+/// exactly the contradiction the attachment work exists to retire.
 pub const VISION_CHAIN: &[DefaultEntry] = &[
     DefaultEntry {
         provider: "openai",
@@ -289,11 +309,27 @@ pub const fn assert_fast_never_binds_codex() {
 
 const _: () = assert_fast_never_binds_codex();
 
+/// The `Vision`-never-Codex invariant of §4, as a `const fn`.
+///
+/// §3a's measured allowlist has no verified vision support, and §4 does not fall
+/// back on a 400 — so a Codex entry here turns the first attached screenshot
+/// into a hard failure. Called from a `const` item, so adding one is a
+/// **compile error**.
+pub const fn assert_vision_never_binds_codex() {
+    assert!(
+        !chain_binds_codex(VISION_CHAIN),
+        "§4: the Vision role must never bind Codex. §3a's measured allowlist \
+         (gpt-5.5, gpt-5.6-terra, gpt-5.3-codex-spark, gpt-5.6-luna, \
+         gpt-5.6-sol) has no verified image-input support, and §4 does not fall \
+         back on a 400. Bind Vision to OpenAI, Anthropic or Vertex."
+    );
+}
+
 // The same check for the derived chains, so `Cheap` and `Vision` cannot pick up
 // a Codex entry either. `Smart` and `Agent` are *expected* to have one, and are
 // asserted the other way so a silent removal is caught too.
 const _: () = assert!(!chain_binds_codex(CHEAP_CHAIN));
-const _: () = assert!(!chain_binds_codex(VISION_CHAIN));
+const _: () = assert_vision_never_binds_codex();
 const _: () = assert!(chain_binds_codex(SMART_CHAIN));
 
 // ---------------------------------------------------------------------------
@@ -505,24 +541,74 @@ impl RoleBindings {
             .collect()
     }
 
-    /// §4's `Fast`-never-Codex invariant, applied to *user-supplied* chains.
+    /// Whether [`Role::Vision`] has at least one usable entry.
     ///
-    /// The compile-time assertion covers the shipped table; this covers the
+    /// The gate an attachment has to pass before a request is even built: when
+    /// this is `false`, the caller raises
+    /// [`AiboError::no_vision_provider`] with [`vision_providers`] as the
+    /// actionable list, instead of routing to an empty chain and reporting
+    /// `NoProviderConfigured`.
+    pub fn can_see_images(&self) -> bool {
+        self.chain(Role::Vision)
+            .is_some_and(|c| !c.entries.is_empty())
+    }
+
+    /// `provider/model` ids from the seeded [`Role::Vision`] chain, best first.
+    ///
+    /// Feeds [`crate::AiboError::VisionUnsupported::alternatives`] so the panel's
+    /// one §13 action can offer a model that actually works rather than just
+    /// naming the one that does not. Empty when no vision provider is
+    /// configured, which is the `binding: None` case.
+    pub fn vision_alternatives(&self) -> Vec<String> {
+        self.chain(Role::Vision)
+            .map(|c| {
+                c.entries
+                    .iter()
+                    .map(|b| format!("{}/{}", b.provider, b.model))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// §4's `Fast`-never-Codex and `Vision`-never-Codex invariants, applied to
+    /// *user-supplied* chains.
+    ///
+    /// The compile-time assertions cover the shipped table; this covers the
     /// settings UI, an imported config and a future server-pushed manifest —
     /// the cases where the check cannot be static.
     pub fn validate(&self) -> Result<()> {
-        if let Some(chain) = self.chain(Role::Fast)
-            && let Some(bad) = chain
-                .entries
-                .iter()
-                .find(|b| b.provider.as_str() == CODEX_PROVIDER)
-        {
+        if let Some(bad) = self.codex_entry(Role::Fast) {
             return Err(AiboError::Internal(Box::new(FastRoleBindsCodex {
+                model: bad.model.clone(),
+            })));
+        }
+        if let Some(bad) = self.codex_entry(Role::Vision) {
+            return Err(AiboError::Internal(Box::new(VisionRoleBindsCodex {
                 model: bad.model.clone(),
             })));
         }
         Ok(())
     }
+
+    fn codex_entry(&self, role: Role) -> Option<&ModelBinding> {
+        self.chain(role)?
+            .entries
+            .iter()
+            .find(|b| b.provider.as_str() == CODEX_PROVIDER)
+    }
+}
+
+/// The providers §4's [`Role::Vision`] chain draws on, in order.
+///
+/// What settings offers, and what
+/// [`crate::AiboError::VisionUnsupported::alternatives`] carries when the chain
+/// is empty: "configure OpenAI, Anthropic or Vertex" is actionable; "no provider
+/// is configured" is not.
+pub fn vision_providers() -> Vec<ProviderId> {
+    VISION_CHAIN
+        .iter()
+        .map(|e| ProviderId::new(e.provider))
+        .collect()
 }
 
 /// The `Fast`-never-Codex violation, as an error a caller can match on.
@@ -537,6 +623,23 @@ impl RoleBindings {
     floor = CODEX_TTFT_FLOOR_MS
 )]
 pub struct FastRoleBindsCodex {
+    /// The Codex model that was bound.
+    pub model: String,
+}
+
+/// The `Vision`-never-Codex violation, as an error a caller can match on.
+///
+/// Distinct from [`FastRoleBindsCodex`] because the reason is different and the
+/// settings copy has to differ with it: `Fast` refuses Codex on measured
+/// latency, `Vision` refuses it on absent capability.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+#[error(
+    "the Vision role cannot bind codex/{model}: none of §3a's measured allowlist \
+     has verified image-input support, and §4 does not fall back on a 400, so an \
+     attached image would fail outright. Bind Vision to OpenAI, Anthropic or \
+     Vertex instead."
+)]
+pub struct VisionRoleBindsCodex {
     /// The Codex model that was bound.
     pub model: String,
 }
@@ -699,6 +802,113 @@ mod tests {
             b.primary(Role::Smart).unwrap().provider,
             ProviderId::CODEX,
             "§4 puts Codex first on Smart when authed"
+        );
+    }
+
+    // -- Vision is never Codex, and an empty chain is actionable -------------
+
+    #[test]
+    fn vision_never_binds_codex_in_the_shipped_table() {
+        // §3a's measured allowlist has no verified image-input support, and §4
+        // does not fall back on a 400 — so a Codex entry here would fail the
+        // user's first screenshot outright.
+        assert!(!chain_binds_codex(VISION_CHAIN));
+        assert_vision_never_binds_codex();
+    }
+
+    #[test]
+    fn vision_never_binds_codex_under_any_availability() {
+        for authed in [false, true] {
+            for detected in [false, true] {
+                for on_path in [false, true] {
+                    let a = Availability {
+                        configured: everything().configured,
+                        codex_authenticated: authed,
+                        ollama_detected: detected,
+                        codex_cli_on_path: on_path,
+                    };
+                    let b = RoleBindings::seed(&a);
+                    let vision = b.chain(Role::Vision).unwrap();
+                    assert!(
+                        !vision
+                            .entries
+                            .iter()
+                            .any(|e| e.provider == ProviderId::CODEX),
+                        "Codex reached Vision with {a:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_user_supplied_codex_binding_on_vision_is_rejected() {
+        let err = RoleBindings::from_chains([RoleChain {
+            role: Role::Vision,
+            entries: vec![ModelBinding {
+                provider: ProviderId::CODEX,
+                model: "gpt-5.6-sol".into(),
+            }],
+            fallback_enabled: false,
+            allow_crossing_trust_boundary: false,
+        }])
+        .unwrap_err();
+        let rendered = format!("{}", err.source().unwrap());
+        assert!(rendered.contains("image-input"), "{rendered}");
+        assert!(rendered.contains("Vision"), "{rendered}");
+    }
+
+    #[test]
+    fn a_rejected_vision_edit_leaves_the_previous_binding_intact() {
+        let mut b = RoleBindings::seed(&everything());
+        let before = b.chain(Role::Vision).unwrap().clone();
+        assert!(
+            b.set_chain(RoleChain {
+                role: Role::Vision,
+                entries: vec![ModelBinding {
+                    provider: ProviderId::CODEX,
+                    model: "gpt-5.5".into(),
+                }],
+                fallback_enabled: false,
+                allow_crossing_trust_boundary: false,
+            })
+            .is_err()
+        );
+        assert_eq!(b.chain(Role::Vision).unwrap(), &before);
+    }
+
+    #[test]
+    fn with_no_vision_provider_the_chain_is_empty_and_the_fix_is_named() {
+        // Cerebras is configured, so the user is *not* in a "nothing works"
+        // state — reporting `NoProviderConfigured` here is the 2026-07-26 bug.
+        // The honest answer is an empty Vision chain plus the list to configure.
+        let b = RoleBindings::seed(&Availability::configured([ProviderId::CEREBRAS]));
+        assert!(!b.can_see_images());
+        assert!(b.chain(Role::Vision).unwrap().entries.is_empty());
+        assert!(b.vision_alternatives().is_empty());
+        assert_eq!(
+            vision_providers(),
+            vec![
+                ProviderId::OPENAI,
+                ProviderId::ANTHROPIC,
+                ProviderId::VERTEX
+            ]
+        );
+        // Fast still works: the user's text setup is untouched.
+        assert!(b.primary(Role::Fast).is_some());
+    }
+
+    #[test]
+    fn vision_alternatives_are_provider_slash_model_in_chain_order() {
+        let b = RoleBindings::seed(&everything());
+        assert!(b.can_see_images());
+        assert_eq!(
+            b.vision_alternatives(),
+            vec![
+                "openai/gpt-5".to_string(),
+                "anthropic/claude-sonnet-4-5".to_string(),
+                "vertex/gemini-3-pro".to_string(),
+            ]
         );
     }
 

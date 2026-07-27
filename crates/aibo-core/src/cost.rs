@@ -1184,6 +1184,7 @@ output = 1
             tools: Vec::new(),
             user_instruction: None,
             untrusted: Vec::new(),
+            attachments: Vec::new(),
             prompt_version: "complete/1".into(),
         }
     }

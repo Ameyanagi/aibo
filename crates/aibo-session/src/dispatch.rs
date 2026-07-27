@@ -22,6 +22,13 @@ use tokio_util::sync::CancellationToken;
 
 use crate::event::{EventSink, SessionEvent};
 
+/// Largest cumulative text-plus-reasoning payload forwarded from one attempt.
+///
+/// Provider-side token limits are advisory and several compatible endpoints do
+/// not accept one at all. This is the final local bound protecting both the
+/// retained result and the UI event queue from an endless successful stream.
+pub(crate) const MAX_STREAM_OUTPUT_BYTES: usize = 4 << 20;
+
 /// Everything one attempt produced.
 #[derive(Debug, Default)]
 pub(crate) struct StreamOutcome {
@@ -82,6 +89,7 @@ pub(crate) async fn drive(
     events: &EventSink,
 ) -> StreamOutcome {
     let mut out = StreamOutcome::default();
+    let mut output_bytes = 0_usize;
 
     loop {
         let next = tokio::select! {
@@ -121,7 +129,9 @@ pub(crate) async fn drive(
         };
 
         match item {
-            Ok(event) => {
+            Ok(mut event) => {
+                let output_limit_hit = limit_generated_output(&mut event, &mut output_bytes);
+
                 if let StreamEvent::Text(chunk) = &event
                     && !chunk.is_empty()
                     && !out.tokens_seen
@@ -129,7 +139,14 @@ pub(crate) async fn drive(
                     out.tokens_seen = true;
                     let ms = started.elapsed().as_millis().min(u128::from(u64::MAX)) as u64;
                     out.first_token_ms = Some(ms);
-                    events.emit(SessionEvent::FirstToken { elapsed_ms: ms });
+                    if !events
+                        .emit_stream(SessionEvent::FirstToken { elapsed_ms: ms }, cancel)
+                        .await
+                        && cancel.is_cancelled()
+                    {
+                        out.cancelled = true;
+                        break;
+                    }
                 }
 
                 match &event {
@@ -140,7 +157,30 @@ pub(crate) async fn drive(
                 }
 
                 let done = matches!(event, StreamEvent::Done(_));
-                events.emit(SessionEvent::Stream(Box::new(event)));
+                let discard_limited_event = output_limit_hit
+                    && (matches!(
+                        &event,
+                        StreamEvent::Text(chunk) | StreamEvent::Reasoning(chunk) if chunk.is_empty()
+                    ) || matches!(&event, StreamEvent::ToolCall { .. }));
+                if !discard_limited_event
+                    && !events
+                        .emit_stream(SessionEvent::Stream(Box::new(event)), cancel)
+                        .await
+                    && cancel.is_cancelled()
+                {
+                    out.cancelled = true;
+                    break;
+                }
+                if output_limit_hit {
+                    cancel.cancel();
+                    out.error = Some(AiboError::Internal(Box::new(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "provider output exceeded the {MAX_STREAM_OUTPUT_BYTES}-byte limit"
+                        ),
+                    ))));
+                    break;
+                }
                 if done {
                     break;
                 }
@@ -156,6 +196,62 @@ pub(crate) async fn drive(
     // explicit rather than relying on the end of the function.
     drop(stream);
     out
+}
+
+fn limit_generated_output(event: &mut StreamEvent, used: &mut usize) -> bool {
+    let chunk = match event {
+        StreamEvent::Text(chunk) | StreamEvent::Reasoning(chunk) => chunk,
+        StreamEvent::ToolCall { id, name, args } => {
+            // Count a fixed envelope as well as the variable fields so a
+            // malicious stream of empty tool calls cannot bypass the byte
+            // ceiling by producing zero-length values forever.
+            let bytes = 64_usize
+                .saturating_add(id.len())
+                .saturating_add(name.len())
+                .saturating_add(json_value_bytes(args));
+            if used.saturating_add(bytes) > MAX_STREAM_OUTPUT_BYTES {
+                return true;
+            }
+            *used += bytes;
+            return false;
+        }
+        StreamEvent::Usage(_) | StreamEvent::Done(_) => {
+            return false;
+        }
+    };
+    let remaining = MAX_STREAM_OUTPUT_BYTES.saturating_sub(*used);
+    if chunk.len() <= remaining {
+        *used += chunk.len();
+        return false;
+    }
+
+    let mut boundary = remaining;
+    while !chunk.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    chunk.truncate(boundary);
+    *used += chunk.len();
+    true
+}
+
+fn json_value_bytes(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::Null => 4,
+        serde_json::Value::Bool(_) => 5,
+        serde_json::Value::Number(number) => number.to_string().len(),
+        serde_json::Value::String(string) => string.len().saturating_add(2),
+        serde_json::Value::Array(items) => items.iter().fold(2, |bytes, item| {
+            bytes
+                .saturating_add(1)
+                .saturating_add(json_value_bytes(item))
+        }),
+        serde_json::Value::Object(entries) => entries.iter().fold(2, |bytes, (key, value)| {
+            bytes
+                .saturating_add(key.len())
+                .saturating_add(3)
+                .saturating_add(json_value_bytes(value))
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -288,5 +384,78 @@ mod tests {
         assert!(out.cancelled);
         assert!(out.text.is_empty());
         assert!(!out.may_fall_back());
+    }
+
+    #[tokio::test]
+    async fn cumulative_output_is_bounded_on_a_utf8_boundary() {
+        let (sink, mut rx) = EventSink::channel();
+        let cancel = CancellationToken::new();
+        // The byte limit falls in the middle of the final two-byte character.
+        let oversized = format!("{}é", "x".repeat(MAX_STREAM_OUTPUT_BYTES - 1));
+
+        let out = drive(
+            events_of(vec![
+                Ok(StreamEvent::Text(oversized)),
+                Ok(StreamEvent::Done(StopReason::EndTurn)),
+            ]),
+            &cancel,
+            far_future(),
+            Instant::now(),
+            &sink,
+        )
+        .await;
+
+        assert_eq!(out.text.len(), MAX_STREAM_OUTPUT_BYTES - 1);
+        assert!(out.text.is_char_boundary(out.text.len()));
+        assert!(matches!(out.error, Some(AiboError::Internal(_))));
+        assert!(out.stop.is_none());
+        assert!(cancel.is_cancelled());
+
+        assert!(matches!(
+            rx.recv().await,
+            Some(SessionEvent::FirstToken { .. })
+        ));
+        let Some(SessionEvent::Stream(event)) = rx.recv().await else {
+            panic!("the bounded partial text event must be forwarded");
+        };
+        assert!(matches!(
+            *event,
+            StreamEvent::Text(ref text) if text.len() == MAX_STREAM_OUTPUT_BYTES - 1
+        ));
+        assert!(
+            rx.try_recv().is_err(),
+            "the terminal event must not leak through"
+        );
+    }
+
+    #[tokio::test]
+    async fn oversized_tool_arguments_are_rejected_before_ui_fan_out() {
+        let (sink, mut rx) = EventSink::channel();
+        let cancel = CancellationToken::new();
+        let out = drive(
+            events_of(vec![
+                Ok(StreamEvent::ToolCall {
+                    id: "call-1".into(),
+                    name: "run".into(),
+                    args: serde_json::json!({
+                        "input": "x".repeat(MAX_STREAM_OUTPUT_BYTES),
+                    }),
+                }),
+                Ok(StreamEvent::Done(StopReason::ToolUse)),
+            ]),
+            &cancel,
+            far_future(),
+            Instant::now(),
+            &sink,
+        )
+        .await;
+
+        assert!(matches!(out.error, Some(AiboError::Internal(_))));
+        assert!(out.stop.is_none());
+        assert!(cancel.is_cancelled());
+        assert!(
+            rx.try_recv().is_err(),
+            "the oversized tool call must not reach the bounded UI queue"
+        );
     }
 }
