@@ -77,6 +77,7 @@ async fn golden<D: SseDecoder + 'static>(name: &str, provider: ProviderId, decod
     let expected = std::fs::read_to_string(&expected_path).unwrap_or_else(|e| {
         panic!("missing golden {name}.expected.json ({e}); re-run with UPDATE_GOLDEN=1")
     });
+    let expected = expected.replace("\r\n", "\n");
     assert_eq!(
         actual.trim(),
         expected.trim(),

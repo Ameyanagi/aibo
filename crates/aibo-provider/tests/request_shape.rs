@@ -44,6 +44,7 @@ fn golden(name: &str, body: &Value) {
     }
     let expected = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("missing golden {name}.request.json ({e})"));
+    let expected = expected.replace("\r\n", "\n");
     assert_eq!(
         actual.trim(),
         expected.trim(),
