@@ -1377,9 +1377,7 @@ output = 1
 
     #[test]
     fn the_wall_clock_ceiling_stops_the_run() {
-        let started = Instant::now()
-            .checked_sub(Duration::from_secs(600))
-            .expect("clock far enough from its epoch");
+        let started = Instant::now();
         let t = AgentLimitTracker::started_at(
             AgentLimits {
                 max_wall_clock: Duration::from_secs(60),
@@ -1387,7 +1385,13 @@ output = 1
             },
             started,
         );
-        assert!(t.check_now().is_err());
+        let err = t.check(started + Duration::from_secs(61)).unwrap_err();
+        assert!(matches!(
+            err,
+            AiboError::BudgetExceeded {
+                kind: BudgetKind::Steps
+            }
+        ));
     }
 
     #[test]
