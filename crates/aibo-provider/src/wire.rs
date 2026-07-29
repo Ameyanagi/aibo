@@ -147,6 +147,8 @@ pub enum ErrorShape {
     Detail,
     /// `{"type":"error","error":{"type":…,"message":…}}` — Anthropic.
     AnthropicEnvelope,
+    /// `{"error":{"code":…,"message":…,"status":…}}` — Google APIs.
+    GoogleError,
     /// Not JSON at all; use the status only.
     Opaque,
 }
@@ -181,7 +183,10 @@ struct DetailEnvelope {
 /// UI (§13: never render a provider's body verbatim).
 pub fn error_message(shape: ErrorShape, body: &str) -> Option<String> {
     match shape {
-        ErrorShape::OpenAiEnvelope | ErrorShape::AnthropicEnvelope => {
+        // Google's envelope is `{"error":{"code","message","status"}}`,
+        // which is structurally the same as OpenAI's once `code` is allowed to
+        // be a number — so the same deserialiser reads it.
+        ErrorShape::OpenAiEnvelope | ErrorShape::AnthropicEnvelope | ErrorShape::GoogleError => {
             let env: OpenAiErrorEnvelope = serde_json::from_str(body).ok()?;
             env.error.message.or_else(|| {
                 env.error

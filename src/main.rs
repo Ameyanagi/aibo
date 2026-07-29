@@ -1297,6 +1297,11 @@ mod bootstrap {
             }
         }
 
+        /// The credential store (§12).
+        pub fn secrets(&self) -> &Arc<aibo_store::SecretStorage> {
+            &self.secrets
+        }
+
         /// Where aibo keeps things.
         pub fn paths(&self) -> &Paths {
             &self.paths
@@ -1692,6 +1697,190 @@ mod config_file {
         crate::paths::atomic_write(path, updated.as_bytes())
     }
 
+    /// Add or update one `[[providers]]` entry, leaving the rest of the file —
+    /// and every other provider — exactly as the user wrote it.
+    ///
+    /// `[[providers]]` is an array of tables, so [`splice_table`] cannot do this
+    /// job: that function replaces *the* table with a given header, and here
+    /// there are many with the same header. Entries are keyed the way
+    /// `Config::build` addresses them — by explicit `id` when one is set, and by
+    /// `backend` otherwise — so editing a key for an existing provider updates
+    /// it in place instead of appending a duplicate the loader would then have
+    /// to disambiguate.
+    ///
+    /// The API key is deliberately **not** written here. §12 keeps secrets in
+    /// the credential store; `config.toml` records only that a provider exists
+    /// and how to reach it.
+    pub fn upsert_provider(
+        path: &Path,
+        id: Option<&str>,
+        backend: &str,
+        base_url: Option<&str>,
+    ) -> io::Result<()> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+        let updated = splice_provider(&existing, id, backend, base_url);
+        crate::paths::atomic_write(path, updated.as_bytes())
+    }
+
+    /// Remove one `[[providers]]` entry by the id it is addressed by.
+    pub fn remove_provider(path: &Path, key: &str) -> io::Result<()> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let updated = drop_provider(&existing, key);
+        crate::paths::atomic_write(path, updated.as_bytes())
+    }
+
+    /// The body of one `[[providers]]` entry.
+    fn provider_body(id: Option<&str>, backend: &str, base_url: Option<&str>) -> String {
+        let mut body = format!("backend = {}\n", quote(backend));
+        if let Some(id) = id.filter(|value| !value.trim().is_empty()) {
+            body.push_str(&format!("id = {}\n", quote(id)));
+        }
+        if let Some(url) = base_url.filter(|value| !value.trim().is_empty()) {
+            body.push_str(&format!("base_url = {}\n", quote(url)));
+        }
+        body
+    }
+
+    /// How `Config::build` addresses a provider entry: explicit id, else backend.
+    fn provider_key(id: Option<&str>, backend: &str) -> String {
+        id.filter(|value| !value.trim().is_empty())
+            .unwrap_or(backend)
+            .to_owned()
+    }
+
+    /// A file split around its `[[providers]]` array: what came before, the
+    /// entries themselves keyed by how they are addressed, and what came after.
+    type SplitProviders = (Vec<String>, Vec<(String, Vec<String>)>, Vec<String>);
+
+    /// Split a file into its `[[providers]]` blocks and everything else,
+    /// preserving order.
+    ///
+    /// Returns `(prefix_lines, blocks, suffix_lines)` where each block is
+    /// `(key, lines)` — the key being what [`provider_key`] would compute for
+    /// it. A block runs from its `[[providers]]` header to the next line whose
+    /// first non-whitespace character is `[`, which is TOML's own rule.
+    fn split_providers(source: &str) -> SplitProviders {
+        let mut before = Vec::new();
+        let mut blocks: Vec<(String, Vec<String>)> = Vec::new();
+        let mut after = Vec::new();
+        let mut current: Option<Vec<String>> = None;
+        let mut seen_any = false;
+
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if trimmed == "[[providers]]" {
+                if let Some(block) = current.take() {
+                    blocks.push((key_of(&block), block));
+                }
+                seen_any = true;
+                current = Some(vec![line.to_owned()]);
+                continue;
+            }
+            if current.is_some() && trimmed.starts_with('[') {
+                if let Some(block) = current.take() {
+                    blocks.push((key_of(&block), block));
+                }
+                after.push(line.to_owned());
+                continue;
+            }
+            match (&mut current, seen_any) {
+                (Some(block), _) => block.push(line.to_owned()),
+                (None, false) => before.push(line.to_owned()),
+                (None, true) => after.push(line.to_owned()),
+            }
+        }
+        if let Some(block) = current.take() {
+            blocks.push((key_of(&block), block));
+        }
+        (before, blocks, after)
+    }
+
+    /// Read the addressing key out of one block's lines.
+    fn key_of(block: &[String]) -> String {
+        let value_of = |name: &str| {
+            block.iter().find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                (key.trim() == name).then(|| value.trim().trim_matches('"').to_owned())
+            })
+        };
+        let backend = value_of("backend").unwrap_or_default();
+        value_of("id")
+            .filter(|id| !id.is_empty())
+            .unwrap_or(backend)
+    }
+
+    fn splice_provider(
+        source: &str,
+        id: Option<&str>,
+        backend: &str,
+        base_url: Option<&str>,
+    ) -> String {
+        let (before, mut blocks, after) = split_providers(source);
+        let key = provider_key(id, backend);
+        let mut replacement = vec!["[[providers]]".to_owned()];
+        replacement.extend(
+            provider_body(id, backend, base_url)
+                .lines()
+                .map(str::to_owned),
+        );
+
+        match blocks.iter_mut().find(|(existing, _)| *existing == key) {
+            Some((_, block)) => *block = replacement,
+            None => blocks.push((key, replacement)),
+        }
+        render(before, blocks, after)
+    }
+
+    fn drop_provider(source: &str, key: &str) -> String {
+        let (before, mut blocks, after) = split_providers(source);
+        blocks.retain(|(existing, _)| existing != key);
+        render(before, blocks, after)
+    }
+
+    fn render(
+        before: Vec<String>,
+        blocks: Vec<(String, Vec<String>)>,
+        after: Vec<String>,
+    ) -> String {
+        let mut out = String::new();
+        for line in before {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        for (_, block) in blocks {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            for line in block {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+        // A blank line before whatever followed the provider array. Without it
+        // an appended entry runs straight into the next table header — still
+        // valid TOML, but `config.toml` is a file people read and hand-edit.
+        if !after.is_empty()
+            && !out.is_empty()
+            && !out.ends_with("\n\n")
+            && !after[0].trim().is_empty()
+        {
+            out.push('\n');
+        }
+        for line in after {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out
+    }
+
     /// TOML basic-string quoting, for a value that is a model id.
     fn quote(value: &str) -> String {
         let escaped: String = value
@@ -1752,6 +1941,70 @@ mod config_file {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The property that matters most: editing one provider must leave the
+        /// user's other providers, their comments, and their unrelated tables
+        /// byte-for-byte alone. `config.toml` is a file a person writes by hand.
+        #[test]
+        fn adding_a_provider_preserves_everything_else() {
+            let source = "\
+# my notes
+[[providers]]
+backend = \"groq\"
+
+[[providers]]
+backend = \"ollama\"
+base_url = \"http://localhost:11434\"
+
+[codex]
+enabled = true
+";
+            let out = splice_provider(source, None, "anthropic", None);
+
+            assert!(out.contains("# my notes"), "comments survive");
+            assert!(out.contains("backend = \"groq\""));
+            assert!(out.contains("base_url = \"http://localhost:11434\""));
+            assert!(out.contains("[codex]"), "unrelated tables survive");
+            assert!(out.contains("backend = \"anthropic\""));
+            // And it parses back into the config the loader expects.
+            let parsed = aibo_session::Config::from_toml_str(&out).expect("valid toml");
+            assert_eq!(parsed.providers.len(), 3);
+        }
+
+        /// Editing an existing provider updates it rather than appending a
+        /// second entry the loader would have to disambiguate.
+        #[test]
+        fn editing_a_provider_updates_in_place() {
+            let source =
+                "[[providers]]\nbackend = \"custom\"\nid = \"local\"\nbase_url = \"http://old\"\n";
+            let out = splice_provider(source, Some("local"), "custom", Some("http://new"));
+
+            assert!(out.contains("http://new"));
+            assert!(!out.contains("http://old"));
+            let parsed = aibo_session::Config::from_toml_str(&out).expect("valid toml");
+            assert_eq!(parsed.providers.len(), 1, "no duplicate entry");
+        }
+
+        /// Two entries sharing a backend but differing by id are distinct
+        /// providers — §10 supports two Ollama endpoints — so the key has to be
+        /// the id when there is one.
+        #[test]
+        fn two_endpoints_of_one_backend_stay_separate() {
+            let source = "[[providers]]\nbackend = \"ollama\"\nid = \"work\"\n";
+            let out = splice_provider(source, Some("home"), "ollama", Some("http://home"));
+            let parsed = aibo_session::Config::from_toml_str(&out).expect("valid toml");
+            assert_eq!(parsed.providers.len(), 2);
+        }
+
+        #[test]
+        fn removing_a_provider_leaves_the_others() {
+            let source = "[[providers]]\nbackend = \"groq\"\n\n[[providers]]\nbackend = \"anthropic\"\n\n[ui]\nlanguage = \"ja\"\n";
+            let out = drop_provider(source, "groq");
+            let parsed = aibo_session::Config::from_toml_str(&out).expect("valid toml");
+            assert_eq!(parsed.providers.len(), 1);
+            assert!(out.contains("anthropic"));
+            assert!(out.contains("language = \"ja\""));
+        }
 
         #[test]
         fn a_missing_table_is_appended() {
@@ -2784,10 +3037,24 @@ mod runtime {
                 }
 
                 UiRequest::SignIn { provider } => {
-                    // Every other provider authenticates with an API key, and
-                    // there is no field to type one into yet.
-                    // TODO(§10, §17): a key field per provider row.
-                    tracing::warn!(%provider, "no sign-in flow for this provider yet");
+                    // Every other provider authenticates with an API key, which
+                    // the settings window now has a field for. Pressing the row
+                    // opens that field rather than starting a flow; there is
+                    // nothing to do here, and warning would be noise.
+                    tracing::debug!(%provider, "api-key provider: settings owns the credential");
+                }
+
+                UiRequest::SetProviderKey {
+                    backend,
+                    id,
+                    base_url,
+                    key,
+                } => {
+                    self.set_provider_key(&backend, id.as_deref(), base_url.as_deref(), &key);
+                }
+
+                UiRequest::RemoveProvider { id } => {
+                    self.remove_provider(&id);
                 }
 
                 UiRequest::OpenUrl { url } => {
@@ -3202,6 +3469,87 @@ mod runtime {
                     self.publish_codex_phase();
                 }
             }
+        }
+
+        /// Store a provider's API key and record the provider in `config.toml`.
+        ///
+        /// The order is deliberate. The **key is written first**, because
+        /// `Config::build` refuses a provider whose credential is missing —
+        /// writing the config entry first would produce a window in which the
+        /// file describes a provider that cannot be constructed, and a crash in
+        /// that window leaves a config the app then fails to load.
+        ///
+        /// An empty key is a removal, not an empty credential. A user who
+        /// clears the field means "forget this", and storing `""` would produce
+        /// a provider that exists, looks configured, and 401s on first use.
+        fn set_provider_key(
+            &mut self,
+            backend: &str,
+            id: Option<&str>,
+            base_url: Option<&str>,
+            key: &secrecy::SecretString,
+        ) {
+            use secrecy::ExposeSecret as _;
+
+            let addressed_as = id.filter(|v| !v.trim().is_empty()).unwrap_or(backend);
+            if key.expose_secret().trim().is_empty() {
+                self.remove_provider(addressed_as);
+                return;
+            }
+
+            let account = aibo_store::secrets::provider_account(addressed_as);
+            if let Err(error) = self.bootstrap.secrets().set(&account, key.expose_secret()) {
+                // Never log the key, and never log anything derived from it.
+                // Never log the key itself, nor anything derived from it.
+                // No config entry is written, so the provider does not appear
+                // as configured — the settings row staying empty is the
+                // user-visible signal that this failed.
+                tracing::error!(provider = %addressed_as, %error, "could not store the credential");
+                return;
+            }
+
+            if let Err(error) = crate::config_file::upsert_provider(
+                &self.bootstrap.paths().config(),
+                id,
+                backend,
+                base_url,
+            ) {
+                tracing::error!(provider = %addressed_as, %error, "could not write config.toml");
+                return;
+            }
+
+            tracing::info!(provider = %addressed_as, "provider configured from settings");
+            // `rebuild_engine` republishes health for every provider in the new
+            // registry, which is what makes the new row appear.
+            self.rebuild_engine();
+        }
+
+        /// Forget a provider entirely: credential first, then the config entry.
+        ///
+        /// Credential first for the mirror of the reason above — a config entry
+        /// without a key is a provider that cannot be built, which is a state
+        /// the loader already handles, whereas a key without a config entry is
+        /// an orphaned secret sitting on disk for a provider nothing will ever
+        /// construct.
+        fn remove_provider(&mut self, id: &str) {
+            let account = aibo_store::secrets::provider_account(id);
+            if let Err(error) = self.bootstrap.secrets().delete(&account) {
+                tracing::warn!(provider = %id, %error, "could not delete the credential");
+            }
+            if let Err(error) =
+                crate::config_file::remove_provider(&self.bootstrap.paths().config(), id)
+            {
+                tracing::error!(provider = %id, %error, "could not write config.toml");
+                return;
+            }
+            tracing::info!(provider = %id, "provider removed from settings");
+            // Health events only ever *add* a row, so a rebuild alone would
+            // leave the removed provider on screen looking configured. The
+            // removal has to be stated.
+            self.emit(UiEvent::ProviderRemoved {
+                provider: ProviderId::new(id),
+            });
+            self.rebuild_engine();
         }
 
         /// Rebuild the engine so a provider set change takes effect at once.

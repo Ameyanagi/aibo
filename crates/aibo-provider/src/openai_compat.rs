@@ -26,6 +26,7 @@
 pub mod cerebras;
 pub mod groq;
 pub mod openai;
+pub mod openrouter;
 pub mod sambanova;
 pub mod xai;
 

@@ -380,6 +380,10 @@ impl ProviderId {
     pub const SAMBANOVA: Self = Self::from_static("sambanova");
     /// Groq (§10). Distinct from xAI's Grok.
     pub const GROQ: Self = Self::from_static("groq");
+    /// OpenRouter: one credential fronting many upstream vendors (§10).
+    pub const OPENROUTER: Self = Self::from_static("openrouter");
+    /// Google Gemini on the direct Generative Language API (§10).
+    pub const GEMINI: Self = Self::from_static("gemini");
     /// xAI (§10). Distinct from Groq.
     pub const XAI: Self = Self::from_static("xai");
     /// OpenAI (§10).

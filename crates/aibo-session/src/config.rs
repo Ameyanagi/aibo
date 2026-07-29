@@ -197,6 +197,10 @@ pub enum Backend {
     Groq,
     /// xAI / Grok. Not Groq.
     Xai,
+    /// OpenRouter: one key fronting many upstream vendors.
+    OpenRouter,
+    /// Google Gemini on the direct Generative Language API.
+    Gemini,
     /// OpenAI on its native Responses format.
     OpenAi,
     /// OpenAI on Chat Completions, for deployments that need it.
@@ -218,6 +222,8 @@ impl Backend {
             Self::SambaNova => ProviderId::SAMBANOVA,
             Self::Groq => ProviderId::GROQ,
             Self::Xai => ProviderId::XAI,
+            Self::OpenRouter => ProviderId::OPENROUTER,
+            Self::Gemini => ProviderId::GEMINI,
             Self::OpenAi | Self::OpenAiChatCompletions => ProviderId::OPENAI,
             Self::Anthropic => ProviderId::ANTHROPIC,
             Self::Azure => ProviderId::AZURE_OPENAI,
@@ -582,7 +588,14 @@ impl Config {
                 },
                 trust,
                 tiers,
-                catalogue: BTreeMap::new(),
+                // The shipped half of §10's catalogue. A live
+                // `Provider::models()` refresh merges over this once the
+                // network has answered; until then these are the only per-model
+                // capabilities there are, and an empty map here means every
+                // binding silently inherits `Capabilities::default()` — an
+                // 8 192-token context window applied to models with twenty-five
+                // times that.
+                catalogue: aibo_provider::ModelCatalogue::shipped().capabilities_by_binding(),
                 do_verbs: aibo_core::router::DoVerbRegistry::builtin(),
                 max_payload_chars: self.max_payload_chars.unwrap_or(DEFAULT_MAX_PAYLOAD_CHARS),
                 request_deadline: self
@@ -652,6 +665,8 @@ impl Config {
             Backend::SambaNova => ProviderKind::SambaNova,
             Backend::Groq => ProviderKind::Groq,
             Backend::Xai => ProviderKind::Xai,
+            Backend::OpenRouter => ProviderKind::OpenRouter,
+            Backend::Gemini => ProviderKind::Gemini,
             Backend::OpenAi => ProviderKind::OpenAi,
             Backend::OpenAiChatCompletions => ProviderKind::OpenAiChatCompletions,
             Backend::Anthropic => ProviderKind::Anthropic,
