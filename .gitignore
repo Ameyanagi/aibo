@@ -16,3 +16,10 @@ spikes/**/out/
 spikes/**/dump/
 
 .DS_Store
+
+# Local developer credentials. `.env.dev` holds real API keys for manual
+# testing; `.env.dev.example` is the committed template and holds none.
+# Listed before the file is ever created, so a key cannot be staged by accident.
+.env
+.env.dev
+.env.*.local

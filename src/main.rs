@@ -3510,7 +3510,24 @@ mod runtime {
         ) {
             use secrecy::ExposeSecret as _;
 
-            let addressed_as = id.filter(|v| !v.trim().is_empty()).unwrap_or(backend);
+            // The id the *registry* will address this provider by, which is not
+            // always the `backend = "…"` string: serde spells the enum in
+            // kebab-case, so `open-ai`, `open-router` and `samba-nova` all
+            // differ from their `ProviderId`. The credential has to be filed
+            // under the id the lookup uses, or `Config::build` reports a missing
+            // credential and the provider is never constructed — which from the
+            // settings window looks exactly like "Save did nothing".
+            let addressed_as = match id.filter(|v| !v.trim().is_empty()) {
+                Some(explicit) => explicit.to_owned(),
+                None => aibo_session::provider_id_for_backend(backend)
+                    .map(|id| id.as_str().to_owned())
+                    // An unrecognised backend cannot be built either way; using
+                    // the raw string keeps the write and the later delete
+                    // symmetric instead of orphaning a secret.
+                    .unwrap_or_else(|| backend.to_owned()),
+            };
+            let addressed_as = addressed_as.as_str();
+
             if key.expose_secret().trim().is_empty() {
                 self.remove_provider(addressed_as);
                 return;

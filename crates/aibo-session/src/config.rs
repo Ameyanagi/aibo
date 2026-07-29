@@ -215,6 +215,22 @@ pub enum Backend {
     Custom,
 }
 
+/// The [`ProviderId`] a `backend = "…"` string will be addressed by.
+///
+/// **The credential store must be keyed by this, not by the backend string.**
+/// The two differ for `open-ai`, `open-router` and `samba-nova` — serde's
+/// kebab-case spelling is not the provider's id — so storing a key under the
+/// backend name files it where nothing will ever look. `Config::build` then
+/// reports a missing credential and the provider is silently never constructed,
+/// which from the settings window looks like "saving did nothing".
+pub fn provider_id_for_backend(backend: &str) -> Option<ProviderId> {
+    let parsed: Backend = serde::Deserialize::deserialize(serde::de::IntoDeserializer::<
+        serde::de::value::Error,
+    >::into_deserializer(backend))
+    .ok()?;
+    Some(parsed.default_id())
+}
+
 impl Backend {
     fn default_id(self) -> ProviderId {
         match self {
@@ -861,6 +877,49 @@ fn parse_role(name: &str) -> Result<Role, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The credential store is keyed by [`ProviderId`], not by the
+    /// `backend = "…"` string, and for three backends those differ.
+    ///
+    /// Getting this wrong is silent in the worst way: the key is written, the
+    /// config entry is written, `Save` reports nothing amiss, and then
+    /// `Config::build` cannot find a credential for `openai` because the secret
+    /// was filed under `open-ai`. The provider is never constructed and the
+    /// settings window shows a row that does nothing.
+    #[test]
+    fn a_backend_string_maps_to_the_id_the_registry_uses() {
+        // The three that differ — the whole reason this function exists.
+        assert_eq!(
+            provider_id_for_backend("open-ai")
+                .as_ref()
+                .map(ProviderId::as_str),
+            Some("openai")
+        );
+        assert_eq!(
+            provider_id_for_backend("open-router")
+                .as_ref()
+                .map(ProviderId::as_str),
+            Some("openrouter")
+        );
+        assert_eq!(
+            provider_id_for_backend("samba-nova")
+                .as_ref()
+                .map(ProviderId::as_str),
+            Some("sambanova")
+        );
+
+        // And the ones that match, so a future rename cannot quietly break them.
+        for backend in ["anthropic", "groq", "cerebras", "xai", "gemini", "ollama"] {
+            assert_eq!(
+                provider_id_for_backend(backend)
+                    .as_ref()
+                    .map(ProviderId::as_str),
+                Some(backend),
+                "{backend} should address itself"
+            );
+        }
+
+        assert!(provider_id_for_backend("not-a-backend").is_none());
+    }
 
     struct FixedKey;
     impl CredentialSource for FixedKey {

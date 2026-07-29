@@ -1207,6 +1207,13 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                 if let Err(error) = state.panel.attach(attachment) {
                     state.panel.fail(&std::sync::Arc::new(error));
                 }
+                // `/usr/sbin/screencapture` is a separate application. When it
+                // exits, macOS re-activates whatever was frontmost before it,
+                // and that lands *after* `present_panel` asks for focus — so
+                // the panel appeared on top and could not take a keystroke.
+                // Claiming activation explicitly is the only thing that beats
+                // the system's own restore.
+                aibo_platform::activate_self();
                 state.present_panel()
             }
             Err(error) => {
@@ -1217,6 +1224,7 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                     body: i18n::t(crate::i18n::Key::ToastScreenCaptureFailed).to_owned(),
                     offer_diagnostics: false,
                 });
+                aibo_platform::activate_self();
                 state.present_panel()
             }
         },
@@ -2135,7 +2143,19 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 StreamEvent::Done(reason) => {
                     state.panel.phase = Phase::Finished { reason };
                     aibo_platform::announce_accessibility(i18n::t(crate::i18n::Key::TaskCompleted));
-                    resize_panel_if_visible(state)
+                    // Give the caret back, **once, on completion**.
+                    //
+                    // Stripping `operation::focus` out of the resize path was
+                    // right — it was firing on every height change and yanking
+                    // the caret mid-answer, including mid-selection. But
+                    // removing it entirely left focus nowhere once the answer
+                    // finished, so the next question could not be typed: the
+                    // rail said attention had returned to the input
+                    // (`input_rail_state`) while the keyboard disagreed.
+                    //
+                    // Completion is the honest moment for it. Exactly one focus
+                    // per answer, at the point the user is free to type again.
+                    resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
                 }
                 // Tool calls belong to an agent run and surface in the task
                 // window, not the panel.

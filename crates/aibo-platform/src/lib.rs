@@ -24,7 +24,8 @@ pub use accessibility::{
     detach_accessibility, set_accessibility_focus, update_accessibility,
 };
 pub use overlay::{
-    BackdropStatus, OverlayWindowConfiguration, OverlayWindowError, announce_accessibility,
-    configure_panel_window, present_panel_without_activation, reduced_motion_preferred,
+    BackdropStatus, OverlayWindowConfiguration, OverlayWindowError, activate_self,
+    announce_accessibility, configure_panel_window, present_panel_without_activation,
+    reduced_motion_preferred,
 };
 pub use screen_capture::{ScreenCaptureError, capture_screen_region};
