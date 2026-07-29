@@ -709,6 +709,46 @@ pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
     }
 }
 
+/// A form field, for the settings window.
+///
+/// **Not [`input`], and the difference is the point.** §9 removes every border,
+/// and in the panel that costs nothing: there is exactly one input, the rail
+/// marks it, and the caret is already sitting in it when the panel opens. A
+/// settings form is the opposite case — three stacked fields, no rail, nothing
+/// focused — and a borderless transparent input there renders as a line of
+/// static text. The first build of the provider form looked like a heading, a
+/// URL and the words "API key", with no indication that any of them could be
+/// typed into.
+///
+/// The affordance is the palette's one elevation rather than a returning
+/// border: §2 gives `ink-raised` to "the settings sidebar, hovered rows", and a
+/// field the user is meant to fill is the same kind of surface. Text on it is
+/// 14.3:1 and the placeholder 5.7:1, both AA.
+pub fn field(theme: &Theme, status: text_input::Status) -> text_input::Style {
+    let p = palette_of(theme);
+    text_input::Style {
+        background: Background::Color(p.surface_raised),
+        // Focus is the one place a border earns its keep here, because there is
+        // no rail in this window to carry it and `iced` gives a `text_input` no
+        // other focused treatment.
+        border: Border {
+            color: match status {
+                text_input::Status::Focused { .. } => p.accent,
+                _ => Color::TRANSPARENT,
+            },
+            width: match status {
+                text_input::Status::Focused { .. } => 2.0,
+                _ => 0.0,
+            },
+            radius: Radius::new(RADIUS_SMALL),
+        },
+        icon: p.text_dim,
+        placeholder: p.text_dim,
+        value: p.text,
+        selection: p.accent_muted,
+    }
+}
+
 /// A selectable, read-only answer surface.
 ///
 /// Transparent for the same reason as [`assistant_bubble`]: the answer is the
@@ -1164,6 +1204,21 @@ mod tests {
                 input(&theme, text_input::Status::Active).border.width,
                 0.0,
                 "{appearance:?}/input draws a border"
+            );
+            // `field` is the documented exception: a settings form has no rail
+            // to carry focus, so the focused state gets the one border §9's
+            // removal cannot replace. Unfocused it still draws none.
+            assert_eq!(
+                field(&theme, text_input::Status::Active).border.width,
+                0.0,
+                "{appearance:?}/field draws a border when unfocused"
+            );
+            assert!(
+                field(&theme, text_input::Status::Focused { is_hovered: false })
+                    .border
+                    .width
+                    > 0.0,
+                "{appearance:?}: a settings field must show focus somehow"
             );
             assert_eq!(
                 answer_editor(&theme, text_editor::Status::Active)

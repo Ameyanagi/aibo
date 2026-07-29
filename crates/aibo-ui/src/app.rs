@@ -260,6 +260,13 @@ pub enum WindowChord {
     },
     /// Copy the current surface's content.
     Copy,
+    /// Begin a new item on the current surface.
+    ///
+    /// Settings' "Add a provider" advertises `⌘N`. It was a label with no
+    /// binding — §16 requires every action to be reachable by its key, and a
+    /// key hint that does nothing is worse than none, because it teaches the
+    /// user the keyboard route is broken.
+    New,
     /// Open the settings window.
     ///
     /// `design.md` §3's error footer shows `⌘, Settings`, and §8's quality
@@ -1413,6 +1420,7 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
             let message = match chord {
                 // Handled above, for every window.
                 WindowChord::OpenSettings => unreachable!("intercepted before the role match"),
+                WindowChord::New => return Task::none(),
                 WindowChord::Escape if state.panel.toast.is_some() => panel::Message::DismissToast,
                 WindowChord::Escape => panel::Message::Dismiss,
                 WindowChord::Enter {
@@ -1499,7 +1507,21 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
             task_update(state, task, message)
         }
         Some(Role::Settings) => match chord {
+            // Escape backs out of the draft before it closes the window: a
+            // half-typed key is state the user can lose by reflex otherwise.
+            WindowChord::Escape if state.settings.draft.is_some() => {
+                settings_update(state, settings::Message::DraftCancel)
+            }
             WindowChord::Escape => settings_update(state, settings::Message::Close),
+            WindowChord::New if state.settings.section == settings::Section::Providers => {
+                settings_update(
+                    state,
+                    settings::Message::DraftBackend(settings::Backend::default()),
+                )
+            }
+            WindowChord::Enter { command: false, .. } if state.settings.draft.is_some() => {
+                settings_update(state, settings::Message::DraftSave)
+            }
             WindowChord::Copy if state.settings.section == settings::Section::About => {
                 settings_update(state, settings::Message::CopyDiagnostics)
             }
@@ -2659,6 +2681,7 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
                     Some('t') => WindowChord::ShowTask,
                     Some('.') => WindowChord::CancelTask,
                     Some(',') => WindowChord::OpenSettings,
+                    Some('n') => WindowChord::New,
                     _ => return None,
                 },
                 _ => return None,

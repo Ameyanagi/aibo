@@ -1050,7 +1050,7 @@ fn provider_draft(state: &SettingsState) -> Element<'_, Message> {
         .style(theme::model_picker)
         .menu_style(theme::model_picker_menu),
     ]
-    .spacing(space(1.5));
+    .spacing(space(2.0));
 
     // A custom endpoint is the only one that needs to be told where it is, and
     // the only one that needs a name — the rest are addressed by their backend.
@@ -1061,16 +1061,16 @@ fn provider_draft(state: &SettingsState) -> Element<'_, Message> {
                     .on_input(Message::DraftId)
                     .size(type_scale::BODY)
                     .font(theme::MONO_FONT)
-                    .padding(space(1.5))
-                    .style(theme::input),
+                    .padding([space(2.0), space(2.0)])
+                    .style(theme::field),
             )
             .push(
                 text_input(i18n::t(Key::ProviderBaseUrlPlaceholder), &draft.base_url)
                     .on_input(Message::DraftBaseUrl)
                     .size(type_scale::BODY)
                     .font(theme::MONO_FONT)
-                    .padding(space(1.5))
-                    .style(theme::input),
+                    .padding([space(2.0), space(2.0)])
+                    .style(theme::field),
             );
     }
 
@@ -1082,8 +1082,8 @@ fn provider_draft(state: &SettingsState) -> Element<'_, Message> {
             .secure(true)
             .size(type_scale::BODY)
             .font(theme::MONO_FONT)
-            .padding(space(1.5))
-            .style(theme::input),
+            .padding([space(2.0), space(2.0)])
+            .style(theme::field),
     );
 
     let save = Action::new(Key::ActionSaveProvider, "⏎", Message::DraftSave).primary();
