@@ -15,6 +15,7 @@ use accessibility_sys::{
     AXUIElementSetAttributeValue, AXUIElementSetMessagingTimeout, AXValueCreate, AXValueGetType,
     AXValueGetValue, AXValueRef, kAXValueTypeCFRange, kAXValueTypeCGRect,
 };
+use core_foundation::array::CFArray;
 use core_foundation::base::{CFHash, CFRange, CFRelease, CFTypeRef, TCFType};
 use core_foundation::boolean::CFBoolean;
 use core_foundation::number::CFNumber;
@@ -156,6 +157,41 @@ impl AxElement {
         // SAFETY: on success `value` is a +1-retained AXUIElement.
         unsafe { Self::from_create_rule(value as AXUIElementRef) }
             .ok_or(MacosError::Ax("attribute was not an AXUIElement"))
+    }
+
+    /// Child elements, for a subtree walk.
+    ///
+    /// Returns an empty vector rather than an error when the attribute is
+    /// absent: a leaf and an element that declines to answer are the same thing
+    /// to a traversal, and treating "no children" as a failure would abort a
+    /// document read at the first uncooperative node.
+    #[allow(unsafe_code)]
+    pub(crate) fn children(&self) -> Vec<AxElement> {
+        let Ok(value) = self.attribute(accessibility_sys::kAXChildrenAttribute) else {
+            return Vec::new();
+        };
+        let Some(array) = value.as_cf_type().downcast::<CFArray>() else {
+            return Vec::new();
+        };
+        let mut out = Vec::with_capacity(array.len() as usize);
+        for index in 0..array.len() {
+            let Some(item) = array.get(index) else {
+                continue;
+            };
+            let raw = *item as AXUIElementRef;
+            if raw.is_null() {
+                continue;
+            }
+            // SAFETY: `raw` is borrowed from the array (the Get rule), so it is
+            // retained here to give the returned `AxElement` its own +1.
+            unsafe {
+                core_foundation::base::CFRetain(raw.cast());
+                if let Some(element) = Self::from_create_rule(raw) {
+                    out.push(element);
+                }
+            }
+        }
+        out
     }
 
     /// `kAXSelectedTextRangeAttribute`, unwrapped from its `AXValue` box.

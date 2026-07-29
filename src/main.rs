@@ -4756,6 +4756,32 @@ mod runtime {
                 })
             }
 
+            async fn read_document(
+                &self,
+                of: &AppRef,
+                budget: aibo_core::types::DocumentBudget,
+                _timeout: Duration,
+            ) -> aibo_core::error::Result<Option<aibo_core::types::DocumentText>> {
+                self.record("read_document", of);
+                // Long enough to exceed a small budget, so a test can assert
+                // truncation is reported rather than silently swallowed.
+                let body = match of.pid {
+                    TARGET_PID => "the user's whole document, ".repeat(64),
+                    _ => "aibo's own panel".to_owned(),
+                };
+                let truncated = body.len() > budget.max_bytes;
+                let text = if truncated {
+                    body[..budget.max_bytes].to_owned()
+                } else {
+                    body
+                };
+                Ok(Some(aibo_core::types::DocumentText {
+                    text,
+                    truncated,
+                    nodes_visited: 3,
+                }))
+            }
+
             async fn focused_element_id(
                 &self,
                 of: &AppRef,

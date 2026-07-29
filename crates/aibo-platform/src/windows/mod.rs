@@ -60,8 +60,8 @@ use std::time::{Duration, Instant};
 use aibo_core::error::{AiboError, InsertFailure, Result};
 use aibo_core::traits::PlatformBackend;
 use aibo_core::types::{
-    AppInfo, AppRef, BoxStream, ClipboardItem, DisplayInfo, FieldContext, InsertMode, InsertTarget,
-    Permission, PermissionStatus, PowerEvent,
+    AppInfo, AppRef, BoxStream, ClipboardItem, DisplayInfo, DocumentBudget, DocumentText,
+    FieldContext, InsertMode, InsertTarget, Permission, PermissionStatus, PowerEvent,
 };
 use async_trait::async_trait;
 use futures::StreamExt;
@@ -330,6 +330,22 @@ impl PlatformBackend for WindowsBackend {
             display_name,
             is_code_app: CODE_APPS.contains(&stem.as_str()),
         })
+    }
+
+    async fn read_document(
+        &self,
+        of: &AppRef,
+        budget: DocumentBudget,
+        timeout: Duration,
+    ) -> Result<Option<DocumentText>> {
+        let deadline = Instant::now() + timeout;
+        match tokio::time::timeout(timeout, self.uia.read_document(of, budget, deadline)).await {
+            Ok(Ok(document)) => Ok(document),
+            Ok(Err(e)) if e.is_uipi() => Err(e.into_capture_error(Self::app_label(of))),
+            // Out of time, or an app with no text provider. Neither is aibo
+            // failing, and §13 renders "nothing to read" without an error.
+            Ok(Err(_)) | Err(_) => Ok(None),
+        }
     }
 
     async fn focused_element_id(&self, of: &AppRef, timeout: Duration) -> Result<Option<String>> {

@@ -306,6 +306,53 @@ pub struct InsertTarget {
     pub prefix_hash: Option<u64>,
 }
 
+/// How much of a document a read may take, and how hard it may look.
+///
+/// A **separate budget from the caret path, deliberately.** §5 forbids reading
+/// a document through the small-field path, and `WHOLE_VALUE_CAP_UTF16` exists
+/// to enforce that. Raising that constant to implement "read the whole thing"
+/// would turn every ordinary caret capture into a potential 200 KB read on the
+/// 120 ms deadline — so document reads get their own method, their own caps and
+/// their own, longer deadline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DocumentBudget {
+    /// Ceiling on returned text, in bytes.
+    pub max_bytes: usize,
+    /// Ceiling on accessibility nodes visited.
+    ///
+    /// Bytes alone do not bound the work: a deep tree of empty containers costs
+    /// a cross-process call each and returns nothing, so a page that is mostly
+    /// structure can exhaust the deadline without ever approaching the byte
+    /// cap.
+    pub max_nodes: usize,
+}
+
+impl Default for DocumentBudget {
+    /// Enough for an article or a code file, not for a log.
+    fn default() -> Self {
+        Self {
+            max_bytes: 128 * 1024,
+            max_nodes: 4_000,
+        }
+    }
+}
+
+/// Text read from the whole focused document (§8).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DocumentText {
+    /// The text, already truncated to the budget.
+    pub text: String,
+    /// A cap was hit and the text is incomplete.
+    ///
+    /// Surfaced rather than hidden: a summary of the first half of a document,
+    /// presented as a summary of the document, is a wrong answer the user has
+    /// no way to detect.
+    pub truncated: bool,
+    /// Accessibility nodes visited, for the §15 budget and for diagnosing an
+    /// app that reports a huge tree of nothing.
+    pub nodes_visited: usize,
+}
+
 /// Power / display transitions the platform layer forwards (§13 sleep-wake).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
