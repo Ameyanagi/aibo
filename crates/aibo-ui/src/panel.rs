@@ -1275,6 +1275,8 @@ pub enum Message {
     PickerCommit,
     /// Pin or unpin the highlighted model.
     PickerToggleFavourite,
+    /// Move to the next lane.
+    PickerCycleLane,
 }
 
 /// Render the panel.
@@ -1411,11 +1413,21 @@ impl PanelState {
 
     /// The quick-pick's rows for the current state.
     pub fn picker_rows(&self) -> Vec<crate::model_picker::Row> {
-        self.picker.rows(
-            &self.capable_models(),
-            &self.favourite_models,
-            &self.recent_models,
-        )
+        let capable = self.capable_models();
+        self.picker
+            .rows(&capable, &self.pins(&capable), &self.recent_models)
+    }
+
+    /// The pinned set, falling back to a derived starter set.
+    ///
+    /// The fallback applies only while nothing is pinned, so unpinning the last
+    /// model does bring the defaults back — which is the right behaviour for a
+    /// *default* and the reason they are not written into state on first run.
+    pub fn pins(&self, capable: &[ModelOption]) -> Vec<aibo_core::types::ModelBinding> {
+        if self.favourite_models.is_empty() {
+            return crate::model_picker::default_pins(capable);
+        }
+        self.favourite_models.clone()
     }
 
     /// Record a model as just used, most recent first.
@@ -1428,7 +1440,14 @@ impl PanelState {
     }
 
     /// Pin or unpin a model.
+    ///
+    /// Materialises the derived defaults first when nothing is pinned yet:
+    /// without that, unpinning one of the visible default pins would edit an
+    /// empty list and appear to do nothing at all.
     pub fn toggle_favourite(&mut self, binding: aibo_core::types::ModelBinding) {
+        if self.favourite_models.is_empty() {
+            self.favourite_models = crate::model_picker::default_pins(&self.capable_models());
+        }
         match self.favourite_models.iter().position(|b| b == &binding) {
             Some(at) => {
                 self.favourite_models.remove(at);
@@ -1591,9 +1610,14 @@ fn picker_overlay(state: &PanelState) -> Element<'_, Message> {
             .size(type_scale::META)
             .font(theme::MONO_FONT)
             .style(theme::text_dim),
-        scrollable(list)
-            .height(Length::Fixed(PICKER_LIST_HEIGHT))
-            .style(theme::scroller),
+        row![
+            lane_column(state),
+            scrollable(list)
+                .height(Length::Fixed(PICKER_LIST_HEIGHT))
+                .width(Length::Fill)
+                .style(theme::scroller),
+        ]
+        .spacing(space(2.0)),
         widgets::action_list(vec![
             Action::new(Key::ActionSelect, "⏎", Message::PickerCommit).primary(),
             Action::new(Key::ActionPinModel, "⌘D", Message::PickerToggleFavourite),
@@ -1602,6 +1626,37 @@ fn picker_overlay(state: &PanelState) -> Element<'_, Message> {
     ]
     .spacing(space(1.5))
     .into()
+}
+
+/// The lane column: `all`, `pinned`, then one entry per configured provider.
+///
+/// t3's equivalent is a rail of vendor icons. This is the same affordance in
+/// words, for two reasons: `design.md` §9 cut icons from the product, and a
+/// column of other people's logos is a trademark question aibo does not need to
+/// answer. `⇥` cycles, which is what the search placeholder already promises.
+fn lane_column(state: &PanelState) -> Element<'_, Message> {
+    let capable = state.capable_models();
+    let lanes = crate::model_picker::lanes(&capable, &state.pins(&capable));
+    let mut column = column![];
+    for lane in lanes {
+        let active = lane == state.picker.lane;
+        column = column.push(widgets::railed(
+            if active {
+                RailState::Active
+            } else {
+                RailState::Inactive
+            },
+            text(lane.label())
+                .size(type_scale::META)
+                .font(theme::MONO_FONT)
+                .style(if active {
+                    theme::text_primary
+                } else {
+                    theme::text_dim
+                }),
+        ));
+    }
+    container(column).width(Length::Fixed(96.0)).into()
 }
 
 /// One row of the quick-pick.
@@ -2587,6 +2642,7 @@ mod tests {
             },
             display_name: model.to_owned(),
             latency_ms: Some(435),
+            released_at: None,
             abilities: Default::default(),
             cost: None,
         }

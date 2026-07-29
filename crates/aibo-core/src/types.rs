@@ -584,6 +584,14 @@ pub struct ModelInfo {
     pub display_name: String,
     /// Per-model capabilities (§10).
     pub capabilities: Capabilities,
+    /// When the provider says the model was released, as a Unix timestamp.
+    ///
+    /// **The ordering signal, and it is real data rather than a guess.** Sorting
+    /// a model list alphabetically puts `gpt-3.5-turbo` above `gpt-5`, so the
+    /// first thing a user sees is the oldest thing on offer. OpenAI's `/models`
+    /// reports `created` for every entry; where a provider does not, `None`
+    /// sorts last, which is the honest place for "release date unknown".
+    pub released_at: Option<u64>,
     /// The provider has announced retirement.
     pub deprecated: bool,
     /// Suggested successor when `deprecated`.

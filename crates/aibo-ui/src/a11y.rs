@@ -945,6 +945,7 @@ mod tests {
             },
             display_name: "GPT-5.6 Terra".to_owned(),
             latency_ms: Some(446),
+            released_at: None,
             abilities: Default::default(),
             cost: None,
         };

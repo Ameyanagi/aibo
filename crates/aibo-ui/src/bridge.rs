@@ -67,6 +67,11 @@ pub struct ModelOption {
     /// is the question that actually decides a choice, and the alternative was
     /// finding out from a `VisionUnsupported` error after the fact.
     pub abilities: Abilities,
+    /// When the provider says it was released, as a Unix timestamp.
+    ///
+    /// The ordering signal: newest first. `None` sorts last, which is the honest
+    /// place for a release date the provider does not report.
+    pub released_at: Option<u64>,
     /// Roughly what it costs to run, from §14's price table.
     ///
     /// `None` means **unpriced, not free**. §14 is explicit that reporting

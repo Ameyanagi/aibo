@@ -66,6 +66,57 @@ pub struct ModelPicker {
     pub query: String,
     /// Index into [`ModelPicker::rows`]'s selectable entries.
     pub highlight: usize,
+    /// Which lane the list is narrowed to.
+    pub lane: Lane,
+}
+
+/// What the picker is currently narrowed to.
+///
+/// The equivalent of t3's left icon rail, as words rather than brand marks:
+/// `design.md` §9 cut icons on the grounds that "the rail plus a key hint
+/// carries every meaning an icon would", and a column of unlabelled vendor
+/// logos is the case it was arguing against. It also avoids shipping other
+/// people's trademarks.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum Lane {
+    /// Everything, grouped by provider.
+    #[default]
+    All,
+    /// Pinned models only.
+    Pinned,
+    /// One provider.
+    Provider(String),
+}
+
+impl Lane {
+    /// The label shown in the lane column.
+    pub fn label(&self) -> String {
+        match self {
+            Lane::All => crate::i18n::t(crate::i18n::Key::LaneAll).to_owned(),
+            Lane::Pinned => crate::i18n::t(crate::i18n::Key::PickerFavourites).to_owned(),
+            Lane::Provider(p) => p.clone(),
+        }
+    }
+}
+
+/// The lanes available for a given catalogue, in cycle order.
+///
+/// Built from what is actually configured rather than from a fixed list: a lane
+/// for a provider the user has not set up is a filter that can only ever return
+/// nothing.
+pub fn lanes(capable: &[ModelOption], favourites: &[ModelBinding]) -> Vec<Lane> {
+    let mut lanes = vec![Lane::All];
+    if !favourites.is_empty() {
+        lanes.push(Lane::Pinned);
+    }
+    let mut providers: Vec<&str> = capable
+        .iter()
+        .map(|o| o.binding.provider.as_str())
+        .collect();
+    providers.sort_unstable();
+    providers.dedup();
+    lanes.extend(providers.into_iter().map(|p| Lane::Provider(p.to_owned())));
+    lanes
 }
 
 impl ModelPicker {
@@ -78,6 +129,7 @@ impl ModelPicker {
         self.open = true;
         self.query.clear();
         self.highlight = 0;
+        self.lane = Lane::All;
     }
 
     /// Close it.
@@ -124,10 +176,54 @@ impl ModelPicker {
         favourites: &[ModelBinding],
         recent: &[ModelBinding],
     ) -> Vec<Row> {
+        // The lane narrows the candidate set *before* the query, so a search
+        // inside a lane stays inside it. The other order would make typing
+        // silently escape the filter the user just chose.
+        let in_lane: Vec<ModelOption> = match &self.lane {
+            Lane::All => capable.to_vec(),
+            Lane::Pinned => capable
+                .iter()
+                .filter(|o| favourites.contains(&o.binding))
+                .cloned()
+                .collect(),
+            Lane::Provider(provider) => capable
+                .iter()
+                .filter(|o| o.binding.provider.as_str() == provider)
+                .cloned()
+                .collect(),
+        };
+
         if !self.query.trim().is_empty() {
-            return self.fuzzy_rows(capable, favourites);
+            return self.fuzzy_rows(&in_lane, favourites);
         }
-        self.browse_rows(capable, favourites, recent)
+        // Inside a single lane the provider heading is noise — every row shares
+        // it — so only the "everything" lane groups.
+        if matches!(self.lane, Lane::All) {
+            self.browse_rows(&in_lane, favourites, recent)
+        } else {
+            in_lane
+                .into_iter()
+                .map(|option| Row::Model {
+                    favourite: favourites.contains(&option.binding),
+                    option,
+                })
+                .collect()
+        }
+    }
+
+    /// Move to the next lane, wrapping.
+    ///
+    /// Wrapping is right here and wrong for the highlight: there are a handful
+    /// of lanes and cycling them is the gesture, whereas a wrapping list of
+    /// eighty-nine loses the user's place.
+    pub fn cycle_lane(&mut self, lanes: &[Lane]) {
+        if lanes.is_empty() {
+            return;
+        }
+        let at = lanes.iter().position(|l| l == &self.lane).unwrap_or(0);
+        self.lane = lanes[(at + 1) % lanes.len()].clone();
+        // A new lane is a new result set, so the old index means nothing.
+        self.highlight = 0;
     }
 
     /// Fuzzy-matched, flat, best first.
@@ -253,6 +349,38 @@ impl ModelPicker {
     }
 }
 
+/// A starter set of pins, for a user who has pinned nothing.
+///
+/// **Derived, not hardcoded.** §10's whole warning is that a baked-in model list
+/// starts failing months later, and a shipped list of "good models" is exactly
+/// that with a shorter half-life. The newest model from each configured provider
+/// is a rule that stays right as models ship: it is what the user would pick
+/// anyway, and it needs no maintenance.
+///
+/// Returned rather than written into state, so an explicit unpin is never undone
+/// by a restart — the defaults apply only while the set is genuinely empty.
+pub fn default_pins(capable: &[ModelOption]) -> Vec<ModelBinding> {
+    let mut providers: Vec<&str> = capable
+        .iter()
+        .map(|o| o.binding.provider.as_str())
+        .collect();
+    providers.sort_unstable();
+    providers.dedup();
+
+    providers
+        .into_iter()
+        .filter_map(|provider| {
+            capable
+                .iter()
+                .filter(|o| o.binding.provider.as_str() == provider)
+                // `max_by_key` on the date, falling back to the order the
+                // runtime already sorted into when no provider reports one.
+                .max_by_key(|o| o.released_at.unwrap_or(0))
+                .map(|o| o.binding.clone())
+        })
+        .collect()
+}
+
 /// The bindings in `rows` that can actually be chosen, in display order.
 ///
 /// The highlight indexes this rather than `rows`, so arrowing past a group
@@ -280,9 +408,103 @@ mod tests {
             },
             display_name: model.to_owned(),
             latency_ms: None,
+            released_at: None,
             abilities: Default::default(),
             cost: None,
         }
+    }
+
+    fn dated(provider: &str, model: &str, released: u64) -> ModelOption {
+        ModelOption {
+            released_at: Some(released),
+            ..option(provider, model)
+        }
+    }
+
+    /// Newest first is the whole point: alphabetical ordering put
+    /// `gpt-3.5-turbo` above `gpt-5`, so the first thing offered was the oldest
+    /// thing available.
+    #[test]
+    fn default_pins_are_the_newest_model_per_provider() {
+        let capable = vec![
+            dated("openai", "gpt-3.5-turbo", 1_600_000_000),
+            dated("openai", "gpt-5", 1_760_000_000),
+            dated("anthropic", "claude-3", 1_700_000_000),
+            dated("anthropic", "claude-sonnet-4-5", 1_780_000_000),
+        ];
+        let pins = default_pins(&capable);
+        let models: Vec<&str> = pins.iter().map(|b| b.model.as_str()).collect();
+        assert_eq!(models, vec!["claude-sonnet-4-5", "gpt-5"]);
+    }
+
+    /// One pin per provider, so a user with five providers gets five, not fifty.
+    #[test]
+    fn default_pins_are_one_per_provider() {
+        let pins = default_pins(&catalogue());
+        let mut providers: Vec<&str> = pins.iter().map(|b| b.provider.as_str()).collect();
+        let before = providers.len();
+        providers.sort_unstable();
+        providers.dedup();
+        assert_eq!(providers.len(), before, "no provider appears twice");
+    }
+
+    /// A lane narrows before the query, so searching inside a lane cannot escape
+    /// it — the other order would silently discard the filter just chosen.
+    #[test]
+    fn a_lane_narrows_before_the_query() {
+        let mut picker = ModelPicker {
+            lane: Lane::Provider("openai".to_owned()),
+            ..ModelPicker::default()
+        };
+        picker.set_query("gpt".to_owned());
+        let rows = picker.rows(&catalogue(), &[], &[]);
+        assert!(
+            selectable(&rows)
+                .iter()
+                .all(|o| o.binding.provider.as_str() == "openai"),
+            "the lane must survive a query that matches other providers"
+        );
+    }
+
+    /// Inside one provider's lane the heading is noise: every row shares it.
+    #[test]
+    fn a_provider_lane_drops_the_group_heading() {
+        let picker = ModelPicker {
+            lane: Lane::Provider("openai".to_owned()),
+            ..ModelPicker::default()
+        };
+        let rows = picker.rows(&catalogue(), &[], &[]);
+        assert!(!rows.iter().any(|r| matches!(r, Row::Group(_))));
+    }
+
+    #[test]
+    fn cycling_lanes_wraps_and_resets_the_highlight() {
+        let capable = catalogue();
+        let pins = default_pins(&capable);
+        let lanes = lanes(&capable, &pins);
+        let mut picker = ModelPicker {
+            highlight: 3,
+            ..ModelPicker::default()
+        };
+
+        picker.cycle_lane(&lanes);
+        assert_ne!(picker.lane, Lane::All, "cycling moves off the first lane");
+        assert_eq!(picker.highlight, 0, "a new lane is a new result set");
+
+        for _ in 0..lanes.len() {
+            picker.cycle_lane(&lanes);
+        }
+        assert_eq!(picker.lane, lanes[1], "a full cycle returns");
+    }
+
+    /// The pinned lane only exists once something is pinned; a lane that can
+    /// only ever be empty is a filter with no purpose.
+    #[test]
+    fn the_pinned_lane_appears_only_when_something_is_pinned() {
+        let capable = catalogue();
+        assert!(!lanes(&capable, &[]).contains(&Lane::Pinned));
+        let pins = default_pins(&capable);
+        assert!(lanes(&capable, &pins).contains(&Lane::Pinned));
     }
 
     fn catalogue() -> Vec<ModelOption> {

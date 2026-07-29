@@ -356,6 +356,7 @@ impl ModelsResponse {
                         ..defaults.clone()
                     },
                     id,
+                    released_at: None,
                     deprecated: false,
                     replaced_by: None,
                 }

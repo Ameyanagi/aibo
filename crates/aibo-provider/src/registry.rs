@@ -427,6 +427,7 @@ pub fn codex_models() -> Vec<ModelInfo> {
             id: m.id.to_string(),
             display_name: m.display_name.to_string(),
             capabilities: capabilities.clone(),
+            released_at: None,
             deprecated: false,
             replaced_by: None,
         })
@@ -455,6 +456,7 @@ pub fn codex_rejected_models() -> Vec<ModelInfo> {
             // Nothing is known about a model that cannot be called; the
             // conservative floor is the honest default.
             capabilities: Capabilities::default(),
+            released_at: None,
             deprecated: true,
             replaced_by: Some(
                 if id.contains("codex") {
@@ -687,6 +689,7 @@ mod tests {
             id: id.to_string(),
             display_name: id.to_string(),
             capabilities: Capabilities::default(),
+            released_at: None,
             deprecated,
             replaced_by: replaced_by.map(str::to_string),
         }
@@ -1109,6 +1112,7 @@ mod tests {
                             max_context: 128_000,
                             ..Capabilities::default()
                         },
+                        released_at: None,
                         deprecated: false,
                         replaced_by: None,
                     })

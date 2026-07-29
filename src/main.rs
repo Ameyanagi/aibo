@@ -2742,6 +2742,7 @@ mod runtime {
                 binding,
                 display_name: entry.display_name.clone(),
                 latency_ms: None,
+                released_at: entry.released_at,
                 abilities,
                 cost,
             });
@@ -2755,14 +2756,22 @@ mod runtime {
             option.cost = cost;
         }
 
-        // Grouped by provider, then by model, so a picker with several hundred
-        // OpenRouter entries is still navigable — §16's "every action has a key"
-        // does not help if the list has no order.
+        // Grouped by provider, then **newest first** within each provider.
+        //
+        // Alphabetical ordering was actively harmful: it put `chat-latest` and
+        // `gpt-3.5-turbo` at the top of OpenAI's lane and `gpt-5` far below, so
+        // the first thing offered was the oldest thing available. `released_at`
+        // comes from the provider's own `created` field, so this stays correct
+        // as models ship without anyone maintaining a list.
+        //
+        // A missing date sorts last — honest for "unknown" — and the name breaks
+        // ties so the order is stable between refreshes rather than shuffling.
         options.sort_by(|a, b| {
             a.binding
                 .provider
                 .as_str()
                 .cmp(b.binding.provider.as_str())
+                .then_with(|| b.released_at.cmp(&a.released_at))
                 .then_with(|| a.display_name.cmp(&b.display_name))
         });
 
@@ -2818,6 +2827,7 @@ mod runtime {
                 latency_ms: Some(model.ttft_p50_ms),
                 // Filled in by `model_options_event`, which is the only caller
                 // holding the catalogue and the price table.
+                released_at: None,
                 abilities: Default::default(),
                 cost: None,
             })
@@ -2827,6 +2837,7 @@ mod runtime {
                 binding: selected.clone(),
                 display_name: selected.model.clone(),
                 latency_ms: None,
+                released_at: None,
                 abilities: Default::default(),
                 cost: None,
             });

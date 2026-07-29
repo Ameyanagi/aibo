@@ -514,6 +514,7 @@ impl Provider for OpenAiCompat {
             .map(|m| ModelInfo {
                 provider: self.id.clone(),
                 display_name: m.id.clone(),
+                released_at: m.created,
                 id: m.id,
                 // No provider in the §10 matrix returns capability information
                 // from `/models`. The authoritative values come from the signed
@@ -571,6 +572,10 @@ struct ModelsResponse {
 #[derive(Debug, Deserialize)]
 struct ModelEntry {
     id: String,
+    /// Unix timestamp. Present on OpenAI and most compatible endpoints; absent
+    /// ones sort last rather than pretending to be new.
+    #[serde(default)]
+    created: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1341,6 +1346,9 @@ pub fn model(
         id: id.to_string(),
         display_name: display_name.to_string(),
         capabilities,
+        // A statically declared model carries no release date; the ordering
+        // falls back to the name, which is right for a short curated list.
+        released_at: None,
         deprecated: false,
         replaced_by: None,
     }

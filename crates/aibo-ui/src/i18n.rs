@@ -115,6 +115,8 @@ pub enum Key {
     AbilityReasoning,
     /// Badge: the model can be given tools.
     AbilityTools,
+    /// The quick-pick lane showing every provider.
+    LaneAll,
     /// Quick-pick heading above pinned models.
     PickerFavourites,
     /// Quick-pick heading above recently used models.
@@ -558,6 +560,7 @@ fn en(key: Key) -> &'static str {
         K::AbilityVision => "vision",
         K::AbilityReasoning => "reasoning",
         K::AbilityTools => "tools",
+        K::LaneAll => "all",
         K::PickerFavourites => "pinned",
         K::PickerRecent => "recent",
         K::PickerPlaceholder => "search models, or \u{21e5} to browse",
@@ -757,6 +760,7 @@ fn ja(key: Key) -> &'static str {
         K::AbilityVision => "画像",
         K::AbilityReasoning => "推論",
         K::AbilityTools => "ツール",
+        K::LaneAll => "すべて",
         K::PickerFavourites => "ピン留め",
         K::PickerRecent => "最近使用",
         K::PickerPlaceholder => "モデルを検索",

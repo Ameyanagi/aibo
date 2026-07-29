@@ -262,6 +262,8 @@ pub enum WindowChord {
     Copy,
     /// Open the model quick-pick.
     PickModel,
+    /// Move to the next quick-pick lane. `⇥`, as the placeholder promises.
+    NextLane,
     /// Pin or unpin the highlighted model. Only meaningful while the quick-pick
     /// is open; the subscription cannot see panel state, so the meaning is
     /// decided where the chord is handled.
@@ -1442,12 +1444,13 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
                     WindowChord::HistoryOlder => panel::Message::PickerMove(-1),
                     WindowChord::HistoryNewer => panel::Message::PickerMove(1),
                     WindowChord::PinModel => panel::Message::PickerToggleFavourite,
+                    WindowChord::NextLane => panel::Message::PickerCycleLane,
                     _ => return Task::none(),
                 },
                 WindowChord::PickModel => panel::Message::OpenPicker,
                 // Outside the picker ⌘D means nothing, and inventing a meaning
                 // for it would make the binding unpredictable.
-                WindowChord::PinModel => return Task::none(),
+                WindowChord::PinModel | WindowChord::NextLane => return Task::none(),
                 // Handled above, for every window.
                 WindowChord::OpenSettings => unreachable!("intercepted before the role match"),
                 WindowChord::New => return Task::none(),
@@ -1593,6 +1596,12 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
         M::PickerMove(delta) => {
             let count = crate::model_picker::selectable(&state.panel.picker_rows()).len();
             state.panel.picker.move_highlight(delta, count);
+            Task::none()
+        }
+        M::PickerCycleLane => {
+            let capable = state.panel.capable_models();
+            let lanes = crate::model_picker::lanes(&capable, &state.panel.pins(&capable));
+            state.panel.picker.cycle_lane(&lanes);
             Task::none()
         }
         M::PickerToggleFavourite => {
@@ -2797,6 +2806,7 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
                     command: modifiers.command(),
                     shift: modifiers.shift(),
                 },
+                Key::Named(Named::Tab) => WindowChord::NextLane,
                 Key::Named(Named::ArrowUp) => WindowChord::HistoryOlder,
                 Key::Named(Named::ArrowDown) => WindowChord::HistoryNewer,
                 // ⌘C stays here rather than above: inside a text field it is
@@ -2980,6 +2990,7 @@ mod tests {
             },
             display_name: model.to_owned(),
             latency_ms: Some(435),
+            released_at: None,
             abilities: Default::default(),
             cost: None,
         }
