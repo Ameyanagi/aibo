@@ -219,6 +219,29 @@ impl Quirks {
             done_sentinel: false,
             reasoning_effort: true,
             json_schema: true,
+            // **No sampling parameters on the Responses wire.**
+            //
+            // Measured against the live endpoint on 2026-07-30: `gpt-5` on
+            // `/v1/responses` answers a request carrying `temperature` with
+            //
+            //     HTTP 400 — Unsupported parameter: 'temperature' is not
+            //     supported with this model.
+            //
+            // Reasoning models do not take sampling params, and the gpt-5 family
+            // is both the modern default and §4's `VISION_CHAIN` binding — so
+            // sending it broke every image request against OpenAI outright.
+            //
+            // The asymmetry decides it. Sending it is a hard 400, and §4 refuses
+            // to move a 4xx down the role chain, so the request simply dies.
+            // Omitting it costs §5's per-surface temperature (0.2 for Complete
+            // and Transform, 0.7 for Ask) on the models that *would* have
+            // honoured it, which is a quality nudge rather than a failure.
+            //
+            // `Quirks` is per provider, not per model, so this cannot yet be
+            // narrowed to "reasoning models only". The Codex path already
+            // disabled it for the same reason; this generalises that to the wire
+            // format where the constraint actually lives.
+            sampling_params: false,
             ..Self::chat_completions()
         }
     }

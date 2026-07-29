@@ -64,11 +64,30 @@ pub struct ModelOption {
 }
 
 impl std::fmt::Display for ModelOption {
+    /// `provider · model · latency`.
+    ///
+    /// **The provider is named, and it has to be.** The picker used to show the
+    /// model alone, which was unambiguous only while Codex was the sole
+    /// provider. With several configured, "gpt-5" could be OpenAI directly or
+    /// OpenRouter fronting it — at different prices, context windows and trust
+    /// boundaries (§14) — and the row gave no way to tell. Worse, the label
+    /// could name a Codex model while the request had actually been routed
+    /// elsewhere by role, which is how a vision request appeared to come from
+    /// "GPT-5.6 Sol".
+    ///
+    /// Latency stays last because only the shipped Codex entries have a measured
+    /// figure; no `/models` endpoint returns one.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.latency_ms {
-            Some(latency) => write!(f, "{} · {latency} ms", self.display_name),
-            None => f.write_str(&self.display_name),
+        write!(
+            f,
+            "{} · {}",
+            self.binding.provider.as_str(),
+            self.display_name
+        )?;
+        if let Some(latency) = self.latency_ms {
+            write!(f, " · {latency} ms")?;
         }
+        Ok(())
     }
 }
 

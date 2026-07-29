@@ -94,6 +94,7 @@ async fn a_failed_request_releases_its_reserve() {
     mock.push(Script::Reject(AiboError::ProviderUnavailable {
         provider: ProviderId::OPENAI,
         status: 503,
+        detail: None,
     }));
 
     let engine = engine(&mock, PriceTable::from_toml_str(PRICES).unwrap(), None);
@@ -252,6 +253,7 @@ async fn the_reserve_does_not_stack_across_a_fallback_attempt() {
     first.push(Script::Reject(AiboError::ProviderUnavailable {
         provider: ProviderId::OPENAI,
         status: 503,
+        detail: None,
     }));
     let second = Mock::new(ProviderId::ANTHROPIC);
     second.push(Script::ok("answer"));

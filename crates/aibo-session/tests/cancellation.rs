@@ -148,6 +148,7 @@ async fn a_mid_stream_failure_yields_a_partial_and_never_retries_elsewhere() {
         AiboError::ProviderUnavailable {
             provider: ProviderId::ANTHROPIC,
             status: 503,
+            detail: None,
         },
     ));
     let secondary = Mock::new(ProviderId::OPENAI);

@@ -136,6 +136,9 @@ pub fn map_transport_error(provider: &ProviderId, err: &reqwest::Error) -> AiboE
         return AiboError::ProviderUnavailable {
             provider: provider.clone(),
             status: status.as_u16(),
+            // A transport-level status has no body to explain it; the detail is
+            // only available where the response was read (`wire::map_status`).
+            detail: None,
         };
     }
     AiboError::Offline

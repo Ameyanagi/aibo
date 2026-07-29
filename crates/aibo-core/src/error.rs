@@ -231,12 +231,22 @@ pub enum AiboError {
     Offline,
 
     /// The provider answered, but not usefully.
-    #[error("{provider} returned HTTP {status}")]
+    #[error("{provider} returned HTTP {status}{}", detail.as_deref().map(|d| format!(": {d}")).unwrap_or_default())]
     ProviderUnavailable {
         /// The provider.
         provider: ProviderId,
         /// HTTP status. A 4xx here is a bug in aibo and must not fall back (§4).
         status: u16,
+        /// The provider's own explanation, when its error body carried one.
+        ///
+        /// **Kept because discarding it made a whole class of bug
+        /// undiagnosable.** A 400 from OpenAI says exactly what is wrong —
+        /// "Unsupported parameter: 'temperature' is not supported with this
+        /// model" — and throwing that away left nothing but a status code.
+        /// Finding the cause of one such 400 took reproducing the request by
+        /// hand against the live API; the user saw only "openai is not
+        /// responding", which was not even true.
+        detail: Option<String>,
     },
 
     /// The assembled request exceeds the model's context.
@@ -578,6 +588,7 @@ mod tests {
             AiboError::ProviderUnavailable {
                 provider: ProviderId::OPENAI,
                 status: 503,
+                detail: None,
             },
             AiboError::Internal(boxed),
         ];
@@ -607,7 +618,8 @@ mod tests {
         assert_eq!(
             AiboError::ProviderUnavailable {
                 provider: ProviderId::GROQ,
-                status: 502
+                status: 502,
+                detail: None,
             }
             .treatment(),
             Treatment::SilentFallback
@@ -721,14 +733,16 @@ mod tests {
         assert!(
             !AiboError::ProviderUnavailable {
                 provider: ProviderId::OPENAI,
-                status: 400
+                status: 400,
+                detail: None,
             }
             .is_fallback_eligible()
         );
         assert!(
             AiboError::ProviderUnavailable {
                 provider: ProviderId::OPENAI,
-                status: 500
+                status: 500,
+                detail: None,
             }
             .is_fallback_eligible()
         );

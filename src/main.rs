@@ -2663,6 +2663,12 @@ mod runtime {
         CodexAuth(codex_signin::Event),
         /// Explicit encrypted-history setup finished off the runtime workers.
         HistoryInitialized(aibo_store::Result<Option<secrecy::SecretString>>),
+        /// A `Provider::models()` sweep finished (§10).
+        ///
+        /// Boxed for the same reason as `Captured`: a catalogue of several
+        /// hundred OpenRouter entries must not set the size of every message on
+        /// this channel.
+        CatalogueRefreshed(Box<aibo_provider::ModelCatalogue>),
     }
 
     /// What the backend remembers about the Codex login (§3a).
@@ -2695,6 +2701,59 @@ mod runtime {
         }
     }
 
+    /// How long one provider gets to answer `/models` during a refresh.
+    const MODEL_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The picker's contents: Codex's shipped list plus whatever every other
+    /// configured provider reports.
+    ///
+    /// Codex stays the *base* rather than being merged in from the catalogue,
+    /// because `CODEX_MODELS` carries §3a's measured `ttft_p50_ms` and no
+    /// `/models` endpoint anywhere returns a latency. A catalogue entry can add
+    /// a model; it must not take away a measurement.
+    fn model_options_event(config: &Config, catalogue: &aibo_provider::ModelCatalogue) -> UiEvent {
+        let UiEvent::ModelOptions {
+            mut options,
+            selected,
+        } = codex_model_options_event(config)
+        else {
+            unreachable!("codex_model_options_event returns ModelOptions");
+        };
+
+        for entry in catalogue.entries() {
+            // Codex is already represented, with latency the catalogue lacks.
+            // A retired id is offered to nobody.
+            if entry.provider == ProviderId::CODEX || entry.deprecated {
+                continue;
+            }
+            let binding = ModelBinding {
+                provider: entry.provider.clone(),
+                model: entry.id.clone(),
+            };
+            if options.iter().any(|option| option.binding == binding) {
+                continue;
+            }
+            options.push(ModelOption {
+                binding,
+                display_name: entry.display_name.clone(),
+                latency_ms: None,
+            });
+        }
+
+        // Grouped by provider, then by model, so a picker with several hundred
+        // OpenRouter entries is still navigable — §16's "every action has a key"
+        // does not help if the list has no order.
+        options.sort_by(|a, b| {
+            a.binding
+                .provider
+                .as_str()
+                .cmp(b.binding.provider.as_str())
+                .then_with(|| a.display_name.cmp(&b.display_name))
+        });
+
+        UiEvent::ModelOptions { options, selected }
+    }
+
     fn codex_model_options_event(config: &Config) -> UiEvent {
         let selected = ModelBinding {
             provider: ProviderId::CODEX,
@@ -2724,10 +2783,28 @@ mod runtime {
         }
     }
 
-    fn model_selection_allowed(config: &Config, binding: &ModelBinding) -> bool {
-        binding.provider == ProviderId::CODEX
-            && (aibo_provider::registry::is_codex_model_allowed(&binding.model)
-                || binding.model == config.codex.model)
+    /// Whether a selection the UI sent is one the runtime actually offered.
+    ///
+    /// The guard exists to reject an *injected* binding, not to narrow the
+    /// picker. It used to require `provider == CODEX`, which was correct only
+    /// while Codex was the sole provider — offering a model and then silently
+    /// refusing it is the "advertised and inert" defect §17 treats as worse than
+    /// an absent control.
+    fn model_selection_allowed(
+        config: &Config,
+        catalogue: &aibo_provider::ModelCatalogue,
+        binding: &ModelBinding,
+    ) -> bool {
+        if binding.provider == ProviderId::CODEX {
+            // §3a's allowlist still applies: an API-style id on the Codex path
+            // is a hard 400 that §4 will not fall back from.
+            return aibo_provider::registry::is_codex_model_allowed(&binding.model)
+                || binding.model == config.codex.model;
+        }
+        catalogue
+            .entries()
+            .iter()
+            .any(|entry| entry.provider == binding.provider && entry.id == binding.model)
     }
 
     /// The deadline-bounded half of §8's capture, once it has landed.
@@ -2813,6 +2890,20 @@ mod runtime {
         active_session: Option<SessionId>,
         sessions: HashMap<SessionId, Session>,
         events: Sender<UiEvent>,
+        /// Sender for the internal channel, once `run` has created it.
+        ///
+        /// `rebuild_engine` has six callers and needs to kick off a catalogue
+        /// refresh from all of them; threading the sender through each was
+        /// noise. `None` before the loop starts, when there is nothing to
+        /// refresh into anyway.
+        internal: Option<Sender<Internal>>,
+        /// §10's model catalogue: the shipped Codex entries, plus whatever a
+        /// live `Provider::models()` refresh has added.
+        ///
+        /// One source for two readers that must agree — the picker's contents
+        /// and `model_selection_allowed`. When they disagreed, the picker offered
+        /// models the guard then refused.
+        catalogue: aibo_provider::ModelCatalogue,
         /// TODO(P1): hand to the agent and MCP spawn sites (§6).
         #[allow(dead_code)]
         children: ChildRegistry,
@@ -2845,6 +2936,9 @@ mod runtime {
                 sessions: HashMap::new(),
                 events,
                 children,
+                internal: None,
+                // Shipped entries only until the first refresh answers.
+                catalogue: aibo_provider::ModelCatalogue::shipped(),
             }
         }
 
@@ -2856,7 +2950,11 @@ mod runtime {
             // §13: "Still handle NSWorkspaceDidWakeNotification /
             // WM_POWERBROADCAST, but for re-probing provider health and
             // clearing the degraded flags, not for re-warming sockets."
+            self.internal = Some(internal_tx.clone());
             self.spawn_power_watch(internal_tx.clone());
+            // Ask every configured provider what it serves, now that there is
+            // somewhere to deliver the answer.
+            self.spawn_model_refresh();
 
             // The first thing the UI should know is which providers exist and
             // what aibo currently believes about them.
@@ -3148,6 +3246,18 @@ mod runtime {
                 }
 
                 Internal::CodexAuth(event) => self.handle_codex_auth(event),
+                Internal::CatalogueRefreshed(catalogue) => {
+                    let before = self.catalogue.entries().len();
+                    self.catalogue = *catalogue;
+                    tracing::info!(
+                        models = self.catalogue.entries().len(),
+                        added = self.catalogue.entries().len().saturating_sub(before),
+                        "model catalogue refreshed"
+                    );
+                    // Republish so the picker gains the new entries, and so
+                    // `model_selection_allowed` and the picker keep agreeing.
+                    self.publish_model_options();
+                }
                 Internal::HistoryInitialized(result) => {
                     self.history_initializing = false;
                     match result {
@@ -3275,7 +3385,7 @@ mod runtime {
         /// id as the current option so an upgrade cannot silently rewrite a
         /// choice merely because this build predates it.
         fn model_options_event(&self) -> UiEvent {
-            codex_model_options_event(&self.bootstrap.config())
+            model_options_event(&self.bootstrap.config(), &self.catalogue)
         }
 
         fn publish_model_options(&self) {
@@ -3290,7 +3400,7 @@ mod runtime {
         /// UI bridge.
         fn set_model(&mut self, binding: ModelBinding) {
             let config = self.bootstrap.config();
-            if !model_selection_allowed(&config, &binding) {
+            if !model_selection_allowed(&config, &self.catalogue, &binding) {
                 tracing::warn!("refused a model selection outside the offered catalogue");
                 return;
             }
@@ -3607,6 +3717,29 @@ mod runtime {
                 }
             }
             self.publish_model_options();
+            self.spawn_model_refresh();
+        }
+
+        /// Ask every configured provider what it serves, off the hot path.
+        ///
+        /// Spawned rather than awaited: §10's runtime catalogue is a network
+        /// round trip per provider, and this runs where a user has just signed
+        /// in or saved a key — the panel must stay usable throughout. The
+        /// shipped entries are already on screen; a refresh only ever adds.
+        fn spawn_model_refresh(&self) {
+            let Some(internal) = self.internal.clone() else {
+                return;
+            };
+            let engine = Arc::clone(&self.engine);
+            tokio::spawn(async move {
+                let mut catalogue = aibo_provider::ModelCatalogue::shipped();
+                catalogue
+                    .refresh_from(engine.providers(), MODEL_REFRESH_TIMEOUT)
+                    .await;
+                let _ = internal
+                    .send(Internal::CatalogueRefreshed(Box::new(catalogue)))
+                    .await;
+            });
         }
 
         // -- capture ---------------------------------------------------------
@@ -4469,6 +4602,12 @@ mod runtime {
         /// never produce.
         const AIBO_PID: i32 = 99;
 
+        /// The catalogue as it is before any network refresh, which is the state
+        /// these tests describe.
+        fn shipped_catalogue() -> aibo_provider::ModelCatalogue {
+            aibo_provider::ModelCatalogue::shipped()
+        }
+
         #[test]
         fn popup_model_catalogue_tracks_config_and_rejects_injected_choices() {
             let config =
@@ -4482,9 +4621,14 @@ mod runtime {
             assert_eq!(selected.model, "gpt-5.6-terra");
             assert_eq!(options.len(), 5);
             assert!(options.iter().all(|option| option.latency_ms.is_some()));
-            assert!(model_selection_allowed(&config, &selected));
+            assert!(model_selection_allowed(
+                &config,
+                &shipped_catalogue(),
+                &selected
+            ));
             assert!(!model_selection_allowed(
                 &config,
+                &shipped_catalogue(),
                 &ModelBinding {
                     provider: ProviderId::CODEX,
                     model: "unoffered-model".to_owned(),
@@ -4492,6 +4636,7 @@ mod runtime {
             ));
             assert!(!model_selection_allowed(
                 &config,
+                &shipped_catalogue(),
                 &ModelBinding {
                     provider: ProviderId::OPENAI,
                     model: "gpt-5.6-terra".to_owned(),
@@ -4511,7 +4656,11 @@ mod runtime {
             let selected = selected.expect("selected model");
             assert_eq!(options.len(), 6);
             assert!(options.iter().any(|option| option.binding == selected));
-            assert!(model_selection_allowed(&config, &selected));
+            assert!(model_selection_allowed(
+                &config,
+                &shipped_catalogue(),
+                &selected
+            ));
         }
 
         #[test]

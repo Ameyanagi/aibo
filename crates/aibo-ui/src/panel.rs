@@ -397,6 +397,20 @@ impl ErrorView {
                 i18n::t(Key::ErrOffline).to_owned(),
                 Some(ErrorAction::Retry),
             ),
+            // A 4xx is not "not responding" — the provider answered, and said
+            // why. §13 wants errors that state what happened, and the provider's
+            // own sentence is more use than anything aibo can invent: it is the
+            // difference between "openai is not responding" and "temperature is
+            // not supported with this model".
+            AiboError::ProviderUnavailable {
+                provider,
+                status,
+                detail: Some(detail),
+            } if *status < 500 => (
+                Severity::Warning,
+                i18n::t2(Key::ErrProviderRejected, provider.as_str(), detail),
+                Some(ErrorAction::CopyDiagnostics),
+            ),
             AiboError::ProviderUnavailable { provider, .. } => (
                 Severity::Warning,
                 i18n::t1(Key::ErrProviderUnavailable, provider.as_str()),

@@ -275,6 +275,13 @@ pub enum Key {
     ErrOffline,
     /// `ProviderUnavailable` — `{}` = provider.
     ErrProviderUnavailable,
+    /// A 4xx: the provider answered and explained why. `{}` = provider,
+    /// `{}` = the provider's own message.
+    ///
+    /// Distinct from [`Key::ErrProviderUnavailable`], which is for a provider
+    /// that genuinely did not answer. Rendering a 400 as "not responding" is
+    /// both wrong and unactionable.
+    ErrProviderRejected,
     /// `ContextTooLarge`.
     ErrContextTooLarge,
     /// `Timeout`.
@@ -603,6 +610,7 @@ fn en(key: Key) -> &'static str {
         K::ErrRateLimited => "{} is rate limiting requests.",
         K::ErrOffline => "aibo cannot reach the network.",
         K::ErrProviderUnavailable => "{} is not responding.",
+        K::ErrProviderRejected => "{} rejected the request: {}",
         K::ErrContextTooLarge => "The selection is too long for this model.",
         K::ErrTimeout => "The request took too long.",
         K::ErrCaptureFailed => "aibo could not read the text in {}.",
@@ -789,6 +797,7 @@ fn ja(key: Key) -> &'static str {
         K::ErrRateLimited => "{} がレート制限中です。",
         K::ErrOffline => "ネットワークに接続できません。",
         K::ErrProviderUnavailable => "{} が応答しません。",
+        K::ErrProviderRejected => "{} がリクエストを拒否しました: {}",
         K::ErrContextTooLarge => "選択範囲がこのモデルには長すぎます。",
         K::ErrTimeout => "応答に時間がかかりすぎました。",
         K::ErrCaptureFailed => "{} のテキストを読み取れませんでした。",

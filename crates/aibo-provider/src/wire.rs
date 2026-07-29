@@ -243,6 +243,9 @@ pub fn map_status(
         _ => AiboError::ProviderUnavailable {
             provider: provider.clone(),
             status,
+            // `detail` was already extracted above for the other arms; carrying
+            // it here is what makes a 400 diagnosable.
+            detail: (!detail.is_empty()).then(|| detail.clone()),
         },
     }
 }

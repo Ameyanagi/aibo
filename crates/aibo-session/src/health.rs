@@ -603,6 +603,7 @@ mod tests {
             FailureKind::classify(&AiboError::ProviderUnavailable {
                 provider: ProviderId::GROQ,
                 status: 503,
+                detail: None,
             }),
             Some(FailureKind::Server)
         );
@@ -610,6 +611,7 @@ mod tests {
             FailureKind::classify(&AiboError::ProviderUnavailable {
                 provider: ProviderId::GROQ,
                 status: 400,
+                detail: None,
             }),
             None,
             "§4: a 400 is a bug in aibo, not evidence about the network"
