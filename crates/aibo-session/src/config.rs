@@ -566,6 +566,7 @@ impl Config {
         let mut registry = ProviderRegistry::new();
         let mut trust = TrustMap::new();
         let mut tiers = BTreeMap::new();
+        let mut failures: Vec<ConfigError> = Vec::new();
 
         for provider in &self.providers {
             let id = provider
@@ -592,11 +593,66 @@ impl Config {
                 tiers.insert(id.clone(), ProviderTier::new(tier.clone()));
             }
 
-            let spec = self.spec_for(provider, &id, credentials)?;
-            registry.insert(id, aibo_provider::registry::build(spec)?);
+            // **One bad provider must not take the others down with it.**
+            //
+            // These two `?`s used to propagate, and `Bootstrap::config` treats a
+            // failed build as "the configuration could not be applied" and
+            // hands back an *empty* registry. So a single `[[providers]]` entry
+            // whose key was missing disabled every other provider — including a
+            // signed-in Codex, which needs no key at all. Adding a provider and
+            // mistyping its key logged one line and silently unconfigured the
+            // product.
+            //
+            // §13 wants a misconfiguration to "show up in settings rather than
+            // on the first hotkey press", and §17's onboarding is built around
+            // per-provider state. Skipping the entry gives both: the working
+            // providers stay, and the broken one is absent from the registry,
+            // which is exactly what the settings row renders as unconfigured.
+            match self
+                .spec_for(provider, &id, credentials)
+                .and_then(|spec| aibo_provider::registry::build(spec).map_err(Into::into))
+            {
+                Ok(built) => {
+                    registry.insert(id, built);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        provider = %id,
+                        %error,
+                        "a provider could not be built; continuing with the others"
+                    );
+                    // Kept, not discarded: if it turns out *nothing* could be
+                    // built, this is the message the user needs — it names the
+                    // provider and the environment variable to set. Reported
+                    // below, once whether anything survived is known.
+                    failures.push(error);
+                }
+            }
         }
 
         let codex_authenticated = self.insert_codex(&mut registry, codex_tokens)?;
+
+        // **The rule, and why it is this one.**
+        //
+        // A provider that cannot be built must not disable the ones that can:
+        // `Bootstrap::config` falls back to an empty registry on error, so
+        // propagating unconditionally meant one `[[providers]]` entry with a
+        // missing key unconfigured the whole product — including a signed-in
+        // Codex, which needs no key at all. That was observed in the wild.
+        //
+        // But skipping unconditionally is also wrong. On a first run with a
+        // single misconfigured provider, the error is the *only* thing that
+        // tells the user which provider failed and which environment variable
+        // to set; swallowing it leaves an app that starts and does nothing.
+        //
+        // So: report the failure when nothing at all survived, and skip when
+        // something did. Checked after Codex is inserted, because Codex
+        // surviving is precisely the case that must not be sacrificed.
+        if registry.is_empty()
+            && let Some(error) = failures.into_iter().next()
+        {
+            return Err(error);
+        }
         let bindings = self.bindings(&registry, codex_authenticated)?;
 
         Ok((
@@ -877,6 +933,67 @@ fn parse_role(name: &str) -> Result<Role, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A provider that cannot be built must not disable the ones that can.
+    ///
+    /// `Bootstrap::config` treats a failed build as "the configuration could not
+    /// be applied" and falls back to an *empty* registry, so propagating here
+    /// meant one `[[providers]]` entry with a missing key unconfigured the whole
+    /// product — including a signed-in Codex, which needs no key at all.
+    /// Observed in the wild: adding an OpenAI key whose secret was filed under
+    /// the wrong account silently killed Codex.
+    #[test]
+    fn a_provider_with_no_credential_does_not_take_the_others_with_it() {
+        let config = Config::from_toml_str(
+            "[[providers]]\nbackend = \"groq\"\n\n[[providers]]\nbackend = \"open-ai\"\n",
+        )
+        .expect("valid toml");
+
+        // Only Groq has a key; OpenAI's is missing.
+        struct OnlyGroq;
+        impl CredentialSource for OnlyGroq {
+            fn api_key(&self, provider: &ProviderId) -> Option<secrecy::SecretString> {
+                (provider.as_str() == "groq")
+                    .then(|| secrecy::SecretString::from("gsk-test".to_owned()))
+            }
+        }
+
+        let (registry, _) = config
+            .build(&OnlyGroq, PriceTable::default())
+            .expect("the build must succeed despite one unbuildable provider");
+
+        let ids: Vec<String> = registry
+            .ids()
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        assert!(
+            ids.contains(&"groq".to_owned()),
+            "the working provider survives"
+        );
+        assert!(
+            !ids.contains(&"openai".to_owned()),
+            "the one with no credential is absent, which is what settings renders as unconfigured"
+        );
+    }
+
+    /// The other half of the rule: with nothing left standing, the error is the
+    /// only thing that tells a first-run user what to fix, so it must surface.
+    #[test]
+    fn a_lone_unbuildable_provider_still_reports_why() {
+        let config =
+            Config::from_toml_str("[[providers]]\nbackend = \"open-ai\"\n").expect("valid toml");
+
+        let error = config
+            .build(&NoCredentials, PriceTable::default())
+            .expect_err("nothing could be built, so the reason must reach the caller");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("AIBO_OPENAI_API_KEY"),
+            "the message must name the variable to set, got: {message}"
+        );
+    }
+
     /// The credential store is keyed by [`ProviderId`], not by the
     /// `backend = "…"` string, and for three backends those differ.
     ///
