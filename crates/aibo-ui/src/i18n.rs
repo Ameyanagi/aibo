@@ -121,6 +121,22 @@ pub enum Key {
     ContextChipFrom,
     /// Context chip when no context could be captured at all.
     ContextChipNone,
+    /// The empty panel's one line of invitation (`design.md` §4).
+    PanelEmptyInvitation,
+    /// Source line while the capture is still in flight.
+    ///
+    /// `design.md` §4 requires this state to read `no context — reading…` and
+    /// then `no context available`, **never blank**. Capture is asynchronous
+    /// with a 120 ms deadline (§8), so there is always a moment where the panel
+    /// is up and the answer to "where was I?" is not known yet; saying so is
+    /// what stops that moment reading as a failure.
+    ContextChipReading,
+    /// Source line once capture has settled with nothing to show.
+    ///
+    /// Distinct from [`Key::ContextChipNone`]: this is a capture that finished
+    /// and found nothing, not one that never ran. The user can act on the
+    /// difference — the first is worth a re-read, the second is not.
+    ContextChipUnavailable,
 
     // --- panel: attachments (§2 vision, §14 cost) -------------------------
     /// Chip label for a clipboard image whose source app is known: `{}` = app.
@@ -174,6 +190,12 @@ pub enum Key {
     ActionCopy,
     /// Re-run against the `Smart` role.
     ActionSmartModel,
+    /// Begin adding a provider in settings.
+    ActionAddProvider,
+    /// Save the provider being added.
+    ActionSaveProvider,
+    /// Forget a configured provider and its credential.
+    ActionForgetProvider,
     /// Close the panel.
     ActionDismiss,
     /// Retry the failed request.
@@ -225,6 +247,20 @@ pub enum Key {
     // --- error treatments (§13) ------------------------------------------
     /// `NoProviderConfigured` — the only blocking error.
     ErrNoProvider,
+    /// Heading over the add-a-provider form.
+    SettingsAddProvider,
+    /// Placeholder for a custom endpoint's name.
+    ProviderIdPlaceholder,
+    /// Placeholder for a custom endpoint's base URL.
+    ProviderBaseUrlPlaceholder,
+    /// Placeholder for the API-key field.
+    ProviderKeyPlaceholder,
+    /// The second line of the no-provider state: what to actually do about it.
+    ///
+    /// `design.md` §6 requires errors to state what happened *and* what to do,
+    /// in one sentence each. The headline alone ("No provider configured.") is
+    /// a diagnosis with no next step.
+    ErrNoProviderBody,
     /// `Auth` — `{}` = provider.
     ErrAuth,
     /// `RateLimited` — `{}` = provider.
@@ -492,6 +528,9 @@ fn en(key: Key) -> &'static str {
         K::ContextSelectedText => "Selected text",
         K::ContextChipFrom => "{}",
         K::ContextChipNone => "No context",
+        K::PanelEmptyInvitation => "ask, or ⇥ for actions",
+        K::ContextChipReading => "no context — reading…",
+        K::ContextChipUnavailable => "no context available",
 
         K::AttachmentClipboardFrom => "Image from {}",
         K::AttachmentClipboardLabel => "Clipboard image",
@@ -519,7 +558,14 @@ fn en(key: Key) -> &'static str {
 
         K::ActionReplace => "Replace",
         K::ActionCopy => "Copy",
-        K::ActionSmartModel => "Smart model",
+        K::ActionSmartModel => "smart model",
+        K::ActionAddProvider => "Add a provider",
+        K::ActionSaveProvider => "Save",
+        K::ActionForgetProvider => "Forget",
+        K::SettingsAddProvider => "Add a provider",
+        K::ProviderIdPlaceholder => "Name, e.g. deepseek",
+        K::ProviderBaseUrlPlaceholder => "Base URL, e.g. https://api.deepseek.com/v1",
+        K::ProviderKeyPlaceholder => "API key",
         K::ActionDismiss => "Dismiss",
         K::ActionRetry => "Retry",
         K::ActionSend => "Send",
@@ -544,7 +590,8 @@ fn en(key: Key) -> &'static str {
         K::ActionEnableHistory => "Enable encrypted history",
         K::ActionCopyRecoveryCode => "Copy recovery code",
 
-        K::ErrNoProvider => "No provider is configured yet.",
+        K::ErrNoProvider => "No provider configured.",
+        K::ErrNoProviderBody => "Sign in with ChatGPT to start, or add an API key.",
         K::ErrAuth => "Your {} credentials are no longer valid.",
         K::ErrRateLimited => "{} is rate limiting requests.",
         K::ErrOffline => "aibo cannot reach the network.",
@@ -668,6 +715,9 @@ fn ja(key: Key) -> &'static str {
         K::ContextSelectedText => "選択したテキスト",
         K::ContextChipFrom => "{}",
         K::ContextChipNone => "コンテキストなし",
+        K::PanelEmptyInvitation => "質問するか、⇥ で操作を選択",
+        K::ContextChipReading => "コンテキストを読み取り中…",
+        K::ContextChipUnavailable => "コンテキストを取得できません",
 
         K::AttachmentClipboardFrom => "{} の画像",
         K::AttachmentClipboardLabel => "クリップボードの画像",
@@ -694,6 +744,13 @@ fn ja(key: Key) -> &'static str {
         K::ActionReplace => "置換",
         K::ActionCopy => "コピー",
         K::ActionSmartModel => "高性能モデル",
+        K::ActionAddProvider => "プロバイダーを追加",
+        K::ActionSaveProvider => "保存",
+        K::ActionForgetProvider => "削除",
+        K::SettingsAddProvider => "プロバイダーを追加",
+        K::ProviderIdPlaceholder => "名前（例: deepseek）",
+        K::ProviderBaseUrlPlaceholder => "ベース URL（例: https://api.deepseek.com/v1）",
+        K::ProviderKeyPlaceholder => "API キー",
         K::ActionDismiss => "閉じる",
         K::ActionRetry => "再試行",
         K::ActionSend => "送信",
@@ -718,7 +775,8 @@ fn ja(key: Key) -> &'static str {
         K::ActionEnableHistory => "暗号化履歴を有効にする",
         K::ActionCopyRecoveryCode => "復旧コードをコピー",
 
-        K::ErrNoProvider => "プロバイダーが設定されていません。",
+        K::ErrNoProvider => "プロバイダーが未設定です。",
+        K::ErrNoProviderBody => "ChatGPT でサインインするか、API キーを追加してください。",
         K::ErrAuth => "{} の認証情報が無効になりました。",
         K::ErrRateLimited => "{} がレート制限中です。",
         K::ErrOffline => "ネットワークに接続できません。",

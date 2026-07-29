@@ -1228,6 +1228,12 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                 monitor_size: monitor.map(|s| (f64::from(s.width), f64::from(s.height))),
                 scale_factor: f64::from(scale),
             });
+            // §4 sizes the answer area as a fraction of the display, so the
+            // panel needs the display's height in the same logical points its
+            // own layout is measured in. `monitor_size` is physical; dividing by
+            // the scale factor is what makes 60 % mean the same thing on a
+            // Retina panel and an external 1× monitor.
+            state.panel.display_height = monitor.filter(|_| scale > 0.0).map(|s| s.height / scale);
 
             let pending = std::mem::take(&mut state.pending_show);
             if pending || state.panel_visible {
@@ -1854,6 +1860,65 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             state.send(UiRequest::SignIn { provider });
             Task::none()
         }
+        M::DraftBackend(backend) => {
+            match &mut state.settings.draft {
+                // Switching backend mid-draft keeps what was typed: the key is
+                // usually the last thing entered and re-typing it because the
+                // wrong row was picked first is a real annoyance.
+                Some(draft) => draft.backend = backend,
+                None => state.settings.draft = Some(settings::ProviderDraft::new(backend)),
+            }
+            Task::none()
+        }
+        M::DraftId(id) => {
+            if let Some(draft) = &mut state.settings.draft {
+                draft.id = id;
+            }
+            Task::none()
+        }
+        M::DraftBaseUrl(url) => {
+            if let Some(draft) = &mut state.settings.draft {
+                draft.base_url = url;
+            }
+            Task::none()
+        }
+        M::DraftKey(key) => {
+            if let Some(draft) = &mut state.settings.draft {
+                draft.set_key(key);
+            }
+            Task::none()
+        }
+        M::DraftCancel => {
+            // Dropping the draft scrubs the key; that is `ProviderDraft::drop`.
+            state.settings.draft = None;
+            Task::none()
+        }
+        M::DraftSave => {
+            let Some(mut draft) = state.settings.draft.take() else {
+                return Task::none();
+            };
+            if !draft.is_saveable() {
+                state.settings.draft = Some(draft);
+                return Task::none();
+            }
+            let id = draft.id.trim();
+            let base_url = draft.base_url.trim();
+            state.send(UiRequest::SetProviderKey {
+                backend: draft.backend.config_value().to_owned(),
+                id: (!id.is_empty()).then(|| id.to_owned()),
+                base_url: (!base_url.is_empty()).then(|| base_url.to_owned()),
+                // Moves the key out and scrubs the remainder. The draft is
+                // dropped immediately after, so nothing survives this line.
+                key: draft.take_key(),
+            });
+            Task::none()
+        }
+        M::ForgetProvider(provider) => {
+            state.send(UiRequest::RemoveProvider {
+                id: provider.as_str().to_owned(),
+            });
+            Task::none()
+        }
         M::OpenSystemSettings(permission) => {
             state.send(UiRequest::OpenSystemSettings { permission });
             Task::none()
@@ -2197,6 +2262,12 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             Task::none()
         }
 
+        UiEvent::ProviderRemoved { provider } => {
+            state.settings.providers.retain(|row| row.id != provider);
+            state.settings.sync_device_code();
+            Task::none()
+        }
+
         UiEvent::ProviderHealth { provider, health } => {
             match state
                 .settings
@@ -2367,15 +2438,31 @@ fn clipboard_offer(item: Option<&aibo_core::types::ClipboardItem>) -> panel::Cli
 
 /// Re-run placement so the panel's height follows its content.
 ///
-/// The height change is one of the three things §16 allows to animate; with
-/// [`Motion::Reduced`] it snaps.
+/// **Geometry only.** This deliberately does not go through
+/// [`Aibo::show_panel`], and the distinction is load-bearing rather than
+/// stylistic. `show_panel` is the *arrival* sequence: it resizes, moves, takes
+/// the window out of `Mode::Hidden`, applies the native overlay policy, gains
+/// focus, and focuses the input. Every one of those is correct exactly once,
+/// when the panel appears.
+///
+/// This function runs while the panel is **already on screen and streaming an
+/// answer**, several times per response. Routing it through `show_panel` meant
+/// re-issuing `set_mode`, `orderFrontRegardless`, `gain_focus` and
+/// `operation::focus(INPUT_ID)` mid-answer: the window jumped, and the caret was
+/// yanked back into the input while the user was reading — or worse, while they
+/// were selecting the text they wanted to copy. Growing a window and presenting
+/// a window are two different operations that happened to share a code path.
 fn resize_panel_if_visible(state: &mut Aibo) -> Task<Message> {
     if !state.panel_visible {
         return Task::none();
     }
     let placement = state.placement();
-    let _duration = state.config.motion.duration(ui_theme::motion::FAST);
-    state.show_panel(placement)
+    state.last_placement = Some(placement);
+
+    let position = Point::new(placement.position.0, placement.position.1);
+    let size = Size::new(placement.size.0, placement.size.1);
+
+    window::resize(state.panel_window, size).chain(window::move_to(state.panel_window, position))
 }
 
 fn capture_screen_region_task() -> Task<Message> {

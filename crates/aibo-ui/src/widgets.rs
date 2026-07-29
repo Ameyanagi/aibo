@@ -29,6 +29,76 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use crate::i18n::{self, Key};
 use crate::theme::{self, Severity, space, type_scale};
 
+/// What a rail segment says about the row beside it (`design.md` §3).
+///
+/// The rail is the product's one signature element, and it earns the place by
+/// encoding something true rather than decorating: at a glance it tells you
+/// where the panel thinks you are. It also replaces every border in the design —
+/// nothing else gets a box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RailState {
+    /// The row is present but not where the attention is. Drawn in `rule`.
+    #[default]
+    Inactive,
+    /// The row that currently has the user's attention: the input while typing,
+    /// the answer while streaming. Drawn in `amber`.
+    Active,
+    /// A permission or error row. Drawn in `danger`.
+    ///
+    /// Quiet by construction — `design.md` §4 treats a denied permission as a
+    /// state, not an alarm — but it is a second channel beside the message's own
+    /// colour, so severity never depends on reading one coloured word.
+    Alert,
+}
+
+impl RailState {
+    fn color(self, p: &theme::Palette) -> iced::Color {
+        match self {
+            RailState::Inactive => p.border,
+            RailState::Active => p.accent,
+            RailState::Alert => p.danger,
+        }
+    }
+}
+
+/// Attach a rail segment to a row (`design.md` §3).
+///
+/// Segments are stacked per row rather than drawn as one full-height bar with a
+/// computed offset. The result is the same continuous 3 pt rail down the left
+/// gutter, amber only beside the row that has attention, but it needs no layout
+/// measurement, so it cannot drift out of alignment when a row changes height
+/// mid-stream.
+///
+/// **The row's vertical rhythm lives inside this function, not between calls to
+/// it.** §3 says the rail "runs the full height of the panel", and a parent
+/// `column` with `spacing` set would break it into floating stubs with gaps of
+/// background showing through — which is what a rail must never look like,
+/// because a gap reads as the rail *ending*. So the padding that separates rows
+/// is applied to the content here, inside the segment, and callers stack these
+/// with **zero** spacing.
+pub fn railed<'a, Message: 'a>(
+    state: RailState,
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    row![
+        container(Space::new().width(theme::RAIL_WIDTH).height(Length::Fill)).style(
+            move |t: &iced::Theme| container::Style {
+                background: Some(Background::Color(state.color(&theme::palette_of(t)))),
+                ..Default::default()
+            }
+        ),
+        // `space(1.0)` and not more: two adjacent rows contribute 4 pt each, so
+        // the gap between them is the 8 pt the parent `column`'s `spacing` used
+        // to provide. Anything larger silently inflates the rendered height
+        // beyond what `PanelState::desired_height` budgets for, and the window
+        // is sized from that budget — so the surplus is not extra breathing
+        // room, it is content pushed past the bottom edge.
+        container(content.into()).padding([space(1.0), 0.0]),
+    ]
+    .spacing(theme::RAIL_GUTTER)
+    .into()
+}
+
 /// Render a shortcut using the platform's primary-modifier convention.
 pub const fn primary_shortcut(macos: &'static str, other: &'static str) -> &'static str {
     if cfg!(target_os = "macos") {
@@ -86,11 +156,24 @@ impl<Message> Action<Message> {
     }
 }
 
-/// The context chip: source app plus a one-line excerpt (§16).
+/// The source line: where you were, and what you had selected.
+///
+/// `design.md` §1 calls this the most interesting information on screen — "that
+/// line is the whole pitch: it knows where you were" — and records that the
+/// first build rendered it as the smallest, dullest element on the panel.
+/// Correcting that inversion is mostly a matter of *showing the excerpt*, which
+/// is why `excerpt` is no longer optional in practice: `ghostty` alone says far
+/// less than `ghostty · "…and screencapture works"`.
+///
+/// Two things it deliberately no longer draws. The 2 pt accent leading rule is
+/// gone, superseded by the rail that now runs down the whole gutter — two
+/// vertical accent marks 16 pt apart read as a rendering bug. So is the chip's
+/// box: §9 counts it among the borders being removed, and a pill around the one
+/// line that is meant to feel ambient is the wrong container.
 ///
 /// Renders the "no context" state rather than disappearing. §8 captures context
 /// asynchronously with a deadline, so the panel is often shown *before* the
-/// chip has anything to say — a chip that pops into existence mid-interaction
+/// line has anything to say — text that pops into existence mid-interaction
 /// would move the input under the user's cursor.
 pub fn context_chip<'a, Message: 'a>(
     source_app: Option<&str>,
@@ -102,32 +185,88 @@ pub fn context_chip<'a, Message: 'a>(
     };
 
     let mut line = row![
-        // The accent leading rule from the §16 mock.
-        container(Space::new().width(2.0).height(20.0)).style(|t: &iced::Theme| {
-            container::Style {
-                background: Some(Background::Color(theme::palette_of(t).accent)),
-                ..Default::default()
-            }
-        }),
         text(label)
-            .size(type_scale::CHIP)
-            .style(theme::text_primary),
+            .size(type_scale::META)
+            .font(theme::MONO_FONT)
+            .style(theme::text_dim),
     ]
-    .spacing(space(2.0))
+    .spacing(space(1.5))
     .align_y(Alignment::Center);
 
-    if let Some(excerpt) = excerpt {
+    // An empty excerpt is not an excerpt. A caret-only capture yields
+    // `Some("")`, and quoting it renders `Ghostty · ""` — a pair of empty
+    // quotes that says the panel read something and it was nothing.
+    if let Some(excerpt) = excerpt.map(str::trim).filter(|e| !e.is_empty()) {
         line = line.push(
-            text(elide(excerpt, 96))
-                .size(type_scale::CHIP)
+            text(format!("· \u{201c}{}\u{201d}", elide(excerpt, 96)))
+                .size(type_scale::META)
+                .font(theme::MONO_FONT)
                 .style(theme::text_dim),
         );
     }
 
-    container(line)
-        .padding([space(1.5), space(2.5)])
-        .style(theme::chip)
+    container(line).style(theme::chip).into()
+}
+
+/// Pre-first-token: a three-dot mono ellipsis, and deliberately not a spinner.
+///
+/// `design.md` §4 is specific about the reason. A spinner means *indeterminate*
+/// — it promises nothing about when this ends — and §15 budgets first token at
+/// around 400 ms. Spinning for 400 ms reads as a stall the product does not
+/// have, and it is the single most common way a fast thing is made to feel
+/// slow. Three static dots say "in progress" without making a claim about
+/// duration.
+///
+/// `reserve` holds the answer's height from this moment, so the first chunk
+/// replaces the dots in place instead of growing the panel out from under the
+/// eye (§16: "streaming must not reflow").
+pub fn thinking<'a, Message: 'a>(reserve: Option<f32>) -> Element<'a, Message> {
+    let dots = text("\u{00b7}\u{00b7}\u{00b7}")
+        .size(type_scale::META)
+        .font(theme::MONO_FONT)
+        .style(theme::text_dim);
+
+    match reserve {
+        Some(height) => container(dots)
+            .height(Length::Fixed(height))
+            .align_y(Alignment::Start)
+            .into(),
+        None => dots.into(),
+    }
+}
+
+/// The empty panel: an invitation, not a mood (`design.md` §4, §6).
+///
+/// One dim line under the source line, with no placeholder box around it.
+/// `design.md` §6: "Empty states are an invitation to act, not a mood."
+pub fn empty_invitation<'a, Message: 'a>() -> Element<'a, Message> {
+    text(i18n::t(Key::PanelEmptyInvitation))
+        .size(type_scale::META)
+        .font(theme::MONO_FONT)
+        .style(theme::text_dim)
         .into()
+}
+
+/// The source line while context capture is still in flight (`design.md` §4).
+pub fn reading_context_line<'a, Message: 'a>() -> Element<'a, Message> {
+    source_note(i18n::t(Key::ContextChipReading))
+}
+
+/// The source line once capture has settled with nothing (`design.md` §4).
+pub fn unavailable_context_line<'a, Message: 'a>() -> Element<'a, Message> {
+    source_note(i18n::t(Key::ContextChipUnavailable))
+}
+
+/// One dim mono line in the source-line slot, holding its height.
+fn source_note<'a, Message: 'a>(body: &str) -> Element<'a, Message> {
+    container(
+        text(body.to_owned())
+            .size(type_scale::META)
+            .font(theme::MONO_FONT)
+            .style(theme::text_dim),
+    )
+    .style(theme::chip)
+    .into()
 }
 
 /// Edge of the square thumbnail on an attachment chip, in points.
@@ -392,7 +531,8 @@ pub fn answer<'a, Message: 'a>(
         stack = stack.push(
             text(i18n::t(Key::StateTruncated))
                 .size(type_scale::META)
-                .style(theme::text_severity(Severity::Warning)),
+                .font(theme::MONO_FONT)
+                .style(theme::text_dim),
         );
     }
 
@@ -426,7 +566,8 @@ pub fn selectable_answer<'a, Message: Clone + 'a>(
         stack = stack.push(
             text(i18n::t(Key::StateTruncated))
                 .size(type_scale::META)
-                .style(theme::text_severity(Severity::Warning)),
+                .font(theme::MONO_FONT)
+                .style(theme::text_dim),
         );
     }
 
@@ -460,7 +601,8 @@ pub fn selectable_chat_answer<'a, Message: Clone + 'a>(
         stack = stack.push(
             text(i18n::t(Key::StateTruncated))
                 .size(type_scale::META)
-                .style(theme::text_severity(Severity::Warning)),
+                .font(theme::MONO_FONT)
+                .style(theme::text_dim),
         );
     }
 

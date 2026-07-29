@@ -173,6 +173,30 @@ pub enum UiRequest {
         provider: ProviderId,
     },
 
+    /// Add or replace an API-key provider from the settings window (§10, §12).
+    ///
+    /// The key travels as a [`SecretString`] and is consumed by the credential
+    /// store on arrival. §12 keeps it out of `config.toml`, out of the UI's
+    /// retained state once sent, and out of diagnostics — `SecretString`'s own
+    /// `Debug` redacts, so the enum's derive cannot leak it into a log line.
+    SetProviderKey {
+        /// Which backend, spelled as `config.toml`'s `backend = "…"` value.
+        backend: String,
+        /// Explicit id, for a second endpoint of a backend already configured.
+        id: Option<String>,
+        /// Base URL. Required for a custom endpoint, ignored for the rest.
+        base_url: Option<String>,
+        /// The key. Empty means "the user cleared the field", which is a
+        /// removal rather than an empty credential.
+        key: SecretString,
+    },
+
+    /// Forget a provider: drop its credential and its `config.toml` entry.
+    RemoveProvider {
+        /// The id the provider is addressed by.
+        id: String,
+    },
+
     /// Open the OS privacy pane for a permission (§17).
     OpenSystemSettings {
         /// Which permission.
@@ -343,6 +367,18 @@ pub enum UiEvent {
     },
 
     /// A provider's health changed (§13: per provider, with hysteresis).
+    /// A provider was removed in settings and its row must go.
+    ///
+    /// [`UiEvent::ProviderHealth`] only ever adds or updates a row, so without
+    /// this a forgotten provider stays on screen looking configured — an
+    /// advertised control backed by nothing, which §17 treats as worse than an
+    /// absent one.
+    ProviderRemoved {
+        /// The provider that no longer exists.
+        provider: ProviderId,
+    },
+
+    /// A provider's reachability changed (§13, per provider with hysteresis).
     ProviderHealth {
         /// The provider.
         provider: ProviderId,
