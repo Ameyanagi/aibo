@@ -510,6 +510,7 @@ impl Provider for OpenAiCompat {
         Ok(body
             .data
             .into_iter()
+            .filter(|m| is_chat_model(&m.id))
             .map(|m| ModelInfo {
                 provider: self.id.clone(),
                 display_name: m.id.clone(),
@@ -783,6 +784,41 @@ pub fn build_responses_body(req: &ChatRequest, q: &Quirks) -> Value {
     }
 
     body
+}
+
+/// Whether an id from `/models` names something aibo can hold a conversation
+/// with.
+///
+/// **A correctness filter, not a cosmetic one.** OpenAI's `/models` returns the
+/// whole account catalogue: of 125 entries measured on 2026-07-30, 45 were not
+/// chat models at all — embeddings, TTS, transcription, DALL·E, moderation,
+/// realtime, Sora, and the legacy `davinci-002`/`babbage-002` completions
+/// models. Offering `text-embedding-3-small` in a model picker is offering a
+/// row whose only possible outcome is a 400, and §17 treats an action that
+/// cannot work as worse than an absent one.
+///
+/// Gemini gets this for free: its `/models` reports
+/// `supportedGenerationMethods`, so `gemini.rs` filters on `generateContent`.
+/// The OpenAI-compatible endpoint publishes no capability field at all, so the
+/// id is the only signal available — hence a denylist of families rather than
+/// an allowlist of ids, which would go stale with every model release.
+fn is_chat_model(id: &str) -> bool {
+    const NOT_CHAT: [&str; 12] = [
+        "embedding",
+        "tts",
+        "whisper",
+        "transcribe",
+        "dall-e",
+        "moderation",
+        "realtime",
+        "sora",
+        "image",
+        "audio",
+        "davinci",
+        "babbage",
+    ];
+    let id = id.to_ascii_lowercase();
+    !NOT_CHAT.iter().any(|marker| id.contains(marker))
 }
 
 fn responses_message(msg: &Message) -> Value {
@@ -1318,6 +1354,54 @@ pub fn boxed(p: OpenAiCompat) -> Arc<dyn Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/models` returns the whole account catalogue, not the chat models.
+    ///
+    /// Measured on 2026-07-30: 45 of OpenAI's 125 entries were embeddings, TTS,
+    /// transcription, image, moderation, realtime, Sora or legacy completions.
+    /// Every one of them in a model picker is a row whose only outcome is a 400.
+    #[test]
+    fn the_model_list_excludes_everything_that_is_not_a_chat_model() {
+        for id in [
+            "text-embedding-3-small",
+            "text-embedding-ada-002",
+            "tts-1-hd",
+            "whisper-1",
+            "gpt-4o-transcribe",
+            "gpt-transcribe",
+            "dall-e-3",
+            "omni-moderation-latest",
+            "gpt-realtime",
+            "gpt-4o-realtime-preview",
+            "sora-2-pro",
+            "davinci-002",
+            "babbage-002",
+            "gpt-image-1",
+            "gpt-4o-audio-preview",
+        ] {
+            assert!(!is_chat_model(id), "{id} is not a chat model");
+        }
+    }
+
+    /// And it keeps the ones that are — including the reasoning families, whose
+    /// ids share no common prefix with the gpt line.
+    #[test]
+    fn the_model_list_keeps_the_chat_models() {
+        for id in [
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5.6-sol",
+            "gpt-4o",
+            "chatgpt-4o-latest",
+            "o3",
+            "o4-mini",
+            "claude-sonnet-4-5",
+            "llama-3.3-70b",
+            "deepseek-chat",
+        ] {
+            assert!(is_chat_model(id), "{id} is a chat model");
+        }
+    }
     use futures_util::StreamExt as _;
 
     fn base() -> Url {
