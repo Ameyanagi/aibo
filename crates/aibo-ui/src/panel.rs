@@ -1570,21 +1570,40 @@ fn picker_overlay(state: &PanelState) -> Element<'_, Message> {
         match row {
             crate::model_picker::Row::Group(label) => {
                 list = list.push(
-                    text(label.clone())
-                        .size(type_scale::META)
-                        .font(theme::MONO_FONT)
-                        .style(theme::text_dim),
+                    container(
+                        text(label.clone())
+                            .size(type_scale::META)
+                            .font(theme::MONO_FONT)
+                            .style(theme::text_dim),
+                    )
+                    // Headings sit above the rail column, not in it, so the
+                    // rail reads as one continuous track of rows.
+                    .padding(iced::Padding {
+                        top: space(1.0),
+                        right: 0.0,
+                        bottom: space(0.25),
+                        left: space(0.5),
+                    }),
                 );
             }
-            crate::model_picker::Row::Model { option, favourite } => {
+            crate::model_picker::Row::Model {
+                option,
+                favourite,
+                show_provider,
+            } => {
                 let highlighted = index == state.picker.highlight;
-                list = list.push(widgets::railed(
+                list = list.push(widgets::railed_with(
                     if highlighted {
                         RailState::Active
                     } else {
                         RailState::Inactive
                     },
-                    model_row(option, *favourite, highlighted),
+                    if highlighted {
+                        theme::raised
+                    } else {
+                        theme::ground
+                    },
+                    model_row(option, *favourite, *show_provider, highlighted),
                 ));
                 index += 1;
             }
@@ -1637,45 +1656,65 @@ fn picker_overlay(state: &PanelState) -> Element<'_, Message> {
 fn lane_column(state: &PanelState) -> Element<'_, Message> {
     let capable = state.capable_models();
     let lanes = crate::model_picker::lanes(&capable, &state.pins(&capable));
-    let mut column = column![];
-    for lane in lanes {
-        let active = lane == state.picker.lane;
-        column = column.push(widgets::railed(
-            if active {
-                RailState::Active
-            } else {
-                RailState::Inactive
-            },
-            text(lane.label())
-                .size(type_scale::META)
-                .font(theme::MONO_FONT)
-                .style(if active {
-                    theme::text_primary
-                } else {
-                    theme::text_dim
-                }),
-        ));
+    let mut list = column![].spacing(space(0.25));
+    for lane in &lanes {
+        let active = *lane == state.picker.lane;
+        list = list.push(
+            container(
+                text(crate::model_picker::lane_label(lane))
+                    .size(type_scale::META)
+                    .font(theme::MONO_FONT)
+                    .style(if active {
+                        theme::text_accent
+                    } else {
+                        theme::text_dim
+                    }),
+            )
+            .padding([space(0.75), space(1.0)])
+            .width(Length::Fill)
+            // The active lane is a fill, not a rail. Rails here would put a
+            // second column of amber bars beside the list's own, and two
+            // parallel tracks of the same signal read as a rendering fault
+            // rather than as two states.
+            .style(if active { theme::raised } else { theme::ground }),
+        );
     }
-    container(column).width(Length::Fixed(96.0)).into()
+    container(list)
+        .width(Length::Fixed(104.0))
+        .padding(iced::Padding {
+            top: 0.0,
+            right: space(1.0),
+            bottom: 0.0,
+            left: 0.0,
+        })
+        .into()
 }
 
 /// One row of the quick-pick.
 ///
-/// Name, then the facts that actually decide a choice: what it costs, and what
-/// it can do. Both come from real data — §14's price table and §10's catalogue —
-/// so neither goes stale as models change.
+/// Three zones, left to right, because a row is scanned rather than read:
 ///
-/// The badges are words rather than icons. `design.md` §9 cut icons from the
-/// product on the grounds that "the rail plus a key hint carries every meaning
-/// an icon would", and three unlabelled glyphs are exactly the case it was
-/// arguing against: an eye and a brain have to be learned, `vision` does not.
-fn model_row<'a>(option: &ModelOption, favourite: bool, highlighted: bool) -> Element<'a, Message> {
-    let mut row = row![
-        text(if favourite { "★" } else { " " })
-            .width(Length::Fixed(space(3.0)))
-            .size(type_scale::META)
-            .style(theme::text_accent),
-        text(option.to_string())
+/// 1. **The pin.** A fixed-width column so names align whether pinned or not.
+/// 2. **The name**, at answer size in full-strength text — the one thing that
+///    distinguishes this row from the eighty-eight around it, so it gets the
+///    only bright weight. The provider follows in dim meta *only when no
+///    heading above already says it*; repeating `openai` down a group headed
+///    `openai` is noise competing with the name.
+/// 3. **Latency and cost, right-aligned** behind a `Fill` spacer. Aligned
+///    rather than trailing the name, so the numbers form a column that can be
+///    compared down the list — which is the entire reason to show them. Ragged
+///    right, they are decoration.
+///
+/// Both facts come from real data — §14's price table and §10's catalogue — so
+/// neither goes stale as models change.
+fn model_row<'a>(
+    option: &ModelOption,
+    favourite: bool,
+    show_provider: bool,
+    highlighted: bool,
+) -> Element<'a, Message> {
+    let mut name = row![
+        text(option.display_name.clone())
             .size(type_scale::ANSWER)
             .style(if highlighted {
                 theme::text_primary
@@ -1686,16 +1725,44 @@ fn model_row<'a>(option: &ModelOption, favourite: bool, highlighted: bool) -> El
     .spacing(space(1.0))
     .align_y(Alignment::Center);
 
-    // §14: an unpriced model shows nothing rather than `$`. Reporting a price
-    // aibo does not know is worse than reporting none.
-    if let Some(cost) = option.cost {
-        row = row.push(
-            text(cost.glyphs())
+    if show_provider {
+        name = name.push(
+            text(option.binding.provider.as_str().to_owned())
                 .size(type_scale::META)
                 .font(theme::MONO_FONT)
-                .style(theme::text_accent),
+                .style(theme::text_dim),
         );
     }
+
+    // The right-hand column, built in fixed widths so it aligns across rows
+    // even when a model reports no latency or no price.
+    let meta = row![
+        text(
+            option
+                .latency_ms
+                .map(|ms| format!("{ms} ms"))
+                .unwrap_or_default()
+        )
+        .size(type_scale::META)
+        .font(theme::MONO_FONT)
+        .style(theme::text_dim)
+        .align_x(Alignment::End)
+        .width(Length::Fixed(56.0)),
+        // §14: an unpriced model shows nothing rather than `$`. Reporting a
+        // price aibo does not know is worse than reporting none.
+        text(
+            option
+                .cost
+                .map(|c| c.glyphs().to_owned())
+                .unwrap_or_default()
+        )
+        .size(type_scale::META)
+        .font(theme::MONO_FONT)
+        .style(theme::text_accent)
+        .width(Length::Fixed(40.0)),
+    ]
+    .spacing(space(1.0))
+    .align_y(Alignment::Center);
 
     // **No ability badges, and this is a data problem rather than a design one.**
     //
@@ -1714,7 +1781,24 @@ fn model_row<'a>(option: &ModelOption, favourite: bool, highlighted: bool) -> El
     // true.
     let _ = &option.abilities;
 
-    row.into()
+    row![
+        text(if favourite { "\u{2605}" } else { " " })
+            .width(Length::Fixed(space(2.0)))
+            .size(type_scale::META)
+            .style(theme::text_accent),
+        name,
+        Space::new().width(Length::Fill),
+        meta,
+    ]
+    .padding(iced::Padding {
+        top: 0.0,
+        right: space(1.0),
+        bottom: 0.0,
+        left: space(1.0),
+    })
+    .spacing(space(1.0))
+    .align_y(Alignment::Center)
+    .into()
 }
 
 /// Total panel height while the quick-pick is open.

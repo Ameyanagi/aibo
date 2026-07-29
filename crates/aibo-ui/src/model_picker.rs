@@ -22,12 +22,20 @@
 //! search. It is Unicode-aware and returns a score, which is what makes "type
 //! three letters and press return" land on the right entry rather than the first
 //! alphabetical one.
+//!
+//! **This module is an adapter.** All of the mechanics — lanes, fuzzy ranking,
+//! the clamped highlight, pinned-before-recent — live in [`crate::palette`],
+//! because none of it is about models. What is left here is the part that is:
+//! how a model is identified (`provider/model`, the spelling `config.toml`
+//! uses), what a query matches against, and what "the newest one per provider"
+//! means for a starter set of pins.
 
 use aibo_core::types::ModelBinding;
-use nucleo_matcher::pattern::{CaseMatching, Normalization, Pattern};
-use nucleo_matcher::{Config, Matcher};
 
 use crate::bridge::ModelOption;
+use crate::palette::{self, Item, Palette};
+
+pub use crate::palette::Lane;
 
 /// One row the picker can show.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -40,6 +48,12 @@ pub enum Row {
         option: ModelOption,
         /// Pinned by the user.
         favourite: bool,
+        /// Whether the row states its own provider.
+        ///
+        /// False beneath a provider heading that already says it. Repeating
+        /// `openai` on all eighty-eight rows of the openai group is noise
+        /// competing with the only thing that distinguishes them.
+        show_provider: bool,
     },
 }
 
@@ -53,49 +67,43 @@ impl Row {
     }
 }
 
-/// The quick-pick's state.
-///
-/// Lives in [`crate::panel::PanelState`] rather than being rebuilt per frame:
-/// the query and the highlight are user state, and losing them on a redraw
-/// would make the widget unusable.
-#[derive(Debug, Clone, Default)]
-pub struct ModelPicker {
-    /// Whether the overlay is showing.
-    pub open: bool,
-    /// What the user has typed.
-    pub query: String,
-    /// Index into [`ModelPicker::rows`]'s selectable entries.
-    pub highlight: usize,
-    /// Which lane the list is narrowed to.
-    pub lane: Lane,
+/// A model, as something the palette can list.
+impl Item for ModelOption {
+    fn id(&self) -> String {
+        binding_id(&self.binding)
+    }
+
+    /// Provider *and* name, so `openai 4o` and `4om` both find it.
+    fn search_text(&self) -> String {
+        format!("{} {}", self.binding.provider.as_str(), self.display_name)
+    }
+
+    fn lane(&self) -> Option<String> {
+        Some(self.binding.provider.as_str().to_owned())
+    }
 }
 
-/// What the picker is currently narrowed to.
+/// The label shown in the lane column.
 ///
-/// The equivalent of t3's left icon rail, as words rather than brand marks:
-/// `design.md` §9 cut icons on the grounds that "the rail plus a key hint
-/// carries every meaning an icon would", and a column of unlabelled vendor
-/// logos is the case it was arguing against. It also avoids shipping other
-/// people's trademarks.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum Lane {
-    /// Everything, grouped by provider.
-    #[default]
-    All,
-    /// Pinned models only.
-    Pinned,
-    /// One provider.
-    Provider(String),
+/// t3's equivalent is a rail of vendor icons. This is the same affordance in
+/// words, for two reasons: `design.md` §9 cut icons on the grounds that "the
+/// rail plus a key hint carries every meaning an icon would", and a column of
+/// other people's logos is a trademark question aibo does not need to answer.
+/// `⇥` cycles, which is what the search placeholder already promises.
+pub fn lane_label(lane: &Lane) -> String {
+    match lane {
+        Lane::All => crate::i18n::t(crate::i18n::Key::LaneAll).to_owned(),
+        Lane::Pinned => crate::i18n::t(crate::i18n::Key::PickerFavourites).to_owned(),
+        Lane::Named(p) => p.clone(),
+    }
 }
 
-impl Lane {
-    /// The label shown in the lane column.
-    pub fn label(&self) -> String {
-        match self {
-            Lane::All => crate::i18n::t(crate::i18n::Key::LaneAll).to_owned(),
-            Lane::Pinned => crate::i18n::t(crate::i18n::Key::PickerFavourites).to_owned(),
-            Lane::Provider(p) => p.clone(),
-        }
+/// The heading text for a group row, resolving the palette's reserved headings.
+pub fn group_label(group: &str) -> String {
+    match group {
+        palette::PINNED_HEADING => crate::i18n::t(crate::i18n::Key::PickerFavourites).to_owned(),
+        palette::RECENT_HEADING => crate::i18n::t(crate::i18n::Key::PickerRecent).to_owned(),
+        other => other.to_owned(),
     }
 }
 
@@ -105,248 +113,68 @@ impl Lane {
 /// for a provider the user has not set up is a filter that can only ever return
 /// nothing.
 pub fn lanes(capable: &[ModelOption], favourites: &[ModelBinding]) -> Vec<Lane> {
-    let mut lanes = vec![Lane::All];
-    if !favourites.is_empty() {
-        lanes.push(Lane::Pinned);
+    palette::lanes(capable, &ids(favourites))
+}
+
+/// The quick-pick's state.
+///
+/// Lives in [`crate::panel::PanelState`] rather than being rebuilt per frame:
+/// the query and the highlight are user state, and losing them on a redraw
+/// would make the widget unusable.
+#[derive(Debug, Clone, Default)]
+pub struct ModelPicker(pub Palette);
+
+impl std::ops::Deref for ModelPicker {
+    type Target = Palette;
+    fn deref(&self) -> &Palette {
+        &self.0
     }
-    let mut providers: Vec<&str> = capable
-        .iter()
-        .map(|o| o.binding.provider.as_str())
-        .collect();
-    providers.sort_unstable();
-    providers.dedup();
-    lanes.extend(providers.into_iter().map(|p| Lane::Provider(p.to_owned())));
-    lanes
+}
+
+impl std::ops::DerefMut for ModelPicker {
+    fn deref_mut(&mut self) -> &mut Palette {
+        &mut self.0
+    }
 }
 
 impl ModelPicker {
-    /// Open the picker, starting from a clean query.
-    ///
-    /// A retained query would mean reopening the picker shows the *last*
-    /// search rather than where you are, which is the opposite of what a
-    /// quick-pick is for.
-    pub fn open(&mut self) {
-        self.open = true;
-        self.query.clear();
-        self.highlight = 0;
-        self.lane = Lane::All;
-    }
-
-    /// Close it.
-    pub fn close(&mut self) {
-        self.open = false;
-        self.query.clear();
-        self.highlight = 0;
-    }
-
-    /// Replace the query, resetting the highlight.
-    ///
-    /// The reset matters: leaving the highlight where it was means typing a
-    /// character can move the selection onto an unrelated entry, and pressing
-    /// return then picks something the user never looked at.
-    pub fn set_query(&mut self, query: String) {
-        self.query = query;
-        self.highlight = 0;
-    }
-
-    /// Move the highlight, clamped rather than wrapping.
-    ///
-    /// Wrapping in a list of eighty-eight means holding the key past the end
-    /// silently returns to the top, and the user loses their place.
-    pub fn move_highlight(&mut self, delta: isize, selectable: usize) {
-        if selectable == 0 {
-            self.highlight = 0;
-            return;
-        }
-        let last = selectable - 1;
-        self.highlight = self.highlight.saturating_add_signed(delta).min(last);
-    }
-
-    /// The rows to render, in order.
-    ///
-    /// `capable` has already filtered out models that cannot serve the current
-    /// request — a vision-incapable model with an image attached, for instance.
-    /// Filtering *before* this point rather than dimming here is deliberate:
-    /// §17 treats an offered action that cannot work as worse than an absent
-    /// one, and the alternative was the confusion of a picker naming a Codex
-    /// model while §4 routed the request to OpenAI because Codex cannot see.
+    /// The rows to draw, in display order.
     pub fn rows(
         &self,
         capable: &[ModelOption],
         favourites: &[ModelBinding],
-        recent: &[ModelBinding],
+        recents: &[ModelBinding],
     ) -> Vec<Row> {
-        // The lane narrows the candidate set *before* the query, so a search
-        // inside a lane stays inside it. The other order would make typing
-        // silently escape the filter the user just chose.
-        let in_lane: Vec<ModelOption> = match &self.lane {
-            Lane::All => capable.to_vec(),
-            Lane::Pinned => capable
-                .iter()
-                .filter(|o| favourites.contains(&o.binding))
-                .cloned()
-                .collect(),
-            Lane::Provider(provider) => capable
-                .iter()
-                .filter(|o| o.binding.provider.as_str() == provider)
-                .cloned()
-                .collect(),
-        };
-
-        if !self.query.trim().is_empty() {
-            return self.fuzzy_rows(&in_lane, favourites);
-        }
-        // Inside a single lane the provider heading is noise — every row shares
-        // it — so only the "everything" lane groups.
-        if matches!(self.lane, Lane::All) {
-            self.browse_rows(&in_lane, favourites, recent)
-        } else {
-            in_lane
-                .into_iter()
-                .map(|option| Row::Model {
-                    favourite: favourites.contains(&option.binding),
-                    option,
-                })
-                .collect()
-        }
-    }
-
-    /// Move to the next lane, wrapping.
-    ///
-    /// Wrapping is right here and wrong for the highlight: there are a handful
-    /// of lanes and cycling them is the gesture, whereas a wrapping list of
-    /// eighty-nine loses the user's place.
-    pub fn cycle_lane(&mut self, lanes: &[Lane]) {
-        if lanes.is_empty() {
-            return;
-        }
-        let at = lanes.iter().position(|l| l == &self.lane).unwrap_or(0);
-        self.lane = lanes[(at + 1) % lanes.len()].clone();
-        // A new lane is a new result set, so the old index means nothing.
-        self.highlight = 0;
-    }
-
-    /// Fuzzy-matched, flat, best first.
-    ///
-    /// No group headings here, and that is the point: a query spans providers,
-    /// so grouping would scatter the best matches down the list behind headings
-    /// the user did not ask for.
-    fn fuzzy_rows(&self, capable: &[ModelOption], favourites: &[ModelBinding]) -> Vec<Row> {
-        let mut matcher = Matcher::new(Config::DEFAULT);
-        let pattern = Pattern::parse(
-            self.query.trim(),
-            CaseMatching::Ignore,
-            Normalization::Smart,
-        );
-
-        // Matched against `provider model`, so "openai 4o" and "4o" both work
-        // and a provider name alone lists that provider.
-        let haystacks: Vec<String> = capable
-            .iter()
-            .map(|o| format!("{} {}", o.binding.provider.as_str(), o.display_name))
-            .collect();
-
-        let mut scored: Vec<(u32, &ModelOption)> = capable
-            .iter()
-            .zip(&haystacks)
-            .filter_map(|(option, hay)| {
-                let mut buf = Vec::new();
-                let haystack = nucleo_matcher::Utf32Str::new(hay, &mut buf);
-                pattern.score(haystack, &mut matcher).map(|s| (s, option))
-            })
-            .collect();
-
-        // Score descending, then by name so equal scores are stable rather than
-        // reordering between keystrokes.
-        scored.sort_by(|a, b| {
-            b.0.cmp(&a.0)
-                .then_with(|| a.1.display_name.cmp(&b.1.display_name))
-        });
-
-        scored
+        self.0
+            .rows(capable, &ids(favourites), &ids(recents))
             .into_iter()
-            .map(|(_, option)| Row::Model {
-                favourite: favourites.contains(&option.binding),
-                option: option.clone(),
+            .map(|row| match row {
+                palette::Row::Group(g) => Row::Group(group_label(&g)),
+                palette::Row::Entry {
+                    item,
+                    pinned,
+                    show_lane,
+                } => Row::Model {
+                    option: item.clone(),
+                    favourite: pinned,
+                    show_provider: show_lane,
+                },
             })
             .collect()
     }
+}
 
-    /// Browsing order: favourites, then recents, then grouped by provider.
-    fn browse_rows(
-        &self,
-        capable: &[ModelOption],
-        favourites: &[ModelBinding],
-        recent: &[ModelBinding],
-    ) -> Vec<Row> {
-        let mut rows = Vec::new();
-        let mut shown: Vec<&ModelBinding> = Vec::new();
+/// A binding as a palette id.
+///
+/// `provider/model` — the same spelling `config.toml` uses, so a pinned set can
+/// be persisted without a second encoding.
+fn binding_id(binding: &ModelBinding) -> String {
+    format!("{}/{}", binding.provider.as_str(), binding.model)
+}
 
-        // Favourites first: pinned deliberately, so they outrank recency.
-        let favourite_rows: Vec<&ModelOption> = favourites
-            .iter()
-            .filter_map(|b| capable.iter().find(|o| &o.binding == b))
-            .collect();
-        if !favourite_rows.is_empty() {
-            rows.push(Row::Group(
-                crate::i18n::t(crate::i18n::Key::PickerFavourites).to_owned(),
-            ));
-            for option in favourite_rows {
-                shown.push(&option.binding);
-                rows.push(Row::Model {
-                    option: option.clone(),
-                    favourite: true,
-                });
-            }
-        }
-
-        // Then recents, skipping anything already pinned above — a model listed
-        // twice makes the highlight ambiguous.
-        let recent_rows: Vec<&ModelOption> = recent
-            .iter()
-            .filter(|b| !favourites.contains(b))
-            .filter_map(|b| capable.iter().find(|o| &o.binding == b))
-            .collect();
-        if !recent_rows.is_empty() {
-            rows.push(Row::Group(
-                crate::i18n::t(crate::i18n::Key::PickerRecent).to_owned(),
-            ));
-            for option in recent_rows {
-                shown.push(&option.binding);
-                rows.push(Row::Model {
-                    option: option.clone(),
-                    favourite: false,
-                });
-            }
-        }
-
-        // Then everything else, under its provider.
-        let mut providers: Vec<&str> = capable
-            .iter()
-            .map(|o| o.binding.provider.as_str())
-            .collect();
-        providers.sort_unstable();
-        providers.dedup();
-
-        for provider in providers {
-            let rest: Vec<&ModelOption> = capable
-                .iter()
-                .filter(|o| o.binding.provider.as_str() == provider)
-                .filter(|o| !shown.contains(&&o.binding))
-                .collect();
-            if rest.is_empty() {
-                continue;
-            }
-            rows.push(Row::Group(provider.to_owned()));
-            for option in rest {
-                rows.push(Row::Model {
-                    option: option.clone(),
-                    favourite: favourites.contains(&option.binding),
-                });
-            }
-        }
-        rows
-    }
+/// Bindings as palette ids.
+fn ids(bindings: &[ModelBinding]) -> Vec<String> {
+    bindings.iter().map(binding_id).collect()
 }
 
 /// A starter set of pins, for a user who has pinned nothing.
@@ -452,10 +280,10 @@ mod tests {
     /// it — the other order would silently discard the filter just chosen.
     #[test]
     fn a_lane_narrows_before_the_query() {
-        let mut picker = ModelPicker {
-            lane: Lane::Provider("openai".to_owned()),
-            ..ModelPicker::default()
-        };
+        let mut picker = ModelPicker(Palette {
+            lane: Lane::Named("openai".to_owned()),
+            ..Palette::default()
+        });
         picker.set_query("gpt".to_owned());
         let rows = picker.rows(&catalogue(), &[], &[]);
         assert!(
@@ -469,10 +297,10 @@ mod tests {
     /// Inside one provider's lane the heading is noise: every row shares it.
     #[test]
     fn a_provider_lane_drops_the_group_heading() {
-        let picker = ModelPicker {
-            lane: Lane::Provider("openai".to_owned()),
-            ..ModelPicker::default()
-        };
+        let picker = ModelPicker(Palette {
+            lane: Lane::Named("openai".to_owned()),
+            ..Palette::default()
+        });
         let rows = picker.rows(&catalogue(), &[], &[]);
         assert!(!rows.iter().any(|r| matches!(r, Row::Group(_))));
     }
@@ -482,10 +310,10 @@ mod tests {
         let capable = catalogue();
         let pins = default_pins(&capable);
         let lanes = lanes(&capable, &pins);
-        let mut picker = ModelPicker {
+        let mut picker = ModelPicker(Palette {
             highlight: 3,
-            ..ModelPicker::default()
-        };
+            ..Palette::default()
+        });
 
         picker.cycle_lane(&lanes);
         assert_ne!(picker.lane, Lane::All, "cycling moves off the first lane");

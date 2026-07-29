@@ -96,11 +96,26 @@ pub fn railed<'a, Message: 'a>(
     // ground over everything but that strip. Both are content-sized, so the
     // rail is always precisely as tall as the row beside it and can never
     // dictate the row's height.
+    railed_with(state, theme::ground, content)
+}
+
+/// [`railed`], with the fill the content is painted in chosen by the caller.
+///
+/// Split out for the quick-pick, where the highlighted row wants the palette's
+/// one elevation (`ink-raised`) rather than the ground: a 3pt rail alone is
+/// legible on a source line, where it is the only marked row on screen, but
+/// inside a list of ninety it is a detail the eye has to hunt for. Fill plus
+/// rail reads instantly and adds no new colour.
+pub fn railed_with<'a, Message: 'a>(
+    state: RailState,
+    fill: fn(&iced::Theme) -> container::Style,
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
     container(
         container(content.into())
             .padding([space(1.0), 0.0])
             .width(Length::Fill)
-            .style(theme::ground),
+            .style(fill),
     )
     .padding(iced::Padding {
         top: 0.0,
