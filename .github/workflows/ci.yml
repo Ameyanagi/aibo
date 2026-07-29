@@ -51,6 +51,53 @@ jobs:
       - name: Test
         run: cargo test --workspace --all-targets --locked
 
+  # A real link, in the profile that ships.
+  #
+  # `native` proves the code compiles and its tests pass on both platforms, but
+  # `cargo check` never links and `cargo test` links only the *test* binaries in
+  # the dev profile. §15's release profile is a different build: `lto = "fat"`
+  # and `codegen-units = 1` are exactly where a link fails or a runner runs out
+  # of memory, and `strip = "symbols"` is where a platform disagrees about what
+  # may be stripped.
+  #
+  # It also answers §20's **S8**, the one P0 spike with no harness: §12 marks the
+  # `bundled-sqlcipher-vendored-openssl` build on Windows `[unverified]`, and
+  # linking the real binary is what verifies it.
+  release-build:
+    name: Release build ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-14
+            artifact: aibo-macos-aarch64
+            path: target/release/aibo
+          - name: Windows
+            os: windows-2022
+            artifact: aibo-windows-x86_64
+            path: target/release/aibo.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-${{ matrix.os }}
+
+      - name: Build the release binary
+        run: cargo build --release --bin aibo --locked
+
+      # Unsigned and un-notarised: §19 puts Authenticode, notarisation and the
+      # installers in P8. This is a build artefact for testing, not a release —
+      # macOS Gatekeeper and Windows SmartScreen will both object.
+      - name: Upload the binary
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.path }}
+          if-no-files-found: error
+          retention-days: 14
+
   cross-check:
     name: Cross-check ${{ matrix.target }}
     runs-on: macos-14
