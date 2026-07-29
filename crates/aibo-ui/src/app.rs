@@ -260,6 +260,12 @@ pub enum WindowChord {
     },
     /// Copy the current surface's content.
     Copy,
+    /// Open the model quick-pick.
+    PickModel,
+    /// Pin or unpin the highlighted model. Only meaningful while the quick-pick
+    /// is open; the subscription cannot see panel state, so the meaning is
+    /// decided where the chord is handled.
+    PinModel,
     /// Begin a new item on the current surface.
     ///
     /// Settings' "Add a provider" advertises `⌘N`. It was a label with no
@@ -1426,6 +1432,22 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
     match state.role_of(window) {
         Some(Role::Panel) if state.panel_visible => {
             let message = match chord {
+                // The quick-pick owns the keyboard while it is open, so its
+                // keys are matched before the panel's own. Otherwise ↑/↓ would
+                // recall history instead of moving the highlight, and ⏎ would
+                // submit an empty instruction.
+                _ if state.panel.picker.open => match chord {
+                    WindowChord::Escape => panel::Message::ClosePicker,
+                    WindowChord::Enter { .. } => panel::Message::PickerCommit,
+                    WindowChord::HistoryOlder => panel::Message::PickerMove(-1),
+                    WindowChord::HistoryNewer => panel::Message::PickerMove(1),
+                    WindowChord::PinModel => panel::Message::PickerToggleFavourite,
+                    _ => return Task::none(),
+                },
+                WindowChord::PickModel => panel::Message::OpenPicker,
+                // Outside the picker ⌘D means nothing, and inventing a meaning
+                // for it would make the binding unpredictable.
+                WindowChord::PinModel => return Task::none(),
                 // Handled above, for every window.
                 WindowChord::OpenSettings => unreachable!("intercepted before the role match"),
                 WindowChord::New => return Task::none(),
@@ -1550,6 +1572,57 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             Task::none()
         }
 
+        M::OpenPicker => {
+            state.panel.picker.open();
+            // The picker asks for a taller panel than the transcript does, and
+            // `desired_height` alone changes nothing — a window is only resized
+            // when something asks. Without this the overlay rendered into the
+            // old height and the list was clipped after its first row.
+            resize_panel_if_visible(state).chain(operation::focus(panel::PICKER_ID))
+        }
+        M::ClosePicker => {
+            state.panel.picker.close();
+            // Back to the transcript's height, and focus back to the input, or
+            // the panel is unusable without the mouse after closing.
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
+        }
+        M::PickerQuery(query) => {
+            state.panel.picker.set_query(query);
+            Task::none()
+        }
+        M::PickerMove(delta) => {
+            let count = crate::model_picker::selectable(&state.panel.picker_rows()).len();
+            state.panel.picker.move_highlight(delta, count);
+            Task::none()
+        }
+        M::PickerToggleFavourite => {
+            let rows = state.panel.picker_rows();
+            if let Some(option) =
+                crate::model_picker::selectable(&rows).get(state.panel.picker.highlight)
+            {
+                let binding = option.binding.clone();
+                state.panel.toggle_favourite(binding);
+            }
+            Task::none()
+        }
+        M::PickerCommit => {
+            let rows = state.panel.picker_rows();
+            let choices = crate::model_picker::selectable(&rows);
+            let Some(option) = choices
+                .get(state.panel.picker.highlight)
+                .map(|o| (*o).clone())
+            else {
+                return Task::none();
+            };
+            drop(choices);
+            state.panel.picker.close();
+            // Closing shrinks the panel back to the transcript's height, so the
+            // resize belongs here too.
+            panel_update(state, M::SelectModel(option))
+                .chain(resize_panel_if_visible(state))
+                .chain(operation::focus(panel::INPUT_ID))
+        }
+
         M::SelectModel(option) => {
             // Rebuilding the engine cancels its in-flight request. Keep model
             // changes available while composing or reviewing an answer, but
@@ -1557,6 +1630,8 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             if matches!(state.panel.phase, Phase::Loading | Phase::Streaming) {
                 return Task::none();
             }
+            state.panel.remember_model(option.binding.clone());
+            state.panel.selected_model = Some(option.clone());
             state.send(UiRequest::SetModel {
                 binding: option.binding,
             });
@@ -2683,6 +2758,35 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
                     },
                 ));
             }
+            // **Command chords are extracted before the `Captured` check, and
+            // only these.**
+            //
+            // A focused `text_input` captures every key event it sees, including
+            // ⌘-modified ones. Bailing on `Captured` therefore meant ⌘K, ⌘R, ⌘T
+            // and ⌘, were dead whenever the panel input had focus — which is
+            // always, since the panel focuses its input on open. Pressing ⌘K
+            // typed a literal "k".
+            //
+            // The list is deliberately short: ⌘C, ⌘V, ⌘X, ⌘A and ⌘Z are *text
+            // editing* commands, and stealing them would break copy and paste
+            // inside the field the user is typing in. These five have no meaning
+            // in a text field, so intercepting them takes nothing away.
+            if modifiers.command()
+                && let Some(latin) = key.to_latin(physical_key)
+            {
+                let chord = match latin {
+                    'k' => Some(WindowChord::PickModel),
+                    'd' => Some(WindowChord::PinModel),
+                    'r' => Some(WindowChord::Retry),
+                    't' => Some(WindowChord::ShowTask),
+                    ',' => Some(WindowChord::OpenSettings),
+                    _ => None,
+                };
+                if let Some(chord) = chord {
+                    return Some(Message::WindowKey(window, chord));
+                }
+            }
+
             if status == iced::event::Status::Captured {
                 return None;
             }
@@ -2695,12 +2799,12 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
                 },
                 Key::Named(Named::ArrowUp) => WindowChord::HistoryOlder,
                 Key::Named(Named::ArrowDown) => WindowChord::HistoryNewer,
+                // ⌘C stays here rather than above: inside a text field it is
+                // the field's copy, and only an *uncaptured* ⌘C means "copy the
+                // answer".
                 _ if modifiers.command() => match key.to_latin(physical_key) {
                     Some('c') => WindowChord::Copy,
-                    Some('r') => WindowChord::Retry,
-                    Some('t') => WindowChord::ShowTask,
                     Some('.') => WindowChord::CancelTask,
-                    Some(',') => WindowChord::OpenSettings,
                     Some('n') => WindowChord::New,
                     _ => return None,
                 },

@@ -51,6 +51,7 @@ pub mod error;
 pub mod history_ring;
 pub mod hotkey;
 pub mod i18n;
+pub mod model_picker;
 pub mod panel;
 pub mod placement;
 pub mod settings;

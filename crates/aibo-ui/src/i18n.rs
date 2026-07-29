@@ -109,6 +109,20 @@ pub enum Key {
     PanelPlaceholder,
     /// Label for the model selector in the popup panel.
     PanelModel,
+    /// Quick-pick heading above pinned models.
+    PickerFavourites,
+    /// Quick-pick heading above recently used models.
+    PickerRecent,
+    /// Quick-pick placeholder.
+    PickerPlaceholder,
+    /// How many models match: `{}` = count.
+    PickerCount,
+    /// No model matched the query.
+    PickerNoMatch,
+    /// Choose the highlighted entry.
+    ActionSelect,
+    /// Pin or unpin the highlighted model.
+    ActionPinModel,
     /// Accessible name for the generated answer surface.
     PanelResponse,
     /// Label above user-authored chat bubbles.
@@ -535,6 +549,13 @@ fn en(key: Key) -> &'static str {
 
         K::PanelPlaceholder => "Ask about the selection or reply…",
         K::PanelModel => "Model",
+        K::PickerFavourites => "pinned",
+        K::PickerRecent => "recent",
+        K::PickerPlaceholder => "search models, or \u{21e5} to browse",
+        K::PickerCount => "{} models",
+        K::PickerNoMatch => "no model matches",
+        K::ActionSelect => "Select",
+        K::ActionPinModel => "Pin",
         K::PanelResponse => "Response",
         K::ChatYou => "You",
         K::ChatAssistant => "Aibo",
@@ -724,6 +745,13 @@ fn ja(key: Key) -> &'static str {
 
         K::PanelPlaceholder => "選択範囲について質問、または返信…",
         K::PanelModel => "モデル",
+        K::PickerFavourites => "ピン留め",
+        K::PickerRecent => "最近使用",
+        K::PickerPlaceholder => "モデルを検索",
+        K::PickerCount => "{} 件",
+        K::PickerNoMatch => "一致するモデルがありません",
+        K::ActionSelect => "選択",
+        K::ActionPinModel => "ピン留め",
         K::PanelResponse => "応答",
         K::ChatYou => "あなた",
         K::ChatAssistant => "Aibo",

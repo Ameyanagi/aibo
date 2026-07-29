@@ -42,6 +42,9 @@ use crate::widgets::{self, Action, RailState};
 /// The id of the panel's text input, so focus can be requested on show.
 pub const INPUT_ID: &str = "aibo.panel.input";
 
+/// The id of the model quick-pick's search field.
+pub const PICKER_ID: &str = "aibo.panel.picker";
+
 /// Where the panel is in its lifecycle.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Phase {
@@ -730,6 +733,19 @@ pub struct PanelState {
     pub model_options: Vec<ModelOption>,
     /// Model currently persisted in configuration.
     pub selected_model: Option<ModelOption>,
+    /// The quick-pick's own state (§4).
+    pub picker: crate::model_picker::ModelPicker,
+    /// Models the user has pinned, newest first.
+    ///
+    /// Persisted, unlike [`PanelState::recent_models`]: a pin is a deliberate
+    /// statement about what the user works with, and losing it on quit would
+    /// make pinning pointless.
+    pub favourite_models: Vec<aibo_core::types::ModelBinding>,
+    /// Models used this session, most recent first.
+    ///
+    /// Session-scoped on purpose. Recency is an observation, not a preference,
+    /// and one restored from last week describes a task that is over.
+    pub recent_models: Vec<aibo_core::types::ModelBinding>,
     /// `↑`/`↓` recall over previous submissions.
     ///
     /// Session-local: §12's `messages` table is the eventual home, but the
@@ -766,6 +782,9 @@ impl PanelState {
             clipboard: ClipboardOffer::Unknown,
             model_options: Vec::new(),
             selected_model: None,
+            picker: crate::model_picker::ModelPicker::default(),
+            favourite_models: Vec::new(),
+            recent_models: Vec::new(),
             // Constructed once at boot, not per session, so recall survives
             // closing and reopening the panel — which is the whole point.
             history: crate::history_ring::HistoryRing::new(),
@@ -787,7 +806,14 @@ impl PanelState {
         // invocation and only recover once the window server answered again —
         // a visible shrink between the hotkey and the first frame.
         let display_height = self.display_height;
+        // Neither favourites nor recents belong to a panel session: a pin is a
+        // durable preference, and recency describes the user's day rather than
+        // one invocation.
+        let favourite_models = std::mem::take(&mut self.favourite_models);
+        let recent_models = std::mem::take(&mut self.recent_models);
         *self = Self::new(session);
+        self.favourite_models = favourite_models;
+        self.recent_models = recent_models;
         self.model_options = model_options;
         self.selected_model = selected_model;
         self.display_height = display_height;
@@ -1137,6 +1163,12 @@ impl PanelState {
 
     /// The height the panel wants, for [`crate::placement::PlacementRequest`].
     pub fn desired_height(&self) -> f32 {
+        // The quick-pick replaces the body, so it sets its own height. Falling
+        // through to the transcript arithmetic sized the window for content that
+        // is not on screen, and clipped the list after its first row.
+        if self.picker.open {
+            return PICKER_PANEL_HEIGHT.min(self.max_panel_height());
+        }
         // The chips are their own row above the input, so they add height in
         // every phase — including the collapsed one, which is otherwise a
         // constant. Attaching an image into a fixed-height panel would push the
@@ -1231,6 +1263,18 @@ pub enum Message {
     CopyLink(String),
     /// Selection, cursor, or an ignored edit attempt in the read-only answer.
     ResponseAction(text_editor::Action),
+    /// Open the model quick-pick.
+    OpenPicker,
+    /// Close it without choosing.
+    ClosePicker,
+    /// The quick-pick's search query changed.
+    PickerQuery(String),
+    /// Move the quick-pick highlight.
+    PickerMove(isize),
+    /// Choose the highlighted model.
+    PickerCommit,
+    /// Pin or unpin the highlighted model.
+    PickerToggleFavourite,
 }
 
 /// Render the panel.
@@ -1258,6 +1302,18 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
     // The rest of §3 is unaffected: the rail still runs the full height and is
     // amber on whichever row holds attention, which is the part of the spec
     // doing the real work.
+    // While the quick-pick is open it *is* the panel. Rendering it alongside the
+    // transcript would put two focusable text fields on screen at once, and the
+    // one that answers the keyboard would be whichever iced focused last.
+    if state.picker.open {
+        return container(widgets::railed(RailState::Active, picker_overlay(state)))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(space(4.0))
+            .style(theme::panel_surface)
+            .into();
+    }
+
     let has_result =
         state.has_conversation() || !matches!(state.phase, Phase::Hidden | Phase::Idle);
     let shows_content = has_result
@@ -1321,6 +1377,69 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
         .style(theme::panel_surface)
         .into()
 }
+
+impl PanelState {
+    /// The models that can serve *this* request.
+    ///
+    /// With an image attached, a model that cannot see is not a choice — it is a
+    /// row whose only outcome is `VisionUnsupported`. Hiding it is also what
+    /// makes §4's routing legible: the picker previously named a Codex model
+    /// while the request went to OpenAI, because Codex declares no vision
+    /// support, and nothing on screen explained the discrepancy.
+    pub fn capable_models(&self) -> Vec<ModelOption> {
+        if !self.has_attachments() {
+            return self.model_options.clone();
+        }
+        self.model_options
+            .iter()
+            .filter(|option| self.model_supports_vision(&option.binding))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether the catalogue says this binding accepts image input.
+    ///
+    /// The UI cannot reach `ModelCatalogue`, so the runtime has to have said so.
+    /// Until `UiEvent::ModelOptions` carries capabilities, the one thing known
+    /// for certain is §3a's measurement that the Codex endpoint has never been
+    /// sent an image — so that provider is excluded and everything else is
+    /// assumed capable, which matches the modern reality that most chat models
+    /// take images.
+    fn model_supports_vision(&self, binding: &aibo_core::types::ModelBinding) -> bool {
+        binding.provider.as_str() != "codex"
+    }
+
+    /// The quick-pick's rows for the current state.
+    pub fn picker_rows(&self) -> Vec<crate::model_picker::Row> {
+        self.picker.rows(
+            &self.capable_models(),
+            &self.favourite_models,
+            &self.recent_models,
+        )
+    }
+
+    /// Record a model as just used, most recent first.
+    pub fn remember_model(&mut self, binding: aibo_core::types::ModelBinding) {
+        self.recent_models.retain(|b| b != &binding);
+        self.recent_models.insert(0, binding);
+        // Bounded: a "recent" list longer than the screen is a second full
+        // catalogue with worse ordering.
+        self.recent_models.truncate(RECENT_MODEL_LIMIT);
+    }
+
+    /// Pin or unpin a model.
+    pub fn toggle_favourite(&mut self, binding: aibo_core::types::ModelBinding) {
+        match self.favourite_models.iter().position(|b| b == &binding) {
+            Some(at) => {
+                self.favourite_models.remove(at);
+            }
+            None => self.favourite_models.push(binding),
+        }
+    }
+}
+
+/// How many recently used models the picker keeps.
+const RECENT_MODEL_LIMIT: usize = 5;
 
 /// Which rail state the input row carries (`design.md` §3).
 ///
@@ -1388,12 +1507,127 @@ fn chip_row(state: &PanelState) -> Element<'_, Message> {
         return context;
     }
 
+    // The current model as a quiet, keyboard-reachable button rather than a
+    // dropdown. §16: every action has a key, and a `pick_list` of eighty-eight
+    // entries has no key at all — the mouse was the only way in.
+    let current = state
+        .selected_model
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| i18n::t(Key::PanelModel).to_owned());
+
     row![
         context,
         Space::new().width(Length::Fill),
-        text(i18n::t(Key::PanelModel))
-            .size(type_scale::CHIP)
+        widgets::action_list(vec![Action::new(
+            Key::PanelModel,
+            widgets::primary_shortcut("⌘K", "Ctrl+K"),
+            Message::OpenPicker,
+        )]),
+        text(current)
+            .size(type_scale::META)
+            .font(theme::MONO_FONT)
             .style(theme::text_dim),
+    ]
+    .spacing(space(1.5))
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// The model quick-pick overlay (§4).
+///
+/// Replaces the panel's body while open rather than floating over it: the panel
+/// is already an overlay, and a popover inside an overlay reads as a rendering
+/// fault. The search field takes focus, so the first keystroke filters instead
+/// of being lost.
+fn picker_overlay(state: &PanelState) -> Element<'_, Message> {
+    let rows = state.picker_rows();
+    let choices = crate::model_picker::selectable(&rows);
+    let total = choices.len();
+
+    let mut list = column![].spacing(space(0.5));
+    let mut index = 0usize;
+    for row in &rows {
+        match row {
+            crate::model_picker::Row::Group(label) => {
+                list = list.push(
+                    text(label.clone())
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_dim),
+                );
+            }
+            crate::model_picker::Row::Model { option, favourite } => {
+                let highlighted = index == state.picker.highlight;
+                let marker = if *favourite { "★ " } else { "  " };
+                list = list.push(widgets::railed(
+                    if highlighted {
+                        RailState::Active
+                    } else {
+                        RailState::Inactive
+                    },
+                    text(format!("{marker}{option}"))
+                        .size(type_scale::ANSWER)
+                        .style(if highlighted {
+                            theme::text_primary
+                        } else {
+                            theme::text_dim
+                        }),
+                ));
+                index += 1;
+            }
+        }
+    }
+
+    let count = if total == 0 {
+        i18n::t(Key::PickerNoMatch).to_owned()
+    } else {
+        i18n::t1(Key::PickerCount, &total.to_string())
+    };
+
+    column![
+        text_input(i18n::t(Key::PickerPlaceholder), &state.picker.query)
+            .id(PICKER_ID)
+            .on_input(Message::PickerQuery)
+            .on_submit(Message::PickerCommit)
+            .size(type_scale::BODY)
+            .font(theme::MONO_FONT)
+            .padding(space(1.0))
+            .style(theme::input),
+        text(count)
+            .size(type_scale::META)
+            .font(theme::MONO_FONT)
+            .style(theme::text_dim),
+        scrollable(list)
+            .height(Length::Fixed(PICKER_LIST_HEIGHT))
+            .style(theme::scroller),
+        widgets::action_list(vec![
+            Action::new(Key::ActionSelect, "⏎", Message::PickerCommit).primary(),
+            Action::new(Key::ActionPinModel, "⌘D", Message::PickerToggleFavourite),
+            Action::new(Key::ActionDismiss, "esc", Message::ClosePicker),
+        ]),
+    ]
+    .spacing(space(1.5))
+    .into()
+}
+
+/// Total panel height while the quick-pick is open.
+///
+/// The list plus the search field, the result count, the action row and the
+/// panel's own padding. Fixed rather than derived from the number of matches: a
+/// window that resizes on every keystroke is unreadable while typing, which is
+/// the one thing this widget exists to make easy.
+const PICKER_PANEL_HEIGHT: f32 = 400.0;
+
+/// Height of the quick-pick's scrolling list.
+///
+/// Fixed so the panel does not resize as the query narrows the results — a list
+/// that changes height on every keystroke is unreadable while typing.
+const PICKER_LIST_HEIGHT: f32 = 260.0;
+
+#[expect(dead_code, reason = "kept while the old dropdown path is retired")]
+fn unused_pick_list(state: &PanelState) -> Element<'_, Message> {
+    row![
         pick_list(
             state.model_options.as_slice(),
             state.selected_model.as_ref(),
