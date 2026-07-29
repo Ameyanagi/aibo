@@ -21,7 +21,7 @@
 use std::sync::Arc;
 
 use aibo_core::context::Turn;
-use aibo_core::error::{AttachmentRejection, Treatment};
+use aibo_core::error::{AttachmentRejection, CaptureFailure, InsertFailure, Treatment};
 use aibo_core::types::{
     AppInfo, Attachment, AttachmentSource, PermissionStatus, ProviderId, Rect, Role, StopReason,
     Surface, validate_attachments,
@@ -412,9 +412,30 @@ impl ErrorView {
                 i18n::t(Key::ErrTimeout).to_owned(),
                 Some(ErrorAction::RetryWith(Role::Smart)),
             ),
+            // Secure input is not a generic capture failure and must not read
+            // as one. §8: any process holding the global secure-event-input
+            // flag blocks every AX read — a password field, a password manager,
+            // or an app that set it and never cleared it. There is no user
+            // action, so the copy names the cause and offers nothing rather
+            // than implying something is theirs to fix.
+            AiboError::CaptureFailed {
+                reason: CaptureFailure::SecureInput,
+                ..
+            } => (
+                Severity::Info,
+                i18n::t(Key::ErrSecureInput).to_owned(),
+                None,
+            ),
             AiboError::CaptureFailed { app, .. } => {
                 (Severity::Info, i18n::t1(Key::ErrCaptureFailed, app), None)
             }
+            AiboError::InsertFailed {
+                reason: InsertFailure::SecureInput,
+            } => (
+                Severity::Info,
+                i18n::t(Key::ErrSecureInput).to_owned(),
+                None,
+            ),
             AiboError::InsertFailed { .. } => (
                 Severity::Info,
                 i18n::t(Key::ErrInsertFailed).to_owned(),

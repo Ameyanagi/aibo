@@ -245,6 +245,12 @@ pub enum Key {
     ActionCopyRecoveryCode,
 
     // --- error treatments (§13) ------------------------------------------
+    /// Secure input mode blocks every read and every synthetic keystroke.
+    ///
+    /// Distinct from a permission denial, and the distinction is the point:
+    /// §8's Accessibility checkbox is already ticked when this fires, so the
+    /// copy must not send the user there.
+    ErrSecureInput,
     /// `NoProviderConfigured` — the only blocking error.
     ErrNoProvider,
     /// Heading over the add-a-provider form.
@@ -590,6 +596,7 @@ fn en(key: Key) -> &'static str {
         K::ActionEnableHistory => "Enable encrypted history",
         K::ActionCopyRecoveryCode => "Copy recovery code",
 
+        K::ErrSecureInput => "A password field has focus, so nothing can be read.",
         K::ErrNoProvider => "No provider configured.",
         K::ErrNoProviderBody => "Sign in with ChatGPT to start, or add an API key.",
         K::ErrAuth => "Your {} credentials are no longer valid.",
@@ -775,6 +782,7 @@ fn ja(key: Key) -> &'static str {
         K::ActionEnableHistory => "暗号化履歴を有効にする",
         K::ActionCopyRecoveryCode => "復旧コードをコピー",
 
+        K::ErrSecureInput => "パスワード入力中のため読み取れません。",
         K::ErrNoProvider => "プロバイダーが未設定です。",
         K::ErrNoProviderBody => "ChatGPT でサインインするか、API キーを追加してください。",
         K::ErrAuth => "{} の認証情報が無効になりました。",

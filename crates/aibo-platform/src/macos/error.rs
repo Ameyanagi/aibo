@@ -67,7 +67,11 @@ impl MacosError {
     /// either way.
     pub fn into_capture_error(self, app: &str) -> AiboError {
         let reason = match self {
-            MacosError::NotTrusted | MacosError::SecureInput => CaptureFailure::Denied,
+            MacosError::NotTrusted => CaptureFailure::Denied,
+            // Not `Denied`: see `CaptureFailure::SecureInput`. Sending the user
+            // to a checkbox that is already ticked is worse than saying "a
+            // password field has focus".
+            MacosError::SecureInput => CaptureFailure::SecureInput,
             MacosError::ImeActive => CaptureFailure::ImeActive,
             _ => CaptureFailure::NoAxTree,
         };
@@ -80,7 +84,8 @@ impl MacosError {
     /// Map onto the write-back half of the failure model.
     pub fn into_insert_error(self) -> AiboError {
         let reason = match self {
-            MacosError::NotTrusted | MacosError::SecureInput => InsertFailure::PermissionDenied,
+            MacosError::NotTrusted => InsertFailure::PermissionDenied,
+            MacosError::SecureInput => InsertFailure::SecureInput,
             MacosError::ImeActive => InsertFailure::ImeActive,
             MacosError::TargetChanged => InsertFailure::Cancelled,
             _ => InsertFailure::AppRejected,

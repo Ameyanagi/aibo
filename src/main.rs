@@ -2833,7 +2833,7 @@ mod runtime {
             let engine = bootstrap.engine();
             let startup_history_ready = bootstrap.history_ready();
             Self {
-                platform: platform_backend(),
+                platform: platform_backend(&config),
                 engine,
                 bootstrap,
                 codex,
@@ -4391,13 +4391,23 @@ mod runtime {
     }
 
     /// Construct the platform backend for this OS.
+    ///
+    /// `config` supplies the §8 accessibility-activation opt-in on macOS. It is
+    /// read here rather than inside `aibo-platform` because the platform crate
+    /// has no notion of a config file, and because §17 wants the choice to be
+    /// something a user made rather than a constant a build chose for them.
     #[cfg(target_os = "macos")]
-    fn platform_backend() -> Arc<dyn PlatformBackend> {
-        Arc::new(aibo_platform::macos::MacosBackend::default())
+    fn platform_backend(config: &Config) -> Arc<dyn PlatformBackend> {
+        Arc::new(aibo_platform::macos::MacosBackend::new(
+            aibo_platform::macos::MacosConfig {
+                allow_ax_tree_activation: config.ui.allow_ax_tree_activation,
+                ..Default::default()
+            },
+        ))
     }
 
     #[cfg(target_os = "windows")]
-    fn platform_backend() -> Arc<dyn PlatformBackend> {
+    fn platform_backend(_config: &Config) -> Arc<dyn PlatformBackend> {
         // §9: `WindowsBackend::new` opts into Per-Monitor-V2 DPI awareness and
         // must therefore run before the first window exists — which is why the
         // backend is built here, ahead of `aibo_ui::run`, and not lazily.
@@ -4408,7 +4418,7 @@ mod runtime {
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    fn platform_backend() -> Arc<dyn PlatformBackend> {
+    fn platform_backend(_config: &Config) -> Arc<dyn PlatformBackend> {
         // §2 locks the shipping targets to macOS and Windows. Keeping the binary
         // buildable elsewhere is worth more than a `compile_error!`, but there
         // is no third implementation and writing one would be exactly the

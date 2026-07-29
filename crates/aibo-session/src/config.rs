@@ -475,6 +475,22 @@ pub struct Config {
 pub struct UiSettings {
     /// BCP-47 language tag. Unsupported tags fall back in the UI layer.
     pub language: Option<String>,
+    /// Let aibo switch on an application's accessibility tree so its content
+    /// can be read (§8, macOS only).
+    ///
+    /// Off by default, and that default is a judgement rather than caution for
+    /// its own sake. Chrome honours `AXEnhancedUserInterface` and Electron
+    /// honours `AXManualAccessibility`; §8 records that the Chrome flag "breaks
+    /// window positioning and makes resizing sluggish", so a tray utility
+    /// setting it unasked degrades an app the user did not consent to have
+    /// touched.
+    ///
+    /// Leaving it off has a cost the user should get to weigh: Chrome, Edge,
+    /// Slack, VS Code, Discord and every other Electron app return **no
+    /// context at all**. That is most of the surface this product is sold
+    /// into, which is why this is a setting and not a permanent no.
+    #[serde(default)]
+    pub allow_ax_tree_activation: bool,
 }
 
 impl Config {

@@ -790,18 +790,41 @@ mod tests {
     /// The refusal must be *typed*, not an empty success: §5's whole point is
     /// that the panel says why rather than showing a silent blank, and a
     /// `CaptureFailed` is what the failure model (§13) renders.
+    ///
+    /// It must also be typed **as secure input rather than as denial**. Both
+    /// end in "aibo could not read that", but the recoveries are opposite:
+    /// `Denied` renders a banner pointing at the Accessibility pane, and when
+    /// secure input is the cause that checkbox is already ticked — so the user
+    /// is sent to fix a setting that is not broken, with no way to tell the app
+    /// is wrong rather than themselves. Secure input has no user action at all.
     #[test]
-    fn the_refusal_is_capture_failed_denied() {
+    fn secure_input_is_reported_as_itself_not_as_a_permission_denial() {
         let err = MacosError::SecureInput.into_capture_error("com.apple.Terminal");
         assert!(matches!(
             err,
+            AiboError::CaptureFailed {
+                reason: CaptureFailure::SecureInput,
+                ..
+            }
+        ));
+        assert!(matches!(
+            MacosError::SecureInput.into_insert_error(),
+            AiboError::InsertFailed {
+                reason: InsertFailure::SecureInput,
+            }
+        ));
+
+        // The missing-permission case keeps pointing at the pane, because there
+        // it is the correct advice.
+        assert!(matches!(
+            MacosError::NotTrusted.into_capture_error("com.apple.Terminal"),
             AiboError::CaptureFailed {
                 reason: CaptureFailure::Denied,
                 ..
             }
         ));
         assert!(matches!(
-            MacosError::SecureInput.into_insert_error(),
+            MacosError::NotTrusted.into_insert_error(),
             AiboError::InsertFailed {
                 reason: InsertFailure::PermissionDenied,
             }
