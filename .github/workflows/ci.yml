@@ -87,6 +87,22 @@ jobs:
       - name: Build the release binary
         run: cargo build --release --bin aibo --locked
 
+      # §15 budgets the shipped binary at 25 MB. Reported rather than enforced:
+      # Windows measured 27 MB on the first real link, and §21's second lever
+      # ("cut tier-1 sandboxed code execution — also fixes the binary budget")
+      # names the cause. Failing the build would block every unrelated change
+      # behind a scope decision; a number in the summary keeps it visible and
+      # trending instead of discovered by download.
+      - name: Report the binary size against the §15 budget
+        shell: bash
+        run: |
+          size=$(wc -c < "${{ matrix.path }}")
+          mb=$(( size / 1048576 ))
+          echo "### ${{ matrix.name }} binary: ${mb} MB (§15 budget: 25 MB)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$mb" -gt 25 ]; then
+            echo ":warning: over the §15 budget by $(( mb - 25 )) MB" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
       # Unsigned and un-notarised: §19 puts Authenticode, notarisation and the
       # installers in P8. This is a build artefact for testing, not a release —
       # macOS Gatekeeper and Windows SmartScreen will both object.

@@ -43,6 +43,25 @@
 // The binary is allowed no `unsafe` at all. Every platform API that needs it is
 // isolated inside `aibo-platform` (§7).
 #![forbid(unsafe_code)]
+// Windows: no console window.
+//
+// Without this the linker produces a *console* subsystem executable, and
+// launching it opens a `conhost` window that sits behind the panel for the
+// life of the process. For a tray utility whose entire premise is appearing
+// over someone's work and getting out of the way (§1), a permanent black
+// rectangle on the taskbar is not a cosmetic problem.
+//
+// Gated on `debug_assertions` rather than applied unconditionally: a debug
+// build is run from a terminal, and `windows_subsystem = "windows"` detaches
+// stdout, so every `tracing` line — including the ones that explain why the
+// hotkey did not register — would vanish exactly when they are wanted. Release
+// builds route diagnostics through the §19 ring buffer and the crash marker
+// instead, neither of which needs a console.
+//
+// This is invisible to `cargo check`, to `cargo test`, and to every unit test
+// in the workspace: it is a property of the linked artefact, which is why it
+// went unnoticed until CI produced one.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use anyhow::Context as _;
 
