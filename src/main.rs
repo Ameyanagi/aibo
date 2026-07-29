@@ -4063,14 +4063,25 @@ mod runtime {
             .ok()
             .flatten();
         let clipboard = platform.clipboard(app_ref, CAPTURE_DEADLINE).await.ok();
+        // §8's third insert-validation comparison. On the AX budget, not the
+        // clipboard one: this is a single attribute read, and a slow answer
+        // should weaken validation rather than delay the panel.
+        let focused_element = platform
+            .focused_element_id(app_ref, AX_DEADLINE)
+            .await
+            .ok()
+            .flatten();
 
         let target = InsertTarget {
             app_ref: app_ref.clone(),
-            // TODO(cross-crate): no backend exposes the focused element's
-            // identity from a *capture* call, only from inside
-            // `validate_target`. `None` means the element check is skipped; the
-            // pid, window and content checks still run.
-            focused_element: None,
+            // §8 validates pid, window, focused element and content hashes
+            // before writing into another application. This is the third:
+            // without it a target that kept its pid and window but moved focus
+            // to a *different field* passed validation and took the paste —
+            // the "pasting a rewrite over the wrong content is unrecoverable"
+            // case. `None` still means the check is skipped, but now only when
+            // the platform genuinely cannot identify the element.
+            focused_element,
             selection_hash: selection.as_deref().map(content_hash),
             prefix_hash: field.as_ref().map(|f| content_hash(&f.prefix)),
         };
@@ -4745,6 +4756,18 @@ mod runtime {
                 })
             }
 
+            async fn focused_element_id(
+                &self,
+                of: &AppRef,
+                _timeout: Duration,
+            ) -> aibo_core::error::Result<Option<String>> {
+                self.record("focused_element_id", of);
+                // Distinct per pid, so a test can tell "same app, different
+                // field" from "different app" — which is the distinction §8's
+                // third validation exists to draw.
+                Ok(Some(format!("element:{}", of.pid)))
+            }
+
             async fn selected_text(
                 &self,
                 of: &AppRef,
@@ -4857,6 +4880,36 @@ mod runtime {
         /// whichever app it is handed, so a frontmost-based caller silently gets
         /// aibo's bundle id, aibo's panel text and aibo-attributed clipboard —
         /// exactly the shape of the shipped defect.
+        /// §8 validates four things before writing into another application:
+        /// pid, window handle, focused element, and the content hashes. The
+        /// third had nothing to compare — every capture site set
+        /// `focused_element: None` — so a target that kept its pid and window
+        /// but moved focus to a **different field** passed validation and took
+        /// the paste. §8 calls that outcome unrecoverable.
+        ///
+        /// It must also be the *snapshotted* app's element, not the frontmost
+        /// one: by the time deferred capture runs, the frontmost app is aibo,
+        /// and validating against aibo's own field would make the check
+        /// meaningless in precisely the way the pid check already was.
+        #[tokio::test]
+        async fn capture_records_the_focused_element_for_insert_validation() {
+            let platform = FakePlatform::panel_focused();
+            let snapshot = target_ref();
+
+            let captured = capture_context(&platform, &snapshot, SessionId::nil()).await;
+
+            assert_eq!(
+                platform.asked_about("focused_element_id"),
+                snapshot,
+                "the element identity must come from the snapshotted app, not aibo's panel"
+            );
+            assert_eq!(
+                captured.target.expect("insert target").focused_element,
+                Some(format!("element:{TARGET_PID}")),
+                "§8's third validation cannot run against None"
+            );
+        }
+
         #[tokio::test]
         async fn capture_reads_the_snapshotted_app_not_the_frontmost_one() {
             let platform = FakePlatform::panel_focused();

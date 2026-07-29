@@ -144,6 +144,27 @@ pub trait PlatformBackend: Send + Sync {
     /// since a synthetic chord goes to whichever app has focus.
     async fn selected_text(&self, of: &AppRef, timeout: Duration) -> Result<Option<String>>;
 
+    /// An opaque identity for the element focused **inside `of`**, when the
+    /// platform can express one.
+    ///
+    /// §8's insert sequence validates four things before writing into another
+    /// application: pid, window handle, focused element, and selection hash.
+    /// Without this the third comparison had nothing to compare — `InsertTarget`
+    /// carried `focused_element: None` from every capture site, so a target that
+    /// kept its pid and window but moved focus to a *different field* passed
+    /// validation and took the paste. That is the "pasting a rewrite over the
+    /// wrong content is unrecoverable" case §8 names.
+    ///
+    /// The value is opaque and comparable only against itself, within one
+    /// process: macOS derives it from `CFHash` of the `AXUIElement`, Windows
+    /// from the UIA runtime id. Neither is stable across processes or restarts,
+    /// which is why `InsertTarget` is never persisted.
+    ///
+    /// `Ok(None)` means "this platform or app cannot identify the element",
+    /// which is a weaker validation, not a failure — §13 would rather insert
+    /// with three checks than refuse every insert on an app with no AX tree.
+    async fn focused_element_id(&self, of: &AppRef, timeout: Duration) -> Result<Option<String>>;
+
     /// Read a bounded window of the text field focused **inside `of`**.
     ///
     /// Must return `Ok(None)` — never captured text — when the field is secure

@@ -198,6 +198,21 @@ impl PlatformBackend for MacosBackend {
         }
     }
 
+    async fn focused_element_id(&self, of: &AppRef, timeout: Duration) -> Result<Option<String>> {
+        let of = of.clone();
+        let label = of.clone();
+        match self
+            .thread
+            .call(timeout, move |w| w.focused_element_id(&of))
+            .await
+        {
+            Ok(id) => Ok(id),
+            // A deadline here weakens validation rather than breaking it.
+            Err(MacosError::Deadline(_)) => Ok(None),
+            Err(err) => Err(err.into_capture_error(&Self::identifier_of(&label))),
+        }
+    }
+
     /// Read a bounded window of the focused field.
     ///
     /// A secure field or an active composition yields a [`FieldContext`] whose

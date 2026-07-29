@@ -332,6 +332,19 @@ impl PlatformBackend for WindowsBackend {
         })
     }
 
+    async fn focused_element_id(&self, of: &AppRef, timeout: Duration) -> Result<Option<String>> {
+        let deadline = Instant::now() + timeout;
+        // §8's third insert-validation comparison. A UIA runtime id identifies
+        // the control within this session; failing to get one weakens the check
+        // to pid-plus-window rather than blocking the insert, which is what §13
+        // prefers on an app with no usable UIA tree.
+        match tokio::time::timeout(timeout, self.uia.focused_element_id(of, deadline)).await {
+            Ok(Ok(id)) => Ok(id),
+            Ok(Err(e)) if e.is_uipi() => Err(e.into_capture_error(Self::app_label(of))),
+            Ok(Err(_)) | Err(_) => Ok(None),
+        }
+    }
+
     async fn selected_text(&self, of: &AppRef, timeout: Duration) -> Result<Option<String>> {
         let deadline = Instant::now() + timeout;
 

@@ -554,6 +554,20 @@ impl Worker {
             .any(|attr| element.has_attribute(attr))
     }
 
+    /// Opaque identity of the focused element inside `of` (§8).
+    ///
+    /// `CFHash` of the `AXUIElement`, which is comparable only against another
+    /// hash taken in this process — exactly the lifetime `InsertTarget` has.
+    pub(crate) fn focused_element_id(&mut self, of: &AppRef) -> MacosResult<Option<String>> {
+        match self.focused_element(of) {
+            Ok((element, _)) => Ok(Some(element.identity())),
+            // No AX tree is not a failure: §13 prefers an insert validated on
+            // pid and window to no insert at all.
+            Err(MacosError::NotTrusted) | Err(MacosError::Platform(_)) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+
     /// The clipboard, with §12 hygiene applied.
     ///
     /// macOS does not report the pasteboard's owner, so the best available
@@ -648,6 +662,23 @@ impl Worker {
             .is_ok_and(|focused| !focused)
         {
             return Ok(false);
+        }
+        // §9's IME rule, on the write-back side. Windows guards both of its
+        // write paths; macOS guarded neither, so a paste landing mid-composition
+        // would be interleaved with the marked text the user is still editing —
+        // corrupting the buffer in a way no undo restores cleanly, and doing it
+        // in exactly the market §9 says the product cannot afford to lose.
+        //
+        // An `Err` rather than `Ok(false)`: `false` means "the target changed,
+        // copy instead", which is the wrong story. This is "you are mid-word,
+        // aibo is not going to interrupt", and §13 renders it as its own state.
+        //
+        // Checked *here* rather than in `insert_text` because this is the one
+        // place that runs after `restore_focus` has confirmed the target is
+        // frontmost again, and it already holds the resolved element. Composing
+        // status read before the restore would describe aibo's own field.
+        if Self::ime_composition_active(&element) {
+            return Err(MacosError::ImeActive);
         }
         if let Some(expected) = &target.focused_element
             && element.identity() != *expected
