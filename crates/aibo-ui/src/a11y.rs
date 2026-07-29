@@ -945,6 +945,8 @@ mod tests {
             },
             display_name: "GPT-5.6 Terra".to_owned(),
             latency_ms: Some(446),
+            abilities: Default::default(),
+            cost: None,
         };
         state.model_options.push(option.clone());
         state.selected_model = Some(option.clone());

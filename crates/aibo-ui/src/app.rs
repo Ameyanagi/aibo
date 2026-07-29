@@ -2980,6 +2980,8 @@ mod tests {
             },
             display_name: model.to_owned(),
             latency_ms: Some(435),
+            abilities: Default::default(),
+            cost: None,
         }
     }
 

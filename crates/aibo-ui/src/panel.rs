@@ -1559,20 +1559,13 @@ fn picker_overlay(state: &PanelState) -> Element<'_, Message> {
             }
             crate::model_picker::Row::Model { option, favourite } => {
                 let highlighted = index == state.picker.highlight;
-                let marker = if *favourite { "★ " } else { "  " };
                 list = list.push(widgets::railed(
                     if highlighted {
                         RailState::Active
                     } else {
                         RailState::Inactive
                     },
-                    text(format!("{marker}{option}"))
-                        .size(type_scale::ANSWER)
-                        .style(if highlighted {
-                            theme::text_primary
-                        } else {
-                            theme::text_dim
-                        }),
+                    model_row(option, *favourite, highlighted),
                 ));
                 index += 1;
             }
@@ -1609,6 +1602,64 @@ fn picker_overlay(state: &PanelState) -> Element<'_, Message> {
     ]
     .spacing(space(1.5))
     .into()
+}
+
+/// One row of the quick-pick.
+///
+/// Name, then the facts that actually decide a choice: what it costs, and what
+/// it can do. Both come from real data — §14's price table and §10's catalogue —
+/// so neither goes stale as models change.
+///
+/// The badges are words rather than icons. `design.md` §9 cut icons from the
+/// product on the grounds that "the rail plus a key hint carries every meaning
+/// an icon would", and three unlabelled glyphs are exactly the case it was
+/// arguing against: an eye and a brain have to be learned, `vision` does not.
+fn model_row<'a>(option: &ModelOption, favourite: bool, highlighted: bool) -> Element<'a, Message> {
+    let mut row = row![
+        text(if favourite { "★" } else { " " })
+            .width(Length::Fixed(space(3.0)))
+            .size(type_scale::META)
+            .style(theme::text_accent),
+        text(option.to_string())
+            .size(type_scale::ANSWER)
+            .style(if highlighted {
+                theme::text_primary
+            } else {
+                theme::text_dim
+            }),
+    ]
+    .spacing(space(1.0))
+    .align_y(Alignment::Center);
+
+    // §14: an unpriced model shows nothing rather than `$`. Reporting a price
+    // aibo does not know is worse than reporting none.
+    if let Some(cost) = option.cost {
+        row = row.push(
+            text(cost.glyphs())
+                .size(type_scale::META)
+                .font(theme::MONO_FONT)
+                .style(theme::text_accent),
+        );
+    }
+
+    // **No ability badges, and this is a data problem rather than a design one.**
+    //
+    // `Abilities` is carried and populated, but rendering it would lie. No
+    // OpenAI-compatible `/models` endpoint reports capabilities, so every
+    // fetched model inherits its *provider's* declared defaults — which made
+    // `gpt-3.5-turbo` claim vision, reasoning and tools, none of which it has.
+    // A picker that says a model can see when it cannot is worse than one that
+    // says nothing, because the user acts on it and gets a 400.
+    //
+    // Badges become honest as soon as there is per-model capability data: the
+    // §19 signed manifest is where §10 says that belongs, and `models.toml`
+    // would let a user correct one entry without waiting for a release. The
+    // field stays populated so the capability *filter* can use it — excluding a
+    // vision-incapable provider is a provider-level fact, and that much is
+    // true.
+    let _ = &option.abilities;
+
+    row.into()
 }
 
 /// Total panel height while the quick-pick is open.
@@ -2536,6 +2587,8 @@ mod tests {
             },
             display_name: model.to_owned(),
             latency_ms: Some(435),
+            abilities: Default::default(),
+            cost: None,
         }
     }
 

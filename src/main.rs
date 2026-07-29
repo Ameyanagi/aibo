@@ -2711,7 +2711,11 @@ mod runtime {
     /// because `CODEX_MODELS` carries §3a's measured `ttft_p50_ms` and no
     /// `/models` endpoint anywhere returns a latency. A catalogue entry can add
     /// a model; it must not take away a measurement.
-    fn model_options_event(config: &Config, catalogue: &aibo_provider::ModelCatalogue) -> UiEvent {
+    fn model_options_event(
+        config: &Config,
+        catalogue: &aibo_provider::ModelCatalogue,
+        prices: &aibo_core::cost::PriceTable,
+    ) -> UiEvent {
         let UiEvent::ModelOptions {
             mut options,
             selected,
@@ -2733,11 +2737,22 @@ mod runtime {
             if options.iter().any(|option| option.binding == binding) {
                 continue;
             }
+            let (abilities, cost) = model_facts(catalogue, prices, &binding);
             options.push(ModelOption {
                 binding,
                 display_name: entry.display_name.clone(),
                 latency_ms: None,
+                abilities,
+                cost,
             });
+        }
+
+        // Codex rows come from `CODEX_MODELS` for their measured latency, so
+        // their abilities and cost are filled here rather than at construction.
+        for option in &mut options {
+            let (abilities, cost) = model_facts(catalogue, prices, &option.binding);
+            option.abilities = abilities;
+            option.cost = cost;
         }
 
         // Grouped by provider, then by model, so a picker with several hundred
@@ -2754,6 +2769,39 @@ mod runtime {
         UiEvent::ModelOptions { options, selected }
     }
 
+    /// The UI-facing facts about one binding: what it can do, and roughly what
+    /// it costs.
+    ///
+    /// Both come from data aibo already holds — §10's catalogue and §14's price
+    /// table — rather than from a curated list. That is the difference between
+    /// badges that stay true as models change and badges that go stale: nothing
+    /// here is written per model by hand.
+    fn model_facts(
+        catalogue: &aibo_provider::ModelCatalogue,
+        prices: &aibo_core::cost::PriceTable,
+        binding: &ModelBinding,
+    ) -> (aibo_ui::Abilities, Option<aibo_ui::CostTier>) {
+        let abilities = catalogue
+            .entries()
+            .iter()
+            .find(|e| e.provider == binding.provider && e.id == binding.model)
+            .map(|e| aibo_ui::Abilities {
+                vision: e.capabilities.vision,
+                tools: e.capabilities.tools,
+                reasoning: e.capabilities.reasoning_effort,
+            })
+            .unwrap_or_default();
+
+        // §14: a model with no row is *unpriced*, not free. `None` renders as
+        // nothing rather than as `$`, because a wrong price is worse than a
+        // missing one.
+        let cost = prices
+            .lookup(&binding.provider, &binding.model, None)
+            .map(|p| aibo_ui::CostTier::from_output_micros(p.output));
+
+        (abilities, cost)
+    }
+
     fn codex_model_options_event(config: &Config) -> UiEvent {
         let selected = ModelBinding {
             provider: ProviderId::CODEX,
@@ -2768,6 +2816,10 @@ mod runtime {
                 },
                 display_name: model.display_name.to_owned(),
                 latency_ms: Some(model.ttft_p50_ms),
+                // Filled in by `model_options_event`, which is the only caller
+                // holding the catalogue and the price table.
+                abilities: Default::default(),
+                cost: None,
             })
             .collect::<Vec<_>>();
         if !options.iter().any(|option| option.binding == selected) {
@@ -2775,6 +2827,8 @@ mod runtime {
                 binding: selected.clone(),
                 display_name: selected.model.clone(),
                 latency_ms: None,
+                abilities: Default::default(),
+                cost: None,
             });
         }
         UiEvent::ModelOptions {
@@ -3385,7 +3439,11 @@ mod runtime {
         /// id as the current option so an upgrade cannot silently rewrite a
         /// choice merely because this build predates it.
         fn model_options_event(&self) -> UiEvent {
-            model_options_event(&self.bootstrap.config(), &self.catalogue)
+            model_options_event(
+                &self.bootstrap.config(),
+                &self.catalogue,
+                self.engine.prices(),
+            )
         }
 
         fn publish_model_options(&self) {

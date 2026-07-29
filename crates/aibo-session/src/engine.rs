@@ -226,6 +226,11 @@ impl Engine {
         &self.providers
     }
 
+    /// §14's price table, for showing a cost band next to a model.
+    pub fn prices(&self) -> &aibo_core::cost::PriceTable {
+        &self.config.prices
+    }
+
     /// The engine's configuration.
     pub fn config(&self) -> &EngineConfig {
         &self.config

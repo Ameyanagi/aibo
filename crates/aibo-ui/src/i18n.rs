@@ -109,6 +109,12 @@ pub enum Key {
     PanelPlaceholder,
     /// Label for the model selector in the popup panel.
     PanelModel,
+    /// Badge: the model accepts images.
+    AbilityVision,
+    /// Badge: the model exposes a reasoning-effort control.
+    AbilityReasoning,
+    /// Badge: the model can be given tools.
+    AbilityTools,
     /// Quick-pick heading above pinned models.
     PickerFavourites,
     /// Quick-pick heading above recently used models.
@@ -549,6 +555,9 @@ fn en(key: Key) -> &'static str {
 
         K::PanelPlaceholder => "Ask about the selection or reply…",
         K::PanelModel => "Model",
+        K::AbilityVision => "vision",
+        K::AbilityReasoning => "reasoning",
+        K::AbilityTools => "tools",
         K::PickerFavourites => "pinned",
         K::PickerRecent => "recent",
         K::PickerPlaceholder => "search models, or \u{21e5} to browse",
@@ -745,6 +754,9 @@ fn ja(key: Key) -> &'static str {
 
         K::PanelPlaceholder => "選択範囲について質問、または返信…",
         K::PanelModel => "モデル",
+        K::AbilityVision => "画像",
+        K::AbilityReasoning => "推論",
+        K::AbilityTools => "ツール",
         K::PickerFavourites => "ピン留め",
         K::PickerRecent => "最近使用",
         K::PickerPlaceholder => "モデルを検索",

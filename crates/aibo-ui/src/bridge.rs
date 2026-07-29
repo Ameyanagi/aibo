@@ -61,6 +61,78 @@ pub struct ModelOption {
     pub display_name: String,
     /// Measured first-token latency, when the shipped catalogue has one.
     pub latency_ms: Option<u32>,
+    /// What the model can do, from §10's catalogue.
+    ///
+    /// Shown as badges in the quick-pick, because "can this one see an image?"
+    /// is the question that actually decides a choice, and the alternative was
+    /// finding out from a `VisionUnsupported` error after the fact.
+    pub abilities: Abilities,
+    /// Roughly what it costs to run, from §14's price table.
+    ///
+    /// `None` means **unpriced, not free**. §14 is explicit that reporting
+    /// $0.00 for a model whose price aibo does not know is worse than saying
+    /// nothing, so the picker renders nothing rather than a zero.
+    pub cost: Option<CostTier>,
+}
+
+/// The capabilities worth showing next to a model name.
+///
+/// A deliberate subset of `aibo_core::types::Capabilities`: these three change
+/// what the user can *ask for*. Context window and output cap matter too, but
+/// they do not belong on a one-line row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Abilities {
+    /// Accepts image input.
+    pub vision: bool,
+    /// Can be given tools.
+    pub tools: bool,
+    /// Exposes a reasoning-effort control.
+    pub reasoning: bool,
+}
+
+/// A coarse price band, for comparing models at a glance (§14).
+///
+/// Derived from the **output** rate, which dominates the bill for chat: a reply
+/// is mostly output tokens, and the input side is usually cached or small. The
+/// bands are wide on purpose — this is for "which of these is the cheap one",
+/// not for budgeting, which §14's spend meter does with real numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CostTier {
+    /// Under $1 per million output tokens.
+    Low,
+    /// Under $5.
+    Moderate,
+    /// Under $20.
+    High,
+    /// $20 or more.
+    Premium,
+}
+
+impl CostTier {
+    /// Band an output rate given in micros per million tokens.
+    pub fn from_output_micros(micros_per_mtok: u64) -> Self {
+        // 1 USD = 1_000_000 micros.
+        // Disjoint bounds rather than open-ended `..=`, which would each start
+        // at zero and overlap: the arms happen to resolve correctly by order,
+        // but a reader cannot see that and a reordering would silently change
+        // every band.
+        match micros_per_mtok {
+            0..=1_000_000 => CostTier::Low,
+            1_000_001..=5_000_000 => CostTier::Moderate,
+            5_000_001..=20_000_000 => CostTier::High,
+            _ => CostTier::Premium,
+        }
+    }
+
+    /// `$` to `$$$$`.
+    pub const fn glyphs(self) -> &'static str {
+        match self {
+            CostTier::Low => "$",
+            CostTier::Moderate => "$$",
+            CostTier::High => "$$$",
+            CostTier::Premium => "$$$$",
+        }
+    }
 }
 
 impl std::fmt::Display for ModelOption {
@@ -448,4 +520,33 @@ pub enum UiEvent {
 
     /// Encrypted history setup failed; details remain diagnostics-only.
     HistorySetupFailed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bands must be disjoint and monotonic, or two models with different
+    /// prices can read as the same cost.
+    #[test]
+    fn cost_bands_are_monotonic_and_disjoint() {
+        assert_eq!(CostTier::from_output_micros(400_000), CostTier::Low);
+        assert_eq!(CostTier::from_output_micros(2_000_000), CostTier::Moderate);
+        assert_eq!(CostTier::from_output_micros(10_000_000), CostTier::High);
+        assert_eq!(CostTier::from_output_micros(75_000_000), CostTier::Premium);
+
+        // Boundaries land in the cheaper band, and never in two.
+        assert_eq!(CostTier::from_output_micros(1_000_000), CostTier::Low);
+        assert_eq!(CostTier::from_output_micros(1_000_001), CostTier::Moderate);
+        assert_eq!(CostTier::from_output_micros(0), CostTier::Low);
+
+        assert!(CostTier::Low < CostTier::Moderate);
+        assert!(CostTier::High < CostTier::Premium);
+    }
+
+    #[test]
+    fn cost_glyphs_grow_with_the_band() {
+        assert_eq!(CostTier::Low.glyphs().len(), 1);
+        assert_eq!(CostTier::Premium.glyphs().len(), 4);
+    }
 }
