@@ -12,7 +12,8 @@
 
 use aibo_core::types::{Health, Permission, PermissionStatus, ProviderId, Role};
 use iced::widget::{
-    Space, button, column, container, pick_list, row, scrollable, text, text_editor, text_input,
+    Space, button, column, container, pick_list, row, rule, scrollable, text, text_editor,
+    text_input,
 };
 use iced::{Element, Length};
 use secrecy::{ExposeSecret as _, SecretString};
@@ -631,55 +632,77 @@ pub enum Message {
 
 /// Render the settings window.
 pub fn view(state: &SettingsState) -> Element<'_, Message> {
+    // `design.md` §7: "Sidebar on `ink-raised`, content on `ink`, one hairline
+    // between. No card borders anywhere; group with space and a single
+    // hairline." The sidebar shared the content's ground and had no separator,
+    // so the two regions read as one undifferentiated field with a floating
+    // selection box in it.
     let body = row![
         container(navigation(state))
             .width(Length::Fixed(180.0))
-            .padding(space(2.0)),
+            .height(Length::Fill)
+            .padding(space(2.0))
+            .style(theme::raised),
+        rule::vertical(1).style(theme::separator),
         container(scrollable(section_body(state)).style(theme::scroller))
             .width(Length::Fill)
             .padding(space(3.0)),
-    ]
-    .spacing(space(2.0));
+    ];
 
     container(body)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(space(3.0))
         .style(theme::panel_surface)
         .into()
 }
 
+/// The section list (`design.md` §7).
+///
+/// §7: "The active sidebar item is marked by an amber rail segment — the
+/// identity element, reused, so the two windows read as one product." It was a
+/// filled amber box, which is the treatment §9 removes everywhere else; a
+/// settings window that boxes its selection while the panel draws a rail reads
+/// as two products stapled together.
+///
+/// The checkmark stays. §16 does not let selection depend on perceiving a
+/// colour, and a 3 pt bar is exactly the sort of cue that disappears for a
+/// colour-blind user or on a dim external display.
 fn navigation(state: &SettingsState) -> Element<'_, Message> {
-    let mut list = column![].spacing(space(1.0));
+    let mut list = column![];
     for section in Section::VISIBLE {
         let selected = section == state.section;
-        list = list.push(
-            button(
-                row![
-                    text(selection_marker(selected))
-                        .width(Length::Fixed(space(3.0)))
-                        .size(type_scale::META)
-                        .style(theme::text_primary),
-                    text(i18n::t(section.title()))
-                        .size(type_scale::BODY)
-                        .style(if selected {
-                            theme::text_primary
-                        } else {
-                            theme::text_dim
-                        }),
-                ]
-                .align_y(iced::Alignment::Center),
-            )
-            .width(Length::Fill)
-            .height(Length::Fixed(theme::MIN_HIT_TARGET))
-            .padding([space(1.5), space(2.0)])
-            .style(if selected {
-                theme::selected_button
+        let row = button(
+            row![
+                text(selection_marker(selected))
+                    .width(Length::Fixed(space(3.0)))
+                    .size(type_scale::META)
+                    .style(theme::text_primary),
+                text(i18n::t(section.title()))
+                    .size(type_scale::BODY)
+                    .style(if selected {
+                        theme::text_primary
+                    } else {
+                        theme::text_dim
+                    }),
+            ]
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(theme::MIN_HIT_TARGET))
+        .padding([space(1.5), space(2.0)])
+        .style(theme::action_button)
+        .on_press(Message::Select(section));
+
+        // The same `railed` the panel uses, so the amber segment means the same
+        // thing in both windows: this is where you are.
+        list = list.push(widgets::railed(
+            if selected {
+                widgets::RailState::Active
             } else {
-                theme::action_button
-            })
-            .on_press(Message::Select(section)),
-        );
+                widgets::RailState::Inactive
+            },
+            row,
+        ));
     }
     list.into()
 }

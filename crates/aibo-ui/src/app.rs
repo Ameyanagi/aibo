@@ -260,6 +260,13 @@ pub enum WindowChord {
     },
     /// Copy the current surface's content.
     Copy,
+    /// Open the settings window.
+    ///
+    /// `design.md` §3's error footer shows `⌘, Settings`, and §8's quality
+    /// floor makes the mouse optional — but there was no keyboard route to
+    /// Settings from anywhere, so the one window that fixes a misconfiguration
+    /// could only be reached through the tray.
+    OpenSettings,
     /// Retry the current panel request.
     Retry,
     /// Bring an agent task forward.
@@ -1394,9 +1401,18 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
         return Task::none();
     }
 
+    // Available from every window, and from the panel in particular: §17's
+    // recovery from "no provider configured" is *open settings*, and until now
+    // that had no key.
+    if matches!(chord, WindowChord::OpenSettings) {
+        return open_settings(state);
+    }
+
     match state.role_of(window) {
         Some(Role::Panel) if state.panel_visible => {
             let message = match chord {
+                // Handled above, for every window.
+                WindowChord::OpenSettings => unreachable!("intercepted before the role match"),
                 WindowChord::Escape if state.panel.toast.is_some() => panel::Message::DismissToast,
                 WindowChord::Escape => panel::Message::Dismiss,
                 WindowChord::Enter {
@@ -2642,6 +2658,7 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
                     Some('r') => WindowChord::Retry,
                     Some('t') => WindowChord::ShowTask,
                     Some('.') => WindowChord::CancelTask,
+                    Some(',') => WindowChord::OpenSettings,
                     _ => return None,
                 },
                 _ => return None,

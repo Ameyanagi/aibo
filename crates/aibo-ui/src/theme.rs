@@ -685,9 +685,17 @@ pub fn text_severity(severity: Severity) -> impl Fn(&Theme) -> text::Style {
 ///
 /// `design.md` §3's thesis is that the panel should read as "the caret
 /// continuing into a second place", so the input is not a field you fill in; it
-/// is the line you were already typing on. Focus is shown by the amber rail
-/// segment beside the row and by the amber caret in it, which is why removing
-/// the focus border here loses no focus indication — see `rail` in `widgets`.
+/// is the line you were already typing on.
+///
+/// **The caret is not amber, and cannot be.** §2 picks amber partly because it
+/// "is the colour of a text caret", but iced 0.14's `text_input::Style` has no
+/// caret field — the caret is drawn in `value`, so tinting it amber would tint
+/// every typed character with it. That is a worse outcome than a white caret,
+/// and faking it by colouring the text would break the one thing the input is
+/// for. Focus indication therefore rests entirely on the amber rail segment
+/// beside the row (`widgets::railed`), which is why removing the focus border
+/// here loses nothing: the rail says where focus is, more legibly than a 1 px
+/// outline did.
 pub fn input(theme: &Theme, status: text_input::Status) -> text_input::Style {
     let _ = status;
     let p = palette_of(theme);
