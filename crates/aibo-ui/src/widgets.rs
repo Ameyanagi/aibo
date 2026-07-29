@@ -80,22 +80,39 @@ pub fn railed<'a, Message: 'a>(
     state: RailState,
     content: impl Into<Element<'a, Message>>,
 ) -> Element<'a, Message> {
-    row![
-        container(Space::new().width(theme::RAIL_WIDTH).height(Length::Fill)).style(
-            move |t: &iced::Theme| container::Style {
-                background: Some(Background::Color(state.color(&theme::palette_of(t)))),
-                ..Default::default()
-            }
-        ),
-        // `space(1.0)` and not more: two adjacent rows contribute 4 pt each, so
-        // the gap between them is the 8 pt the parent `column`'s `spacing` used
-        // to provide. Anything larger silently inflates the rendered height
-        // beyond what `PanelState::desired_height` budgets for, and the window
-        // is sized from that budget — so the surplus is not extra breathing
-        // room, it is content pushed past the bottom edge.
-        container(content.into()).padding([space(1.0), 0.0]),
-    ]
-    .spacing(theme::RAIL_GUTTER)
+    // Drawn as a **background the content is painted over**, not as a
+    // `Length::Fill` sibling in a row.
+    //
+    // The sibling version is the obvious construction and it is wrong: a
+    // `Fill`-height child makes the *row* report "I want to fill", the parent
+    // `column` then sees five such rows and divides the panel between them, and
+    // the result is a source line inflated into a band of empty space and an
+    // answer squashed to a few points. Pinning the row to `Shrink` fixes the
+    // squashing and kills the rail instead, because `Fill` inside `Shrink`
+    // resolves to nothing.
+    //
+    // So: the outer container is painted the rail colour and inset from the
+    // left by exactly `RAIL_WIDTH`; the inner container repaints the panel
+    // ground over everything but that strip. Both are content-sized, so the
+    // rail is always precisely as tall as the row beside it and can never
+    // dictate the row's height.
+    container(
+        container(content.into())
+            .padding([space(1.0), 0.0])
+            .width(Length::Fill)
+            .style(theme::ground),
+    )
+    .padding(iced::Padding {
+        top: 0.0,
+        right: 0.0,
+        bottom: 0.0,
+        left: theme::RAIL_WIDTH,
+    })
+    .width(Length::Fill)
+    .style(move |t: &iced::Theme| container::Style {
+        background: Some(Background::Color(state.color(&theme::palette_of(t)))),
+        ..Default::default()
+    })
     .into()
 }
 

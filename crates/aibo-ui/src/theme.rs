@@ -906,6 +906,18 @@ pub fn model_picker_menu(theme: &Theme) -> overlay::menu::Style {
     }
 }
 
+/// The panel's own ground, for painting over a rail strip.
+///
+/// Used by `widgets::railed` to mask everything except the 3 pt bar; see the
+/// comment there for why the rail is drawn as a background rather than as a
+/// `Fill`-height sibling.
+pub fn ground(theme: &Theme) -> container::Style {
+    container::Style {
+        background: Some(Background::Color(palette_of(theme).surface)),
+        ..container::Style::default()
+    }
+}
+
 /// A hairline separator.
 pub fn separator(theme: &Theme) -> rule::Style {
     let p = palette_of(theme);
