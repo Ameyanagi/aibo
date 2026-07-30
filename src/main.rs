@@ -71,6 +71,37 @@ use anyhow::Context as _;
 /// commit; short enough that quitting feels immediate.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// The panel hotkey from `config.toml`, if the user set one.
+///
+/// Read here rather than taken from the backend's already-loaded config because
+/// the backend owns that on another thread and iced needs this before it starts.
+/// Parsing one string twice is cheaper than a channel round trip on the startup
+/// path (§15).
+///
+/// Every failure returns `None` and lets the platform default stand. A missing
+/// or malformed config must not stop aibo starting — and a hotkey that cannot
+/// be parsed least of all, since the reason this setting exists is that a user
+/// whose shortcut does not work has no other way in.
+fn panel_hotkey_override(paths: &paths::Paths) -> Option<aibo_ui::hotkey::HotKey> {
+    let config = match aibo_session::config::Config::load(&paths.config()) {
+        Ok(config) => config,
+        // Silent: the backend loads the same file and reports properly on it.
+        // Two errors for one typo reads as two problems.
+        Err(_) => return None,
+    };
+    let spec = config.ui.panel_hotkey.as_deref()?;
+    match aibo_ui::hotkey::parse(spec) {
+        Ok(hotkey) => {
+            tracing::info!(spec, "using the configured panel hotkey");
+            Some(hotkey)
+        }
+        Err(error) => {
+            tracing::error!(spec, %error, "ui.panel_hotkey is not a valid combination; using the default");
+            None
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     diagnostics::init_tracing();
 
@@ -166,6 +197,16 @@ fn main() -> anyhow::Result<()> {
             } else {
                 aibo_ui::theme::motion::Motion::Full
             },
+            // The seam for this was already read in `boot`; nothing ever fed
+            // it, so the platform default was the only reachable value. With
+            // `Message::RebindHotkey` still a stub, a shortcut some other app
+            // had taken left no way at all to change it — and since the panel
+            // is how settings is reached, that locked the user out.
+            //
+            // A bad value is reported and dropped rather than fatal. Refusing
+            // to start because a shortcut is mistyped is the same lockout by
+            // another route.
+            panel_hotkey: panel_hotkey_override(&paths),
             ..aibo_ui::UiConfig::default()
         };
         aibo_ui::run(

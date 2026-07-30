@@ -78,7 +78,10 @@
 
 use std::collections::BTreeMap;
 
-use global_hotkey::hotkey::{Code, HotKey, Modifiers};
+use global_hotkey::hotkey::{Code, Modifiers};
+// Re-exported so a caller can name the type `parse` returns without taking a
+// direct dependency on `global-hotkey`.
+pub use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 
 use crate::error::{Result, UiError};

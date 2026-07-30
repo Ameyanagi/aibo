@@ -507,6 +507,21 @@ pub struct UiSettings {
     /// into, which is why this is a setting and not a permanent no.
     #[serde(default)]
     pub allow_ax_tree_activation: bool,
+    /// Override the panel hotkey, e.g. `"control+alt+Space"`.
+    ///
+    /// **The only way to change it that works.** §9 planned a picker in
+    /// settings; `Message::RebindHotkey` is still `Task::none()`, so the button
+    /// there does nothing. Until it is built, a taken shortcut locked the user
+    /// out of their own app: the panel would not open, and the panel is how you
+    /// reach settings.
+    ///
+    /// The syntax is what `aibo_ui::hotkey::parse` accepts — modifiers
+    /// from `control`, `alt`, `shift`, `super`, joined by `+`, then one key
+    /// code. An unparseable value is reported and ignored rather than fatal;
+    /// refusing to start over a typo in a shortcut is the same lockout by
+    /// another route.
+    #[serde(default)]
+    pub panel_hotkey: Option<String>,
 }
 
 impl Config {
