@@ -1287,11 +1287,16 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
             });
             // §4 sizes the answer area as a fraction of the display, so the
             // panel needs the display's height in the same logical points its
-            // own layout is measured in. `monitor_size` is physical; dividing by
-            // the scale factor is what makes 60 % mean the same thing on a
-            // Retina panel and an external 1× monitor.
-            state.panel.display_height = monitor.filter(|_| scale > 0.0).map(|s| s.height / scale);
-            state.panel.display_width = monitor.filter(|_| scale > 0.0).map(|s| s.width / scale);
+            // own layout is measured in — which is what `monitor_size` already
+            // is. iced converts before handing it over (`iced_winit`'s
+            // `GetMonitorSize` does `monitor.size().to_logical(scale)`), so this
+            // used to divide by the scale factor a *second* time: a 1920×1080
+            // display at 150 % reported 853×480 instead of 1280×720. Height
+            // survived by luck, because `max_panel_height`'s floor absorbed the
+            // error; width did not, and every Retina Mac asked for the 420 pt
+            // minimum where 680 was intended.
+            state.panel.display_height = monitor.map(|s| s.height);
+            state.panel.display_width = monitor.map(|s| s.width);
 
             let pending = std::mem::take(&mut state.pending_show);
             if pending || state.panel_visible {

@@ -4934,6 +4934,112 @@ mod runtime {
             assert!(sessions.is_empty());
         }
 
+        /// Reopening the panel keeps the session id (`Aibo::resume_panel_session`),
+        /// so the runtime's `Session` — and the [`InsertTarget`] inside it — is
+        /// the *same entry* across invocations rather than a fresh one. The
+        /// suspicion was that this left `⌘↩` aiming at wherever the caret was the
+        /// first time the panel opened, which would make replace insert into the
+        /// wrong app or refuse outright.
+        ///
+        /// It does not. `activate_session` returns early for the current session
+        /// without clearing the table, and `resume_panel_session` still requests a
+        /// capture, so `apply_captured` overwrites the target with what the second
+        /// capture found. Continuity retains the *conversation*, not the target.
+        #[test]
+        fn resuming_a_session_retargets_it_instead_of_reusing_the_old_target() {
+            let session = SessionId::now_v7();
+            let mut active = None;
+            let mut sessions = HashMap::new();
+
+            // First invocation: the caret is in one app.
+            assert_eq!(
+                activate_session(&mut active, &mut sessions, session),
+                None,
+                "the first activation has no predecessor to cancel"
+            );
+            let first_target = InsertTarget {
+                app_ref: AppRef {
+                    pid: 4242,
+                    window: Some(7),
+                },
+                focused_element: None,
+                selection_hash: None,
+                prefix_hash: None,
+            };
+            assert!(apply_captured(
+                active,
+                &mut sessions,
+                Captured {
+                    session,
+                    app: None,
+                    target: Some(first_target.clone()),
+                    selection: None,
+                    field: None,
+                    clipboard: None,
+                },
+            ));
+
+            // Reopening on the same id must not discard the conversation, so the
+            // table entry survives — this is the step that made a stale target
+            // look plausible.
+            assert_eq!(
+                activate_session(&mut active, &mut sessions, session),
+                None,
+                "re-activating the current session has no predecessor and keeps its entry"
+            );
+            assert!(sessions.contains_key(&session));
+
+            // Second invocation: the caret is somewhere else, and that is what
+            // the target must become.
+            let second_target = InsertTarget {
+                app_ref: AppRef {
+                    pid: 9191,
+                    window: Some(3),
+                },
+                focused_element: None,
+                selection_hash: None,
+                prefix_hash: None,
+            };
+            assert!(apply_captured(
+                active,
+                &mut sessions,
+                Captured {
+                    session,
+                    app: None,
+                    target: Some(second_target.clone()),
+                    selection: None,
+                    field: None,
+                    clipboard: None,
+                },
+            ));
+            assert_eq!(
+                sessions[&session].target.as_ref().map(|t| t.app_ref.pid),
+                Some(second_target.app_ref.pid),
+                "a resumed session must aim at the caret it was just reopened over, \
+                 not the one from the invocation before it"
+            );
+
+            // A reopen over an app that exposes nothing must clear the target
+            // rather than leave the previous one armed: inserting into a window
+            // the user has since left is worse than refusing (§8).
+            assert!(apply_captured(
+                active,
+                &mut sessions,
+                Captured {
+                    session,
+                    app: None,
+                    target: None,
+                    selection: None,
+                    field: None,
+                    clipboard: None,
+                },
+            ));
+            assert!(
+                sessions[&session].target.is_none(),
+                "an unreadable reopen must disarm the target, not inherit one"
+            );
+        }
+
         /// A `PlatformBackend` that models the one fact §7 and §8 turn on: by
         /// the time the deferred capture and the insert run, **aibo owns the
         /// foreground**.

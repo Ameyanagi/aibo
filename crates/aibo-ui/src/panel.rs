@@ -2383,15 +2383,26 @@ impl PanelState {
 
     /// The tallest the panel may grow on this display (`design.md` §4).
     ///
-    /// 60 % of the display, floored at [`theme::PANEL_HEIGHT_MAX`] so an unknown
-    /// display behaves exactly as the old constant did, and ceilinged so the
-    /// panel stays a panel: something that covers the screen is a window, and
-    /// this product is explicitly not that (§1 — it appears *over* your work).
+    /// 60 % of the display, ceilinged so the panel stays a panel: something that
+    /// covers the screen is a window, and this product is explicitly not that
+    /// (§1 — it appears *over* your work).
+    ///
+    /// The floor is [`CHAT_PANEL_MIN_HEIGHT`], not [`theme::PANEL_HEIGHT_MAX`].
+    /// Flooring a *known* display at 520 pt defeated the measurement it was
+    /// reading: 60 % only exceeds 520 above an 867 pt display, so on anything
+    /// smaller — a 1080p laptop at 150 % scaling is 720 pt — the fraction never
+    /// bound and the panel took 72 % of the screen. The unknown-display case
+    /// still answers [`theme::PANEL_HEIGHT_MAX`], which is what that floor was
+    /// for; it is the early return above, not a clamp bound.
+    ///
+    /// The floor may not drop below [`CHAT_PANEL_MIN_HEIGHT`] because
+    /// [`PanelState::desired_height`] clamps against this value, and `f32::clamp`
+    /// panics when its own bounds cross.
     pub fn max_panel_height(&self) -> f32 {
         let Some(display) = self.display_height else {
             return theme::PANEL_HEIGHT_MAX;
         };
-        (display * PANEL_HEIGHT_DISPLAY_FRACTION).clamp(theme::PANEL_HEIGHT_MAX, 900.0)
+        (display * PANEL_HEIGHT_DISPLAY_FRACTION).clamp(CHAT_PANEL_MIN_HEIGHT, 900.0)
     }
 
     /// The active answer bubble's ceiling.
@@ -2408,12 +2419,23 @@ impl PanelState {
 
     /// The transcript's ceiling before it scrolls internally.
     fn max_transcript_height(&self) -> f32 {
+        // Floored at the *transcript's* minimum, not at a comfortable-looking
+        // 268 pt. This value is already "what the panel has left after its
+        // chrome", so any floor above it hands the transcript space the window
+        // does not contain and the content paints past the bottom edge.
+        //
+        // The 268 pt floor was unreachable while `max_panel_height` could not go
+        // below 520: the subtraction only falls short of 268 on a panel under
+        // ~460 pt. So this is not a bug being fixed, it is the companion to
+        // letting the panel be short — with the old floor still in place, a
+        // 480 pt display overflowed by 138 pt. Both tests below prove that
+        // direction.
         (self.max_panel_height()
             - theme::PANEL_HEIGHT_COLLAPSED
             - self.attachment_block_height()
             - self.selection_preview_height()
             - self.footer_height())
-        .max(CHAT_TRANSCRIPT_MIN_MAX_HEIGHT)
+        .max(CHAT_TRANSCRIPT_MIN_HEIGHT)
     }
 
     /// Maximum height the answer may consume while preserving fixed chrome.
@@ -2516,11 +2538,6 @@ const CHAT_TRANSCRIPT_MIN_HEIGHT: f32 = 112.0;
 /// what the constant allowed.
 const PANEL_HEIGHT_DISPLAY_FRACTION: f32 = 0.60;
 
-/// The chat transcript's ceiling once the panel itself is at full height.
-///
-/// Kept as a floor rather than the answer, so a display whose size is not yet
-/// known still behaves the way the old constant did instead of collapsing.
-const CHAT_TRANSCRIPT_MIN_MAX_HEIGHT: f32 = 268.0;
 /// The granularity at which the answer area is allowed to grow.
 ///
 /// §16: "streaming must not reflow". A window resize is not free — on macOS it
@@ -3671,6 +3688,58 @@ mod tests {
             state.max_chat_answer_height() >= CHAT_ANSWER_MAX_HEIGHT,
             "the fallback must not shrink the answer below the old 172 pt cap"
         );
+    }
+
+    /// §4's 60 % is a *ceiling*, and it used to be unreachable: the floor was
+    /// [`theme::PANEL_HEIGHT_MAX`], so 60 % only bound above an 867 pt display
+    /// and everything smaller got a panel larger than the rule allows. A 1080p
+    /// laptop at 150 % scaling is 720 pt — the common Windows case — and it was
+    /// handing the panel 72 % of the screen.
+    #[test]
+    fn the_panel_never_takes_more_of_the_display_than_the_fraction_allows() {
+        for display in [640.0_f32, 720.0, 800.0, 900.0, 1080.0, 1440.0, 2160.0] {
+            let mut state = panel();
+            state.display_height = Some(display);
+            let allowed = display * PANEL_HEIGHT_DISPLAY_FRACTION;
+            assert!(
+                state.max_panel_height() <= allowed.max(CHAT_PANEL_MIN_HEIGHT) + 0.01,
+                "a {display} pt display allows {allowed} pt, got {}",
+                state.max_panel_height()
+            );
+        }
+    }
+
+    /// `max_transcript_height` is "what the panel has left after its chrome", so
+    /// flooring it at a constant grants the transcript space the window does not
+    /// contain. Unreachable while the panel could not be shorter than 520 pt, and
+    /// a 138 pt overflow at 480 pt the moment it can be — which is what the test
+    /// above now allows. Guards the companion change, not a shipped bug.
+    #[test]
+    fn the_transcript_never_asks_for_more_room_than_the_panel_has() {
+        for display in [480.0_f32, 560.0, 640.0, 720.0, 800.0, 1080.0, 1440.0] {
+            let mut state = panel();
+            state.display_height = Some(display);
+            state.active_user = Some("Explain this".to_owned());
+            state.phase = Phase::Streaming;
+            state.attribution.provider = Some(ProviderId::OPENAI);
+            state.attribution.model = Some("gpt-5".to_owned());
+            state.set_response("A long wrapped response. ".repeat(200));
+
+            let occupied = theme::PANEL_HEIGHT_COLLAPSED
+                + state.transcript_height()
+                + state.attachment_block_height()
+                + state.selection_preview_height()
+                + state.footer_height();
+            assert!(
+                occupied <= state.max_panel_height() + 0.01,
+                "on a {display} pt display the transcript stack is {occupied} pt \
+                 inside a {} pt panel",
+                state.max_panel_height()
+            );
+            // The window must actually be asked for that much, or the transcript
+            // fits arithmetically and still paints past the edge.
+            assert!(state.desired_height() <= state.max_panel_height() + 0.01);
+        }
     }
 
     /// The display is hardware, not session state.
