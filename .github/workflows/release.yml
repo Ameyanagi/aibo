@@ -1,10 +1,23 @@
 # Build the binaries and attach them to a GitHub Release.
 #
-# **This is not §19.** §19 wants a Developer ID signed, notarised DMG and an
-# Authenticode signed MSI, and puts both in P8. Nothing here is signed, so
-# Gatekeeper and SmartScreen will object on first run — that is expected, and the
-# release notes say so rather than leaving someone to guess whether the download
-# is broken.
+# **Partly §19.** macOS reaches what §19 asks for — a Developer ID signed,
+# notarised, stapled DMG with `LSUIElement` — but only when the Apple secrets are
+# configured; without them the same DMG is built unsigned so that testing is
+# never blocked on Apple paperwork. Windows is still unsigned: §19 wants an
+# Authenticode-signed MSI or MSIX, and neither the certificate nor the installer
+# exists yet. The generated release notes state which of these is true of the
+# build in hand, rather than leaving a tester to guess whether a Gatekeeper or
+# SmartScreen prompt means the download is broken.
+#
+# Secrets, all optional (`gh secret set NAME < file`):
+#
+#   MACOS_CERT_P12       base64 of the Developer ID Application .p12
+#   MACOS_CERT_PASSWORD  its export password
+#   ASC_KEY_P8           base64 of an App Store Connect API key (.p8)
+#   ASC_KEY_ID           that key's id
+#   ASC_ISSUER_ID        the issuer uuid from App Store Connect
+#
+# Signing needs the first two; notarisation needs all five.
 #
 # What it is for: getting a build onto a Windows machine to test. Two ways in:
 #
@@ -57,10 +70,11 @@ jobs:
           - name: macOS
             os: macos-14
             binary: target/release/aibo
-            # Shipped as a tarball, unlike Windows, because a bare download
-            # loses the executable bit and `tar` preserves it. A raw file that
-            # needs `chmod +x` before it will start reads as a broken build.
-            asset: aibo-macos-aarch64.tar.gz
+            # A disk image holding `aibo.app`, not a tarball of a bare binary.
+            # `LSUIElement` lives in the bundle's Info.plist, and a notarisation
+            # ticket can only be stapled to a bundle or an image — see
+            # `packaging/macos/Info.plist`.
+            asset: aibo-macos-aarch64.dmg
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
@@ -74,21 +88,185 @@ jobs:
       # `--locked` above is the load-bearing flag: a release built from a
       # resolver that quietly picked different versions is not the thing CI
       # tested.
-      - name: Package
+      - name: Work out the version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          # From the tag, so the version a user reports cannot drift from the
+          # build they downloaded. A manual run has no tag, so it is stamped
+          # with the short sha instead of a version it is not.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            version="${GITHUB_REF_NAME#v}"
+          else
+            version="0.0.0-dev.${GITHUB_SHA::7}"
+          fi
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      # Whether the Apple credentials are configured. Mapped to an output
+      # because `secrets` cannot be read from a step's `if:` directly, and
+      # because every signing step below needs the same answer.
+      #
+      # Absent secrets are not an error: an unsigned build is still a build
+      # someone can test, and the whole point of gating is that Windows testing
+      # is not blocked on Apple paperwork.
+      - name: Check for signing credentials
+        id: creds
+        if: runner.os == 'macOS'
+        shell: bash
+        env:
+          CERT: ${{ secrets.MACOS_CERT_P12 }}
+          ASC: ${{ secrets.ASC_KEY_P8 }}
+        run: |
+          set -euo pipefail
+          if [ -n "$CERT" ]; then sign=true; else sign=false; fi
+          # Notarisation needs signing first, so it can never be the only one.
+          if [ "$sign" = true ] && [ -n "$ASC" ]; then notarise=true; else notarise=false; fi
+          echo "sign=$sign" >> "$GITHUB_OUTPUT"
+          echo "notarise=$notarise" >> "$GITHUB_OUTPUT"
+          echo "signing=$sign, notarising=$notarise" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Build the app bundle
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          app="dist/aibo.app"
+          mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+          cp target/release/aibo "$app/Contents/MacOS/aibo"
+          chmod +x "$app/Contents/MacOS/aibo"
+          sed "s/VERSION/${{ steps.version.outputs.version }}/g" \
+            packaging/macos/Info.plist > "$app/Contents/Info.plist"
+          # Verify the substitution landed rather than shipping a bundle whose
+          # version reads literally "VERSION".
+          /usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' \
+            "$app/Contents/Info.plist"
+
+      - name: Import the signing identity
+        if: steps.creds.outputs.sign == 'true'
+        env:
+          CERT_P12: ${{ secrets.MACOS_CERT_P12 }}
+          CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # A throwaway keychain with a random password, unlocked only for this
+          # job. The login keychain is never touched, and nothing survives the
+          # runner.
+          keychain="$RUNNER_TEMP/signing.keychain-db"
+          password="$(openssl rand -base64 24)"
+          echo "$CERT_P12" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 3600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/cert.p12" -k "$keychain" \
+            -P "$CERT_PASSWORD" -T /usr/bin/codesign
+          # Without this, codesign blocks on a GUI prompt that no one can answer
+          # and the job hangs until it times out.
+          security set-key-partition-list -S apple-tool:,apple:,codesign: \
+            -s -k "$password" "$keychain" > /dev/null
+          security list-keychain -d user -s "$keychain" login.keychain-db
+          rm -f "$RUNNER_TEMP/cert.p12"
+
+          # Read the identity out of the certificate rather than taking it as a
+          # secret: one fewer value to keep in sync, and it cannot disagree with
+          # the key that is actually present.
+          identity="$(security find-identity -v -p codesigning "$keychain" \
+            | awk -F'"' '/Developer ID Application/ {print $2; exit}')"
+          if [ -z "$identity" ]; then
+            echo "::error::the .p12 holds no Developer ID Application identity"
+            security find-identity -v -p codesigning "$keychain"
+            exit 1
+          fi
+          echo "SIGN_IDENTITY=$identity" >> "$GITHUB_ENV"
+          echo "SIGN_KEYCHAIN=$keychain" >> "$GITHUB_ENV"
+          echo "Signing as: $identity"
+
+      - name: Sign the bundle
+        if: steps.creds.outputs.sign == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `--options runtime` is the hardened runtime, which notarisation
+          # requires and which is why the entitlements file exists.
+          codesign --force --timestamp --options runtime \
+            --entitlements packaging/macos/aibo.entitlements \
+            --keychain "$SIGN_KEYCHAIN" \
+            --sign "$SIGN_IDENTITY" \
+            dist/aibo.app
+          codesign --verify --strict --verbose=2 dist/aibo.app
+
+      - name: Build the disk image
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # UDZO read-only compressed, which is what `hdiutil` gives a plain
+          # folder. Applications symlink so the image is drag-to-install.
+          staging="$RUNNER_TEMP/dmg"
+          mkdir -p "$staging"
+          cp -R dist/aibo.app "$staging/"
+          ln -s /Applications "$staging/Applications"
+          hdiutil create -volname aibo -srcfolder "$staging" -ov \
+            -format UDZO "dist/${{ matrix.asset }}"
+          rm -rf dist/aibo.app
+
+      - name: Sign the disk image
+        if: steps.creds.outputs.sign == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # The image is signed separately from the bundle inside it: Gatekeeper
+          # checks the image the user actually downloaded.
+          codesign --force --timestamp --keychain "$SIGN_KEYCHAIN" \
+            --sign "$SIGN_IDENTITY" "dist/${{ matrix.asset }}"
+
+      - name: Notarise and staple
+        if: steps.creds.outputs.notarise == 'true'
+        env:
+          ASC_KEY_P8: ${{ secrets.ASC_KEY_P8 }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # An App Store Connect API key rather than an Apple ID and
+          # app-specific password: scoped to notarisation, revocable on its own,
+          # and not coupled to anyone's 2FA.
+          key="$RUNNER_TEMP/asc.p8"
+          echo "$ASC_KEY_P8" | base64 --decode > "$key"
+
+          # `--wait` blocks until Apple answers. On rejection the log says why,
+          # and printing it is the difference between a fixable failure and a
+          # mystery.
+          if ! xcrun notarytool submit "dist/${{ matrix.asset }}" \
+              --key "$key" --key-id "$ASC_KEY_ID" --issuer "$ASC_ISSUER_ID" \
+              --wait --timeout 30m; then
+            echo "::error::notarisation was rejected"
+            xcrun notarytool history --key "$key" --key-id "$ASC_KEY_ID" \
+              --issuer "$ASC_ISSUER_ID" | head -20
+            rm -f "$key"
+            exit 1
+          fi
+
+          # Stapling is the point of using a disk image: it embeds the ticket so
+          # Gatekeeper does not need to reach Apple on first launch.
+          xcrun stapler staple "dist/${{ matrix.asset }}"
+          rm -f "$key"
+
+          # Proves the finished artefact passes the check a user's machine will
+          # run, rather than trusting that each step above worked.
+          spctl --assess --type open --context context:primary-signature -vv \
+            "dist/${{ matrix.asset }}"
+
+      - name: Package the Windows binary
+        if: runner.os == 'Windows'
         shell: bash
         run: |
           set -euo pipefail
           mkdir -p dist
-          case "${{ matrix.asset }}" in
-            *.tar.gz)
-              # -C so the archive holds `aibo`, not `target/release/aibo`.
-              tar -czf "dist/${{ matrix.asset }}" -C "$(dirname '${{ matrix.binary }}')" \
-                "$(basename '${{ matrix.binary }}')"
-              ;;
-            *)
-              cp "${{ matrix.binary }}" "dist/${{ matrix.asset }}"
-              ;;
-          esac
+          cp "${{ matrix.binary }}" "dist/${{ matrix.asset }}"
 
       # Nothing is signed, so a checksum is the only integrity claim a tester
       # can actually check. Cheap to produce and worth having.
@@ -168,24 +346,46 @@ jobs:
           echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
 
       - name: Write the release notes
+        env:
+          # Read here rather than passed up from the build job: a matrix job's
+          # outputs are last-writer-wins, and the question is about
+          # configuration, which this job can see for itself. Notes that claim
+          # "unsigned" over a notarised image would send a tester through
+          # Gatekeeper steps they do not need.
+          SIGNED: ${{ secrets.MACOS_CERT_P12 != '' }}
+          NOTARISED: ${{ secrets.MACOS_CERT_P12 != '' && secrets.ASC_KEY_P8 != '' }}
         shell: bash
         run: |
           set -euo pipefail
           {
             echo "Built from \`${{ github.sha }}\`."
             echo
-            echo "## Unsigned"
+            echo "## macOS"
             echo
-            echo "These binaries are **not code-signed or notarised** (§19 puts that in P8)."
-            echo "That is expected, not a broken download:"
+            if [ "$NOTARISED" = "true" ]; then
+              echo "\`aibo-macos-aarch64.dmg\` is Developer ID signed, notarised and"
+              echo "stapled. Open the image and drag aibo to Applications."
+            elif [ "$SIGNED" = "true" ]; then
+              echo "\`aibo-macos-aarch64.dmg\` is Developer ID signed but **not notarised**,"
+              echo "so Gatekeeper will still object on a machine that did not build it."
+              echo "Open it once from System Settings → Privacy & Security → Open Anyway."
+            else
+              echo "\`aibo-macos-aarch64.dmg\` is **not signed or notarised** (§19 puts that"
+              echo "in P8). Gatekeeper will block it — that is expected, not a broken"
+              echo "download. Open it once from System Settings → Privacy & Security →"
+              echo "Open Anyway, or clear the quarantine flag:"
+              echo
+              echo "    xattr -dr com.apple.quarantine /Applications/aibo.app"
+            fi
             echo
-            echo "* **Windows** shows a SmartScreen warning. More info → Run anyway."
-            echo "* **macOS** is blocked by Gatekeeper. Open it once from"
-            echo "  System Settings → Privacy & Security → Open Anyway,"
-            echo "  or clear the quarantine flag:"
-            echo '  `xattr -d com.apple.quarantine ./aibo`'
+            echo "## Windows"
             echo
-            echo "Verify what you downloaded against the \`.sha256\` file beside it."
+            echo "\`aibo-windows-x86_64.exe\` is **not Authenticode signed** — §19 wants an"
+            echo "OV certificate and notes that reputation has to accumulate before"
+            echo "SmartScreen stops warning. Expect a SmartScreen prompt:"
+            echo "More info → Run anyway."
+            echo
+            echo "Verify either download against the \`.sha256\` beside it."
             echo
             echo "## First run"
             echo

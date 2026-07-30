@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  The bundle is not cosmetic. Three things depend on it:
+
+  * `LSUIElement` (§19: "no Dock icon") is an Info.plist key. A bare signed
+    binary is a Dock application, which is the wrong shape for a tray app.
+  * A notarisation ticket can only be *stapled* to a bundle or a disk image. A
+    lone binary relies on an online Gatekeeper lookup, so it fails closed on a
+    machine that is offline the first time it runs.
+  * `NSMicrophoneUsageDescription` is where the dictation prompt's text comes
+    from. Without it macOS terminates the process on first mic access rather
+    than showing a prompt.
+
+  `VERSION` is substituted by the release workflow from the tag, so the version
+  a user reports cannot drift from the build they downloaded.
+
+  No usage-description key exists for Accessibility or Screen Recording — both
+  are TCC-gated with system-worded prompts. §17's onboarding is what explains
+  them, not this file.
+-->
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>en</string>
+	<key>CFBundleExecutable</key>
+	<string>aibo</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.ameyanagi.aibo</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>aibo</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>VERSION</string>
+	<key>CFBundleVersion</key>
+	<string>VERSION</string>
+	<!-- The AX work uses APIs available well before this, but the runner builds
+	     against the 14 SDK and there is no reason to claim support that is
+	     untested. -->
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<!-- §19: a tray app, so no Dock icon and no menu bar of its own. -->
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>aibo transcribes what you dictate into the panel. Audio is sent to the speech-to-text provider you configured and is not stored.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>
