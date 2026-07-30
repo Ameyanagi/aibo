@@ -29,3 +29,27 @@ pub use overlay::{
     reduced_motion_preferred,
 };
 pub use screen_capture::{ScreenCaptureError, capture_screen_region};
+
+/// The proxy the OS says to use for HTTPS, or `None` for a direct connection.
+///
+/// §13: a managed network is a supported environment, not an edge case. reqwest
+/// reads `HTTPS_PROXY` and nothing else, and Windows does not set it — a machine
+/// configured through Internet Settings or Group Policy looked to aibo like a
+/// machine with no route, which was reported as "offline" on a machine that was
+/// online.
+///
+/// macOS returns `None` on purpose. Its proxy configuration lives in
+/// `SCDynamicStore` and, unlike Windows, an inspecting proxy there installs its
+/// root into the login keychain — which the native certificate roots already
+/// handle. Reading `SCDynamicStore` is worth doing when there is a report that
+/// needs it, and not before.
+pub fn system_proxy() -> Option<String> {
+    #[cfg(target_os = "windows")]
+    {
+        windows::proxy::system_proxy()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        None
+    }
+}

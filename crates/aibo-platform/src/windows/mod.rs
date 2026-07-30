@@ -53,6 +53,7 @@ mod input;
 mod msgwin;
 pub(crate) mod overlay;
 mod permissions;
+pub(crate) mod proxy;
 mod uia;
 
 use std::time::{Duration, Instant};

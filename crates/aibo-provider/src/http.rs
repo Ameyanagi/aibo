@@ -79,7 +79,36 @@ impl HttpConfig {
 
 /// Build a pooled client for one provider.
 pub fn build_client(cfg: &HttpConfig) -> Result<Client> {
-    Client::builder()
+    let mut builder = Client::builder();
+
+    // §13: a managed network is a first-class failure mode, not an edge case.
+    //
+    // reqwest reads `HTTPS_PROXY`/`HTTP_PROXY` from the environment by itself,
+    // and that path is left alone — an explicit proxy would override the env
+    // vars *and* their `NO_PROXY` exclusions, which is a regression for anyone
+    // who already has them set correctly. The system proxy is consulted only
+    // when the environment says nothing, which is the case that used to fail
+    // with no route and no explanation.
+    if !env_proxy_configured()
+        && let Some(url) = system_proxy()
+    {
+        {
+            match reqwest::Proxy::all(url) {
+                Ok(proxy) => {
+                    tracing::info!(proxy = %url, "using the system proxy");
+                    builder = builder.proxy(proxy);
+                }
+                // A malformed proxy is worth saying out loud and then ignoring:
+                // failing client construction would take down every provider
+                // over a value the user never typed.
+                Err(error) => {
+                    tracing::warn!(proxy = %url, %error, "ignoring an unusable system proxy");
+                }
+            }
+        }
+    }
+
+    builder
         .user_agent(cfg.user_agent.clone())
         .connect_timeout(cfg.connect_timeout)
         .read_timeout(cfg.read_timeout)
@@ -119,6 +148,45 @@ pub async fn prewarm(client: &Client, url: &Url) {
             tracing::debug!(host = %origin, error = %e, "pre-warm failed; first request will be cold")
         }
     }
+}
+
+/// The system proxy, as discovered by the platform layer at startup.
+static SYSTEM_PROXY: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+
+/// Record the OS-level proxy, once, before any provider is built.
+///
+/// A seam rather than a [`HttpConfig`] field because every provider constructs
+/// its own config (see `codex_http_config`), so a field would have to be
+/// threaded through all of them and each new provider could silently forget it.
+/// It is also not something `aibo-provider` can discover for itself: reading it
+/// is platform work, and this crate deliberately does not depend on
+/// `aibo-platform`.
+///
+/// Later calls are ignored, so a client built before this ran cannot be
+/// contradicted by one built after.
+pub fn set_system_proxy(url: Option<String>) {
+    let _ = SYSTEM_PROXY.set(url);
+}
+
+fn system_proxy() -> Option<&'static str> {
+    SYSTEM_PROXY.get().and_then(|value| value.as_deref())
+}
+
+/// Whether the environment already specifies a proxy.
+///
+/// Checked because reqwest honours these on its own, together with `NO_PROXY`.
+/// Overriding them with a system proxy would break the exclusion list of anyone
+/// who has configured this deliberately.
+fn env_proxy_configured() -> bool {
+    [
+        "HTTPS_PROXY",
+        "https_proxy",
+        "HTTP_PROXY",
+        "http_proxy",
+        "ALL_PROXY",
+    ]
+    .iter()
+    .any(|key| std::env::var_os(key).is_some_and(|value| !value.is_empty()))
 }
 
 /// Classify a `reqwest` transport failure into the failure model (§13).

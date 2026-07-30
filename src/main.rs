@@ -81,6 +81,13 @@ fn main() -> anyhow::Result<()> {
     // before the hook for *this* run is installed.
     let recovered_from_crash = diagnostics::install_panic_hook(&paths);
 
+    // Before any provider is built, because a provider's HTTP client is
+    // configured once and reused. §13: a managed network is a supported
+    // environment — reqwest reads `HTTPS_PROXY` and nothing else, and Windows
+    // does not set it, so a machine configured through Internet Settings looked
+    // like a machine with no route and was reported as "offline" while online.
+    aibo_provider::http::set_system_proxy(aibo_platform::system_proxy());
+
     // §6 single instance. Two aibos fighting over one hotkey, one database and
     // one `codex` subprocess is a support nightmare.
     let _instance = match instance::acquire(&paths)? {
