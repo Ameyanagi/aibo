@@ -3441,6 +3441,15 @@ mod tests {
         state
             .panel
             .set_response("the deployment should be reverted");
+        // §8's insert needs a captured field; `can_accept` now requires one, so
+        // without this the test would pass by never dispatching at all.
+        state.panel.context = panel::ContextState::Available {
+            app: None,
+            excerpt: Some("hello".to_owned()),
+            selection: None,
+            truncated: false,
+            caret_bounds: None,
+        };
         assert!(state.panel.can_accept());
 
         let task = panel_update(&mut state, panel::Message::Accept);
@@ -3469,6 +3478,15 @@ mod tests {
             reason: StopReason::EndTurn,
         };
         state.panel.set_response("replacement");
+        // Replace requires a captured field to insert into, so the test needs
+        // one: without it `can_accept` refuses and this asserts nothing.
+        state.panel.context = panel::ContextState::Available {
+            app: None,
+            excerpt: Some("hello".to_owned()),
+            selection: None,
+            truncated: false,
+            caret_bounds: None,
+        };
 
         let panel_window = state.panel_window;
         let task = update(
@@ -3499,6 +3517,15 @@ mod tests {
             reason: StopReason::EndTurn,
         };
         state.panel.set_response("replacement");
+        // Replace requires a captured field to insert into, so the test needs
+        // one: without it `can_accept` refuses and this asserts nothing.
+        state.panel.context = panel::ContextState::Available {
+            app: None,
+            excerpt: Some("hello".to_owned()),
+            selection: None,
+            truncated: false,
+            caret_bounds: None,
+        };
         let panel_window = state.panel_window;
         state.ime_preedit.insert(panel_window);
 

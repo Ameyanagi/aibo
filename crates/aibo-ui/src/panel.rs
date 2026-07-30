@@ -1098,7 +1098,21 @@ impl PanelState {
                 reason: StopReason::EndTurn
             }
         ) && !self.response.is_empty()
-            && !matches!(self.context, ContextState::ImeActive)
+            // Replace needs somewhere to replace *into*, and this used to only
+            // exclude `ImeActive`. Every other non-`Available` state — a
+            // terminal or Electron app that exposes no field, a capture still
+            // in flight, a capture that failed — left the affordance enabled
+            // with no target behind it. Pressing it dispatched `Insert`, the
+            // panel hid itself per §8's ordering, the runtime found nothing to
+            // insert into, and the user saw an action fire and do nothing.
+            //
+            // `Available` on its own is the right gate rather than
+            // `caret_bounds.is_some()`: §8's insert path is a pasteboard write
+            // plus a synthetic paste into the focused field, which needs a
+            // field and not a caret rectangle. S1 has the bounds arriving as
+            // `None` throughout, so requiring them would disable replace
+            // everywhere.
+            && matches!(self.context, ContextState::Available { .. })
     }
 
     /// Whether the response ended early and must be marked truncated.
@@ -2763,9 +2777,54 @@ mod tests {
         }
     }
 
+    /// A captured text field, which replace now requires.
+    fn available_context() -> ContextState {
+        ContextState::Available {
+            app: None,
+            excerpt: Some("hello".to_owned()),
+            selection: None,
+            truncated: false,
+            caret_bounds: None,
+        }
+    }
+
+    /// Replace must not be offered when there is nowhere to insert. It used to
+    /// be, so the affordance lit up over a terminal or an Electron app, fired,
+    /// hid the panel and did nothing.
+    #[test]
+    fn replace_needs_somewhere_to_insert() {
+        let mut state = panel();
+        state.set_response("a rewrite");
+        state.phase = Phase::Finished {
+            reason: StopReason::EndTurn,
+        };
+
+        for context in [
+            ContextState::Pending,
+            ContextState::Unavailable { app: None },
+            ContextState::ImeActive,
+        ] {
+            state.context = context.clone();
+            assert!(
+                !state.can_accept(),
+                "replace offered with no target: {context:?}"
+            );
+            assert!(
+                state.can_copy(),
+                "copy stays available — it needs no target (§13)"
+            );
+        }
+
+        state.context = available_context();
+        assert!(state.can_accept());
+    }
+
     #[test]
     fn a_partial_response_is_never_acceptable() {
         let mut state = panel();
+        // A target, so this test is about the *phase* rather than accidentally
+        // passing because there is nowhere to insert.
+        state.context = available_context();
         state.set_response("half a rewr");
         state.phase = Phase::Streaming;
         assert!(!state.can_accept());
