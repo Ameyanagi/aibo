@@ -667,7 +667,10 @@ impl Aibo {
             remembered_display: self.last_placement.map(|p| p.display_id),
             displays: self.displays.clone(),
             observed: self.observed,
-            preferred_width: None,
+            // §9's width range, finally given a number: 45 % of the display,
+            // clamped. A fixed 680 is a column down the middle of a 5K screen
+            // and wider than the window it describes on a small one.
+            preferred_width: Some(ui_theme::panel_width_for(self.panel.display_width)),
             content_height: self.panel.desired_height(),
         })
     }
@@ -1264,6 +1267,7 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
             // the scale factor is what makes 60 % mean the same thing on a
             // Retina panel and an external 1× monitor.
             state.panel.display_height = monitor.filter(|_| scale > 0.0).map(|s| s.height / scale);
+            state.panel.display_width = monitor.filter(|_| scale > 0.0).map(|s| s.width / scale);
 
             let pending = std::mem::take(&mut state.pending_show);
             if pending || state.panel_visible {

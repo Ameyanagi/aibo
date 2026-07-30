@@ -58,6 +58,34 @@ pub const PANEL_WIDTH_MIN: f32 = 420.0;
 /// Widest the panel may get, so long translations do not force a redesign (§9).
 pub const PANEL_WIDTH_MAX: f32 = 920.0;
 
+/// Share of the display's logical width the panel aims for.
+///
+/// Calibrated, not picked: 0.45 of a 14" MacBook Pro's logical width (1512 pt)
+/// is 680 — [`PANEL_WIDTH_DEFAULT`] exactly. So the fraction *is* today's
+/// proportion, and the only thing it changes is what happens on a display that
+/// is not that one. A 27" 5K at 2560 pt asks for 1152 and gets
+/// [`PANEL_WIDTH_MAX`]; a small or portrait display asks for less than
+/// [`PANEL_WIDTH_MIN`] and gets the floor.
+const PANEL_WIDTH_FRACTION: f32 = 0.45;
+
+/// The width to ask for on a display of this logical width.
+///
+/// §9 already made the width a range and [`crate::placement::place`] already
+/// clamps it to the display — this supplies the number that range was for. A
+/// fixed 680 on a 5K display is a column of text down the middle of an
+/// otherwise empty screen; on a small one it is a panel wider than the window
+/// it is describing.
+///
+/// `None` — before the window server has answered — keeps the default, because
+/// a panel that appears at one width and jumps to another a frame later is
+/// worse than one that is slightly narrow.
+pub fn panel_width_for(display_width: Option<f32>) -> f32 {
+    let Some(logical) = display_width.filter(|w| w.is_finite() && *w > 0.0) else {
+        return PANEL_WIDTH_DEFAULT;
+    };
+    (logical * PANEL_WIDTH_FRACTION).clamp(PANEL_WIDTH_MIN, PANEL_WIDTH_MAX)
+}
+
 /// Height the panel collapses to with no response — input plus chrome.
 pub const PANEL_HEIGHT_COLLAPSED: f32 = 132.0;
 
@@ -1306,6 +1334,33 @@ mod tests {
             palette_of(&Appearance::Light.iced_theme()).surface,
             Palette::LIGHT.surface
         );
+    }
+
+    /// The fraction is only defensible if it reproduces today's width on the
+    /// display it was chosen for. If someone retunes it, this says so.
+    #[test]
+    fn the_width_fraction_reproduces_the_default_on_a_14_inch_macbook() {
+        assert!(
+            (panel_width_for(Some(1512.0)) - PANEL_WIDTH_DEFAULT).abs() < 1.0,
+            "0.45 x 1512 should still be ~{PANEL_WIDTH_DEFAULT}, got {}",
+            panel_width_for(Some(1512.0))
+        );
+    }
+
+    #[test]
+    fn the_panel_widens_on_a_large_display_and_never_past_the_maximum() {
+        assert!(panel_width_for(Some(2560.0)) > PANEL_WIDTH_DEFAULT);
+        assert_eq!(panel_width_for(Some(7680.0)), PANEL_WIDTH_MAX);
+    }
+
+    #[test]
+    fn a_small_display_gets_the_floor_and_an_unknown_one_gets_the_default() {
+        assert_eq!(panel_width_for(Some(600.0)), PANEL_WIDTH_MIN);
+        assert_eq!(panel_width_for(None), PANEL_WIDTH_DEFAULT);
+        // A nonsense answer from the window server must not produce a
+        // zero-width window.
+        assert_eq!(panel_width_for(Some(0.0)), PANEL_WIDTH_DEFAULT);
+        assert_eq!(panel_width_for(Some(f32::NAN)), PANEL_WIDTH_DEFAULT);
     }
 
     /// §9 lets the panel grow for localisation and shrink on small displays, so

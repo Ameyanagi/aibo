@@ -696,6 +696,12 @@ pub struct PanelState {
     /// Deliberately **not** reset by [`PanelState::reset`]: it describes the
     /// hardware, not the session.
     pub display_height: Option<f32>,
+    /// Logical width of the display the panel is on (§9).
+    ///
+    /// Feeds [`theme::panel_width_for`]. Same provenance and same reasoning as
+    /// [`PanelState::display_height`], and likewise not reset by
+    /// [`PanelState::reset`] — it describes the hardware, not the session.
+    pub display_width: Option<f32>,
     /// Completed exchanges above the active turn.
     pub turns: Vec<ConversationTurn>,
     /// User message currently being answered or reviewed.
@@ -769,6 +775,7 @@ impl PanelState {
             response_markdown: markdown::Content::new(),
             turns: Vec::new(),
             display_height: None,
+            display_width: None,
             active_user: None,
             context_expanded: false,
             reasoning: String::new(),
@@ -806,6 +813,7 @@ impl PanelState {
         // invocation and only recover once the window server answered again —
         // a visible shrink between the hotkey and the first frame.
         let display_height = self.display_height;
+        let display_width = self.display_width;
         // Neither favourites nor recents belong to a panel session: a pin is a
         // durable preference, and recency describes the user's day rather than
         // one invocation.
@@ -817,6 +825,7 @@ impl PanelState {
         self.model_options = model_options;
         self.selected_model = selected_model;
         self.display_height = display_height;
+        self.display_width = display_width;
         if warm {
             self.phase = Phase::Idle;
         }
