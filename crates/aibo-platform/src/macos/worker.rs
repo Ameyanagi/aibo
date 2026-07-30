@@ -9,7 +9,8 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use std::time::{Duration, Instant};
 
 use aibo_core::types::{
-    AppInfo, AppRef, ClipboardItem, FieldContext, InsertMode, InsertTarget, Rect,
+    AppInfo, AppRef, ClipboardItem, DocumentBudget, DocumentText, FieldContext, InsertMode,
+    InsertTarget, Rect,
 };
 use core_foundation::base::{CFIndex, CFRange};
 
@@ -81,6 +82,23 @@ impl Default for MacosConfig {
             ax_messaging_timeout: Duration::from_millis(100),
         }
     }
+}
+
+/// Largest char boundary at or below `index`.
+///
+/// `str::floor_char_boundary` is still unstable, and slicing a `String` at an
+/// arbitrary byte offset panics mid-codepoint — which for a document read means
+/// the whole capture dies on the first multi-byte character near the cap. That
+/// is the CJK case, i.e. the one §9 says the product cannot afford to break.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    let mut end = index;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 /// Stable-within-a-process hash of captured content, for [`InsertTarget`].
@@ -554,6 +572,147 @@ impl Worker {
             .any(|attr| element.has_attribute(attr))
     }
 
+    /// Read the whole focused document (§8), bounded by `budget`.
+    ///
+    /// Walks the accessibility subtree breadth-first from the focused element's
+    /// nearest document-shaped ancestor. Breadth-first and not depth-first on
+    /// purpose: when a budget runs out mid-document, the shallow nodes are the
+    /// headings, paragraphs and top-level structure, while the deep ones are
+    /// spans and inline formatting. Truncating a depth-first walk leaves the
+    /// first section in full and everything after it missing; truncating a
+    /// breadth-first one leaves the shape of the whole document.
+    ///
+    /// Two things are deliberately skipped rather than read:
+    ///
+    /// * **Secure fields.** §5 forbids capturing from them at all, so a
+    ///   document containing a password field yields the rest of the document
+    ///   without it, not a redaction marker that admits one was there.
+    /// * **Elements whose text duplicates a parent's.** AX trees routinely
+    ///   report the same string on a container and on each of its children, and
+    ///   concatenating both returns the document two or three times over —
+    ///   inflating the token bill for content the model has already seen.
+    pub(crate) fn read_document(
+        &mut self,
+        of: &AppRef,
+        budget: DocumentBudget,
+    ) -> MacosResult<Option<DocumentText>> {
+        self.refuse_if_secure_input()?;
+        let (focused, _) = match self.focused_element(of) {
+            Ok(pair) => pair,
+            // No AX tree is "this app cannot be read", not a failure (§13).
+            Err(MacosError::NotTrusted) => return Err(MacosError::NotTrusted),
+            Err(_) => return Ok(None),
+        };
+
+        let root = Self::document_root(focused);
+        let mut text = String::new();
+        let mut nodes_visited = 0usize;
+        let mut truncated = false;
+        let mut queue = std::collections::VecDeque::from([root]);
+
+        while let Some(element) = queue.pop_front() {
+            if nodes_visited >= budget.max_nodes {
+                truncated = true;
+                break;
+            }
+            nodes_visited += 1;
+
+            // §5: never read a secure field, and never walk into one.
+            if Self::is_secure_field(&element) {
+                continue;
+            }
+
+            if let Some(value) = Self::node_text(&element) {
+                // A container repeating its children's text is the common AX
+                // shape; appending both duplicates the document.
+                if !value.is_empty() && !text.contains(value.as_str()) {
+                    if text.len() + value.len() > budget.max_bytes {
+                        let room = budget.max_bytes.saturating_sub(text.len());
+                        text.push_str(&value[..floor_char_boundary(&value, room)]);
+                        truncated = true;
+                        break;
+                    }
+                    if !text.is_empty() {
+                        text.push('\n');
+                    }
+                    text.push_str(&value);
+                }
+            }
+            queue.extend(element.children());
+        }
+
+        if text.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(DocumentText {
+            text,
+            truncated,
+            nodes_visited,
+        }))
+    }
+
+    /// The nearest ancestor that looks like a document, or the element itself.
+    ///
+    /// Reading from the focused *element* alone returns one paragraph; reading
+    /// from the application element returns the toolbar, the sidebar and the
+    /// window chrome along with the text. The document container is the level
+    /// that means "the thing the user is looking at".
+    fn document_root(focused: AxElement) -> AxElement {
+        const DOCUMENT_ROLES: [&str; 4] = ["AXWebArea", "AXScrollArea", "AXDocument", "AXGroup"];
+        // The chain owns every element it walks: `AxElement` is not `Clone`
+        // (it wraps a retained `AXUIElementRef`), so the ancestors are kept
+        // until one of them is chosen or the walk gives up.
+        let mut chain = vec![focused];
+        // Bounded at eight: an AX tree containing a cycle would otherwise hang
+        // the worker thread, and a document is never far below its container.
+        for _ in 0..8 {
+            let current = chain.last().expect("chain is never empty");
+            if current
+                .role()
+                .is_some_and(|role| DOCUMENT_ROLES.contains(&role.as_str()))
+            {
+                return chain.pop().expect("chain is never empty");
+            }
+            match current.element_attribute(accessibility_sys::kAXParentAttribute) {
+                Ok(parent) => chain.push(parent),
+                Err(_) => break,
+            }
+        }
+        // No document-shaped ancestor: read from the focused element itself.
+        chain.swap_remove(0)
+    }
+
+    /// The text this node contributes, if any.
+    fn node_text(element: &AxElement) -> Option<String> {
+        // `kAXValueAttribute` for fields and text areas, `kAXTitleAttribute`
+        // for headings and links, in that order — a node with both usually has
+        // the value as its content and the title as its label.
+        element
+            .string_attribute(accessibility_sys::kAXValueAttribute)
+            .ok()
+            .or_else(|| {
+                element
+                    .string_attribute(accessibility_sys::kAXTitleAttribute)
+                    .ok()
+            })
+            .map(|s| s.trim().to_owned())
+            .filter(|s| !s.is_empty())
+    }
+
+    /// Opaque identity of the focused element inside `of` (§8).
+    ///
+    /// `CFHash` of the `AXUIElement`, which is comparable only against another
+    /// hash taken in this process — exactly the lifetime `InsertTarget` has.
+    pub(crate) fn focused_element_id(&mut self, of: &AppRef) -> MacosResult<Option<String>> {
+        match self.focused_element(of) {
+            Ok((element, _)) => Ok(Some(element.identity())),
+            // No AX tree is not a failure: §13 prefers an insert validated on
+            // pid and window to no insert at all.
+            Err(MacosError::NotTrusted) | Err(MacosError::Platform(_)) => Ok(None),
+            Err(other) => Err(other),
+        }
+    }
+
     /// The clipboard, with §12 hygiene applied.
     ///
     /// macOS does not report the pasteboard's owner, so the best available
@@ -648,6 +807,23 @@ impl Worker {
             .is_ok_and(|focused| !focused)
         {
             return Ok(false);
+        }
+        // §9's IME rule, on the write-back side. Windows guards both of its
+        // write paths; macOS guarded neither, so a paste landing mid-composition
+        // would be interleaved with the marked text the user is still editing —
+        // corrupting the buffer in a way no undo restores cleanly, and doing it
+        // in exactly the market §9 says the product cannot afford to lose.
+        //
+        // An `Err` rather than `Ok(false)`: `false` means "the target changed,
+        // copy instead", which is the wrong story. This is "you are mid-word,
+        // aibo is not going to interrupt", and §13 renders it as its own state.
+        //
+        // Checked *here* rather than in `insert_text` because this is the one
+        // place that runs after `restore_focus` has confirmed the target is
+        // frontmost again, and it already holds the resolved element. Composing
+        // status read before the restore would describe aibo's own field.
+        if Self::ime_composition_active(&element) {
+            return Err(MacosError::ImeActive);
         }
         if let Some(expected) = &target.focused_element
             && element.identity() != *expected
@@ -790,22 +966,78 @@ mod tests {
     /// The refusal must be *typed*, not an empty success: §5's whole point is
     /// that the panel says why rather than showing a silent blank, and a
     /// `CaptureFailed` is what the failure model (§13) renders.
+    ///
+    /// It must also be typed **as secure input rather than as denial**. Both
+    /// end in "aibo could not read that", but the recoveries are opposite:
+    /// `Denied` renders a banner pointing at the Accessibility pane, and when
+    /// secure input is the cause that checkbox is already ticked — so the user
+    /// is sent to fix a setting that is not broken, with no way to tell the app
+    /// is wrong rather than themselves. Secure input has no user action at all.
     #[test]
-    fn the_refusal_is_capture_failed_denied() {
+    fn secure_input_is_reported_as_itself_not_as_a_permission_denial() {
         let err = MacosError::SecureInput.into_capture_error("com.apple.Terminal");
         assert!(matches!(
             err,
             AiboError::CaptureFailed {
-                reason: CaptureFailure::Denied,
+                reason: CaptureFailure::SecureInput,
                 ..
             }
         ));
         assert!(matches!(
             MacosError::SecureInput.into_insert_error(),
             AiboError::InsertFailed {
+                reason: InsertFailure::SecureInput,
+            }
+        ));
+
+        // The missing-permission case keeps pointing at the pane, because there
+        // it is the correct advice.
+        assert!(matches!(
+            MacosError::NotTrusted.into_capture_error("com.apple.Terminal"),
+            AiboError::CaptureFailed {
+                reason: CaptureFailure::Denied,
+                ..
+            }
+        ));
+        assert!(matches!(
+            MacosError::NotTrusted.into_insert_error(),
+            AiboError::InsertFailed {
                 reason: InsertFailure::PermissionDenied,
             }
         ));
+    }
+
+    /// Slicing a document at an arbitrary byte offset panics mid-codepoint.
+    ///
+    /// That failure lands on multi-byte text first, so it is the CJK case §9
+    /// says the product cannot afford to break — a Japanese document would die
+    /// on capture while an English one of the same length succeeded.
+    #[test]
+    fn a_byte_cap_never_splits_a_codepoint() {
+        let japanese = "これは日本語の文書です";
+        for cap in 0..=japanese.len() {
+            let end = floor_char_boundary(japanese, cap);
+            // The whole point: this must not panic, for any cap.
+            let slice = &japanese[..end];
+            assert!(end <= cap, "the cap is a ceiling, not a target");
+            assert!(japanese.starts_with(slice));
+        }
+    }
+
+    #[test]
+    fn a_cap_beyond_the_text_returns_the_whole_text() {
+        let text = "short";
+        assert_eq!(floor_char_boundary(text, 999), text.len());
+    }
+
+    /// Emoji are the four-byte case, and a naive `is_char_boundary` walk that
+    /// stops one byte short of a boundary would still slice one in half.
+    #[test]
+    fn a_byte_cap_never_splits_an_emoji() {
+        let text = "ok 🚀 done";
+        for cap in 0..=text.len() {
+            let _ = &text[..floor_char_boundary(text, cap)];
+        }
     }
 
     /// The gate must be conditional. With the flag clear the call proceeds to

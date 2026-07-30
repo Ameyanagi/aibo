@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Hardened runtime entitlements. Notarisation requires the hardened runtime, and
+  the hardened runtime breaks two things aibo does unless they are declared.
+
+  Deliberately minimal. Every entitlement here is a check being switched off, so
+  each one needs a reason, and the ones that are *not* here are as much of a
+  decision as the ones that are:
+
+  * **No `com.apple.security.app-sandbox`.** §19 already rules out the App Store
+    — Accessibility APIs and running the user's `codex` binary are both
+    incompatible with the sandbox — so claiming it would only break the product.
+  * **No `disable-library-validation`.** aibo loads no third-party plugins. It
+    is the entitlement most often added by reflex and it disables the check that
+    stops a malicious dylib being injected.
+  * **No `allow-unsigned-executable-memory`.** `allow-jit` below is the narrow
+    version of the same permission and is sufficient for Wasmtime.
+-->
+<plist version="1.0">
+<dict>
+	<!-- Wasmtime maps executable pages for compiled Wasm (§20's tier-1 sandboxed
+	     execution). Without this the hardened runtime kills the process the
+	     first time a tool runs. If §21's second lever is taken and Wasmtime
+	     goes, this entitlement goes with it. -->
+	<key>com.apple.security.cs.allow-jit</key>
+	<true/>
+</dict>
+</plist>

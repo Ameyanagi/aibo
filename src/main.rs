@@ -43,6 +43,25 @@
 // The binary is allowed no `unsafe` at all. Every platform API that needs it is
 // isolated inside `aibo-platform` (§7).
 #![forbid(unsafe_code)]
+// Windows: no console window.
+//
+// Without this the linker produces a *console* subsystem executable, and
+// launching it opens a `conhost` window that sits behind the panel for the
+// life of the process. For a tray utility whose entire premise is appearing
+// over someone's work and getting out of the way (§1), a permanent black
+// rectangle on the taskbar is not a cosmetic problem.
+//
+// Gated on `debug_assertions` rather than applied unconditionally: a debug
+// build is run from a terminal, and `windows_subsystem = "windows"` detaches
+// stdout, so every `tracing` line — including the ones that explain why the
+// hotkey did not register — would vanish exactly when they are wanted. Release
+// builds route diagnostics through the §19 ring buffer and the crash marker
+// instead, neither of which needs a console.
+//
+// This is invisible to `cargo check`, to `cargo test`, and to every unit test
+// in the workspace: it is a property of the linked artefact, which is why it
+// went unnoticed until CI produced one.
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 use anyhow::Context as _;
 
@@ -1297,6 +1316,11 @@ mod bootstrap {
             }
         }
 
+        /// The credential store (§12).
+        pub fn secrets(&self) -> &Arc<aibo_store::SecretStorage> {
+            &self.secrets
+        }
+
         /// Where aibo keeps things.
         pub fn paths(&self) -> &Paths {
             &self.paths
@@ -1692,6 +1716,190 @@ mod config_file {
         crate::paths::atomic_write(path, updated.as_bytes())
     }
 
+    /// Add or update one `[[providers]]` entry, leaving the rest of the file —
+    /// and every other provider — exactly as the user wrote it.
+    ///
+    /// `[[providers]]` is an array of tables, so [`splice_table`] cannot do this
+    /// job: that function replaces *the* table with a given header, and here
+    /// there are many with the same header. Entries are keyed the way
+    /// `Config::build` addresses them — by explicit `id` when one is set, and by
+    /// `backend` otherwise — so editing a key for an existing provider updates
+    /// it in place instead of appending a duplicate the loader would then have
+    /// to disambiguate.
+    ///
+    /// The API key is deliberately **not** written here. §12 keeps secrets in
+    /// the credential store; `config.toml` records only that a provider exists
+    /// and how to reach it.
+    pub fn upsert_provider(
+        path: &Path,
+        id: Option<&str>,
+        backend: &str,
+        base_url: Option<&str>,
+    ) -> io::Result<()> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+        let updated = splice_provider(&existing, id, backend, base_url);
+        crate::paths::atomic_write(path, updated.as_bytes())
+    }
+
+    /// Remove one `[[providers]]` entry by the id it is addressed by.
+    pub fn remove_provider(path: &Path, key: &str) -> io::Result<()> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        let updated = drop_provider(&existing, key);
+        crate::paths::atomic_write(path, updated.as_bytes())
+    }
+
+    /// The body of one `[[providers]]` entry.
+    fn provider_body(id: Option<&str>, backend: &str, base_url: Option<&str>) -> String {
+        let mut body = format!("backend = {}\n", quote(backend));
+        if let Some(id) = id.filter(|value| !value.trim().is_empty()) {
+            body.push_str(&format!("id = {}\n", quote(id)));
+        }
+        if let Some(url) = base_url.filter(|value| !value.trim().is_empty()) {
+            body.push_str(&format!("base_url = {}\n", quote(url)));
+        }
+        body
+    }
+
+    /// How `Config::build` addresses a provider entry: explicit id, else backend.
+    fn provider_key(id: Option<&str>, backend: &str) -> String {
+        id.filter(|value| !value.trim().is_empty())
+            .unwrap_or(backend)
+            .to_owned()
+    }
+
+    /// A file split around its `[[providers]]` array: what came before, the
+    /// entries themselves keyed by how they are addressed, and what came after.
+    type SplitProviders = (Vec<String>, Vec<(String, Vec<String>)>, Vec<String>);
+
+    /// Split a file into its `[[providers]]` blocks and everything else,
+    /// preserving order.
+    ///
+    /// Returns `(prefix_lines, blocks, suffix_lines)` where each block is
+    /// `(key, lines)` — the key being what [`provider_key`] would compute for
+    /// it. A block runs from its `[[providers]]` header to the next line whose
+    /// first non-whitespace character is `[`, which is TOML's own rule.
+    fn split_providers(source: &str) -> SplitProviders {
+        let mut before = Vec::new();
+        let mut blocks: Vec<(String, Vec<String>)> = Vec::new();
+        let mut after = Vec::new();
+        let mut current: Option<Vec<String>> = None;
+        let mut seen_any = false;
+
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if trimmed == "[[providers]]" {
+                if let Some(block) = current.take() {
+                    blocks.push((key_of(&block), block));
+                }
+                seen_any = true;
+                current = Some(vec![line.to_owned()]);
+                continue;
+            }
+            if current.is_some() && trimmed.starts_with('[') {
+                if let Some(block) = current.take() {
+                    blocks.push((key_of(&block), block));
+                }
+                after.push(line.to_owned());
+                continue;
+            }
+            match (&mut current, seen_any) {
+                (Some(block), _) => block.push(line.to_owned()),
+                (None, false) => before.push(line.to_owned()),
+                (None, true) => after.push(line.to_owned()),
+            }
+        }
+        if let Some(block) = current.take() {
+            blocks.push((key_of(&block), block));
+        }
+        (before, blocks, after)
+    }
+
+    /// Read the addressing key out of one block's lines.
+    fn key_of(block: &[String]) -> String {
+        let value_of = |name: &str| {
+            block.iter().find_map(|line| {
+                let (key, value) = line.split_once('=')?;
+                (key.trim() == name).then(|| value.trim().trim_matches('"').to_owned())
+            })
+        };
+        let backend = value_of("backend").unwrap_or_default();
+        value_of("id")
+            .filter(|id| !id.is_empty())
+            .unwrap_or(backend)
+    }
+
+    fn splice_provider(
+        source: &str,
+        id: Option<&str>,
+        backend: &str,
+        base_url: Option<&str>,
+    ) -> String {
+        let (before, mut blocks, after) = split_providers(source);
+        let key = provider_key(id, backend);
+        let mut replacement = vec!["[[providers]]".to_owned()];
+        replacement.extend(
+            provider_body(id, backend, base_url)
+                .lines()
+                .map(str::to_owned),
+        );
+
+        match blocks.iter_mut().find(|(existing, _)| *existing == key) {
+            Some((_, block)) => *block = replacement,
+            None => blocks.push((key, replacement)),
+        }
+        render(before, blocks, after)
+    }
+
+    fn drop_provider(source: &str, key: &str) -> String {
+        let (before, mut blocks, after) = split_providers(source);
+        blocks.retain(|(existing, _)| existing != key);
+        render(before, blocks, after)
+    }
+
+    fn render(
+        before: Vec<String>,
+        blocks: Vec<(String, Vec<String>)>,
+        after: Vec<String>,
+    ) -> String {
+        let mut out = String::new();
+        for line in before {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        for (_, block) in blocks {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            for line in block {
+                out.push_str(&line);
+                out.push('\n');
+            }
+        }
+        // A blank line before whatever followed the provider array. Without it
+        // an appended entry runs straight into the next table header — still
+        // valid TOML, but `config.toml` is a file people read and hand-edit.
+        if !after.is_empty()
+            && !out.is_empty()
+            && !out.ends_with("\n\n")
+            && !after[0].trim().is_empty()
+        {
+            out.push('\n');
+        }
+        for line in after {
+            out.push_str(&line);
+            out.push('\n');
+        }
+        out
+    }
+
     /// TOML basic-string quoting, for a value that is a model id.
     fn quote(value: &str) -> String {
         let escaped: String = value
@@ -1752,6 +1960,70 @@ mod config_file {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The property that matters most: editing one provider must leave the
+        /// user's other providers, their comments, and their unrelated tables
+        /// byte-for-byte alone. `config.toml` is a file a person writes by hand.
+        #[test]
+        fn adding_a_provider_preserves_everything_else() {
+            let source = "\
+# my notes
+[[providers]]
+backend = \"groq\"
+
+[[providers]]
+backend = \"ollama\"
+base_url = \"http://localhost:11434\"
+
+[codex]
+enabled = true
+";
+            let out = splice_provider(source, None, "anthropic", None);
+
+            assert!(out.contains("# my notes"), "comments survive");
+            assert!(out.contains("backend = \"groq\""));
+            assert!(out.contains("base_url = \"http://localhost:11434\""));
+            assert!(out.contains("[codex]"), "unrelated tables survive");
+            assert!(out.contains("backend = \"anthropic\""));
+            // And it parses back into the config the loader expects.
+            let parsed = aibo_session::Config::from_toml_str(&out).expect("valid toml");
+            assert_eq!(parsed.providers.len(), 3);
+        }
+
+        /// Editing an existing provider updates it rather than appending a
+        /// second entry the loader would have to disambiguate.
+        #[test]
+        fn editing_a_provider_updates_in_place() {
+            let source =
+                "[[providers]]\nbackend = \"custom\"\nid = \"local\"\nbase_url = \"http://old\"\n";
+            let out = splice_provider(source, Some("local"), "custom", Some("http://new"));
+
+            assert!(out.contains("http://new"));
+            assert!(!out.contains("http://old"));
+            let parsed = aibo_session::Config::from_toml_str(&out).expect("valid toml");
+            assert_eq!(parsed.providers.len(), 1, "no duplicate entry");
+        }
+
+        /// Two entries sharing a backend but differing by id are distinct
+        /// providers — §10 supports two Ollama endpoints — so the key has to be
+        /// the id when there is one.
+        #[test]
+        fn two_endpoints_of_one_backend_stay_separate() {
+            let source = "[[providers]]\nbackend = \"ollama\"\nid = \"work\"\n";
+            let out = splice_provider(source, Some("home"), "ollama", Some("http://home"));
+            let parsed = aibo_session::Config::from_toml_str(&out).expect("valid toml");
+            assert_eq!(parsed.providers.len(), 2);
+        }
+
+        #[test]
+        fn removing_a_provider_leaves_the_others() {
+            let source = "[[providers]]\nbackend = \"groq\"\n\n[[providers]]\nbackend = \"anthropic\"\n\n[ui]\nlanguage = \"ja\"\n";
+            let out = drop_provider(source, "groq");
+            let parsed = aibo_session::Config::from_toml_str(&out).expect("valid toml");
+            assert_eq!(parsed.providers.len(), 1);
+            assert!(out.contains("anthropic"));
+            assert!(out.contains("language = \"ja\""));
+        }
 
         #[test]
         fn a_missing_table_is_appended() {
@@ -2391,6 +2663,12 @@ mod runtime {
         CodexAuth(codex_signin::Event),
         /// Explicit encrypted-history setup finished off the runtime workers.
         HistoryInitialized(aibo_store::Result<Option<secrecy::SecretString>>),
+        /// A `Provider::models()` sweep finished (§10).
+        ///
+        /// Boxed for the same reason as `Captured`: a catalogue of several
+        /// hundred OpenRouter entries must not set the size of every message on
+        /// this channel.
+        CatalogueRefreshed(Box<aibo_provider::ModelCatalogue>),
     }
 
     /// What the backend remembers about the Codex login (§3a).
@@ -2423,6 +2701,116 @@ mod runtime {
         }
     }
 
+    /// How long one provider gets to answer `/models` during a refresh.
+    const MODEL_REFRESH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+    /// The picker's contents: Codex's shipped list plus whatever every other
+    /// configured provider reports.
+    ///
+    /// Codex stays the *base* rather than being merged in from the catalogue,
+    /// because `CODEX_MODELS` carries §3a's measured `ttft_p50_ms` and no
+    /// `/models` endpoint anywhere returns a latency. A catalogue entry can add
+    /// a model; it must not take away a measurement.
+    fn model_options_event(
+        config: &Config,
+        catalogue: &aibo_provider::ModelCatalogue,
+        prices: &aibo_core::cost::PriceTable,
+    ) -> UiEvent {
+        let UiEvent::ModelOptions {
+            mut options,
+            selected,
+        } = codex_model_options_event(config)
+        else {
+            unreachable!("codex_model_options_event returns ModelOptions");
+        };
+
+        for entry in catalogue.entries() {
+            // Codex is already represented, with latency the catalogue lacks.
+            // A retired id is offered to nobody.
+            if entry.provider == ProviderId::CODEX || entry.deprecated {
+                continue;
+            }
+            let binding = ModelBinding {
+                provider: entry.provider.clone(),
+                model: entry.id.clone(),
+            };
+            if options.iter().any(|option| option.binding == binding) {
+                continue;
+            }
+            let (abilities, cost) = model_facts(catalogue, prices, &binding);
+            options.push(ModelOption {
+                binding,
+                display_name: entry.display_name.clone(),
+                latency_ms: None,
+                released_at: entry.released_at,
+                abilities,
+                cost,
+            });
+        }
+
+        // Codex rows come from `CODEX_MODELS` for their measured latency, so
+        // their abilities and cost are filled here rather than at construction.
+        for option in &mut options {
+            let (abilities, cost) = model_facts(catalogue, prices, &option.binding);
+            option.abilities = abilities;
+            option.cost = cost;
+        }
+
+        // Grouped by provider, then **newest first** within each provider.
+        //
+        // Alphabetical ordering was actively harmful: it put `chat-latest` and
+        // `gpt-3.5-turbo` at the top of OpenAI's lane and `gpt-5` far below, so
+        // the first thing offered was the oldest thing available. `released_at`
+        // comes from the provider's own `created` field, so this stays correct
+        // as models ship without anyone maintaining a list.
+        //
+        // A missing date sorts last — honest for "unknown" — and the name breaks
+        // ties so the order is stable between refreshes rather than shuffling.
+        options.sort_by(|a, b| {
+            a.binding
+                .provider
+                .as_str()
+                .cmp(b.binding.provider.as_str())
+                .then_with(|| b.released_at.cmp(&a.released_at))
+                .then_with(|| a.display_name.cmp(&b.display_name))
+        });
+
+        UiEvent::ModelOptions { options, selected }
+    }
+
+    /// The UI-facing facts about one binding: what it can do, and roughly what
+    /// it costs.
+    ///
+    /// Both come from data aibo already holds — §10's catalogue and §14's price
+    /// table — rather than from a curated list. That is the difference between
+    /// badges that stay true as models change and badges that go stale: nothing
+    /// here is written per model by hand.
+    fn model_facts(
+        catalogue: &aibo_provider::ModelCatalogue,
+        prices: &aibo_core::cost::PriceTable,
+        binding: &ModelBinding,
+    ) -> (aibo_ui::Abilities, Option<aibo_ui::CostTier>) {
+        let abilities = catalogue
+            .entries()
+            .iter()
+            .find(|e| e.provider == binding.provider && e.id == binding.model)
+            .map(|e| aibo_ui::Abilities {
+                vision: e.capabilities.vision,
+                tools: e.capabilities.tools,
+                reasoning: e.capabilities.reasoning_effort,
+            })
+            .unwrap_or_default();
+
+        // §14: a model with no row is *unpriced*, not free. `None` renders as
+        // nothing rather than as `$`, because a wrong price is worse than a
+        // missing one.
+        let cost = prices
+            .lookup(&binding.provider, &binding.model, None)
+            .map(|p| aibo_ui::CostTier::from_output_micros(p.output));
+
+        (abilities, cost)
+    }
+
     fn codex_model_options_event(config: &Config) -> UiEvent {
         let selected = ModelBinding {
             provider: ProviderId::CODEX,
@@ -2437,6 +2825,11 @@ mod runtime {
                 },
                 display_name: model.display_name.to_owned(),
                 latency_ms: Some(model.ttft_p50_ms),
+                // Filled in by `model_options_event`, which is the only caller
+                // holding the catalogue and the price table.
+                released_at: None,
+                abilities: Default::default(),
+                cost: None,
             })
             .collect::<Vec<_>>();
         if !options.iter().any(|option| option.binding == selected) {
@@ -2444,6 +2837,9 @@ mod runtime {
                 binding: selected.clone(),
                 display_name: selected.model.clone(),
                 latency_ms: None,
+                released_at: None,
+                abilities: Default::default(),
+                cost: None,
             });
         }
         UiEvent::ModelOptions {
@@ -2452,10 +2848,28 @@ mod runtime {
         }
     }
 
-    fn model_selection_allowed(config: &Config, binding: &ModelBinding) -> bool {
-        binding.provider == ProviderId::CODEX
-            && (aibo_provider::registry::is_codex_model_allowed(&binding.model)
-                || binding.model == config.codex.model)
+    /// Whether a selection the UI sent is one the runtime actually offered.
+    ///
+    /// The guard exists to reject an *injected* binding, not to narrow the
+    /// picker. It used to require `provider == CODEX`, which was correct only
+    /// while Codex was the sole provider — offering a model and then silently
+    /// refusing it is the "advertised and inert" defect §17 treats as worse than
+    /// an absent control.
+    fn model_selection_allowed(
+        config: &Config,
+        catalogue: &aibo_provider::ModelCatalogue,
+        binding: &ModelBinding,
+    ) -> bool {
+        if binding.provider == ProviderId::CODEX {
+            // §3a's allowlist still applies: an API-style id on the Codex path
+            // is a hard 400 that §4 will not fall back from.
+            return aibo_provider::registry::is_codex_model_allowed(&binding.model)
+                || binding.model == config.codex.model;
+        }
+        catalogue
+            .entries()
+            .iter()
+            .any(|entry| entry.provider == binding.provider && entry.id == binding.model)
     }
 
     /// The deadline-bounded half of §8's capture, once it has landed.
@@ -2541,6 +2955,20 @@ mod runtime {
         active_session: Option<SessionId>,
         sessions: HashMap<SessionId, Session>,
         events: Sender<UiEvent>,
+        /// Sender for the internal channel, once `run` has created it.
+        ///
+        /// `rebuild_engine` has six callers and needs to kick off a catalogue
+        /// refresh from all of them; threading the sender through each was
+        /// noise. `None` before the loop starts, when there is nothing to
+        /// refresh into anyway.
+        internal: Option<Sender<Internal>>,
+        /// §10's model catalogue: the shipped Codex entries, plus whatever a
+        /// live `Provider::models()` refresh has added.
+        ///
+        /// One source for two readers that must agree — the picker's contents
+        /// and `model_selection_allowed`. When they disagreed, the picker offered
+        /// models the guard then refused.
+        catalogue: aibo_provider::ModelCatalogue,
         /// TODO(P1): hand to the agent and MCP spawn sites (§6).
         #[allow(dead_code)]
         children: ChildRegistry,
@@ -2561,7 +2989,7 @@ mod runtime {
             let engine = bootstrap.engine();
             let startup_history_ready = bootstrap.history_ready();
             Self {
-                platform: platform_backend(),
+                platform: platform_backend(&config),
                 engine,
                 bootstrap,
                 codex,
@@ -2573,6 +3001,9 @@ mod runtime {
                 sessions: HashMap::new(),
                 events,
                 children,
+                internal: None,
+                // Shipped entries only until the first refresh answers.
+                catalogue: aibo_provider::ModelCatalogue::shipped(),
             }
         }
 
@@ -2584,7 +3015,11 @@ mod runtime {
             // §13: "Still handle NSWorkspaceDidWakeNotification /
             // WM_POWERBROADCAST, but for re-probing provider health and
             // clearing the degraded flags, not for re-warming sockets."
+            self.internal = Some(internal_tx.clone());
             self.spawn_power_watch(internal_tx.clone());
+            // Ask every configured provider what it serves, now that there is
+            // somewhere to deliver the answer.
+            self.spawn_model_refresh();
 
             // The first thing the UI should know is which providers exist and
             // what aibo currently believes about them.
@@ -2784,10 +3219,24 @@ mod runtime {
                 }
 
                 UiRequest::SignIn { provider } => {
-                    // Every other provider authenticates with an API key, and
-                    // there is no field to type one into yet.
-                    // TODO(§10, §17): a key field per provider row.
-                    tracing::warn!(%provider, "no sign-in flow for this provider yet");
+                    // Every other provider authenticates with an API key, which
+                    // the settings window now has a field for. Pressing the row
+                    // opens that field rather than starting a flow; there is
+                    // nothing to do here, and warning would be noise.
+                    tracing::debug!(%provider, "api-key provider: settings owns the credential");
+                }
+
+                UiRequest::SetProviderKey {
+                    backend,
+                    id,
+                    base_url,
+                    key,
+                } => {
+                    self.set_provider_key(&backend, id.as_deref(), base_url.as_deref(), &key);
+                }
+
+                UiRequest::RemoveProvider { id } => {
+                    self.remove_provider(&id);
                 }
 
                 UiRequest::OpenUrl { url } => {
@@ -2862,6 +3311,18 @@ mod runtime {
                 }
 
                 Internal::CodexAuth(event) => self.handle_codex_auth(event),
+                Internal::CatalogueRefreshed(catalogue) => {
+                    let before = self.catalogue.entries().len();
+                    self.catalogue = *catalogue;
+                    tracing::info!(
+                        models = self.catalogue.entries().len(),
+                        added = self.catalogue.entries().len().saturating_sub(before),
+                        "model catalogue refreshed"
+                    );
+                    // Republish so the picker gains the new entries, and so
+                    // `model_selection_allowed` and the picker keep agreeing.
+                    self.publish_model_options();
+                }
                 Internal::HistoryInitialized(result) => {
                     self.history_initializing = false;
                     match result {
@@ -2989,7 +3450,11 @@ mod runtime {
         /// id as the current option so an upgrade cannot silently rewrite a
         /// choice merely because this build predates it.
         fn model_options_event(&self) -> UiEvent {
-            codex_model_options_event(&self.bootstrap.config())
+            model_options_event(
+                &self.bootstrap.config(),
+                &self.catalogue,
+                self.engine.prices(),
+            )
         }
 
         fn publish_model_options(&self) {
@@ -3004,7 +3469,7 @@ mod runtime {
         /// UI bridge.
         fn set_model(&mut self, binding: ModelBinding) {
             let config = self.bootstrap.config();
-            if !model_selection_allowed(&config, &binding) {
+            if !model_selection_allowed(&config, &self.catalogue, &binding) {
                 tracing::warn!("refused a model selection outside the offered catalogue");
                 return;
             }
@@ -3204,6 +3669,104 @@ mod runtime {
             }
         }
 
+        /// Store a provider's API key and record the provider in `config.toml`.
+        ///
+        /// The order is deliberate. The **key is written first**, because
+        /// `Config::build` refuses a provider whose credential is missing —
+        /// writing the config entry first would produce a window in which the
+        /// file describes a provider that cannot be constructed, and a crash in
+        /// that window leaves a config the app then fails to load.
+        ///
+        /// An empty key is a removal, not an empty credential. A user who
+        /// clears the field means "forget this", and storing `""` would produce
+        /// a provider that exists, looks configured, and 401s on first use.
+        fn set_provider_key(
+            &mut self,
+            backend: &str,
+            id: Option<&str>,
+            base_url: Option<&str>,
+            key: &secrecy::SecretString,
+        ) {
+            use secrecy::ExposeSecret as _;
+
+            // The id the *registry* will address this provider by, which is not
+            // always the `backend = "…"` string: serde spells the enum in
+            // kebab-case, so `open-ai`, `open-router` and `samba-nova` all
+            // differ from their `ProviderId`. The credential has to be filed
+            // under the id the lookup uses, or `Config::build` reports a missing
+            // credential and the provider is never constructed — which from the
+            // settings window looks exactly like "Save did nothing".
+            let addressed_as = match id.filter(|v| !v.trim().is_empty()) {
+                Some(explicit) => explicit.to_owned(),
+                None => aibo_session::provider_id_for_backend(backend)
+                    .map(|id| id.as_str().to_owned())
+                    // An unrecognised backend cannot be built either way; using
+                    // the raw string keeps the write and the later delete
+                    // symmetric instead of orphaning a secret.
+                    .unwrap_or_else(|| backend.to_owned()),
+            };
+            let addressed_as = addressed_as.as_str();
+
+            if key.expose_secret().trim().is_empty() {
+                self.remove_provider(addressed_as);
+                return;
+            }
+
+            let account = aibo_store::secrets::provider_account(addressed_as);
+            if let Err(error) = self.bootstrap.secrets().set(&account, key.expose_secret()) {
+                // Never log the key, and never log anything derived from it.
+                // Never log the key itself, nor anything derived from it.
+                // No config entry is written, so the provider does not appear
+                // as configured — the settings row staying empty is the
+                // user-visible signal that this failed.
+                tracing::error!(provider = %addressed_as, %error, "could not store the credential");
+                return;
+            }
+
+            if let Err(error) = crate::config_file::upsert_provider(
+                &self.bootstrap.paths().config(),
+                id,
+                backend,
+                base_url,
+            ) {
+                tracing::error!(provider = %addressed_as, %error, "could not write config.toml");
+                return;
+            }
+
+            tracing::info!(provider = %addressed_as, "provider configured from settings");
+            // `rebuild_engine` republishes health for every provider in the new
+            // registry, which is what makes the new row appear.
+            self.rebuild_engine();
+        }
+
+        /// Forget a provider entirely: credential first, then the config entry.
+        ///
+        /// Credential first for the mirror of the reason above — a config entry
+        /// without a key is a provider that cannot be built, which is a state
+        /// the loader already handles, whereas a key without a config entry is
+        /// an orphaned secret sitting on disk for a provider nothing will ever
+        /// construct.
+        fn remove_provider(&mut self, id: &str) {
+            let account = aibo_store::secrets::provider_account(id);
+            if let Err(error) = self.bootstrap.secrets().delete(&account) {
+                tracing::warn!(provider = %id, %error, "could not delete the credential");
+            }
+            if let Err(error) =
+                crate::config_file::remove_provider(&self.bootstrap.paths().config(), id)
+            {
+                tracing::error!(provider = %id, %error, "could not write config.toml");
+                return;
+            }
+            tracing::info!(provider = %id, "provider removed from settings");
+            // Health events only ever *add* a row, so a rebuild alone would
+            // leave the removed provider on screen looking configured. The
+            // removal has to be stated.
+            self.emit(UiEvent::ProviderRemoved {
+                provider: ProviderId::new(id),
+            });
+            self.rebuild_engine();
+        }
+
         /// Rebuild the engine so a provider set change takes effect at once.
         ///
         /// In-flight work belongs to the old engine and is cancelled: §13 says
@@ -3223,6 +3786,29 @@ mod runtime {
                 }
             }
             self.publish_model_options();
+            self.spawn_model_refresh();
+        }
+
+        /// Ask every configured provider what it serves, off the hot path.
+        ///
+        /// Spawned rather than awaited: §10's runtime catalogue is a network
+        /// round trip per provider, and this runs where a user has just signed
+        /// in or saved a key — the panel must stay usable throughout. The
+        /// shipped entries are already on screen; a refresh only ever adds.
+        fn spawn_model_refresh(&self) {
+            let Some(internal) = self.internal.clone() else {
+                return;
+            };
+            let engine = Arc::clone(&self.engine);
+            tokio::spawn(async move {
+                let mut catalogue = aibo_provider::ModelCatalogue::shipped();
+                catalogue
+                    .refresh_from(engine.providers(), MODEL_REFRESH_TIMEOUT)
+                    .await;
+                let _ = internal
+                    .send(Internal::CatalogueRefreshed(Box::new(catalogue)))
+                    .await;
+            });
         }
 
         // -- capture ---------------------------------------------------------
@@ -3696,14 +4282,25 @@ mod runtime {
             .ok()
             .flatten();
         let clipboard = platform.clipboard(app_ref, CAPTURE_DEADLINE).await.ok();
+        // §8's third insert-validation comparison. On the AX budget, not the
+        // clipboard one: this is a single attribute read, and a slow answer
+        // should weaken validation rather than delay the panel.
+        let focused_element = platform
+            .focused_element_id(app_ref, AX_DEADLINE)
+            .await
+            .ok()
+            .flatten();
 
         let target = InsertTarget {
             app_ref: app_ref.clone(),
-            // TODO(cross-crate): no backend exposes the focused element's
-            // identity from a *capture* call, only from inside
-            // `validate_target`. `None` means the element check is skipped; the
-            // pid, window and content checks still run.
-            focused_element: None,
+            // §8 validates pid, window, focused element and content hashes
+            // before writing into another application. This is the third:
+            // without it a target that kept its pid and window but moved focus
+            // to a *different field* passed validation and took the paste —
+            // the "pasting a rewrite over the wrong content is unrecoverable"
+            // case. `None` still means the check is skipped, but now only when
+            // the platform genuinely cannot identify the element.
+            focused_element,
             selection_hash: selection.as_deref().map(content_hash),
             prefix_hash: field.as_ref().map(|f| content_hash(&f.prefix)),
         };
@@ -4024,13 +4621,23 @@ mod runtime {
     }
 
     /// Construct the platform backend for this OS.
+    ///
+    /// `config` supplies the §8 accessibility-activation opt-in on macOS. It is
+    /// read here rather than inside `aibo-platform` because the platform crate
+    /// has no notion of a config file, and because §17 wants the choice to be
+    /// something a user made rather than a constant a build chose for them.
     #[cfg(target_os = "macos")]
-    fn platform_backend() -> Arc<dyn PlatformBackend> {
-        Arc::new(aibo_platform::macos::MacosBackend::default())
+    fn platform_backend(config: &Config) -> Arc<dyn PlatformBackend> {
+        Arc::new(aibo_platform::macos::MacosBackend::new(
+            aibo_platform::macos::MacosConfig {
+                allow_ax_tree_activation: config.ui.allow_ax_tree_activation,
+                ..Default::default()
+            },
+        ))
     }
 
     #[cfg(target_os = "windows")]
-    fn platform_backend() -> Arc<dyn PlatformBackend> {
+    fn platform_backend(_config: &Config) -> Arc<dyn PlatformBackend> {
         // §9: `WindowsBackend::new` opts into Per-Monitor-V2 DPI awareness and
         // must therefore run before the first window exists — which is why the
         // backend is built here, ahead of `aibo_ui::run`, and not lazily.
@@ -4041,7 +4648,7 @@ mod runtime {
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-    fn platform_backend() -> Arc<dyn PlatformBackend> {
+    fn platform_backend(_config: &Config) -> Arc<dyn PlatformBackend> {
         // §2 locks the shipping targets to macOS and Windows. Keeping the binary
         // buildable elsewhere is worth more than a `compile_error!`, but there
         // is no third implementation and writing one would be exactly the
@@ -4064,6 +4671,12 @@ mod runtime {
         /// never produce.
         const AIBO_PID: i32 = 99;
 
+        /// The catalogue as it is before any network refresh, which is the state
+        /// these tests describe.
+        fn shipped_catalogue() -> aibo_provider::ModelCatalogue {
+            aibo_provider::ModelCatalogue::shipped()
+        }
+
         #[test]
         fn popup_model_catalogue_tracks_config_and_rejects_injected_choices() {
             let config =
@@ -4077,9 +4690,14 @@ mod runtime {
             assert_eq!(selected.model, "gpt-5.6-terra");
             assert_eq!(options.len(), 5);
             assert!(options.iter().all(|option| option.latency_ms.is_some()));
-            assert!(model_selection_allowed(&config, &selected));
+            assert!(model_selection_allowed(
+                &config,
+                &shipped_catalogue(),
+                &selected
+            ));
             assert!(!model_selection_allowed(
                 &config,
+                &shipped_catalogue(),
                 &ModelBinding {
                     provider: ProviderId::CODEX,
                     model: "unoffered-model".to_owned(),
@@ -4087,6 +4705,7 @@ mod runtime {
             ));
             assert!(!model_selection_allowed(
                 &config,
+                &shipped_catalogue(),
                 &ModelBinding {
                     provider: ProviderId::OPENAI,
                     model: "gpt-5.6-terra".to_owned(),
@@ -4106,7 +4725,11 @@ mod runtime {
             let selected = selected.expect("selected model");
             assert_eq!(options.len(), 6);
             assert!(options.iter().any(|option| option.binding == selected));
-            assert!(model_selection_allowed(&config, &selected));
+            assert!(model_selection_allowed(
+                &config,
+                &shipped_catalogue(),
+                &selected
+            ));
         }
 
         #[test]
@@ -4368,6 +4991,44 @@ mod runtime {
                 })
             }
 
+            async fn read_document(
+                &self,
+                of: &AppRef,
+                budget: aibo_core::types::DocumentBudget,
+                _timeout: Duration,
+            ) -> aibo_core::error::Result<Option<aibo_core::types::DocumentText>> {
+                self.record("read_document", of);
+                // Long enough to exceed a small budget, so a test can assert
+                // truncation is reported rather than silently swallowed.
+                let body = match of.pid {
+                    TARGET_PID => "the user's whole document, ".repeat(64),
+                    _ => "aibo's own panel".to_owned(),
+                };
+                let truncated = body.len() > budget.max_bytes;
+                let text = if truncated {
+                    body[..budget.max_bytes].to_owned()
+                } else {
+                    body
+                };
+                Ok(Some(aibo_core::types::DocumentText {
+                    text,
+                    truncated,
+                    nodes_visited: 3,
+                }))
+            }
+
+            async fn focused_element_id(
+                &self,
+                of: &AppRef,
+                _timeout: Duration,
+            ) -> aibo_core::error::Result<Option<String>> {
+                self.record("focused_element_id", of);
+                // Distinct per pid, so a test can tell "same app, different
+                // field" from "different app" — which is the distinction §8's
+                // third validation exists to draw.
+                Ok(Some(format!("element:{}", of.pid)))
+            }
+
             async fn selected_text(
                 &self,
                 of: &AppRef,
@@ -4480,6 +5141,36 @@ mod runtime {
         /// whichever app it is handed, so a frontmost-based caller silently gets
         /// aibo's bundle id, aibo's panel text and aibo-attributed clipboard —
         /// exactly the shape of the shipped defect.
+        /// §8 validates four things before writing into another application:
+        /// pid, window handle, focused element, and the content hashes. The
+        /// third had nothing to compare — every capture site set
+        /// `focused_element: None` — so a target that kept its pid and window
+        /// but moved focus to a **different field** passed validation and took
+        /// the paste. §8 calls that outcome unrecoverable.
+        ///
+        /// It must also be the *snapshotted* app's element, not the frontmost
+        /// one: by the time deferred capture runs, the frontmost app is aibo,
+        /// and validating against aibo's own field would make the check
+        /// meaningless in precisely the way the pid check already was.
+        #[tokio::test]
+        async fn capture_records_the_focused_element_for_insert_validation() {
+            let platform = FakePlatform::panel_focused();
+            let snapshot = target_ref();
+
+            let captured = capture_context(&platform, &snapshot, SessionId::nil()).await;
+
+            assert_eq!(
+                platform.asked_about("focused_element_id"),
+                snapshot,
+                "the element identity must come from the snapshotted app, not aibo's panel"
+            );
+            assert_eq!(
+                captured.target.expect("insert target").focused_element,
+                Some(format!("element:{TARGET_PID}")),
+                "§8's third validation cannot run against None"
+            );
+        }
+
         #[tokio::test]
         async fn capture_reads_the_snapshotted_app_not_the_frontmost_one() {
             let platform = FakePlatform::panel_focused();

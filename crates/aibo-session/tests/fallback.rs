@@ -78,6 +78,7 @@ async fn a_5xx_moves_to_the_next_chain_entry() {
     primary.push(Script::Reject(AiboError::ProviderUnavailable {
         provider: ProviderId::ANTHROPIC,
         status: 503,
+        detail: None,
     }));
     let secondary = Mock::new(ProviderId::OPENAI);
     secondary.push(Script::ok("the answer"));
@@ -178,6 +179,7 @@ async fn a_400_surfaces_as_a_bug_and_never_falls_back() {
     primary.push(Script::Reject(AiboError::ProviderUnavailable {
         provider: ProviderId::ANTHROPIC,
         status: 400,
+        detail: None,
     }));
     let secondary = Mock::new(ProviderId::OPENAI);
 
@@ -293,6 +295,7 @@ async fn fallback_is_off_unless_the_role_enables_it() {
     primary.push(Script::Reject(AiboError::ProviderUnavailable {
         provider: ProviderId::ANTHROPIC,
         status: 503,
+        detail: None,
     }));
     let secondary = Mock::new(ProviderId::OPENAI);
 
@@ -318,6 +321,7 @@ async fn fallback_does_not_leave_the_trust_boundary_without_consent() {
     azure.push(Script::Reject(AiboError::ProviderUnavailable {
         provider: ProviderId::AZURE_OPENAI,
         status: 503,
+        detail: None,
     }));
     let openai = Mock::new(ProviderId::OPENAI);
 
@@ -345,6 +349,7 @@ async fn consent_re_enables_the_crossing() {
     azure.push(Script::Reject(AiboError::ProviderUnavailable {
         provider: ProviderId::AZURE_OPENAI,
         status: 503,
+        detail: None,
     }));
     let openai = Mock::new(ProviderId::OPENAI);
     openai.push(Script::ok("crossed with consent"));
@@ -423,6 +428,7 @@ async fn every_entry_failing_reports_the_last_error() {
     let secondary = Mock::always_failing(ProviderId::OPENAI, || AiboError::ProviderUnavailable {
         provider: ProviderId::OPENAI,
         status: 502,
+        detail: None,
     });
 
     let engine = engine(

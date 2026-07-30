@@ -97,6 +97,27 @@ pub(crate) fn present_panel_without_activation(
     })
 }
 
+/// Make aibo the active application, so its key window can take keystrokes.
+///
+/// Deliberately **not** part of [`present`]. On the hotkey path the panel must
+/// appear *without* replacing the previously focused app — §8's insert sequence
+/// depends on knowing which app to give focus back to, and activating aibo on
+/// every show would make "restore focus to the target" mean "restore focus to
+/// aibo".
+///
+/// It is needed after an out-of-process capture. `/usr/sbin/screencapture` is a
+/// separate application; when it exits, macOS re-activates whatever was
+/// frontmost before it, and that activation lands *after* the panel has asked
+/// for focus. The panel is then visible, on top, and unable to receive a
+/// keystroke — which is the one state a text box must never be in.
+pub(crate) fn activate_self() -> bool {
+    let Some(mtm) = MainThreadMarker::new() else {
+        return false;
+    };
+    NSApplication::sharedApplication(mtm).activate();
+    true
+}
+
 pub(crate) fn reduced_motion_preferred() -> bool {
     // This AppKit preference is main-thread-only. An off-main query cannot
     // safely hop synchronously to the UI thread, so prefer reduced motion.

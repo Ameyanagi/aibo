@@ -13,8 +13,9 @@ use tokio_util::sync::CancellationToken;
 use crate::error::Result;
 use crate::types::{
     AgentFeatures, AgentLimits, AgentStep, AgentTask, AppInfo, AppRef, BoxStream, Capabilities,
-    ChatRequest, ClipboardItem, DisplayInfo, FieldContext, Health, InsertMode, InsertTarget,
-    ModelInfo, Permission, PermissionStatus, PowerEvent, ProviderId, StreamEvent,
+    ChatRequest, ClipboardItem, DisplayInfo, DocumentBudget, DocumentText, FieldContext, Health,
+    InsertMode, InsertTarget, ModelInfo, Permission, PermissionStatus, PowerEvent, ProviderId,
+    StreamEvent,
 };
 
 /// A model backend. One implementation per provider — no
@@ -143,6 +144,54 @@ pub trait PlatformBackend: Send + Sync {
     /// race rules — and which is only legal while `of` is still frontmost,
     /// since a synthetic chord goes to whichever app has focus.
     async fn selected_text(&self, of: &AppRef, timeout: Duration) -> Result<Option<String>>;
+
+    /// Read the **whole focused document** inside `of`, bounded by `budget`.
+    ///
+    /// Distinct from [`PlatformBackend::text_field_context`], which reads a
+    /// small window around the caret on the 120 ms path. This walks the
+    /// document's accessibility subtree and is expected to be slower — callers
+    /// give it its own, longer deadline, and it is never on the hotkey path.
+    ///
+    /// The two failure modes both return `Ok(None)` rather than an error,
+    /// because neither is aibo failing:
+    ///
+    /// * the app exposes no document-shaped subtree (a canvas, a GPU-drawn
+    ///   terminal, a remote desktop session), or
+    /// * it exposes one containing no text.
+    ///
+    /// §5's fencing rules apply unchanged to whatever comes back: this is
+    /// attacker-controlled content from someone else's window, and prompt
+    /// assembly labels it as such.
+    ///
+    /// Secure fields are skipped, not redacted — a document containing a
+    /// password field returns the rest of the document without it.
+    async fn read_document(
+        &self,
+        of: &AppRef,
+        budget: DocumentBudget,
+        timeout: Duration,
+    ) -> Result<Option<DocumentText>>;
+
+    /// An opaque identity for the element focused **inside `of`**, when the
+    /// platform can express one.
+    ///
+    /// §8's insert sequence validates four things before writing into another
+    /// application: pid, window handle, focused element, and selection hash.
+    /// Without this the third comparison had nothing to compare — `InsertTarget`
+    /// carried `focused_element: None` from every capture site, so a target that
+    /// kept its pid and window but moved focus to a *different field* passed
+    /// validation and took the paste. That is the "pasting a rewrite over the
+    /// wrong content is unrecoverable" case §8 names.
+    ///
+    /// The value is opaque and comparable only against itself, within one
+    /// process: macOS derives it from `CFHash` of the `AXUIElement`, Windows
+    /// from the UIA runtime id. Neither is stable across processes or restarts,
+    /// which is why `InsertTarget` is never persisted.
+    ///
+    /// `Ok(None)` means "this platform or app cannot identify the element",
+    /// which is a weaker validation, not a failure — §13 would rather insert
+    /// with three checks than refuse every insert on an app with no AX tree.
+    async fn focused_element_id(&self, of: &AppRef, timeout: Duration) -> Result<Option<String>>;
 
     /// Read a bounded window of the text field focused **inside `of`**.
     ///

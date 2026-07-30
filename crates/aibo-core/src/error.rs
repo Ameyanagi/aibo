@@ -63,6 +63,19 @@ pub enum CaptureFailure {
     NoAxTree,
     /// The OS permission is missing or the app blocked the read.
     Denied,
+    /// Secure input mode is active, so no process can read the field (§8).
+    ///
+    /// Deliberately **not** [`CaptureFailure::Denied`]. Both end in "aibo could
+    /// not read that", but the recovery differs completely and getting it wrong
+    /// is worse than saying nothing: `Denied` sends the user to the
+    /// Accessibility pane, and when secure input is the cause that checkbox is
+    /// already ticked. They are then told to fix a setting that is not broken,
+    /// with no way to tell the app is wrong rather than themselves.
+    ///
+    /// Secure input has no user action at all — a password field has focus, or
+    /// another process left the flag set globally — so the honest treatment is
+    /// to name it and offer nothing.
+    SecureInput,
     /// An IME composition is active; reading returns text the user cannot see
     /// (§9), so aibo declines rather than guessing.
     ImeActive,
@@ -73,6 +86,7 @@ impl std::fmt::Display for CaptureFailure {
         f.write_str(match self {
             CaptureFailure::NoAxTree => "no accessibility tree",
             CaptureFailure::Denied => "denied",
+            CaptureFailure::SecureInput => "secure input is active",
             CaptureFailure::ImeActive => "IME composition active",
         })
     }
@@ -81,9 +95,14 @@ impl std::fmt::Display for CaptureFailure {
 /// Why writing text back failed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InsertFailure {
-    /// The OS permission for synthetic events is missing, or secure input mode
-    /// is enabled globally (§8).
+    /// The OS permission for synthetic events is missing (§8).
     PermissionDenied,
+    /// Secure input mode is active, so no process may synthesise keystrokes.
+    ///
+    /// Split from [`InsertFailure::PermissionDenied`] for the same reason as
+    /// [`CaptureFailure::SecureInput`]: the permission pane is the right answer
+    /// to one and a dead end for the other.
+    SecureInput,
     /// The target app swallowed or ignored the paste.
     AppRejected,
     /// An IME composition is active; pasting would corrupt the buffer (§9).
@@ -96,6 +115,7 @@ impl std::fmt::Display for InsertFailure {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.write_str(match self {
             InsertFailure::PermissionDenied => "permission denied",
+            InsertFailure::SecureInput => "secure input is active",
             InsertFailure::AppRejected => "the app rejected the insert",
             InsertFailure::ImeActive => "IME composition active",
             InsertFailure::Cancelled => "cancelled",
@@ -211,12 +231,22 @@ pub enum AiboError {
     Offline,
 
     /// The provider answered, but not usefully.
-    #[error("{provider} returned HTTP {status}")]
+    #[error("{provider} returned HTTP {status}{}", detail.as_deref().map(|d| format!(": {d}")).unwrap_or_default())]
     ProviderUnavailable {
         /// The provider.
         provider: ProviderId,
         /// HTTP status. A 4xx here is a bug in aibo and must not fall back (§4).
         status: u16,
+        /// The provider's own explanation, when its error body carried one.
+        ///
+        /// **Kept because discarding it made a whole class of bug
+        /// undiagnosable.** A 400 from OpenAI says exactly what is wrong —
+        /// "Unsupported parameter: 'temperature' is not supported with this
+        /// model" — and throwing that away left nothing but a status code.
+        /// Finding the cause of one such 400 took reproducing the request by
+        /// hand against the live API; the user saw only "openai is not
+        /// responding", which was not even true.
+        detail: Option<String>,
     },
 
     /// The assembled request exceeds the model's context.
@@ -558,6 +588,7 @@ mod tests {
             AiboError::ProviderUnavailable {
                 provider: ProviderId::OPENAI,
                 status: 503,
+                detail: None,
             },
             AiboError::Internal(boxed),
         ];
@@ -587,7 +618,8 @@ mod tests {
         assert_eq!(
             AiboError::ProviderUnavailable {
                 provider: ProviderId::GROQ,
-                status: 502
+                status: 502,
+                detail: None,
             }
             .treatment(),
             Treatment::SilentFallback
@@ -701,14 +733,16 @@ mod tests {
         assert!(
             !AiboError::ProviderUnavailable {
                 provider: ProviderId::OPENAI,
-                status: 400
+                status: 400,
+                detail: None,
             }
             .is_fallback_eligible()
         );
         assert!(
             AiboError::ProviderUnavailable {
                 provider: ProviderId::OPENAI,
-                status: 500
+                status: 500,
+                detail: None,
             }
             .is_fallback_eligible()
         );

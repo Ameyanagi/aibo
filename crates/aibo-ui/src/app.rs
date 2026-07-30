@@ -260,6 +260,28 @@ pub enum WindowChord {
     },
     /// Copy the current surface's content.
     Copy,
+    /// Open the model quick-pick.
+    PickModel,
+    /// Move to the next quick-pick lane. `⇥`, as the placeholder promises.
+    NextLane,
+    /// Pin or unpin the highlighted model. Only meaningful while the quick-pick
+    /// is open; the subscription cannot see panel state, so the meaning is
+    /// decided where the chord is handled.
+    PinModel,
+    /// Begin a new item on the current surface.
+    ///
+    /// Settings' "Add a provider" advertises `⌘N`. It was a label with no
+    /// binding — §16 requires every action to be reachable by its key, and a
+    /// key hint that does nothing is worse than none, because it teaches the
+    /// user the keyboard route is broken.
+    New,
+    /// Open the settings window.
+    ///
+    /// `design.md` §3's error footer shows `⌘, Settings`, and §8's quality
+    /// floor makes the mouse optional — but there was no keyboard route to
+    /// Settings from anywhere, so the one window that fixes a misconfiguration
+    /// could only be reached through the tray.
+    OpenSettings,
     /// Retry the current panel request.
     Retry,
     /// Bring an agent task forward.
@@ -645,7 +667,10 @@ impl Aibo {
             remembered_display: self.last_placement.map(|p| p.display_id),
             displays: self.displays.clone(),
             observed: self.observed,
-            preferred_width: None,
+            // §9's width range, finally given a number: 45 % of the display,
+            // clamped. A fixed 680 is a column down the middle of a 5K screen
+            // and wider than the window it describes on a small one.
+            preferred_width: Some(ui_theme::panel_width_for(self.panel.display_width)),
             content_height: self.panel.desired_height(),
         })
     }
@@ -700,8 +725,32 @@ impl Aibo {
         }
     }
 
+    /// Reopen the panel on the conversation it was last showing.
+    ///
+    /// The hotkey used to discard the session every time, so dismissing the
+    /// panel to look something up lost the thread — the one thing a person
+    /// reliably wants back. Continuing is now the default and the session id is
+    /// kept, which is what makes it work: the backend holds the history against
+    /// that id, so reusing it *is* the continuation.
+    ///
+    /// A fresh start still happens whenever new context arrives, because that
+    /// is a different question rather than a follow-up: a selection (see the
+    /// `UiEvent::Context` arm) or a screen capture. `⌘N` forces one on demand.
+    fn resume_panel_session(&mut self) {
+        // §13 unchanged: reopening mid-stream cancels the request. What is
+        // dropped is the in-flight answer, not the conversation above it.
+        if matches!(self.panel.phase, Phase::Loading | Phase::Streaming) {
+            self.send(UiRequest::Cancel {
+                session: self.panel.session,
+            });
+        }
+        self.panel.phase = Phase::Idle;
+        let session = self.panel.session;
+        self.send(UiRequest::CaptureContext { session });
+    }
+
     fn open_panel(&mut self) -> Task<Message> {
-        self.begin_panel_session();
+        self.resume_panel_session();
         self.present_panel()
     }
 
@@ -1193,6 +1242,13 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                 if let Err(error) = state.panel.attach(attachment) {
                     state.panel.fail(&std::sync::Arc::new(error));
                 }
+                // `/usr/sbin/screencapture` is a separate application. When it
+                // exits, macOS re-activates whatever was frontmost before it,
+                // and that lands *after* `present_panel` asks for focus — so
+                // the panel appeared on top and could not take a keystroke.
+                // Claiming activation explicitly is the only thing that beats
+                // the system's own restore.
+                aibo_platform::activate_self();
                 state.present_panel()
             }
             Err(error) => {
@@ -1203,6 +1259,7 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                     body: i18n::t(crate::i18n::Key::ToastScreenCaptureFailed).to_owned(),
                     offer_diagnostics: false,
                 });
+                aibo_platform::activate_self();
                 state.present_panel()
             }
         },
@@ -1228,6 +1285,13 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                 monitor_size: monitor.map(|s| (f64::from(s.width), f64::from(s.height))),
                 scale_factor: f64::from(scale),
             });
+            // §4 sizes the answer area as a fraction of the display, so the
+            // panel needs the display's height in the same logical points its
+            // own layout is measured in. `monitor_size` is physical; dividing by
+            // the scale factor is what makes 60 % mean the same thing on a
+            // Retina panel and an external 1× monitor.
+            state.panel.display_height = monitor.filter(|_| scale > 0.0).map(|s| s.height / scale);
+            state.panel.display_width = monitor.filter(|_| scale > 0.0).map(|s| s.width / scale);
 
             let pending = std::mem::take(&mut state.pending_show);
             if pending || state.panel_visible {
@@ -1388,9 +1452,36 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
         return Task::none();
     }
 
+    // Available from every window, and from the panel in particular: §17's
+    // recovery from "no provider configured" is *open settings*, and until now
+    // that had no key.
+    if matches!(chord, WindowChord::OpenSettings) {
+        return open_settings(state);
+    }
+
     match state.role_of(window) {
         Some(Role::Panel) if state.panel_visible => {
             let message = match chord {
+                // The quick-pick owns the keyboard while it is open, so its
+                // keys are matched before the panel's own. Otherwise ↑/↓ would
+                // recall history instead of moving the highlight, and ⏎ would
+                // submit an empty instruction.
+                _ if state.panel.picker.open => match chord {
+                    WindowChord::Escape => panel::Message::ClosePicker,
+                    WindowChord::Enter { .. } => panel::Message::PickerCommit,
+                    WindowChord::HistoryOlder => panel::Message::PickerMove(-1),
+                    WindowChord::HistoryNewer => panel::Message::PickerMove(1),
+                    WindowChord::PinModel => panel::Message::PickerToggleFavourite,
+                    WindowChord::NextLane => panel::Message::PickerCycleLane,
+                    _ => return Task::none(),
+                },
+                WindowChord::PickModel => panel::Message::OpenPicker,
+                // Outside the picker ⌘D means nothing, and inventing a meaning
+                // for it would make the binding unpredictable.
+                WindowChord::PinModel | WindowChord::NextLane => return Task::none(),
+                // Handled above, for every window.
+                WindowChord::OpenSettings => unreachable!("intercepted before the role match"),
+                WindowChord::New => return Task::none(),
                 WindowChord::Escape if state.panel.toast.is_some() => panel::Message::DismissToast,
                 WindowChord::Escape => panel::Message::Dismiss,
                 WindowChord::Enter {
@@ -1477,7 +1568,21 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
             task_update(state, task, message)
         }
         Some(Role::Settings) => match chord {
+            // Escape backs out of the draft before it closes the window: a
+            // half-typed key is state the user can lose by reflex otherwise.
+            WindowChord::Escape if state.settings.draft.is_some() => {
+                settings_update(state, settings::Message::DraftCancel)
+            }
             WindowChord::Escape => settings_update(state, settings::Message::Close),
+            WindowChord::New if state.settings.section == settings::Section::Providers => {
+                settings_update(
+                    state,
+                    settings::Message::DraftBackend(settings::Backend::default()),
+                )
+            }
+            WindowChord::Enter { command: false, .. } if state.settings.draft.is_some() => {
+                settings_update(state, settings::Message::DraftSave)
+            }
             WindowChord::Copy if state.settings.section == settings::Section::About => {
                 settings_update(state, settings::Message::CopyDiagnostics)
             }
@@ -1498,6 +1603,63 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             Task::none()
         }
 
+        M::OpenPicker => {
+            state.panel.picker.open();
+            // The picker asks for a taller panel than the transcript does, and
+            // `desired_height` alone changes nothing — a window is only resized
+            // when something asks. Without this the overlay rendered into the
+            // old height and the list was clipped after its first row.
+            resize_panel_if_visible(state).chain(operation::focus(panel::PICKER_ID))
+        }
+        M::ClosePicker => {
+            state.panel.picker.close();
+            // Back to the transcript's height, and focus back to the input, or
+            // the panel is unusable without the mouse after closing.
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
+        }
+        M::PickerQuery(query) => {
+            state.panel.picker.set_query(query);
+            Task::none()
+        }
+        M::PickerMove(delta) => {
+            let count = crate::model_picker::selectable(&state.panel.picker_rows()).len();
+            state.panel.picker.move_highlight(delta, count);
+            Task::none()
+        }
+        M::PickerCycleLane => {
+            let capable = state.panel.capable_models();
+            let lanes = crate::model_picker::lanes(&capable, &state.panel.pins(&capable));
+            state.panel.picker.cycle_lane(&lanes);
+            Task::none()
+        }
+        M::PickerToggleFavourite => {
+            let rows = state.panel.picker_rows();
+            if let Some(option) =
+                crate::model_picker::selectable(&rows).get(state.panel.picker.highlight)
+            {
+                let binding = option.binding.clone();
+                state.panel.toggle_favourite(binding);
+            }
+            Task::none()
+        }
+        M::PickerCommit => {
+            let rows = state.panel.picker_rows();
+            let choices = crate::model_picker::selectable(&rows);
+            let Some(option) = choices
+                .get(state.panel.picker.highlight)
+                .map(|o| (*o).clone())
+            else {
+                return Task::none();
+            };
+            drop(choices);
+            state.panel.picker.close();
+            // Closing shrinks the panel back to the transcript's height, so the
+            // resize belongs here too.
+            panel_update(state, M::SelectModel(option))
+                .chain(resize_panel_if_visible(state))
+                .chain(operation::focus(panel::INPUT_ID))
+        }
+
         M::SelectModel(option) => {
             // Rebuilding the engine cancels its in-flight request. Keep model
             // changes available while composing or reviewing an answer, but
@@ -1505,6 +1667,8 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             if matches!(state.panel.phase, Phase::Loading | Phase::Streaming) {
                 return Task::none();
             }
+            state.panel.remember_model(option.binding.clone());
+            state.panel.selected_model = Some(option.clone());
             state.send(UiRequest::SetModel {
                 binding: option.binding,
             });
@@ -1854,6 +2018,65 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             state.send(UiRequest::SignIn { provider });
             Task::none()
         }
+        M::DraftBackend(backend) => {
+            match &mut state.settings.draft {
+                // Switching backend mid-draft keeps what was typed: the key is
+                // usually the last thing entered and re-typing it because the
+                // wrong row was picked first is a real annoyance.
+                Some(draft) => draft.backend = backend,
+                None => state.settings.draft = Some(settings::ProviderDraft::new(backend)),
+            }
+            Task::none()
+        }
+        M::DraftId(id) => {
+            if let Some(draft) = &mut state.settings.draft {
+                draft.id = id;
+            }
+            Task::none()
+        }
+        M::DraftBaseUrl(url) => {
+            if let Some(draft) = &mut state.settings.draft {
+                draft.base_url = url;
+            }
+            Task::none()
+        }
+        M::DraftKey(key) => {
+            if let Some(draft) = &mut state.settings.draft {
+                draft.set_key(key);
+            }
+            Task::none()
+        }
+        M::DraftCancel => {
+            // Dropping the draft scrubs the key; that is `ProviderDraft::drop`.
+            state.settings.draft = None;
+            Task::none()
+        }
+        M::DraftSave => {
+            let Some(mut draft) = state.settings.draft.take() else {
+                return Task::none();
+            };
+            if !draft.is_saveable() {
+                state.settings.draft = Some(draft);
+                return Task::none();
+            }
+            let id = draft.id.trim();
+            let base_url = draft.base_url.trim();
+            state.send(UiRequest::SetProviderKey {
+                backend: draft.backend.config_value().to_owned(),
+                id: (!id.is_empty()).then(|| id.to_owned()),
+                base_url: (!base_url.is_empty()).then(|| base_url.to_owned()),
+                // Moves the key out and scrubs the remainder. The draft is
+                // dropped immediately after, so nothing survives this line.
+                key: draft.take_key(),
+            });
+            Task::none()
+        }
+        M::ForgetProvider(provider) => {
+            state.send(UiRequest::RemoveProvider {
+                id: provider.as_str().to_owned(),
+            });
+            Task::none()
+        }
         M::OpenSystemSettings(permission) => {
             state.send(UiRequest::OpenSystemSettings { permission });
             Task::none()
@@ -1930,8 +2153,23 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             if session != state.panel.session {
                 return Task::none();
             }
-            state.panel.clipboard = clipboard_offer(clipboard.as_deref());
             let selection = selection.filter(|text| !text.is_empty());
+
+            // A selection is a new question, not a follow-up to the last one.
+            // Reopening the panel keeps the conversation
+            // ([`Aibo::resume_panel_session`]); arriving with text selected
+            // discards it, because the alternative is asking about this
+            // selection with an unrelated exchange still above it and in the
+            // model's history.
+            if selection.is_some() && state.panel.has_conversation() {
+                state.begin_panel_session();
+                // `begin_panel_session` re-requests context against the new
+                // id, so this event now belongs to a session that is gone.
+                // Letting it fall through would file the selection under the
+                // old conversation it just replaced.
+                return resize_panel_if_visible(state);
+            }
+            state.panel.clipboard = clipboard_offer(clipboard.as_deref());
             state.panel.context = match field.as_deref() {
                 // §9: while composing, aibo neither reads nor inserts.
                 Some(field) if field.ime_active => ContextState::ImeActive,
@@ -2032,7 +2270,19 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 StreamEvent::Done(reason) => {
                     state.panel.phase = Phase::Finished { reason };
                     aibo_platform::announce_accessibility(i18n::t(crate::i18n::Key::TaskCompleted));
-                    resize_panel_if_visible(state)
+                    // Give the caret back, **once, on completion**.
+                    //
+                    // Stripping `operation::focus` out of the resize path was
+                    // right — it was firing on every height change and yanking
+                    // the caret mid-answer, including mid-selection. But
+                    // removing it entirely left focus nowhere once the answer
+                    // finished, so the next question could not be typed: the
+                    // rail said attention had returned to the input
+                    // (`input_rail_state`) while the keyboard disagreed.
+                    //
+                    // Completion is the honest moment for it. Exactly one focus
+                    // per answer, at the point the user is free to type again.
+                    resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
                 }
                 // Tool calls belong to an agent run and surface in the task
                 // window, not the panel.
@@ -2194,6 +2444,12 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             {
                 state.panel.context = ContextState::PermissionDenied { status };
             }
+            Task::none()
+        }
+
+        UiEvent::ProviderRemoved { provider } => {
+            state.settings.providers.retain(|row| row.id != provider);
+            state.settings.sync_device_code();
             Task::none()
         }
 
@@ -2367,15 +2623,31 @@ fn clipboard_offer(item: Option<&aibo_core::types::ClipboardItem>) -> panel::Cli
 
 /// Re-run placement so the panel's height follows its content.
 ///
-/// The height change is one of the three things §16 allows to animate; with
-/// [`Motion::Reduced`] it snaps.
+/// **Geometry only.** This deliberately does not go through
+/// [`Aibo::show_panel`], and the distinction is load-bearing rather than
+/// stylistic. `show_panel` is the *arrival* sequence: it resizes, moves, takes
+/// the window out of `Mode::Hidden`, applies the native overlay policy, gains
+/// focus, and focuses the input. Every one of those is correct exactly once,
+/// when the panel appears.
+///
+/// This function runs while the panel is **already on screen and streaming an
+/// answer**, several times per response. Routing it through `show_panel` meant
+/// re-issuing `set_mode`, `orderFrontRegardless`, `gain_focus` and
+/// `operation::focus(INPUT_ID)` mid-answer: the window jumped, and the caret was
+/// yanked back into the input while the user was reading — or worse, while they
+/// were selecting the text they wanted to copy. Growing a window and presenting
+/// a window are two different operations that happened to share a code path.
 fn resize_panel_if_visible(state: &mut Aibo) -> Task<Message> {
     if !state.panel_visible {
         return Task::none();
     }
     let placement = state.placement();
-    let _duration = state.config.motion.duration(ui_theme::motion::FAST);
-    state.show_panel(placement)
+    state.last_placement = Some(placement);
+
+    let position = Point::new(placement.position.0, placement.position.1);
+    let size = Size::new(placement.size.0, placement.size.1);
+
+    window::resize(state.panel_window, size).chain(window::move_to(state.panel_window, position))
 }
 
 fn capture_screen_region_task() -> Task<Message> {
@@ -2538,6 +2810,35 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
                     },
                 ));
             }
+            // **Command chords are extracted before the `Captured` check, and
+            // only these.**
+            //
+            // A focused `text_input` captures every key event it sees, including
+            // ⌘-modified ones. Bailing on `Captured` therefore meant ⌘K, ⌘R, ⌘T
+            // and ⌘, were dead whenever the panel input had focus — which is
+            // always, since the panel focuses its input on open. Pressing ⌘K
+            // typed a literal "k".
+            //
+            // The list is deliberately short: ⌘C, ⌘V, ⌘X, ⌘A and ⌘Z are *text
+            // editing* commands, and stealing them would break copy and paste
+            // inside the field the user is typing in. These five have no meaning
+            // in a text field, so intercepting them takes nothing away.
+            if modifiers.command()
+                && let Some(latin) = key.to_latin(physical_key)
+            {
+                let chord = match latin {
+                    'k' => Some(WindowChord::PickModel),
+                    'd' => Some(WindowChord::PinModel),
+                    'r' => Some(WindowChord::Retry),
+                    't' => Some(WindowChord::ShowTask),
+                    ',' => Some(WindowChord::OpenSettings),
+                    _ => None,
+                };
+                if let Some(chord) = chord {
+                    return Some(Message::WindowKey(window, chord));
+                }
+            }
+
             if status == iced::event::Status::Captured {
                 return None;
             }
@@ -2548,13 +2849,16 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
                     command: modifiers.command(),
                     shift: modifiers.shift(),
                 },
+                Key::Named(Named::Tab) => WindowChord::NextLane,
                 Key::Named(Named::ArrowUp) => WindowChord::HistoryOlder,
                 Key::Named(Named::ArrowDown) => WindowChord::HistoryNewer,
+                // ⌘C stays here rather than above: inside a text field it is
+                // the field's copy, and only an *uncaptured* ⌘C means "copy the
+                // answer".
                 _ if modifiers.command() => match key.to_latin(physical_key) {
                     Some('c') => WindowChord::Copy,
-                    Some('r') => WindowChord::Retry,
-                    Some('t') => WindowChord::ShowTask,
                     Some('.') => WindowChord::CancelTask,
+                    Some('n') => WindowChord::New,
                     _ => return None,
                 },
                 _ => return None,
@@ -2729,6 +3033,9 @@ mod tests {
             },
             display_name: model.to_owned(),
             latency_ms: Some(435),
+            released_at: None,
+            abilities: Default::default(),
+            cost: None,
         }
     }
 
@@ -3227,8 +3534,12 @@ mod tests {
         ));
     }
 
+    /// The hotkey used to discard the session every time, so dismissing the
+    /// panel to look something up lost the thread. Reusing the id is what makes
+    /// continuation work — the backend holds the history against it — so a
+    /// `DiscardSession` here would silently break the feature.
     #[test]
-    fn resetting_the_panel_discards_the_previous_session() {
+    fn reopening_the_panel_continues_the_previous_conversation() {
         let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
         let (mut state, _boot) = boot(UiConfig::default(), requests);
         let previous = state.panel.session;
@@ -3236,13 +3547,61 @@ mod tests {
         let _ = state.open_panel();
         assert!(matches!(
             events.try_recv(),
-            Ok(UiRequest::DiscardSession { session }) if session == previous
+            Ok(UiRequest::CaptureContext { session }) if session == previous
         ));
+        assert_eq!(state.panel.session, previous, "same session, same history");
+    }
+
+    /// An explicit new (`⌘N`) and a screen capture both go through
+    /// `begin_panel_session`, which must still throw the old one away.
+    #[test]
+    fn asking_for_a_new_session_still_discards_the_previous_one() {
+        let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _boot) = boot(UiConfig::default(), requests);
+        let previous = state.panel.session;
+
+        state.begin_panel_session();
         assert!(matches!(
             events.try_recv(),
-            Ok(UiRequest::CaptureContext { .. })
+            Ok(UiRequest::DiscardSession { session }) if session == previous
         ));
         assert_ne!(state.panel.session, previous);
+    }
+
+    /// Arriving with text selected is a new question. Answering it with an
+    /// unrelated exchange still above it — and still in the model's history —
+    /// is the case this rule exists for.
+    #[test]
+    fn a_selection_starts_a_new_conversation_but_an_empty_context_does_not() {
+        let mut state = app();
+        state.panel.active_user = Some("what is this".to_owned());
+        assert!(state.panel.has_conversation());
+        let before = state.panel.session;
+
+        let _ = backend_update(&mut state, context_with_selection(before, None));
+        assert_eq!(
+            state.panel.session, before,
+            "nothing selected: this is a follow-up"
+        );
+
+        let _ = backend_update(
+            &mut state,
+            context_with_selection(before, Some("fn main() {}")),
+        );
+        assert_ne!(
+            state.panel.session, before,
+            "a selection is a new question, not a follow-up"
+        );
+    }
+
+    fn context_with_selection(session: SessionId, selection: Option<&str>) -> UiEvent {
+        UiEvent::Context {
+            session,
+            app: None,
+            field: None,
+            selection: selection.map(str::to_owned),
+            clipboard: None,
+        }
     }
 
     #[test]

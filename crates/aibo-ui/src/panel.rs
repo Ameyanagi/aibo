@@ -21,14 +21,14 @@
 use std::sync::Arc;
 
 use aibo_core::context::Turn;
-use aibo_core::error::{AttachmentRejection, Treatment};
+use aibo_core::error::{AttachmentRejection, CaptureFailure, InsertFailure, Treatment};
 use aibo_core::types::{
     AppInfo, Attachment, AttachmentSource, PermissionStatus, ProviderId, Rect, Role, StopReason,
     Surface, validate_attachments,
 };
 use aibo_core::{AiboError, types::Usage};
 use iced::widget::{
-    Space, column, container, image, markdown, pick_list, row, scrollable, text, text_editor,
+    Space, column, container, image, markdown, pick_list, row, rule, scrollable, text, text_editor,
     text_input,
 };
 use iced::{Alignment, Element, Length};
@@ -37,10 +37,13 @@ use uuid::Uuid;
 use crate::bridge::{ModelOption, SessionId};
 use crate::i18n::{self, Key};
 use crate::theme::{self, Severity, space, type_scale};
-use crate::widgets::{self, Action};
+use crate::widgets::{self, Action, RailState};
 
 /// The id of the panel's text input, so focus can be requested on show.
 pub const INPUT_ID: &str = "aibo.panel.input";
+
+/// The id of the model quick-pick's search field.
+pub const PICKER_ID: &str = "aibo.panel.picker";
 
 /// Where the panel is in its lifecycle.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -332,6 +335,13 @@ pub struct ErrorView {
     pub severity: Severity,
     /// One sentence. Never the raw `Display` of `Internal`.
     pub headline: String,
+    /// The second sentence: what to do about it (`design.md` §6).
+    ///
+    /// `headline` says what happened. Errors that can name a next step put it
+    /// here, and `state_block` renders the pair. Most cannot — the action button
+    /// is the next step — so this stays `None` for them rather than padding the
+    /// state with a restatement.
+    pub body: Option<String>,
     /// The single offered action, if any.
     pub action: Option<ErrorAction>,
     /// This error is a complaint about the attachments.
@@ -366,10 +376,14 @@ impl ErrorView {
     pub fn from_error(error: &AiboError) -> Self {
         let treatment = error.treatment();
         let (severity, headline, action) = match error {
+            // `design.md` §6: the button names the outcome, not the window it
+            // lives in — "the button that says Publish produces Published".
+            // "Open settings" described the mechanism and left the user to find
+            // the next step themselves; "Sign in" is the step.
             AiboError::NoProviderConfigured => (
                 Severity::Danger,
                 i18n::t(Key::ErrNoProvider).to_owned(),
-                Some(ErrorAction::OpenSettings),
+                Some(ErrorAction::SignIn(ProviderId::CODEX)),
             ),
             AiboError::Auth { provider, .. } => (
                 Severity::Danger,
@@ -386,6 +400,20 @@ impl ErrorView {
                 i18n::t(Key::ErrOffline).to_owned(),
                 Some(ErrorAction::Retry),
             ),
+            // A 4xx is not "not responding" — the provider answered, and said
+            // why. §13 wants errors that state what happened, and the provider's
+            // own sentence is more use than anything aibo can invent: it is the
+            // difference between "openai is not responding" and "temperature is
+            // not supported with this model".
+            AiboError::ProviderUnavailable {
+                provider,
+                status,
+                detail: Some(detail),
+            } if *status < 500 => (
+                Severity::Warning,
+                i18n::t2(Key::ErrProviderRejected, provider.as_str(), detail),
+                Some(ErrorAction::CopyDiagnostics),
+            ),
             AiboError::ProviderUnavailable { provider, .. } => (
                 Severity::Warning,
                 i18n::t1(Key::ErrProviderUnavailable, provider.as_str()),
@@ -401,9 +429,30 @@ impl ErrorView {
                 i18n::t(Key::ErrTimeout).to_owned(),
                 Some(ErrorAction::RetryWith(Role::Smart)),
             ),
+            // Secure input is not a generic capture failure and must not read
+            // as one. §8: any process holding the global secure-event-input
+            // flag blocks every AX read — a password field, a password manager,
+            // or an app that set it and never cleared it. There is no user
+            // action, so the copy names the cause and offers nothing rather
+            // than implying something is theirs to fix.
+            AiboError::CaptureFailed {
+                reason: CaptureFailure::SecureInput,
+                ..
+            } => (
+                Severity::Info,
+                i18n::t(Key::ErrSecureInput).to_owned(),
+                None,
+            ),
             AiboError::CaptureFailed { app, .. } => {
                 (Severity::Info, i18n::t1(Key::ErrCaptureFailed, app), None)
             }
+            AiboError::InsertFailed {
+                reason: InsertFailure::SecureInput,
+            } => (
+                Severity::Info,
+                i18n::t(Key::ErrSecureInput).to_owned(),
+                None,
+            ),
             AiboError::InsertFailed { .. } => (
                 Severity::Info,
                 i18n::t(Key::ErrInsertFailed).to_owned(),
@@ -542,6 +591,14 @@ impl ErrorView {
             treatment,
             severity,
             headline,
+            // §6 wants "one sentence, one action" — where a second sentence
+            // genuinely tells the user something the button does not, it goes
+            // here. Only the no-provider state has one today: it is the only
+            // error with two real routes out (sign in, or bring a key).
+            body: match error {
+                AiboError::NoProviderConfigured => Some(i18n::t(Key::ErrNoProviderBody).to_owned()),
+                _ => None,
+            },
             action,
             about_attachments: matches!(
                 error,
@@ -628,6 +685,23 @@ pub struct PanelState {
     response_editor: text_editor::Content,
     /// Incrementally parsed Markdown for the active assistant response.
     response_markdown: markdown::Content,
+    /// Usable height of the display the panel is on, in logical points.
+    ///
+    /// `design.md` §4 sizes the answer area as a fraction of the display rather
+    /// than to a constant, so the panel has to know how big the screen is. It
+    /// arrives from `ObservedGeometry::monitor_size` once the window server has
+    /// answered; until then [`PanelState::max_panel_height`] falls back to
+    /// [`theme::PANEL_HEIGHT_MAX`], which is the behaviour this replaced.
+    ///
+    /// Deliberately **not** reset by [`PanelState::reset`]: it describes the
+    /// hardware, not the session.
+    pub display_height: Option<f32>,
+    /// Logical width of the display the panel is on (§9).
+    ///
+    /// Feeds [`theme::panel_width_for`]. Same provenance and same reasoning as
+    /// [`PanelState::display_height`], and likewise not reset by
+    /// [`PanelState::reset`] — it describes the hardware, not the session.
+    pub display_width: Option<f32>,
     /// Completed exchanges above the active turn.
     pub turns: Vec<ConversationTurn>,
     /// User message currently being answered or reviewed.
@@ -665,6 +739,19 @@ pub struct PanelState {
     pub model_options: Vec<ModelOption>,
     /// Model currently persisted in configuration.
     pub selected_model: Option<ModelOption>,
+    /// The quick-pick's own state (§4).
+    pub picker: crate::model_picker::ModelPicker,
+    /// Models the user has pinned, newest first.
+    ///
+    /// Persisted, unlike [`PanelState::recent_models`]: a pin is a deliberate
+    /// statement about what the user works with, and losing it on quit would
+    /// make pinning pointless.
+    pub favourite_models: Vec<aibo_core::types::ModelBinding>,
+    /// Models used this session, most recent first.
+    ///
+    /// Session-scoped on purpose. Recency is an observation, not a preference,
+    /// and one restored from last week describes a task that is over.
+    pub recent_models: Vec<aibo_core::types::ModelBinding>,
     /// `↑`/`↓` recall over previous submissions.
     ///
     /// Session-local: §12's `messages` table is the eventual home, but the
@@ -687,6 +774,8 @@ impl PanelState {
             response_editor: text_editor::Content::new(),
             response_markdown: markdown::Content::new(),
             turns: Vec::new(),
+            display_height: None,
+            display_width: None,
             active_user: None,
             context_expanded: false,
             reasoning: String::new(),
@@ -700,6 +789,9 @@ impl PanelState {
             clipboard: ClipboardOffer::Unknown,
             model_options: Vec::new(),
             selected_model: None,
+            picker: crate::model_picker::ModelPicker::default(),
+            favourite_models: Vec::new(),
+            recent_models: Vec::new(),
             // Constructed once at boot, not per session, so recall survives
             // closing and reopening the panel — which is the whole point.
             history: crate::history_ring::HistoryRing::new(),
@@ -716,9 +808,24 @@ impl PanelState {
         let warm = !matches!(self.phase, Phase::WarmingUp { .. });
         let model_options = std::mem::take(&mut self.model_options);
         let selected_model = self.selected_model.take();
+        // The display is hardware, not session state. Dropping it here would
+        // collapse the panel back to the unknown-display fallback on every new
+        // invocation and only recover once the window server answered again —
+        // a visible shrink between the hotkey and the first frame.
+        let display_height = self.display_height;
+        let display_width = self.display_width;
+        // Neither favourites nor recents belong to a panel session: a pin is a
+        // durable preference, and recency describes the user's day rather than
+        // one invocation.
+        let favourite_models = std::mem::take(&mut self.favourite_models);
+        let recent_models = std::mem::take(&mut self.recent_models);
         *self = Self::new(session);
+        self.favourite_models = favourite_models;
+        self.recent_models = recent_models;
         self.model_options = model_options;
         self.selected_model = selected_model;
+        self.display_height = display_height;
+        self.display_width = display_width;
         if warm {
             self.phase = Phase::Idle;
         }
@@ -1020,8 +1127,7 @@ impl PanelState {
     /// the window — the height animation is one of the three things §16 allows
     /// to move.
     pub fn reserve_for(&mut self, needed: f32) -> bool {
-        const STEP: f32 = 48.0;
-        let target = (needed / STEP).ceil() * STEP;
+        let target = (needed / ANSWER_HEIGHT_STEP).ceil() * ANSWER_HEIGHT_STEP;
         let clamped = target.clamp(theme::ANSWER_BOX_MIN_HEIGHT, self.max_answer_height());
         if clamped > self.reserved_answer_height {
             self.reserved_answer_height = clamped;
@@ -1066,6 +1172,12 @@ impl PanelState {
 
     /// The height the panel wants, for [`crate::placement::PlacementRequest`].
     pub fn desired_height(&self) -> f32 {
+        // The quick-pick replaces the body, so it sets its own height. Falling
+        // through to the transcript arithmetic sized the window for content that
+        // is not on screen, and clipped the list after its first row.
+        if self.picker.open {
+            return PICKER_PANEL_HEIGHT.min(self.max_panel_height());
+        }
         // The chips are their own row above the input, so they add height in
         // every phase — including the collapsed one, which is otherwise a
         // constant. Attaching an image into a fixed-height panel would push the
@@ -1078,13 +1190,13 @@ impl PanelState {
                 + selection
                 + self.transcript_height()
                 + self.footer_height())
-            .clamp(CHAT_PANEL_MIN_HEIGHT, theme::PANEL_HEIGHT_MAX);
+            .clamp(CHAT_PANEL_MIN_HEIGHT, self.max_panel_height());
         }
 
         match self.phase {
             Phase::Hidden | Phase::WarmingUp { .. } | Phase::Idle => {
                 (theme::PANEL_HEIGHT_COLLAPSED + attachments + selection)
-                    .min(theme::PANEL_HEIGHT_MAX)
+                    .min(self.max_panel_height())
             }
             // `COLLAPSED` is input-plus-chrome only. Everything `footer()`
             // renders — the attribution line, any footnotes, and the action row
@@ -1096,7 +1208,7 @@ impl PanelState {
                 + selection
                 + self.answer_height()
                 + self.footer_height())
-            .min(theme::PANEL_HEIGHT_MAX),
+            .min(self.max_panel_height()),
         }
     }
 }
@@ -1160,6 +1272,20 @@ pub enum Message {
     CopyLink(String),
     /// Selection, cursor, or an ignored edit attempt in the read-only answer.
     ResponseAction(text_editor::Action),
+    /// Open the model quick-pick.
+    OpenPicker,
+    /// Close it without choosing.
+    ClosePicker,
+    /// The quick-pick's search query changed.
+    PickerQuery(String),
+    /// Move the quick-pick highlight.
+    PickerMove(isize),
+    /// Choose the highlighted model.
+    PickerCommit,
+    /// Pin or unpin the highlighted model.
+    PickerToggleFavourite,
+    /// Move to the next lane.
+    PickerCycleLane,
 }
 
 /// Render the panel.
@@ -1172,26 +1298,71 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
         return warm_up_view();
     }
 
-    let mut body = column![chip_row(state)].spacing(space(2.0));
-    if let Some(card) = selection_card(state) {
-        body = body.push(card);
+    // Row order: source line, answer, one hairline, footer, and the **input
+    // last**.
+    //
+    // `design.md` §3's mock draws the input second, directly under the source
+    // line, and that was built and tried. It is reverted deliberately: with the
+    // composer at the bottom the panel reads as a conversation you are adding
+    // to, which is what a multi-turn transcript actually is, and the eye ends
+    // where the next keystroke goes. The spec's argument for the other order —
+    // the caret "continuing into a second place" — is about the *first*
+    // interaction, and it stops describing the panel the moment there is a
+    // transcript above the input.
+    //
+    // The rest of §3 is unaffected: the rail still runs the full height and is
+    // amber on whichever row holds attention, which is the part of the spec
+    // doing the real work.
+    // While the quick-pick is open it *is* the panel. Rendering it alongside the
+    // transcript would put two focusable text fields on screen at once, and the
+    // one that answers the keyboard would be whichever iced focused last.
+    if state.picker.open {
+        return container(widgets::railed(RailState::Active, picker_overlay(state)))
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .padding(space(4.0))
+            .style(theme::panel_surface)
+            .into();
     }
-    if let Some(row) = attachment_row(state) {
-        body = body.push(row);
-    }
-    if state.has_conversation()
-        || !matches!(state.phase, Phase::Hidden | Phase::Idle)
+
+    let has_result =
+        state.has_conversation() || !matches!(state.phase, Phase::Hidden | Phase::Idle);
+    let shows_content = has_result
         || matches!(
             state.context,
             ContextState::PermissionDenied { .. } | ContextState::ImeActive
-        )
-    {
-        body = body.push(content(state, appearance));
+        );
+
+    // Zero spacing, deliberately: `widgets::railed` owns the vertical rhythm so
+    // the rail segments abut into one continuous line. Spacing here would show
+    // as gaps in the rail, and a rail with gaps reads as a rail that stopped.
+    let mut body = column![widgets::railed(RailState::Inactive, chip_row(state))];
+    if let Some(card) = selection_card(state) {
+        body = body.push(widgets::railed(RailState::Inactive, card));
     }
-    if state.has_conversation() || !matches!(state.phase, Phase::Hidden | Phase::Idle) {
-        body = body.push(footer(state));
+    if let Some(row) = attachment_row(state) {
+        body = body.push(widgets::railed(RailState::Inactive, row));
     }
-    let body = body.push(input_row(state));
+
+    if shows_content {
+        body = body.push(widgets::railed(
+            content_rail_state(state),
+            content(state, appearance),
+        ));
+    }
+    if has_result {
+        // The one hairline `design.md` §9 leaves standing, and it sits in the
+        // rail's gutter rather than crossing it — the rail is continuous, and a
+        // separator that cut through it would break the element the whole
+        // design hangs on.
+        body = body.push(row![
+            Space::new().width(theme::RAIL_WIDTH + theme::RAIL_GUTTER),
+            rule::horizontal(1).style(theme::separator),
+        ]);
+        body = body.push(widgets::railed(RailState::Inactive, footer(state)));
+    }
+
+    body = body.push(widgets::railed(input_rail_state(state), input_row(state)));
 
     let mut stack = column![body].spacing(space(2.0));
     if let Some(toast) = &state.toast {
@@ -1218,15 +1389,143 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
         .into()
 }
 
+impl PanelState {
+    /// The models that can serve *this* request.
+    ///
+    /// With an image attached, a model that cannot see is not a choice — it is a
+    /// row whose only outcome is `VisionUnsupported`. Hiding it is also what
+    /// makes §4's routing legible: the picker previously named a Codex model
+    /// while the request went to OpenAI, because Codex declares no vision
+    /// support, and nothing on screen explained the discrepancy.
+    pub fn capable_models(&self) -> Vec<ModelOption> {
+        if !self.has_attachments() {
+            return self.model_options.clone();
+        }
+        self.model_options
+            .iter()
+            .filter(|option| self.model_supports_vision(&option.binding))
+            .cloned()
+            .collect()
+    }
+
+    /// Whether the catalogue says this binding accepts image input.
+    ///
+    /// The UI cannot reach `ModelCatalogue`, so the runtime has to have said so.
+    /// Until `UiEvent::ModelOptions` carries capabilities, the one thing known
+    /// for certain is §3a's measurement that the Codex endpoint has never been
+    /// sent an image — so that provider is excluded and everything else is
+    /// assumed capable, which matches the modern reality that most chat models
+    /// take images.
+    fn model_supports_vision(&self, binding: &aibo_core::types::ModelBinding) -> bool {
+        binding.provider.as_str() != "codex"
+    }
+
+    /// The quick-pick's rows for the current state.
+    pub fn picker_rows(&self) -> Vec<crate::model_picker::Row> {
+        let capable = self.capable_models();
+        self.picker
+            .rows(&capable, &self.pins(&capable), &self.recent_models)
+    }
+
+    /// The pinned set, falling back to a derived starter set.
+    ///
+    /// The fallback applies only while nothing is pinned, so unpinning the last
+    /// model does bring the defaults back — which is the right behaviour for a
+    /// *default* and the reason they are not written into state on first run.
+    pub fn pins(&self, capable: &[ModelOption]) -> Vec<aibo_core::types::ModelBinding> {
+        if self.favourite_models.is_empty() {
+            return crate::model_picker::default_pins(capable);
+        }
+        self.favourite_models.clone()
+    }
+
+    /// Record a model as just used, most recent first.
+    pub fn remember_model(&mut self, binding: aibo_core::types::ModelBinding) {
+        self.recent_models.retain(|b| b != &binding);
+        self.recent_models.insert(0, binding);
+        // Bounded: a "recent" list longer than the screen is a second full
+        // catalogue with worse ordering.
+        self.recent_models.truncate(RECENT_MODEL_LIMIT);
+    }
+
+    /// Pin or unpin a model.
+    ///
+    /// Materialises the derived defaults first when nothing is pinned yet:
+    /// without that, unpinning one of the visible default pins would edit an
+    /// empty list and appear to do nothing at all.
+    pub fn toggle_favourite(&mut self, binding: aibo_core::types::ModelBinding) {
+        if self.favourite_models.is_empty() {
+            self.favourite_models = crate::model_picker::default_pins(&self.capable_models());
+        }
+        match self.favourite_models.iter().position(|b| b == &binding) {
+            Some(at) => {
+                self.favourite_models.remove(at);
+            }
+            None => self.favourite_models.push(binding),
+        }
+    }
+}
+
+/// How many recently used models the picker keeps.
+const RECENT_MODEL_LIMIT: usize = 5;
+
+/// Which rail state the input row carries (`design.md` §3).
+///
+/// Amber "while typing" is read as *while the input is where the attention is*
+/// rather than while a key is physically down: a rail that flickered per
+/// keystroke would be decoration, and the rail is meant to encode something
+/// true. Attention leaves the input exactly when the panel starts producing an
+/// answer, and returns when that answer is finished.
+fn input_rail_state(state: &PanelState) -> RailState {
+    match state.phase {
+        Phase::Loading | Phase::Streaming => RailState::Inactive,
+        _ => RailState::Active,
+    }
+}
+
+/// Which rail state the answer/error block carries (`design.md` §3).
+fn content_rail_state(state: &PanelState) -> RailState {
+    if state.error.is_some()
+        || matches!(state.phase, Phase::Failed)
+        || matches!(state.context, ContextState::PermissionDenied { .. })
+    {
+        return RailState::Alert;
+    }
+    match state.phase {
+        Phase::Loading | Phase::Streaming => RailState::Active,
+        _ => RailState::Inactive,
+    }
+}
+
 fn chip_row(state: &PanelState) -> Element<'_, Message> {
     let context = match &state.context {
-        ContextState::Available { app, .. } => {
-            widgets::context_chip(app.as_ref().map(|a| a.display_name.as_str()), None)
-        }
-        // Capture in flight: render the chip in its "no context" form rather
-        // than nothing, so the layout does not shift when it lands (§8).
-        ContextState::Pending => widgets::context_chip(None, None),
-        ContextState::Unavailable { app } => widgets::context_chip(app.as_deref(), None),
+        // The excerpt is the point of this line. `design.md` §1: "the most
+        // interesting information on screen is not the input field — it is the
+        // line that says *ghostty · …and screencapture works*". Every call site
+        // here used to pass `None`, so the panel knew where the user was and
+        // declined to say so.
+        ContextState::Available {
+            app,
+            excerpt,
+            selection,
+            ..
+        } => widgets::context_chip(
+            app.as_ref().map(|a| a.display_name.as_str()),
+            // Prefer what the user actually selected; fall back to the
+            // surrounding field text when the capture was caret-only.
+            selection.as_deref().or(excerpt.as_deref()),
+        ),
+        // Capture in flight. §4 requires "reading…" here rather than a blank or
+        // a premature "no context" — the panel is up before the capture lands
+        // (§8), and silence in that window reads as a failure that has not
+        // happened yet.
+        ContextState::Pending => widgets::reading_context_line(),
+        // Capture settled with nothing. Distinct from Pending, and the wording
+        // says so.
+        ContextState::Unavailable { app } => match app.as_deref() {
+            Some(app) => widgets::context_chip(Some(app), None),
+            None => widgets::unavailable_context_line(),
+        },
         ContextState::PermissionDenied { .. } | ContextState::ImeActive => {
             widgets::context_chip(None, None)
         }
@@ -1236,12 +1535,320 @@ fn chip_row(state: &PanelState) -> Element<'_, Message> {
         return context;
     }
 
+    // The current model as a quiet, keyboard-reachable button rather than a
+    // dropdown. §16: every action has a key, and a `pick_list` of eighty-eight
+    // entries has no key at all — the mouse was the only way in.
+    let current = state
+        .selected_model
+        .as_ref()
+        .map(ToString::to_string)
+        .unwrap_or_else(|| i18n::t(Key::PanelModel).to_owned());
+
     row![
         context,
         Space::new().width(Length::Fill),
-        text(i18n::t(Key::PanelModel))
-            .size(type_scale::CHIP)
+        widgets::action_list(vec![Action::new(
+            Key::PanelModel,
+            widgets::primary_shortcut("⌘K", "Ctrl+K"),
+            Message::OpenPicker,
+        )]),
+        text(current)
+            .size(type_scale::META)
+            .font(theme::MONO_FONT)
             .style(theme::text_dim),
+    ]
+    .spacing(space(1.5))
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// The model quick-pick overlay (§4).
+///
+/// Replaces the panel's body while open rather than floating over it: the panel
+/// is already an overlay, and a popover inside an overlay reads as a rendering
+/// fault. The search field takes focus, so the first keystroke filters instead
+/// of being lost.
+fn picker_overlay(state: &PanelState) -> Element<'_, Message> {
+    let rows = state.picker_rows();
+    let choices = crate::model_picker::selectable(&rows);
+    let total = choices.len();
+
+    let mut list = column![].spacing(space(0.5));
+    let mut index = 0usize;
+    for row in &rows {
+        match row {
+            crate::model_picker::Row::Group(label) => {
+                list = list.push(
+                    container(
+                        text(label.clone())
+                            .size(type_scale::META)
+                            .font(theme::MONO_FONT)
+                            .style(theme::text_dim),
+                    )
+                    // Headings sit above the rail column, not in it, so the
+                    // rail reads as one continuous track of rows.
+                    .padding(iced::Padding {
+                        top: space(1.0),
+                        right: 0.0,
+                        bottom: space(0.25),
+                        left: space(0.5),
+                    }),
+                );
+            }
+            crate::model_picker::Row::Model {
+                option,
+                favourite,
+                show_provider,
+            } => {
+                let highlighted = index == state.picker.highlight;
+                list = list.push(widgets::railed_with(
+                    if highlighted {
+                        RailState::Active
+                    } else {
+                        RailState::Inactive
+                    },
+                    if highlighted {
+                        theme::raised
+                    } else {
+                        theme::ground
+                    },
+                    model_row(option, *favourite, *show_provider, highlighted),
+                ));
+                index += 1;
+            }
+        }
+    }
+
+    let count = if total == 0 {
+        i18n::t(Key::PickerNoMatch).to_owned()
+    } else {
+        i18n::t1(Key::PickerCount, &total.to_string())
+    };
+
+    column![
+        text_input(i18n::t(Key::PickerPlaceholder), &state.picker.query)
+            .id(PICKER_ID)
+            .on_input(Message::PickerQuery)
+            .on_submit(Message::PickerCommit)
+            .size(type_scale::BODY)
+            .font(theme::MONO_FONT)
+            .padding(space(1.0))
+            .style(theme::input),
+        text(count)
+            .size(type_scale::META)
+            .font(theme::MONO_FONT)
+            .style(theme::text_dim),
+        row![
+            lane_column(state),
+            scrollable(list)
+                .height(Length::Fixed(PICKER_LIST_HEIGHT))
+                .width(Length::Fill)
+                .style(theme::scroller),
+        ]
+        .spacing(space(2.0)),
+        widgets::action_list(vec![
+            Action::new(Key::ActionSelect, "⏎", Message::PickerCommit).primary(),
+            Action::new(Key::ActionPinModel, "⌘D", Message::PickerToggleFavourite),
+            Action::new(Key::ActionDismiss, "esc", Message::ClosePicker),
+        ]),
+    ]
+    .spacing(space(1.5))
+    .into()
+}
+
+/// The lane column: `all`, `pinned`, then one entry per configured provider.
+///
+/// t3's equivalent is a rail of vendor icons. This is the same affordance in
+/// words, for two reasons: `design.md` §9 cut icons from the product, and a
+/// column of other people's logos is a trademark question aibo does not need to
+/// answer. `⇥` cycles, which is what the search placeholder already promises.
+fn lane_column(state: &PanelState) -> Element<'_, Message> {
+    let capable = state.capable_models();
+    let lanes = crate::model_picker::lanes(&capable, &state.pins(&capable));
+    let mut list = column![].spacing(space(0.25));
+    for lane in &lanes {
+        let active = *lane == state.picker.lane;
+        list = list.push(
+            container(
+                row![
+                    match lane {
+                        crate::model_picker::Lane::Named(p) =>
+                            widgets::mark(crate::model_picker::provider_mark(p), active),
+                        // `all` and `pinned` are not providers, so they get no
+                        // mark — but they keep the column, or the provider
+                        // labels below would sit at a different x.
+                        _ => Space::new()
+                            .width(widgets::MARK_SIZE)
+                            .height(widgets::MARK_SIZE)
+                            .into(),
+                    },
+                    text(crate::model_picker::lane_label(lane))
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(if active {
+                            theme::text_accent
+                        } else {
+                            theme::text_dim
+                        }),
+                ]
+                .spacing(space(0.75))
+                .align_y(Alignment::Center),
+            )
+            .padding([space(0.75), space(1.0)])
+            .width(Length::Fill)
+            // The active lane is a fill, not a rail. Rails here would put a
+            // second column of amber bars beside the list's own, and two
+            // parallel tracks of the same signal read as a rendering fault
+            // rather than as two states.
+            .style(if active { theme::raised } else { theme::ground }),
+        );
+    }
+    container(list)
+        .width(Length::Fixed(132.0))
+        .padding(iced::Padding {
+            top: 0.0,
+            right: space(1.0),
+            bottom: 0.0,
+            left: 0.0,
+        })
+        .into()
+}
+
+/// One row of the quick-pick.
+///
+/// Three zones, left to right, because a row is scanned rather than read:
+///
+/// 1. **The pin.** A fixed-width column so names align whether pinned or not.
+/// 2. **The name**, at answer size in full-strength text — the one thing that
+///    distinguishes this row from the eighty-eight around it, so it gets the
+///    only bright weight. The provider follows in dim meta *only when no
+///    heading above already says it*; repeating `openai` down a group headed
+///    `openai` is noise competing with the name.
+/// 3. **Latency and cost, right-aligned** behind a `Fill` spacer. Aligned
+///    rather than trailing the name, so the numbers form a column that can be
+///    compared down the list — which is the entire reason to show them. Ragged
+///    right, they are decoration.
+///
+/// Both facts come from real data — §14's price table and §10's catalogue — so
+/// neither goes stale as models change.
+fn model_row<'a>(
+    option: &ModelOption,
+    favourite: bool,
+    show_provider: bool,
+    highlighted: bool,
+) -> Element<'a, Message> {
+    // The mark carries the provider when no heading above does. It occupies
+    // the column either way, so names stay aligned down the whole list —
+    // pinned rows and grouped rows included.
+    let identity: Element<'a, Message> = if show_provider {
+        widgets::mark(
+            crate::model_picker::provider_mark(option.binding.provider.as_str()),
+            highlighted,
+        )
+    } else {
+        Space::new()
+            .width(widgets::MARK_SIZE)
+            .height(widgets::MARK_SIZE)
+            .into()
+    };
+
+    let name = row![
+        identity,
+        text(option.display_name.clone())
+            .size(type_scale::ANSWER)
+            .style(if highlighted {
+                theme::text_primary
+            } else {
+                theme::text_dim
+            }),
+    ]
+    .spacing(space(1.0))
+    .align_y(Alignment::Center);
+
+    // The right-hand column, built in fixed widths so it aligns across rows
+    // even when a model reports no latency or no price.
+    let meta = row![
+        text(
+            option
+                .latency_ms
+                .map(|ms| format!("{ms} ms"))
+                .unwrap_or_default()
+        )
+        .size(type_scale::META)
+        .font(theme::MONO_FONT)
+        .style(theme::text_dim)
+        .align_x(Alignment::End)
+        .width(Length::Fixed(56.0)),
+        // §14: an unpriced model shows nothing rather than `$`. Reporting a
+        // price aibo does not know is worse than reporting none.
+        text(
+            option
+                .cost
+                .map(|c| c.glyphs().to_owned())
+                .unwrap_or_default()
+        )
+        .size(type_scale::META)
+        .font(theme::MONO_FONT)
+        .style(theme::text_accent)
+        .width(Length::Fixed(40.0)),
+    ]
+    .spacing(space(1.0))
+    .align_y(Alignment::Center);
+
+    // **No ability badges, and this is a data problem rather than a design one.**
+    //
+    // `Abilities` is carried and populated, but rendering it would lie. No
+    // OpenAI-compatible `/models` endpoint reports capabilities, so every
+    // fetched model inherits its *provider's* declared defaults — which made
+    // `gpt-3.5-turbo` claim vision, reasoning and tools, none of which it has.
+    // A picker that says a model can see when it cannot is worse than one that
+    // says nothing, because the user acts on it and gets a 400.
+    //
+    // Badges become honest as soon as there is per-model capability data: the
+    // §19 signed manifest is where §10 says that belongs, and `models.toml`
+    // would let a user correct one entry without waiting for a release. The
+    // field stays populated so the capability *filter* can use it — excluding a
+    // vision-incapable provider is a provider-level fact, and that much is
+    // true.
+    let _ = &option.abilities;
+
+    row![
+        text(if favourite { "\u{2605}" } else { " " })
+            .width(Length::Fixed(space(2.0)))
+            .size(type_scale::META)
+            .style(theme::text_accent),
+        name,
+        Space::new().width(Length::Fill),
+        meta,
+    ]
+    .padding(iced::Padding {
+        top: 0.0,
+        right: space(1.0),
+        bottom: 0.0,
+        left: space(1.0),
+    })
+    .spacing(space(1.0))
+    .align_y(Alignment::Center)
+    .into()
+}
+
+/// Total panel height while the quick-pick is open.
+///
+/// The list plus the search field, the result count, the action row and the
+/// panel's own padding. Fixed rather than derived from the number of matches: a
+/// window that resizes on every keystroke is unreadable while typing, which is
+/// the one thing this widget exists to make easy.
+const PICKER_PANEL_HEIGHT: f32 = 400.0;
+
+/// Height of the quick-pick's scrolling list.
+///
+/// Fixed so the panel does not resize as the query narrows the results — a list
+/// that changes height on every keystroke is unreadable while typing.
+const PICKER_LIST_HEIGHT: f32 = 260.0;
+
+#[expect(dead_code, reason = "kept while the old dropdown path is retired")]
+fn unused_pick_list(state: &PanelState) -> Element<'_, Message> {
+    row![
         pick_list(
             state.model_options.as_slice(),
             state.selected_model.as_ref(),
@@ -1249,9 +1856,11 @@ fn chip_row(state: &PanelState) -> Element<'_, Message> {
         )
         .placeholder(i18n::t(Key::PanelModel))
         .width(Length::Fixed(230.0))
-        .text_size(type_scale::CHIP)
+        .text_size(type_scale::META)
         .font(theme::MONO_FONT)
-        .padding([space(1.5), space(2.0)]),
+        .padding([space(1.0), space(1.5)])
+        .style(theme::model_picker)
+        .menu_style(theme::model_picker_menu),
     ]
     .spacing(space(1.5))
     .align_y(Alignment::Center)
@@ -1362,23 +1971,45 @@ fn input_row(state: &PanelState) -> Element<'_, Message> {
     //
     // SPIKE: S10 — iced's IME support has historically been incomplete and an
     // overlay window makes it harder. On the critical path, not a nicety.
-    let input = text_input(i18n::t(Key::PanelPlaceholder), &state.input)
+    // In the empty state the invitation *is* the placeholder, and it has to be:
+    // rendered as its own row underneath, it left the input row visually blank
+    // with the amber rail beside it — the rail pointing at nothing, which is the
+    // opposite of "at a glance, the rail tells you where the panel thinks you
+    // are" (`design.md` §3).
+    let placeholder = if shows_empty_invitation(state) {
+        i18n::t(Key::PanelEmptyInvitation)
+    } else {
+        i18n::t(Key::PanelPlaceholder)
+    };
+
+    let input = text_input(placeholder, &state.input)
         .id(INPUT_ID)
         .on_input(Message::InputChanged)
         .size(type_scale::BODY)
         .font(theme::MONO_FONT)
-        .padding(space(2.5))
+        .padding(space(1.0))
         .style(theme::input);
 
+    // No well. `design.md` §3's mock puts the caret directly on the panel
+    // ground with the rail beside it — the input is the line you were already
+    // typing on, not a field you have been given to fill in.
     container(
         row![input, widgets::action_list(composer_actions_for(state)),]
             .spacing(space(1.5))
             .align_y(Alignment::Center),
     )
     .width(Length::Fill)
-    .padding(space(1.0))
-    .style(theme::raised)
     .into()
+}
+
+/// Whether the panel is in `design.md` §4's empty state.
+///
+/// Nothing typed, nothing asked, nothing in flight — the moment right after the
+/// hotkey. §6: "Empty states are an invitation to act, not a mood."
+fn shows_empty_invitation(state: &PanelState) -> bool {
+    state.input.is_empty()
+        && !state.has_conversation()
+        && matches!(state.phase, Phase::Idle | Phase::Hidden)
 }
 
 fn composer_actions_for(state: &PanelState) -> Vec<Action<Message>> {
@@ -1389,7 +2020,13 @@ fn composer_actions_for(state: &PanelState) -> Vec<Action<Message>> {
         attach.disabled()
     };
 
-    let primary = Action::new(Key::ActionSend, "↩", Message::Submit).primary();
+    // Deliberately *not* `.primary()`. `design.md` §2 makes amber "the one live
+    // accent" and §9's whole method is to spend the boldness in one place — a
+    // filled amber pill in the composer competes with the rail for exactly the
+    // signal the rail exists to carry. It also read as lit even with nothing to
+    // send, because the disabled primary style is still amber at 0.32. Send is
+    // the ⏎ key; the label says so, which §8 considers sufficient.
+    let primary = Action::new(Key::ActionSend, "↩", Message::Submit);
     let primary = if state.input.trim().is_empty()
         || matches!(state.phase, Phase::Loading | Phase::Streaming)
     {
@@ -1490,10 +2127,7 @@ fn active_assistant_bubble(
     appearance: theme::Appearance,
 ) -> Element<'_, Message> {
     let body: Element<'_, Message> = match state.phase {
-        Phase::Loading => text(i18n::t(Key::StateLoading))
-            .size(type_scale::BODY)
-            .style(theme::text_dim)
-            .into(),
+        Phase::Loading => widgets::thinking(Some(state.chat_answer_height())),
         Phase::Streaming | Phase::Finished { .. } => {
             let rendered = markdown_view(state.response_markdown.items(), appearance);
             if state.is_truncated() {
@@ -1501,7 +2135,8 @@ fn active_assistant_bubble(
                     rendered,
                     text(i18n::t(Key::StateTruncated))
                         .size(type_scale::META)
-                        .style(theme::text_severity(Severity::Warning)),
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_dim),
                 ]
                 .spacing(space(1.0))
                 .into()
@@ -1513,7 +2148,8 @@ fn active_assistant_bubble(
             markdown_view(state.response_markdown.items(), appearance),
             text(i18n::t(Key::StateTruncated))
                 .size(type_scale::META)
-                .style(theme::text_severity(Severity::Warning)),
+                .font(theme::MONO_FONT)
+                .style(theme::text_dim),
         ]
         .spacing(space(1.0))
         .into(),
@@ -1556,7 +2192,7 @@ fn conversation(state: &PanelState, appearance: theme::Appearance) -> Element<'_
     }
 
     let height = Length::Fixed(state.transcript_height());
-    if state.transcript_content_height() > CHAT_TRANSCRIPT_MAX_HEIGHT {
+    if state.transcript_content_height() > state.max_transcript_height() {
         scrollable(transcript)
             .height(height)
             .style(theme::scroller)
@@ -1604,7 +2240,12 @@ fn content(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Mes
                 .collect();
             return column![
                 conversation(state, appearance),
-                widgets::state_block(error.severity, &error.headline, None, actions),
+                widgets::state_block(
+                    error.severity,
+                    &error.headline,
+                    error.body.as_deref(),
+                    actions,
+                ),
             ]
             .spacing(space(2.0))
             .into();
@@ -1614,15 +2255,9 @@ fn content(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Mes
 
     match &state.phase {
         Phase::Hidden | Phase::WarmingUp { .. } | Phase::Idle => Space::new().height(0.0).into(),
-        Phase::Loading => container(
-            text(i18n::t(Key::StateLoading))
-                .size(type_scale::BODY)
-                .style(theme::text_dim),
-        )
-        .height(Length::Fill)
-        .padding(space(2.0))
-        .style(theme::raised)
-        .into(),
+        // No box, no spinner, no 15 pt "Thinking…" filling the panel. §4 gives
+        // this state a mono ellipsis and the amber rail, and nothing else.
+        Phase::Loading => widgets::thinking(Some(state.answer_height())),
         Phase::Streaming | Phase::Finished { .. } => widgets::selectable_answer(
             &state.response_editor,
             state.answer_height(),
@@ -1644,7 +2279,12 @@ fn content(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Mes
                 .and_then(error_action)
                 .into_iter()
                 .collect();
-            widgets::state_block(error.severity, &error.headline, None, actions)
+            widgets::state_block(
+                error.severity,
+                &error.headline,
+                error.body.as_deref(),
+                actions,
+            )
         }
     }
 }
@@ -1675,9 +2315,22 @@ fn error_action(action: ErrorAction) -> Option<Action<Message>> {
 
 impl PanelState {
     /// Compact answer height used inside the active assistant bubble.
+    ///
+    /// Deliberately **not** quantised to [`ANSWER_HEIGHT_STEP`], though it was
+    /// worth measuring whether it should be. `estimated_text_height` already
+    /// resolves to whole lines, so this grows one line height at a time and not
+    /// per token: a hundred-chunk answer produces six distinct panel heights,
+    /// not a hundred. Rounding those six up to 48 pt steps would trade a resize
+    /// or two for as much as 47 pt of dead space inside every short reply —
+    /// exactly the "short reply turning into a large empty card" that
+    /// [`theme::CHAT_ANSWER_MIN_HEIGHT`] exists to prevent.
+    ///
+    /// The reflow defect was never the number of height changes. It was that
+    /// every one of them re-ran the panel's whole arrival sequence; see
+    /// `app::resize_panel_if_visible`.
     fn chat_answer_height(&self) -> f32 {
         estimated_text_height(&self.response, CHAT_ASSISTANT_CHARS_PER_LINE)
-            .clamp(theme::CHAT_ANSWER_MIN_HEIGHT, CHAT_ANSWER_MAX_HEIGHT)
+            .clamp(theme::CHAT_ANSWER_MIN_HEIGHT, self.max_chat_answer_height())
     }
 
     /// Estimated height of all messages before applying viewport bounds.
@@ -1711,12 +2364,47 @@ impl PanelState {
     /// Visible transcript height, content-sized until a useful scrolling cap.
     fn transcript_height(&self) -> f32 {
         self.transcript_content_height()
-            .clamp(CHAT_TRANSCRIPT_MIN_HEIGHT, CHAT_TRANSCRIPT_MAX_HEIGHT)
+            .clamp(CHAT_TRANSCRIPT_MIN_HEIGHT, self.max_transcript_height())
+    }
+
+    /// The tallest the panel may grow on this display (`design.md` §4).
+    ///
+    /// 60 % of the display, floored at [`theme::PANEL_HEIGHT_MAX`] so an unknown
+    /// display behaves exactly as the old constant did, and ceilinged so the
+    /// panel stays a panel: something that covers the screen is a window, and
+    /// this product is explicitly not that (§1 — it appears *over* your work).
+    pub fn max_panel_height(&self) -> f32 {
+        let Some(display) = self.display_height else {
+            return theme::PANEL_HEIGHT_MAX;
+        };
+        (display * PANEL_HEIGHT_DISPLAY_FRACTION).clamp(theme::PANEL_HEIGHT_MAX, 900.0)
+    }
+
+    /// The active answer bubble's ceiling.
+    ///
+    /// Derived from the transcript rather than fixed, leaving room for the user
+    /// turn above it. The old flat 172 pt was the binding constraint on a
+    /// single-turn answer — the transcript could be allowed 800 pt and the
+    /// answer inside it would still stop at 172 and scroll, which is the shape
+    /// of "the response is not growing the window".
+    fn max_chat_answer_height(&self) -> f32 {
+        (self.max_transcript_height() - CHAT_BUBBLE_CHROME_HEIGHT * 2.0 - CHAT_MESSAGE_SPACING)
+            .max(CHAT_ANSWER_MAX_HEIGHT)
+    }
+
+    /// The transcript's ceiling before it scrolls internally.
+    fn max_transcript_height(&self) -> f32 {
+        (self.max_panel_height()
+            - theme::PANEL_HEIGHT_COLLAPSED
+            - self.attachment_block_height()
+            - self.selection_preview_height()
+            - self.footer_height())
+        .max(CHAT_TRANSCRIPT_MIN_MAX_HEIGHT)
     }
 
     /// Maximum height the answer may consume while preserving fixed chrome.
     fn max_answer_height(&self) -> f32 {
-        (theme::PANEL_HEIGHT_MAX
+        (self.max_panel_height()
             - theme::PANEL_HEIGHT_COLLAPSED
             - self.attachment_block_height()
             - self.selection_preview_height()
@@ -1802,7 +2490,32 @@ const SELECTION_CARD_COLLAPSED_HEIGHT: f32 = 64.0;
 const SELECTION_CARD_EXPANDED_HEIGHT: f32 = 132.0;
 const CHAT_PANEL_MIN_HEIGHT: f32 = 320.0;
 const CHAT_TRANSCRIPT_MIN_HEIGHT: f32 = 112.0;
-const CHAT_TRANSCRIPT_MAX_HEIGHT: f32 = 268.0;
+
+/// Fraction of the display the panel may occupy before the answer scrolls.
+///
+/// `design.md` §4: "Long answer | Answer area scrolls internally at 60 % display
+/// height; rail stays full-height." The previous fixed 268 pt transcript cap
+/// implemented that rule as a constant, which on any display taller than about
+/// 450 pt meant the window stopped growing long before it had any right to —
+/// the answer went on scrolling inside a small box with most of the screen
+/// empty around it. On a 1440 pt display 60 % is 864 pt, more than three times
+/// what the constant allowed.
+const PANEL_HEIGHT_DISPLAY_FRACTION: f32 = 0.60;
+
+/// The chat transcript's ceiling once the panel itself is at full height.
+///
+/// Kept as a floor rather than the answer, so a display whose size is not yet
+/// known still behaves the way the old constant did instead of collapsing.
+const CHAT_TRANSCRIPT_MIN_MAX_HEIGHT: f32 = 268.0;
+/// The granularity at which the answer area is allowed to grow.
+///
+/// §16: "streaming must not reflow". A window resize is not free — on macOS it
+/// goes to the window server, and each one is a visible jump in a panel that
+/// floats over the user's work — so the answer area is sized in steps rather
+/// than tracked continuously. One step per ~48 pt of answer bounds a full-length
+/// response to a handful of resizes instead of one per token.
+const ANSWER_HEIGHT_STEP: f32 = 48.0;
+
 const CHAT_ANSWER_MAX_HEIGHT: f32 = 172.0;
 const CHAT_BUBBLE_CHROME_HEIGHT: f32 = 38.0;
 const CHAT_MESSAGE_SPACING: f32 = 8.0;
@@ -2044,6 +2757,9 @@ mod tests {
             },
             display_name: model.to_owned(),
             latency_ms: Some(435),
+            released_at: None,
+            abilities: Default::default(),
+            cost: None,
         }
     }
 
@@ -2122,9 +2838,19 @@ mod tests {
             state.error.as_ref().map(|e| e.treatment),
             Some(Treatment::Blocking)
         );
+        // `design.md` §6: the button names the outcome, not the window it lives
+        // in. This used to be `OpenSettings`, which rendered as "Open settings"
+        // — a mechanism, leaving the user to work out what to do once they got
+        // there.
         assert_eq!(
             state.error.as_ref().and_then(|e| e.action.clone()),
-            Some(ErrorAction::OpenSettings)
+            Some(ErrorAction::SignIn(ProviderId::CODEX))
+        );
+        // …and it is the one error that carries a second sentence, because it
+        // is the one with two real routes out.
+        assert!(
+            state.error.as_ref().is_some_and(|e| e.body.is_some()),
+            "the no-provider state must say what to do, not only what happened"
         );
     }
 
@@ -2694,6 +3420,125 @@ mod tests {
         assert!(state.reserved_answer_height <= theme::PANEL_HEIGHT_MAX);
     }
 
+    /// §16's "streaming must not reflow", stated as the number that matters:
+    /// how many times does the window geometry change while one answer streams?
+    ///
+    /// Measured at **6**, for chunk sizes from three characters to a full
+    /// sentence — `estimated_text_height` resolves to whole lines, so growth is
+    /// per line and not per token. The bound is a guard rather than a
+    /// regression test: it fails if someone makes the panel track the response
+    /// continuously, which is the shape of the bug it is here to prevent.
+    ///
+    /// It does **not** cover the defect that was actually fixed alongside it.
+    /// Each of these six changes used to re-run the panel's full arrival
+    /// sequence, including `gain_focus` and `operation::focus(INPUT_ID)`, so the
+    /// caret was pulled back into the input six times per answer. That fix is
+    /// in `app::resize_panel_if_visible`, and it is structural — the two
+    /// operations no longer share a code path — but it lives in a `Task` that
+    /// cannot be introspected from a unit test, so nothing here locks it.
+    #[test]
+    fn streaming_an_answer_changes_the_panel_height_a_handful_of_times() {
+        for (label, chunk, chunks) in [
+            ("tiny", "ab ", 400),
+            ("word", "hello ", 200),
+            (
+                "sentence",
+                "the quick brown fox jumps over the lazy dog. ",
+                100,
+            ),
+        ] {
+            let mut state = panel();
+            state.begin_turn("Rewrite this as a changelog entry".to_owned());
+            state.phase = Phase::Streaming;
+
+            let mut heights = vec![state.desired_height()];
+            for _ in 0..chunks {
+                state.append_response(chunk);
+                let height = state.desired_height();
+                if (height - heights[heights.len() - 1]).abs() >= 1.0 {
+                    heights.push(height);
+                }
+            }
+
+            let resizes = heights.len() - 1;
+            // Expressed as a ratio rather than a fixed count, because the
+            // absolute number legitimately depends on how much room the display
+            // allows the answer — a taller screen means more lines before the
+            // area saturates, and pinning a constant here would fail the moment
+            // §4's 60 %-of-display rule gave the answer the room it asked for.
+            // The invariant that actually matters is unchanged: the panel grows
+            // per *line*, never per token.
+            assert!(
+                resizes * 10 <= chunks,
+                "{label}: {resizes} height changes across {chunks} chunks — \
+                 the panel is tracking the response instead of its lines"
+            );
+
+            // Monotonic, because a panel that shrinks mid-answer is worse than
+            // one that grows: the text being read moves out from under the eye.
+            for pair in heights.windows(2) {
+                assert!(
+                    pair[1] >= pair[0],
+                    "{label}: the panel shrank mid-answer, {} then {}",
+                    pair[0],
+                    pair[1]
+                );
+            }
+        }
+    }
+
+    /// `design.md` §3: the rail is amber "on the row that currently has the
+    /// user's attention — the input while typing, the answer while streaming"
+    /// and danger on a permission or error row.
+    ///
+    /// Exactly one row may be amber at a time. Two amber segments would say the
+    /// panel is in two places at once, which is precisely the claim the rail
+    /// exists to make unambiguous.
+    #[test]
+    fn the_rail_marks_one_row_at_a_time() {
+        let mut state = panel();
+
+        // Idle: attention is the input.
+        assert_eq!(input_rail_state(&state), RailState::Active);
+        assert_eq!(content_rail_state(&state), RailState::Inactive);
+
+        // Streaming: attention moves to the answer, and leaves the input.
+        state.begin_turn("q".to_owned());
+        state.phase = Phase::Streaming;
+        assert_eq!(input_rail_state(&state), RailState::Inactive);
+        assert_eq!(content_rail_state(&state), RailState::Active);
+
+        // Finished: attention returns to the input, so the next thing typed is
+        // obviously going to the same place.
+        state.phase = Phase::Finished {
+            reason: StopReason::EndTurn,
+        };
+        assert_eq!(input_rail_state(&state), RailState::Active);
+        assert_eq!(content_rail_state(&state), RailState::Inactive);
+    }
+
+    /// An error takes the rail regardless of phase, and it takes it as `Alert`
+    /// rather than `Active` — §13's treatment reaching the eye through a second
+    /// channel, so severity never rests on reading one coloured word.
+    #[test]
+    fn an_error_row_turns_the_rail_danger() {
+        let mut state = panel();
+        state.phase = Phase::Streaming;
+        assert_eq!(content_rail_state(&state), RailState::Active);
+
+        state.phase = Phase::Failed;
+        assert_eq!(content_rail_state(&state), RailState::Alert);
+    }
+
+    #[test]
+    fn a_denied_permission_takes_the_rail_even_while_idle() {
+        let mut state = panel();
+        state.context = ContextState::PermissionDenied {
+            status: PermissionStatus::Denied,
+        };
+        assert_eq!(content_rail_state(&state), RailState::Alert);
+    }
+
     #[test]
     fn a_long_answer_cannot_push_the_footer_out_of_the_panel() {
         let mut state = panel();
@@ -2722,8 +3567,60 @@ mod tests {
         let long = state.desired_height();
 
         assert!(long > short, "{long} must grow beyond {short}");
-        assert!(long <= theme::PANEL_HEIGHT_MAX);
-        assert_eq!(state.transcript_height(), CHAT_TRANSCRIPT_MAX_HEIGHT);
+        assert!(long <= state.max_panel_height());
+        assert_eq!(state.transcript_height(), state.max_transcript_height());
+    }
+
+    /// `design.md` §4 sizes the answer area at 60 % of the display, not to a
+    /// constant. The old fixed 268 pt transcript cap and 172 pt answer cap were
+    /// the binding constraints on a long answer: the window stopped growing
+    /// while most of the screen was still empty, and the response scrolled
+    /// inside a small box — "the response is not growing the window".
+    #[test]
+    fn a_taller_display_gives_the_answer_more_room() {
+        let mut small = panel();
+        small.display_height = Some(800.0);
+        let mut large = panel();
+        large.display_height = Some(1440.0);
+
+        assert!(
+            large.max_panel_height() > small.max_panel_height(),
+            "a 1440 pt display must allow a taller panel than an 800 pt one: {} vs {}",
+            large.max_panel_height(),
+            small.max_panel_height()
+        );
+        assert!(
+            large.max_chat_answer_height() > small.max_chat_answer_height(),
+            "the answer bubble must scale with the panel, not stay at 172 pt"
+        );
+
+        // 60 % of 1440 is 864, and the panel stays a panel rather than becoming
+        // a window that covers the screen.
+        assert!((large.max_panel_height() - 864.0).abs() < 0.01);
+        assert!(large.max_panel_height() <= 900.0);
+    }
+
+    /// An unknown display must never be *worse* than the constants it replaced,
+    /// because the window server has not answered when the panel first paints
+    /// and a collapsed panel at that moment is a visible glitch.
+    #[test]
+    fn an_unknown_display_is_never_smaller_than_the_old_constants() {
+        let state = panel();
+        assert_eq!(state.display_height, None);
+        assert_eq!(state.max_panel_height(), theme::PANEL_HEIGHT_MAX);
+        assert!(
+            state.max_chat_answer_height() >= CHAT_ANSWER_MAX_HEIGHT,
+            "the fallback must not shrink the answer below the old 172 pt cap"
+        );
+    }
+
+    /// The display is hardware, not session state.
+    #[test]
+    fn a_new_session_keeps_the_display_height() {
+        let mut state = panel();
+        state.display_height = Some(1440.0);
+        state.reset(SessionId::from_u128(9));
+        assert_eq!(state.display_height, Some(1440.0));
     }
 
     #[test]

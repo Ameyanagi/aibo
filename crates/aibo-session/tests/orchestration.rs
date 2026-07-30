@@ -449,6 +449,7 @@ async fn a_partial_is_persisted_and_marked_truncated() {
         aibo_core::AiboError::ProviderUnavailable {
             provider: ProviderId::OPENAI,
             status: 503,
+            detail: None,
         },
     ));
 

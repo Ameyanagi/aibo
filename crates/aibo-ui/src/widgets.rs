@@ -29,6 +29,167 @@ use unicode_segmentation::UnicodeSegmentation as _;
 use crate::i18n::{self, Key};
 use crate::theme::{self, Severity, space, type_scale};
 
+/// What a rail segment says about the row beside it (`design.md` §3).
+///
+/// The rail is the product's one signature element, and it earns the place by
+/// encoding something true rather than decorating: at a glance it tells you
+/// where the panel thinks you are. It also replaces every border in the design —
+/// nothing else gets a box.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RailState {
+    /// The row is present but not where the attention is. Drawn in `rule`.
+    #[default]
+    Inactive,
+    /// The row that currently has the user's attention: the input while typing,
+    /// the answer while streaming. Drawn in `amber`.
+    Active,
+    /// A permission or error row. Drawn in `danger`.
+    ///
+    /// Quiet by construction — `design.md` §4 treats a denied permission as a
+    /// state, not an alarm — but it is a second channel beside the message's own
+    /// colour, so severity never depends on reading one coloured word.
+    Alert,
+}
+
+impl RailState {
+    fn color(self, p: &theme::Palette) -> iced::Color {
+        match self {
+            RailState::Inactive => p.border,
+            RailState::Active => p.accent,
+            RailState::Alert => p.danger,
+        }
+    }
+}
+
+/// Attach a rail segment to a row (`design.md` §3).
+///
+/// Segments are stacked per row rather than drawn as one full-height bar with a
+/// computed offset. The result is the same continuous 3 pt rail down the left
+/// gutter, amber only beside the row that has attention, but it needs no layout
+/// measurement, so it cannot drift out of alignment when a row changes height
+/// mid-stream.
+///
+/// **The row's vertical rhythm lives inside this function, not between calls to
+/// it.** §3 says the rail "runs the full height of the panel", and a parent
+/// `column` with `spacing` set would break it into floating stubs with gaps of
+/// background showing through — which is what a rail must never look like,
+/// because a gap reads as the rail *ending*. So the padding that separates rows
+/// is applied to the content here, inside the segment, and callers stack these
+/// with **zero** spacing.
+pub fn railed<'a, Message: 'a>(
+    state: RailState,
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    // Drawn as a **background the content is painted over**, not as a
+    // `Length::Fill` sibling in a row.
+    //
+    // The sibling version is the obvious construction and it is wrong: a
+    // `Fill`-height child makes the *row* report "I want to fill", the parent
+    // `column` then sees five such rows and divides the panel between them, and
+    // the result is a source line inflated into a band of empty space and an
+    // answer squashed to a few points. Pinning the row to `Shrink` fixes the
+    // squashing and kills the rail instead, because `Fill` inside `Shrink`
+    // resolves to nothing.
+    //
+    // So: the outer container is painted the rail colour and inset from the
+    // left by exactly `RAIL_WIDTH`; the inner container repaints the panel
+    // ground over everything but that strip. Both are content-sized, so the
+    // rail is always precisely as tall as the row beside it and can never
+    // dictate the row's height.
+    railed_with(state, theme::ground, content)
+}
+
+/// [`railed`], with the fill the content is painted in chosen by the caller.
+///
+/// Split out for the quick-pick, where the highlighted row wants the palette's
+/// one elevation (`ink-raised`) rather than the ground: a 3pt rail alone is
+/// legible on a source line, where it is the only marked row on screen, but
+/// inside a list of ninety it is a detail the eye has to hunt for. Fill plus
+/// rail reads instantly and adds no new colour.
+pub fn railed_with<'a, Message: 'a>(
+    state: RailState,
+    fill: fn(&iced::Theme) -> container::Style,
+    content: impl Into<Element<'a, Message>>,
+) -> Element<'a, Message> {
+    container(
+        container(content.into())
+            .padding([space(1.0), 0.0])
+            .width(Length::Fill)
+            .style(fill),
+    )
+    .padding(iced::Padding {
+        top: 0.0,
+        right: 0.0,
+        bottom: 0.0,
+        left: theme::RAIL_WIDTH,
+    })
+    .width(Length::Fill)
+    .style(move |t: &iced::Theme| container::Style {
+        background: Some(Background::Color(state.color(&theme::palette_of(t)))),
+        ..Default::default()
+    })
+    .into()
+}
+
+/// A small square identity mark — the picker's provider column (§16).
+///
+/// **Why letterforms and not vendor logos.** `design.md` §9 cut icons on the
+/// grounds that "the rail plus a key hint carries every meaning an icon would",
+/// and for *state* that holds: an amber rail says "here" better than any glyph.
+/// Identity is the case it does not cover. Thirteen providers down a list are a
+/// thing you recognise, not a thing you read, and a column of dim lowercase
+/// words is the slowest possible way to present it.
+///
+/// Real logos would be faster still, and are deliberately not used:
+///
+/// * They are other people's trademarks, and aibo would be redistributing the
+///   artwork in a signed binary (§19) — a licence question per vendor, for a
+///   decoration.
+/// * Drawn from memory they come out subtly wrong, and a mangled logo reads as
+///   a broken build.
+/// * A logo carries brand colour, and the palette has seven values on purpose.
+///
+/// So: two letters, mono, in a filled tile. Nothing to learn — `OR` beside
+/// `OA` is unambiguous at a glance in a way an unlabelled pair of glyphs is
+/// not — and it stays inside the palette. If licensed marks ever ship, they
+/// drop in behind this same call.
+///
+/// `on_raised` inverts the fill. The tile is one elevation step from whatever
+/// it sits on: raised against the ground, inset against a highlighted row.
+/// Without the inversion the mark disappears into exactly the row the user is
+/// looking at.
+pub fn mark<'a, Message: 'a>(label: impl Into<String>, on_raised: bool) -> Element<'a, Message> {
+    container(
+        iced::widget::text(label.into())
+            .size(theme::type_scale::CHIP)
+            .font(theme::MONO_FONT)
+            .style(if on_raised {
+                theme::text_primary
+            } else {
+                theme::text_dim
+            })
+            .align_x(Alignment::Center),
+    )
+    .width(Length::Fixed(MARK_SIZE))
+    .height(Length::Fixed(MARK_SIZE))
+    .align_x(Alignment::Center)
+    .align_y(Alignment::Center)
+    .style(move |t: &iced::Theme| {
+        if on_raised {
+            theme::inset(t)
+        } else {
+            theme::raised(t)
+        }
+    })
+    .into()
+}
+
+/// Side of a [`mark`]'s tile.
+///
+/// Square, and fixed rather than derived from the label, so the marks form a
+/// column that the eye can run down — the only reason to have them.
+pub const MARK_SIZE: f32 = 22.0;
+
 /// Render a shortcut using the platform's primary-modifier convention.
 pub const fn primary_shortcut(macos: &'static str, other: &'static str) -> &'static str {
     if cfg!(target_os = "macos") {
@@ -86,11 +247,24 @@ impl<Message> Action<Message> {
     }
 }
 
-/// The context chip: source app plus a one-line excerpt (§16).
+/// The source line: where you were, and what you had selected.
+///
+/// `design.md` §1 calls this the most interesting information on screen — "that
+/// line is the whole pitch: it knows where you were" — and records that the
+/// first build rendered it as the smallest, dullest element on the panel.
+/// Correcting that inversion is mostly a matter of *showing the excerpt*, which
+/// is why `excerpt` is no longer optional in practice: `ghostty` alone says far
+/// less than `ghostty · "…and screencapture works"`.
+///
+/// Two things it deliberately no longer draws. The 2 pt accent leading rule is
+/// gone, superseded by the rail that now runs down the whole gutter — two
+/// vertical accent marks 16 pt apart read as a rendering bug. So is the chip's
+/// box: §9 counts it among the borders being removed, and a pill around the one
+/// line that is meant to feel ambient is the wrong container.
 ///
 /// Renders the "no context" state rather than disappearing. §8 captures context
 /// asynchronously with a deadline, so the panel is often shown *before* the
-/// chip has anything to say — a chip that pops into existence mid-interaction
+/// line has anything to say — text that pops into existence mid-interaction
 /// would move the input under the user's cursor.
 pub fn context_chip<'a, Message: 'a>(
     source_app: Option<&str>,
@@ -102,32 +276,88 @@ pub fn context_chip<'a, Message: 'a>(
     };
 
     let mut line = row![
-        // The accent leading rule from the §16 mock.
-        container(Space::new().width(2.0).height(20.0)).style(|t: &iced::Theme| {
-            container::Style {
-                background: Some(Background::Color(theme::palette_of(t).accent)),
-                ..Default::default()
-            }
-        }),
         text(label)
-            .size(type_scale::CHIP)
-            .style(theme::text_primary),
+            .size(type_scale::META)
+            .font(theme::MONO_FONT)
+            .style(theme::text_dim),
     ]
-    .spacing(space(2.0))
+    .spacing(space(1.5))
     .align_y(Alignment::Center);
 
-    if let Some(excerpt) = excerpt {
+    // An empty excerpt is not an excerpt. A caret-only capture yields
+    // `Some("")`, and quoting it renders `Ghostty · ""` — a pair of empty
+    // quotes that says the panel read something and it was nothing.
+    if let Some(excerpt) = excerpt.map(str::trim).filter(|e| !e.is_empty()) {
         line = line.push(
-            text(elide(excerpt, 96))
-                .size(type_scale::CHIP)
+            text(format!("· \u{201c}{}\u{201d}", elide(excerpt, 96)))
+                .size(type_scale::META)
+                .font(theme::MONO_FONT)
                 .style(theme::text_dim),
         );
     }
 
-    container(line)
-        .padding([space(1.5), space(2.5)])
-        .style(theme::chip)
+    container(line).style(theme::chip).into()
+}
+
+/// Pre-first-token: a three-dot mono ellipsis, and deliberately not a spinner.
+///
+/// `design.md` §4 is specific about the reason. A spinner means *indeterminate*
+/// — it promises nothing about when this ends — and §15 budgets first token at
+/// around 400 ms. Spinning for 400 ms reads as a stall the product does not
+/// have, and it is the single most common way a fast thing is made to feel
+/// slow. Three static dots say "in progress" without making a claim about
+/// duration.
+///
+/// `reserve` holds the answer's height from this moment, so the first chunk
+/// replaces the dots in place instead of growing the panel out from under the
+/// eye (§16: "streaming must not reflow").
+pub fn thinking<'a, Message: 'a>(reserve: Option<f32>) -> Element<'a, Message> {
+    let dots = text("\u{00b7}\u{00b7}\u{00b7}")
+        .size(type_scale::META)
+        .font(theme::MONO_FONT)
+        .style(theme::text_dim);
+
+    match reserve {
+        Some(height) => container(dots)
+            .height(Length::Fixed(height))
+            .align_y(Alignment::Start)
+            .into(),
+        None => dots.into(),
+    }
+}
+
+/// The empty panel: an invitation, not a mood (`design.md` §4, §6).
+///
+/// One dim line under the source line, with no placeholder box around it.
+/// `design.md` §6: "Empty states are an invitation to act, not a mood."
+pub fn empty_invitation<'a, Message: 'a>() -> Element<'a, Message> {
+    text(i18n::t(Key::PanelEmptyInvitation))
+        .size(type_scale::META)
+        .font(theme::MONO_FONT)
+        .style(theme::text_dim)
         .into()
+}
+
+/// The source line while context capture is still in flight (`design.md` §4).
+pub fn reading_context_line<'a, Message: 'a>() -> Element<'a, Message> {
+    source_note(i18n::t(Key::ContextChipReading))
+}
+
+/// The source line once capture has settled with nothing (`design.md` §4).
+pub fn unavailable_context_line<'a, Message: 'a>() -> Element<'a, Message> {
+    source_note(i18n::t(Key::ContextChipUnavailable))
+}
+
+/// One dim mono line in the source-line slot, holding its height.
+fn source_note<'a, Message: 'a>(body: &str) -> Element<'a, Message> {
+    container(
+        text(body.to_owned())
+            .size(type_scale::META)
+            .font(theme::MONO_FONT)
+            .style(theme::text_dim),
+    )
+    .style(theme::chip)
+    .into()
 }
 
 /// Edge of the square thumbnail on an attachment chip, in points.
@@ -392,7 +622,8 @@ pub fn answer<'a, Message: 'a>(
         stack = stack.push(
             text(i18n::t(Key::StateTruncated))
                 .size(type_scale::META)
-                .style(theme::text_severity(Severity::Warning)),
+                .font(theme::MONO_FONT)
+                .style(theme::text_dim),
         );
     }
 
@@ -426,7 +657,8 @@ pub fn selectable_answer<'a, Message: Clone + 'a>(
         stack = stack.push(
             text(i18n::t(Key::StateTruncated))
                 .size(type_scale::META)
-                .style(theme::text_severity(Severity::Warning)),
+                .font(theme::MONO_FONT)
+                .style(theme::text_dim),
         );
     }
 
@@ -460,7 +692,8 @@ pub fn selectable_chat_answer<'a, Message: Clone + 'a>(
         stack = stack.push(
             text(i18n::t(Key::StateTruncated))
                 .size(type_scale::META)
-                .style(theme::text_severity(Severity::Warning)),
+                .font(theme::MONO_FONT)
+                .style(theme::text_dim),
         );
     }
 

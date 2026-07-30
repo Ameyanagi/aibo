@@ -20,6 +20,7 @@ pub mod auth;
 pub mod azure;
 pub mod bedrock;
 pub mod codex;
+pub mod gemini;
 pub mod http;
 pub mod ollama;
 pub mod openai_compat;

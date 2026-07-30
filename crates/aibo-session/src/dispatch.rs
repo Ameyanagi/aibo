@@ -307,6 +307,7 @@ mod tests {
             events_of(vec![Err(AiboError::ProviderUnavailable {
                 provider: aibo_core::types::ProviderId::GROQ,
                 status: 503,
+                detail: None,
             })]),
             &CancellationToken::new(),
             far_future(),
@@ -328,6 +329,7 @@ mod tests {
                 Err(AiboError::ProviderUnavailable {
                     provider: aibo_core::types::ProviderId::GROQ,
                     status: 503,
+                    detail: None,
                 }),
             ]),
             &CancellationToken::new(),

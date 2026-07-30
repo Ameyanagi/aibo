@@ -51,6 +51,8 @@ pub mod error;
 pub mod history_ring;
 pub mod hotkey;
 pub mod i18n;
+pub mod model_picker;
+pub mod palette;
 pub mod panel;
 pub mod placement;
 pub mod settings;
@@ -60,7 +62,7 @@ pub mod tray;
 pub mod widgets;
 
 pub use app::{Message, UiConfig, UiHandles, run};
-pub use bridge::{ModelOption, SessionId, UiEvent, UiRequest};
+pub use bridge::{Abilities, CostTier, ModelOption, SessionId, UiEvent, UiRequest};
 pub use error::{Result, UiError};
 pub use i18n::Lang;
 pub use theme::Appearance;

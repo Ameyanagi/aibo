@@ -61,14 +61,110 @@ pub struct ModelOption {
     pub display_name: String,
     /// Measured first-token latency, when the shipped catalogue has one.
     pub latency_ms: Option<u32>,
+    /// What the model can do, from §10's catalogue.
+    ///
+    /// Shown as badges in the quick-pick, because "can this one see an image?"
+    /// is the question that actually decides a choice, and the alternative was
+    /// finding out from a `VisionUnsupported` error after the fact.
+    pub abilities: Abilities,
+    /// When the provider says it was released, as a Unix timestamp.
+    ///
+    /// The ordering signal: newest first. `None` sorts last, which is the honest
+    /// place for a release date the provider does not report.
+    pub released_at: Option<u64>,
+    /// Roughly what it costs to run, from §14's price table.
+    ///
+    /// `None` means **unpriced, not free**. §14 is explicit that reporting
+    /// $0.00 for a model whose price aibo does not know is worse than saying
+    /// nothing, so the picker renders nothing rather than a zero.
+    pub cost: Option<CostTier>,
+}
+
+/// The capabilities worth showing next to a model name.
+///
+/// A deliberate subset of `aibo_core::types::Capabilities`: these three change
+/// what the user can *ask for*. Context window and output cap matter too, but
+/// they do not belong on a one-line row.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Abilities {
+    /// Accepts image input.
+    pub vision: bool,
+    /// Can be given tools.
+    pub tools: bool,
+    /// Exposes a reasoning-effort control.
+    pub reasoning: bool,
+}
+
+/// A coarse price band, for comparing models at a glance (§14).
+///
+/// Derived from the **output** rate, which dominates the bill for chat: a reply
+/// is mostly output tokens, and the input side is usually cached or small. The
+/// bands are wide on purpose — this is for "which of these is the cheap one",
+/// not for budgeting, which §14's spend meter does with real numbers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum CostTier {
+    /// Under $1 per million output tokens.
+    Low,
+    /// Under $5.
+    Moderate,
+    /// Under $20.
+    High,
+    /// $20 or more.
+    Premium,
+}
+
+impl CostTier {
+    /// Band an output rate given in micros per million tokens.
+    pub fn from_output_micros(micros_per_mtok: u64) -> Self {
+        // 1 USD = 1_000_000 micros.
+        // Disjoint bounds rather than open-ended `..=`, which would each start
+        // at zero and overlap: the arms happen to resolve correctly by order,
+        // but a reader cannot see that and a reordering would silently change
+        // every band.
+        match micros_per_mtok {
+            0..=1_000_000 => CostTier::Low,
+            1_000_001..=5_000_000 => CostTier::Moderate,
+            5_000_001..=20_000_000 => CostTier::High,
+            _ => CostTier::Premium,
+        }
+    }
+
+    /// `$` to `$$$$`.
+    pub const fn glyphs(self) -> &'static str {
+        match self {
+            CostTier::Low => "$",
+            CostTier::Moderate => "$$",
+            CostTier::High => "$$$",
+            CostTier::Premium => "$$$$",
+        }
+    }
 }
 
 impl std::fmt::Display for ModelOption {
+    /// `provider · model · latency`.
+    ///
+    /// **The provider is named, and it has to be.** The picker used to show the
+    /// model alone, which was unambiguous only while Codex was the sole
+    /// provider. With several configured, "gpt-5" could be OpenAI directly or
+    /// OpenRouter fronting it — at different prices, context windows and trust
+    /// boundaries (§14) — and the row gave no way to tell. Worse, the label
+    /// could name a Codex model while the request had actually been routed
+    /// elsewhere by role, which is how a vision request appeared to come from
+    /// "GPT-5.6 Sol".
+    ///
+    /// Latency stays last because only the shipped Codex entries have a measured
+    /// figure; no `/models` endpoint returns one.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.latency_ms {
-            Some(latency) => write!(f, "{} · {latency} ms", self.display_name),
-            None => f.write_str(&self.display_name),
+        write!(
+            f,
+            "{} · {}",
+            self.binding.provider.as_str(),
+            self.display_name
+        )?;
+        if let Some(latency) = self.latency_ms {
+            write!(f, " · {latency} ms")?;
         }
+        Ok(())
     }
 }
 
@@ -171,6 +267,30 @@ pub enum UiRequest {
     SignIn {
         /// Provider whose credential was rejected.
         provider: ProviderId,
+    },
+
+    /// Add or replace an API-key provider from the settings window (§10, §12).
+    ///
+    /// The key travels as a [`SecretString`] and is consumed by the credential
+    /// store on arrival. §12 keeps it out of `config.toml`, out of the UI's
+    /// retained state once sent, and out of diagnostics — `SecretString`'s own
+    /// `Debug` redacts, so the enum's derive cannot leak it into a log line.
+    SetProviderKey {
+        /// Which backend, spelled as `config.toml`'s `backend = "…"` value.
+        backend: String,
+        /// Explicit id, for a second endpoint of a backend already configured.
+        id: Option<String>,
+        /// Base URL. Required for a custom endpoint, ignored for the rest.
+        base_url: Option<String>,
+        /// The key. Empty means "the user cleared the field", which is a
+        /// removal rather than an empty credential.
+        key: SecretString,
+    },
+
+    /// Forget a provider: drop its credential and its `config.toml` entry.
+    RemoveProvider {
+        /// The id the provider is addressed by.
+        id: String,
     },
 
     /// Open the OS privacy pane for a permission (§17).
@@ -343,6 +463,18 @@ pub enum UiEvent {
     },
 
     /// A provider's health changed (§13: per provider, with hysteresis).
+    /// A provider was removed in settings and its row must go.
+    ///
+    /// [`UiEvent::ProviderHealth`] only ever adds or updates a row, so without
+    /// this a forgotten provider stays on screen looking configured — an
+    /// advertised control backed by nothing, which §17 treats as worse than an
+    /// absent one.
+    ProviderRemoved {
+        /// The provider that no longer exists.
+        provider: ProviderId,
+    },
+
+    /// A provider's reachability changed (§13, per provider with hysteresis).
     ProviderHealth {
         /// The provider.
         provider: ProviderId,
@@ -393,4 +525,33 @@ pub enum UiEvent {
 
     /// Encrypted history setup failed; details remain diagnostics-only.
     HistorySetupFailed,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The bands must be disjoint and monotonic, or two models with different
+    /// prices can read as the same cost.
+    #[test]
+    fn cost_bands_are_monotonic_and_disjoint() {
+        assert_eq!(CostTier::from_output_micros(400_000), CostTier::Low);
+        assert_eq!(CostTier::from_output_micros(2_000_000), CostTier::Moderate);
+        assert_eq!(CostTier::from_output_micros(10_000_000), CostTier::High);
+        assert_eq!(CostTier::from_output_micros(75_000_000), CostTier::Premium);
+
+        // Boundaries land in the cheaper band, and never in two.
+        assert_eq!(CostTier::from_output_micros(1_000_000), CostTier::Low);
+        assert_eq!(CostTier::from_output_micros(1_000_001), CostTier::Moderate);
+        assert_eq!(CostTier::from_output_micros(0), CostTier::Low);
+
+        assert!(CostTier::Low < CostTier::Moderate);
+        assert!(CostTier::High < CostTier::Premium);
+    }
+
+    #[test]
+    fn cost_glyphs_grow_with_the_band() {
+        assert_eq!(CostTier::Low.glyphs().len(), 1);
+        assert_eq!(CostTier::Premium.glyphs().len(), 4);
+    }
 }

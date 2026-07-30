@@ -32,6 +32,7 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use aibo_core::error::{AiboError, Result};
 use aibo_core::traits::Provider;
@@ -39,7 +40,7 @@ use aibo_core::types::{Capabilities, Credential, ModelBinding, ModelInfo, Provid
 use url::Url;
 
 use crate::openai_compat::{
-    Quirks, boxed, build as build_compat, cerebras, groq, openai, sambanova, xai,
+    Quirks, boxed, build as build_compat, cerebras, groq, openai, openrouter, sambanova, xai,
 };
 
 /// Which backend a configured provider is.
@@ -56,6 +57,10 @@ pub enum ProviderKind {
     Groq,
     /// xAI / Grok (§10 fast-smart). Not Groq.
     Xai,
+    /// OpenRouter: one key, many upstream vendors.
+    OpenRouter,
+    /// Google Gemini on the direct Generative Language API.
+    Gemini,
     /// OpenAI on its native Responses format.
     OpenAi,
     /// OpenAI on Chat Completions, for deployments that need it.
@@ -135,6 +140,8 @@ pub fn build(spec: ProviderSpec) -> Result<Arc<dyn Provider>> {
         ProviderKind::SambaNova => boxed(sambanova::provider(credential)?),
         ProviderKind::Groq => boxed(groq::provider(credential)?),
         ProviderKind::Xai => boxed(xai::provider(credential)?),
+        ProviderKind::OpenRouter => boxed(openrouter::provider(credential)?),
+        ProviderKind::Gemini => Arc::new(crate::gemini::Gemini::new(credential)?),
         ProviderKind::OpenAi => boxed(openai::provider(credential)?),
         ProviderKind::OpenAiChatCompletions => {
             boxed(openai::chat_completions_provider(credential)?)
@@ -255,6 +262,8 @@ fn default_id_for(kind: &ProviderKind) -> ProviderId {
         ProviderKind::SambaNova => ProviderId::SAMBANOVA,
         ProviderKind::Groq => ProviderId::GROQ,
         ProviderKind::Xai => ProviderId::XAI,
+        ProviderKind::OpenRouter => ProviderId::OPENROUTER,
+        ProviderKind::Gemini => ProviderId::GEMINI,
         ProviderKind::OpenAi | ProviderKind::OpenAiChatCompletions => ProviderId::OPENAI,
         ProviderKind::Anthropic => ProviderId::ANTHROPIC,
         ProviderKind::Azure { .. } => ProviderId::AZURE_OPENAI,
@@ -418,6 +427,7 @@ pub fn codex_models() -> Vec<ModelInfo> {
             id: m.id.to_string(),
             display_name: m.display_name.to_string(),
             capabilities: capabilities.clone(),
+            released_at: None,
             deprecated: false,
             replaced_by: None,
         })
@@ -446,6 +456,7 @@ pub fn codex_rejected_models() -> Vec<ModelInfo> {
             // Nothing is known about a model that cannot be called; the
             // conservative floor is the honest default.
             capabilities: Capabilities::default(),
+            released_at: None,
             deprecated: true,
             replaced_by: Some(
                 if id.contains("codex") {
@@ -535,6 +546,69 @@ impl ModelCatalogue {
         &self.entries
     }
 
+    /// Ask every configured provider what it serves, and merge the answers.
+    ///
+    /// §10 makes `Provider::models()` the runtime source for the providers that
+    /// publish a `/models` endpoint — which is all of them except Codex — and
+    /// [`ModelCatalogue::shipped`] deliberately hardcodes none of them, because
+    /// a baked-in list is a list that rots. Until this existed, `models()` had
+    /// **zero call sites** anywhere in the workspace, so the shipped Codex
+    /// entries were the entire catalogue and every other provider's models were
+    /// invisible to the picker and unpriced by the budget.
+    ///
+    /// Three properties, each of which is a failure mode if dropped:
+    ///
+    /// * **Per-provider timeout.** One unreachable endpoint must not hold the
+    ///   refresh open. A provider that times out contributes nothing and the
+    ///   rest still land.
+    /// * **Failures are not emptiness.** A provider whose call errors is
+    ///   skipped, not recorded as serving no models — [`ModelCatalogue::merge`]
+    ///   never deletes, so a failed refresh leaves the previous answer standing
+    ///   rather than emptying the picker mid-session.
+    /// * **Off the hot path.** Callers run this in the background; nothing here
+    ///   is on the §15 first-token budget.
+    pub async fn refresh_from(&mut self, registry: &ProviderRegistry, per_provider: Duration) {
+        for id in registry.ids() {
+            let Some(provider) = registry.get(&id) else {
+                continue;
+            };
+            match tokio::time::timeout(per_provider, provider.models()).await {
+                Ok(Ok(models)) if !models.is_empty() => self.merge(models),
+                Ok(Ok(_)) => {
+                    tracing::debug!(provider = %id, "provider publishes no model list");
+                }
+                Ok(Err(error)) => {
+                    tracing::debug!(provider = %id, %error, "model refresh failed; keeping catalogue");
+                }
+                Err(_) => {
+                    tracing::debug!(provider = %id, "model refresh timed out; keeping catalogue");
+                }
+            }
+        }
+    }
+
+    /// The catalogue as the engine's per-binding capability lookup.
+    ///
+    /// §10 puts capabilities on the *model*, not the provider, and
+    /// `Engine::capabilities_for` is written to honour that — but it reads from
+    /// a `BTreeMap` that nothing ever filled, so every lookup missed and fell
+    /// through to `provider.capabilities()`. For any provider that does not
+    /// override the default that is `Capabilities::default()`, whose
+    /// `max_context` is **8 192 tokens**: prompt assembly then derives its
+    /// budget from that figure and truncates a 200 k-context model's input to
+    /// a fraction of what it could have taken, silently and on every request.
+    ///
+    /// Deprecated entries are included deliberately. A retired id still needs
+    /// its real context window while `Resolution::Retired` is being explained
+    /// to the user, and omitting it would hand exactly those bindings the
+    /// 8 192-token floor.
+    pub fn capabilities_by_binding(&self) -> BTreeMap<(ProviderId, String), Capabilities> {
+        self.entries
+            .iter()
+            .map(|m| ((m.provider.clone(), m.id.clone()), m.capabilities.clone()))
+            .collect()
+    }
+
     /// Look a binding up.
     pub fn resolve(&self, binding: &ModelBinding) -> Resolution {
         match self
@@ -615,6 +689,7 @@ mod tests {
             id: id.to_string(),
             display_name: id.to_string(),
             capabilities: Capabilities::default(),
+            released_at: None,
             deprecated,
             replaced_by: replaced_by.map(str::to_string),
         }
@@ -824,6 +899,45 @@ mod tests {
         );
     }
 
+    /// The catalogue has to reach `Engine::capabilities_for` as a map, and for
+    /// a long time it did not — `EngineConfig.catalogue` was built as an empty
+    /// `BTreeMap`, so every lookup missed and fell back to the provider's
+    /// defaults.
+    ///
+    /// The cost was not theoretical. Codex serves a **272 000**-token context;
+    /// `Capabilities::default()` declares **8 192**. Prompt assembly derives its
+    /// budget from whatever it is handed, so every Codex request was being
+    /// truncated to three per cent of the window the model actually had, with
+    /// no error and nothing in the logs.
+    #[test]
+    fn the_shipped_catalogue_yields_real_context_windows_not_the_8k_floor() {
+        let map = ModelCatalogue::shipped().capabilities_by_binding();
+        assert!(
+            !map.is_empty(),
+            "an empty map is the bug this test exists for"
+        );
+
+        let key = (ProviderId::CODEX, "gpt-5.5".to_owned());
+        let caps = map.get(&key).expect("gpt-5.5 is a shipped Codex model");
+        assert_eq!(caps.max_context, 272_000);
+        assert!(
+            caps.max_context > Capabilities::default().max_context,
+            "a catalogue entry that matches the 8k floor is indistinguishable \
+             from no entry at all"
+        );
+
+        // Retired ids are present but carry the conservative floor, and that is
+        // correct rather than an oversight: `check_codex_model` refuses them in
+        // `for_binding` before a request is ever built, so their capabilities
+        // are never used to size a prompt. They are in the catalogue so
+        // `resolve` can name a successor, not so anything can be sent to them.
+        let retired = (ProviderId::CODEX, "gpt-5-codex".to_owned());
+        assert!(
+            map.contains_key(&retired),
+            "a retired id must still resolve, or the user gets an opaque 400"
+        );
+    }
+
     #[test]
     fn the_shipped_catalogue_explains_an_api_style_id_instead_of_letting_it_400() {
         let cat = ModelCatalogue::shipped();
@@ -953,6 +1067,129 @@ mod tests {
         async fn health(&self) -> Result<aibo_core::types::Health> {
             unreachable!()
         }
+    }
+
+    /// A provider whose `models()` behaves a chosen way, so the refresh's three
+    /// promises can each be tested against the one that would break it.
+    #[derive(Debug)]
+    struct Catalogued {
+        id: ProviderId,
+        behaviour: Behaviour,
+    }
+
+    #[derive(Debug, Clone)]
+    enum Behaviour {
+        Serves(Vec<String>),
+        Fails,
+        Hangs,
+    }
+
+    #[async_trait::async_trait]
+    impl Provider for Catalogued {
+        fn id(&self) -> ProviderId {
+            self.id.clone()
+        }
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+        async fn chat(
+            &self,
+            _req: aibo_core::types::ChatRequest,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> Result<aibo_core::types::BoxStream<'static, Result<aibo_core::types::StreamEvent>>>
+        {
+            unreachable!("the refresh never dispatches a completion")
+        }
+        async fn models(&self) -> Result<Vec<ModelInfo>> {
+            match &self.behaviour {
+                Behaviour::Serves(ids) => Ok(ids
+                    .iter()
+                    .map(|id| ModelInfo {
+                        provider: self.id.clone(),
+                        id: id.clone(),
+                        display_name: id.clone(),
+                        capabilities: Capabilities {
+                            max_context: 128_000,
+                            ..Capabilities::default()
+                        },
+                        released_at: None,
+                        deprecated: false,
+                        replaced_by: None,
+                    })
+                    .collect()),
+                Behaviour::Fails => Err(AiboError::NoProviderConfigured),
+                Behaviour::Hangs => {
+                    // Longer than any timeout the test will hand it.
+                    tokio::time::sleep(Duration::from_secs(3_600)).await;
+                    Ok(Vec::new())
+                }
+            }
+        }
+        async fn health(&self) -> Result<aibo_core::types::Health> {
+            unreachable!()
+        }
+    }
+
+    fn catalogued(id: ProviderId, behaviour: Behaviour) -> Arc<dyn Provider> {
+        Arc::new(Catalogued { id, behaviour })
+    }
+
+    /// One slow or broken provider must not cost the others their models, and
+    /// must not empty what the catalogue already knew.
+    ///
+    /// This is the whole reason the refresh does not simply `join_all` and
+    /// replace: a hung endpoint would hold the picker empty, and an errored one
+    /// would look identical to "serves nothing".
+    #[tokio::test(start_paused = true)]
+    async fn a_failing_provider_costs_only_its_own_models() {
+        let mut registry = ProviderRegistry::new();
+        registry.insert(
+            ProviderId::CEREBRAS,
+            catalogued(
+                ProviderId::CEREBRAS,
+                Behaviour::Serves(vec!["llama-3.3-70b".to_owned()]),
+            ),
+        );
+        registry.insert(
+            ProviderId::GROQ,
+            catalogued(ProviderId::GROQ, Behaviour::Fails),
+        );
+        registry.insert(
+            ProviderId::OPENAI,
+            catalogued(ProviderId::OPENAI, Behaviour::Hangs),
+        );
+
+        let mut catalogue = ModelCatalogue::shipped();
+        let shipped_before = catalogue.entries().len();
+        catalogue
+            .refresh_from(&registry, Duration::from_millis(100))
+            .await;
+
+        // The healthy provider's models arrived.
+        assert_eq!(
+            catalogue
+                .capabilities_by_binding()
+                .get(&(ProviderId::CEREBRAS, "llama-3.3-70b".to_owned()))
+                .map(|c| c.max_context),
+            Some(128_000)
+        );
+        // The failing and hanging ones contributed nothing, and destroyed
+        // nothing: every shipped Codex entry is still present.
+        assert!(catalogue.entries().len() > shipped_before);
+        assert!(
+            catalogue
+                .entries()
+                .iter()
+                .any(|e| e.provider == ProviderId::CODEX),
+            "a failed refresh must never empty the catalogue"
+        );
+        assert!(
+            !catalogue
+                .entries()
+                .iter()
+                .any(|e| e.provider == ProviderId::GROQ),
+            "an errored provider must not be recorded as serving models"
+        );
     }
 
     #[test]

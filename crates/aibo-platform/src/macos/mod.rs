@@ -54,8 +54,8 @@ use std::time::Duration;
 use aibo_core::error::Result;
 use aibo_core::traits::PlatformBackend;
 use aibo_core::types::{
-    AppInfo, AppRef, BoxStream, ClipboardItem, DisplayInfo, FieldContext, InsertMode, InsertTarget,
-    Permission, PermissionStatus, PowerEvent,
+    AppInfo, AppRef, BoxStream, ClipboardItem, DisplayInfo, DocumentBudget, DocumentText,
+    FieldContext, InsertMode, InsertTarget, Permission, PermissionStatus, PowerEvent,
 };
 use async_trait::async_trait;
 
@@ -193,6 +193,43 @@ impl PlatformBackend for MacosBackend {
             .await
         {
             Ok(text) => Ok(text),
+            Err(MacosError::Deadline(_)) => Ok(None),
+            Err(err) => Err(err.into_capture_error(&Self::identifier_of(&label))),
+        }
+    }
+
+    async fn read_document(
+        &self,
+        of: &AppRef,
+        budget: DocumentBudget,
+        timeout: Duration,
+    ) -> Result<Option<DocumentText>> {
+        let of = of.clone();
+        let label = of.clone();
+        match self
+            .thread
+            .call(timeout, move |w| w.read_document(&of, budget))
+            .await
+        {
+            Ok(document) => Ok(document),
+            // A document read that ran out of time is not a failure: the caller
+            // asked for as much as could be had inside the budget, and "none"
+            // is a truthful answer to that.
+            Err(MacosError::Deadline(_)) => Ok(None),
+            Err(err) => Err(err.into_capture_error(&Self::identifier_of(&label))),
+        }
+    }
+
+    async fn focused_element_id(&self, of: &AppRef, timeout: Duration) -> Result<Option<String>> {
+        let of = of.clone();
+        let label = of.clone();
+        match self
+            .thread
+            .call(timeout, move |w| w.focused_element_id(&of))
+            .await
+        {
+            Ok(id) => Ok(id),
+            // A deadline here weakens validation rather than breaking it.
             Err(MacosError::Deadline(_)) => Ok(None),
             Err(err) => Err(err.into_capture_error(&Self::identifier_of(&label))),
         }

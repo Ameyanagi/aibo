@@ -23,7 +23,6 @@
   },
   "store": false,
   "stream": true,
-  "temperature": 0.699999988079071,
   "tools": [
     {
       "description": "Read a file from the workspace.",
@@ -41,6 +40,5 @@
       },
       "type": "function"
     }
-  ],
-  "top_p": 0.949999988079071
+  ]
 }

@@ -11,7 +11,10 @@
 //! The forms themselves are per-section product work.
 
 use aibo_core::types::{Health, Permission, PermissionStatus, ProviderId, Role};
-use iced::widget::{Space, button, column, container, row, scrollable, text, text_editor};
+use iced::widget::{
+    Space, button, column, container, pick_list, row, rule, scrollable, text, text_editor,
+    text_input,
+};
 use iced::{Element, Length};
 use secrecy::{ExposeSecret as _, SecretString};
 
@@ -334,6 +337,207 @@ pub struct SettingsState {
     pub history_failed: bool,
     /// Newly generated recovery code. Kept redacted and shown only this run.
     pub recovery_code: Option<SecretString>,
+    /// The provider being added or edited, if any.
+    pub draft: Option<ProviderDraft>,
+}
+
+/// A key-based provider the user is part-way through configuring.
+///
+/// §12 keeps secrets out of `config.toml` and out of diagnostics. It cannot
+/// keep them out of a text field — a key has to be typed somewhere — so the
+/// rules here are narrower and enforced by construction: the field renders
+/// masked, the value is never logged and never rendered back after saving, and
+/// [`ProviderDraft::take_key`] moves it out and overwrites what is left rather
+/// than letting a `String` drop with the bytes still on the heap.
+#[derive(Clone, Default)]
+pub struct ProviderDraft {
+    /// Which backend.
+    pub backend: Backend,
+    /// Explicit id, for a second endpoint of a backend already configured.
+    pub id: String,
+    /// Base URL. Required for a custom endpoint.
+    pub base_url: String,
+    /// The API key, as typed.
+    key: String,
+}
+
+impl ProviderDraft {
+    /// Start a draft for `backend`.
+    pub fn new(backend: Backend) -> Self {
+        // Field-by-field rather than `..Self::default()`: `Drop` scrubs the
+        // key, and a type that implements `Drop` cannot be partially moved out
+        // of a temporary.
+        Self {
+            backend,
+            id: String::new(),
+            base_url: String::new(),
+            key: String::new(),
+        }
+    }
+
+    /// The typed key, for the text field to render.
+    ///
+    /// A password field has to be bound to the real value or editing it does
+    /// not work — `secure(true)` is what stops it being *displayed*. This is
+    /// the only reader, and it must stay that way: nothing may log this, put it
+    /// in a `Debug`, or copy it into another struct.
+    pub fn key_field(&self) -> &str {
+        &self.key
+    }
+
+    /// Replace the typed key, scrubbing the previous value.
+    pub fn set_key(&mut self, key: String) {
+        self.scrub_key();
+        self.key = key;
+    }
+
+    /// Move the key out, leaving nothing recoverable behind.
+    pub fn take_key(&mut self) -> SecretString {
+        let key = std::mem::take(&mut self.key);
+        let secret = SecretString::from(key.as_str().to_owned());
+        let mut leftover = key;
+        scrub(&mut leftover);
+        secret
+    }
+
+    fn scrub_key(&mut self) {
+        let mut old = std::mem::take(&mut self.key);
+        scrub(&mut old);
+    }
+
+    /// Whether this draft is complete enough to save.
+    pub fn is_saveable(&self) -> bool {
+        if self.key.trim().is_empty() {
+            return false;
+        }
+        // A custom endpoint is defined by its URL and needs a name to be
+        // addressed by; every other backend has both compiled in.
+        !(self.backend == Backend::Custom
+            && (self.base_url.trim().is_empty() || self.id.trim().is_empty()))
+    }
+}
+
+/// Redacts the key.
+///
+/// **Not `#[derive(Debug)]`, and a test enforces that.** The derive prints
+/// every field, so a draft that reached a `tracing` call, a panic message or
+/// §19's diagnostics bundle would carry the user's API key in clear text — the
+/// precise failure §12 exists to prevent, arriving through a line nobody would
+/// think to audit. Only the key's presence is ever worth reporting.
+impl std::fmt::Debug for ProviderDraft {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderDraft")
+            .field("backend", &self.backend)
+            .field("id", &self.id)
+            .field("base_url", &self.base_url)
+            .field(
+                "key",
+                &if self.key.is_empty() {
+                    "<empty>"
+                } else {
+                    "<redacted>"
+                },
+            )
+            .finish()
+    }
+}
+
+impl Drop for ProviderDraft {
+    fn drop(&mut self) {
+        self.scrub_key();
+    }
+}
+
+/// Overwrite a string's bytes in place before its allocation is released.
+///
+/// `String::clear` and `String::drop` both leave the original bytes in the
+/// freed allocation, where the next allocation of that size can read them.
+/// `zeroize` overwrites through a volatile write the optimiser is not allowed
+/// to elide — which a hand-rolled loop is, since writing to memory that is
+/// about to be freed is exactly the kind of store a compiler may drop.
+fn scrub(value: &mut String) {
+    use zeroize::Zeroize as _;
+    value.zeroize();
+}
+
+/// The key-based backends settings can configure.
+///
+/// Codex is absent deliberately: §3a authenticates it by device code, not by a
+/// key, and offering a key field for it would invite someone to paste an OpenAI
+/// API key into a flow that cannot use one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Backend {
+    /// OpenRouter: one key, many upstream vendors.
+    #[default]
+    OpenRouter,
+    /// Google Gemini, direct.
+    Gemini,
+    /// Anthropic native `messages`.
+    Anthropic,
+    /// OpenAI.
+    OpenAi,
+    /// Groq.
+    Groq,
+    /// Cerebras.
+    Cerebras,
+    /// xAI / Grok.
+    Xai,
+    /// Any other OpenAI-compatible endpoint — DeepSeek, Mistral, LM Studio,
+    /// llama.cpp, vLLM. §10 keeps the provider set open, which is why this is
+    /// a first-class choice rather than a hidden escape hatch.
+    Custom,
+}
+
+impl Backend {
+    /// Everything offerable, in the order the picker shows them.
+    pub const ALL: [Backend; 8] = [
+        Backend::OpenRouter,
+        Backend::Gemini,
+        Backend::Anthropic,
+        Backend::OpenAi,
+        Backend::Groq,
+        Backend::Cerebras,
+        Backend::Xai,
+        Backend::Custom,
+    ];
+
+    /// The `backend = "…"` value `config.toml` expects.
+    ///
+    /// These strings are the serde `kebab-case` spellings of
+    /// `aibo_session::Backend`; a mismatch here writes a config the loader
+    /// rejects, which is why a test asserts every one of them round-trips.
+    pub const fn config_value(self) -> &'static str {
+        match self {
+            Backend::OpenRouter => "open-router",
+            Backend::Gemini => "gemini",
+            Backend::Anthropic => "anthropic",
+            Backend::OpenAi => "open-ai",
+            Backend::Groq => "groq",
+            Backend::Cerebras => "cerebras",
+            Backend::Xai => "xai",
+            Backend::Custom => "custom",
+        }
+    }
+
+    /// Name for the picker. Not localised: these are product names.
+    pub const fn display_name(self) -> &'static str {
+        match self {
+            Backend::OpenRouter => "OpenRouter",
+            Backend::Gemini => "Google Gemini",
+            Backend::Anthropic => "Anthropic",
+            Backend::OpenAi => "OpenAI",
+            Backend::Groq => "Groq",
+            Backend::Cerebras => "Cerebras",
+            Backend::Xai => "xAI",
+            Backend::Custom => "OpenAI-compatible endpoint",
+        }
+    }
+}
+
+impl std::fmt::Display for Backend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.display_name())
+    }
 }
 
 impl SettingsState {
@@ -381,6 +585,20 @@ pub enum Message {
     Select(Section),
     /// Start the sign-in flow for a provider.
     SignIn(ProviderId),
+    /// Begin adding a provider, or switch which backend the draft is for.
+    DraftBackend(Backend),
+    /// Abandon the draft, scrubbing whatever key was typed.
+    DraftCancel,
+    /// The draft's id field changed.
+    DraftId(String),
+    /// The draft's base-URL field changed.
+    DraftBaseUrl(String),
+    /// The draft's key field changed.
+    DraftKey(String),
+    /// Save the draft: store the key, write the config entry, rebuild.
+    DraftSave,
+    /// Forget a configured provider.
+    ForgetProvider(ProviderId),
     /// Expand or collapse the detailed Codex sign-in explanation.
     ToggleCodexDetails,
     /// Open the OS privacy pane for a permission.
@@ -414,55 +632,77 @@ pub enum Message {
 
 /// Render the settings window.
 pub fn view(state: &SettingsState) -> Element<'_, Message> {
+    // `design.md` §7: "Sidebar on `ink-raised`, content on `ink`, one hairline
+    // between. No card borders anywhere; group with space and a single
+    // hairline." The sidebar shared the content's ground and had no separator,
+    // so the two regions read as one undifferentiated field with a floating
+    // selection box in it.
     let body = row![
         container(navigation(state))
             .width(Length::Fixed(180.0))
-            .padding(space(2.0)),
+            .height(Length::Fill)
+            .padding(space(2.0))
+            .style(theme::raised),
+        rule::vertical(1).style(theme::separator),
         container(scrollable(section_body(state)).style(theme::scroller))
             .width(Length::Fill)
             .padding(space(3.0)),
-    ]
-    .spacing(space(2.0));
+    ];
 
     container(body)
         .width(Length::Fill)
         .height(Length::Fill)
-        .padding(space(3.0))
         .style(theme::panel_surface)
         .into()
 }
 
+/// The section list (`design.md` §7).
+///
+/// §7: "The active sidebar item is marked by an amber rail segment — the
+/// identity element, reused, so the two windows read as one product." It was a
+/// filled amber box, which is the treatment §9 removes everywhere else; a
+/// settings window that boxes its selection while the panel draws a rail reads
+/// as two products stapled together.
+///
+/// The checkmark stays. §16 does not let selection depend on perceiving a
+/// colour, and a 3 pt bar is exactly the sort of cue that disappears for a
+/// colour-blind user or on a dim external display.
 fn navigation(state: &SettingsState) -> Element<'_, Message> {
-    let mut list = column![].spacing(space(1.0));
+    let mut list = column![];
     for section in Section::VISIBLE {
         let selected = section == state.section;
-        list = list.push(
-            button(
-                row![
-                    text(selection_marker(selected))
-                        .width(Length::Fixed(space(3.0)))
-                        .size(type_scale::META)
-                        .style(theme::text_primary),
-                    text(i18n::t(section.title()))
-                        .size(type_scale::BODY)
-                        .style(if selected {
-                            theme::text_primary
-                        } else {
-                            theme::text_dim
-                        }),
-                ]
-                .align_y(iced::Alignment::Center),
-            )
-            .width(Length::Fill)
-            .height(Length::Fixed(theme::MIN_HIT_TARGET))
-            .padding([space(1.5), space(2.0)])
-            .style(if selected {
-                theme::selected_button
+        let row = button(
+            row![
+                text(selection_marker(selected))
+                    .width(Length::Fixed(space(3.0)))
+                    .size(type_scale::META)
+                    .style(theme::text_primary),
+                text(i18n::t(section.title()))
+                    .size(type_scale::BODY)
+                    .style(if selected {
+                        theme::text_primary
+                    } else {
+                        theme::text_dim
+                    }),
+            ]
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .height(Length::Fixed(theme::MIN_HIT_TARGET))
+        .padding([space(1.5), space(2.0)])
+        .style(theme::action_button)
+        .on_press(Message::Select(section));
+
+        // The same `railed` the panel uses, so the amber segment means the same
+        // thing in both windows: this is where you are.
+        list = list.push(widgets::railed(
+            if selected {
+                widgets::RailState::Active
             } else {
-                theme::action_button
-            })
-            .on_press(Message::Select(section)),
-        );
+                widgets::RailState::Inactive
+            },
+            row,
+        ));
     }
     list.into()
 }
@@ -763,8 +1003,101 @@ fn providers(state: &SettingsState) -> Element<'_, Message> {
             .padding(space(2.0))
             .style(theme::raised),
         );
+
+        list = list.push(widgets::action_list(vec![
+            Action::new(
+                Key::ActionForgetProvider,
+                "⌫",
+                Message::ForgetProvider(provider.id.clone()),
+            )
+            .destructive(),
+        ]));
     }
+
+    list = list.push(provider_draft(state));
     list.into()
+}
+
+/// The add-a-provider form (§10, §17).
+///
+/// Until this existed, `config.toml` was the only way to add a provider and a
+/// credential file the only way to give it a key — so "configure a provider"
+/// meant "quit aibo and edit two files by hand", which §17 does not consider an
+/// onboarding flow.
+fn provider_draft(state: &SettingsState) -> Element<'_, Message> {
+    let Some(draft) = &state.draft else {
+        return widgets::action_list(vec![
+            Action::new(
+                Key::ActionAddProvider,
+                "⌘N",
+                Message::DraftBackend(Backend::default()),
+            )
+            .primary(),
+        ]);
+    };
+
+    let mut form = column![
+        text(i18n::t(Key::SettingsAddProvider))
+            .size(type_scale::HEADING)
+            .style(theme::text_primary),
+        pick_list(
+            &Backend::ALL[..],
+            Some(draft.backend),
+            Message::DraftBackend,
+        )
+        .text_size(type_scale::META)
+        .padding([space(1.0), space(1.5)])
+        .style(theme::model_picker)
+        .menu_style(theme::model_picker_menu),
+    ]
+    .spacing(space(2.0));
+
+    // A custom endpoint is the only one that needs to be told where it is, and
+    // the only one that needs a name — the rest are addressed by their backend.
+    if draft.backend == Backend::Custom {
+        form = form
+            .push(
+                text_input(i18n::t(Key::ProviderIdPlaceholder), &draft.id)
+                    .on_input(Message::DraftId)
+                    .size(type_scale::BODY)
+                    .font(theme::MONO_FONT)
+                    .padding([space(2.0), space(2.0)])
+                    .style(theme::field),
+            )
+            .push(
+                text_input(i18n::t(Key::ProviderBaseUrlPlaceholder), &draft.base_url)
+                    .on_input(Message::DraftBaseUrl)
+                    .size(type_scale::BODY)
+                    .font(theme::MONO_FONT)
+                    .padding([space(2.0), space(2.0)])
+                    .style(theme::field),
+            );
+    }
+
+    // `secure` is not cosmetic. A key pasted into a settings window sits on
+    // screen until the window closes, and these windows get screen-shared.
+    form = form.push(
+        text_input(i18n::t(Key::ProviderKeyPlaceholder), draft.key_field())
+            .on_input(Message::DraftKey)
+            .secure(true)
+            .size(type_scale::BODY)
+            .font(theme::MONO_FONT)
+            .padding([space(2.0), space(2.0)])
+            .style(theme::field),
+    );
+
+    let save = Action::new(Key::ActionSaveProvider, "⏎", Message::DraftSave).primary();
+    let save = if draft.is_saveable() {
+        save
+    } else {
+        save.disabled()
+    };
+    form = form.push(widgets::action_list(vec![
+        save,
+        Action::new(Key::ActionDismiss, "esc", Message::DraftCancel),
+    ]));
+
+    container(form).width(Length::Fill).into()
 }
 
 fn onboarding_steps(state: &SettingsState) -> Element<'_, Message> {
@@ -988,6 +1321,96 @@ pub const BINDABLE_ROLES: [Role; 5] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every backend the picker offers must be a spelling `config.toml`'s
+    /// loader accepts.
+    ///
+    /// This is the seam where a typo is invisible: the UI writes
+    /// `backend = "open-router"`, the write succeeds, the engine rebuild then
+    /// fails to parse the file, and the user sees a provider that vanishes
+    /// rather than an error. `aibo-ui` cannot depend on `aibo-session`, so the
+    /// spellings cannot be shared — which is exactly why they must be asserted.
+    #[test]
+    fn every_offered_backend_is_a_spelling_the_config_loader_accepts() {
+        // Kept in sync by hand with `aibo_session::Backend`'s serde
+        // `rename_all = "kebab-case"` derivation.
+        const ACCEPTED: &[&str] = &[
+            "cerebras",
+            "samba-nova",
+            "groq",
+            "xai",
+            "open-router",
+            "gemini",
+            "open-ai",
+            "open-ai-chat-completions",
+            "anthropic",
+            "azure",
+            "ollama",
+            "custom",
+        ];
+        for backend in Backend::ALL {
+            assert!(
+                ACCEPTED.contains(&backend.config_value()),
+                "{backend:?} writes backend = {:?}, which the loader would reject",
+                backend.config_value()
+            );
+        }
+    }
+
+    /// A draft is only saveable once it can actually produce a working
+    /// provider. §17: an action that is offered must work.
+    #[test]
+    fn a_custom_endpoint_needs_a_name_and_a_url_before_it_can_be_saved() {
+        let mut draft = ProviderDraft::new(Backend::Custom);
+        draft.set_key("sk-test".to_owned());
+        assert!(!draft.is_saveable(), "no name, no url");
+
+        draft.id = "deepseek".to_owned();
+        assert!(!draft.is_saveable(), "still no url");
+
+        draft.base_url = "https://api.deepseek.com/v1".to_owned();
+        assert!(draft.is_saveable());
+    }
+
+    /// A named backend has its URL compiled in, so a key alone is enough.
+    #[test]
+    fn a_known_backend_needs_only_a_key() {
+        let mut draft = ProviderDraft::new(Backend::OpenRouter);
+        assert!(
+            !draft.is_saveable(),
+            "a provider with no key is not saveable"
+        );
+        draft.set_key("sk-or-test".to_owned());
+        assert!(draft.is_saveable());
+    }
+
+    /// §12: taking the key must leave the draft holding nothing.
+    #[test]
+    fn taking_the_key_empties_the_draft() {
+        let mut draft = ProviderDraft::new(Backend::Groq);
+        draft.set_key("gsk-secret".to_owned());
+
+        let taken = draft.take_key();
+        assert_eq!(taken.expose_secret(), "gsk-secret");
+        assert!(draft.key_field().is_empty(), "the draft must not retain it");
+        assert!(
+            !draft.is_saveable(),
+            "and must not look saveable afterwards"
+        );
+    }
+
+    /// The key must not reach a log line through the type's own `Debug`.
+    #[test]
+    fn debug_output_never_contains_the_key() {
+        let mut draft = ProviderDraft::new(Backend::Anthropic);
+        draft.set_key("sk-ant-do-not-log-me".to_owned());
+        // `ProviderDraft` derives `Debug` for diagnostics, so this is the
+        // check that the derive was not the wrong call.
+        assert!(
+            !format!("{draft:?}").contains("do-not-log-me"),
+            "the key reached Debug output"
+        );
+    }
 
     #[test]
     fn the_information_architecture_matches_section_16() {

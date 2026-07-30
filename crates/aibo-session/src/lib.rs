@@ -84,7 +84,9 @@ pub mod trust;
 pub mod verb;
 
 pub use agent::{AgentEvent, AgentSink};
-pub use config::{Config, ConfigError, CredentialSource, EnvCredentials, NoCredentials};
+pub use config::{
+    Config, ConfigError, CredentialSource, EnvCredentials, NoCredentials, provider_id_for_backend,
+};
 pub use engine::{Engine, EngineConfig};
 pub use event::{
     Capture, Completion, EventSink, Outcome, PartialReason, SessionEvent, SkipReason, Submission,

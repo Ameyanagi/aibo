@@ -489,6 +489,13 @@ pub enum AuthStyle {
     AzureApiKey,
     /// `x-api-key: …` — Anthropic.
     XApiKey,
+    /// `x-goog-api-key: …` — the direct Gemini API.
+    ///
+    /// Google's own examples put the key in a `?key=` query parameter. That is
+    /// deliberately not what this does: query strings are logged by proxies,
+    /// retained in crash reports and echoed in error messages, and §12 keeps
+    /// credentials out of everything that gets written down.
+    GoogleApiKey,
     /// No credential is sent (Ollama / llama.cpp).
     None,
 }
@@ -526,6 +533,7 @@ pub async fn apply_credential(
         }
         (AuthStyle::AzureApiKey, Some(s)) => builder.header("api-key", s.expose_secret()),
         (AuthStyle::XApiKey, Some(s)) => builder.header("x-api-key", s.expose_secret()),
+        (AuthStyle::GoogleApiKey, Some(s)) => builder.header("x-goog-api-key", s.expose_secret()),
     })
 }
 

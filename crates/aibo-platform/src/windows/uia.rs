@@ -44,7 +44,7 @@
 
 use std::time::Instant;
 
-use aibo_core::types::{AppRef, FieldContext, InsertTarget, Rect};
+use aibo_core::types::{AppRef, DocumentBudget, DocumentText, FieldContext, InsertTarget, Rect};
 use tokio::sync::{mpsc, oneshot};
 use uiautomation::UIAutomation;
 use uiautomation::UIElement;
@@ -89,6 +89,12 @@ enum UiaOp {
     FocusedElementId {
         of: AppRef,
         reply: oneshot::Sender<WinResult<Option<String>>>,
+    },
+    /// The whole focused document, bounded (§8).
+    ReadDocument {
+        of: AppRef,
+        budget: DocumentBudget,
+        reply: oneshot::Sender<WinResult<Option<DocumentText>>>,
     },
     ValidateTarget {
         target: Box<InsertTarget>,
@@ -182,6 +188,25 @@ impl UiaHandle {
         rx.await.map_err(|_| WindowsPlatformError::UiaThreadGone)?
     }
 
+    /// The whole focused document inside `of`, bounded by `budget` (§8).
+    pub(crate) async fn read_document(
+        &self,
+        of: &AppRef,
+        budget: DocumentBudget,
+        deadline: Instant,
+    ) -> WinResult<Option<DocumentText>> {
+        let (reply, rx) = oneshot::channel();
+        self.submit(
+            deadline,
+            UiaOp::ReadDocument {
+                of: of.clone(),
+                budget,
+                reply,
+            },
+        )?;
+        rx.await.map_err(|_| WindowsPlatformError::UiaThreadGone)?
+    }
+
     /// Re-check everything that was true at capture time (§8).
     pub(crate) async fn validate_target(
         &self,
@@ -242,6 +267,9 @@ fn worker(mut rx: mpsc::Receiver<UiaJob>) {
             UiaOp::FocusedElementId { of, reply } => {
                 let _ = reply.send(focused_element_id(&automation, &of));
             }
+            UiaOp::ReadDocument { of, budget, reply } => {
+                let _ = reply.send(read_document(&automation, &of, budget));
+            }
             UiaOp::ValidateTarget { target, reply } => {
                 let _ = reply.send(validate_target(&automation, &target));
             }
@@ -265,6 +293,9 @@ fn drain_with_error(mut rx: mpsc::Receiver<UiaJob>, error: impl Fn() -> WindowsP
                 let _ = reply.send(Err(error()));
             }
             UiaOp::FocusedElementId { reply, .. } => {
+                let _ = reply.send(Err(error()));
+            }
+            UiaOp::ReadDocument { reply, .. } => {
                 let _ = reply.send(Err(error()));
             }
             UiaOp::ValidateTarget { reply, .. } => {
@@ -560,6 +591,74 @@ fn element_bounds(element: &UIElement) -> Option<Rect> {
         width: f64::from(r.get_right() - r.get_left()),
         height: f64::from(r.get_bottom() - r.get_top()),
     })
+}
+
+/// Read the whole focused document through `ITextProvider::DocumentRange`.
+///
+/// **This is the call that works where `GetCaretRange` does not.** §8 records
+/// that Chromium declares `ITextProvider2` but has no working `GetCaretRange`,
+/// which costs aibo caret-anchored context in Chrome, Edge, Electron, Slack and
+/// VS Code — the majority of the target surface. `DocumentRange` is on plain
+/// `ITextProvider`, which those same applications do implement, so a document
+/// read succeeds in exactly the places the caret read fails.
+///
+/// `budget.max_nodes` is unused here and that is not an oversight: UIA returns
+/// the document as one string rather than a tree to walk, so there are no nodes
+/// to count. The byte cap still applies, and it is applied to the *request*
+/// via `get_text`'s own limit rather than by truncating afterwards — asking for
+/// a bounded amount is cheaper than marshalling a whole log file across the
+/// process boundary and then discarding most of it.
+fn read_document(
+    automation: &UIAutomation,
+    of: &AppRef,
+    budget: DocumentBudget,
+) -> WinResult<Option<DocumentText>> {
+    let element = focused_in(automation, of)?;
+    let Ok(pattern) = text_pattern(&element) else {
+        // No text provider: a canvas, a game, a remote desktop session. Not a
+        // failure — this app simply cannot be read (§13).
+        return Ok(None);
+    };
+    let Ok(range) = pattern.get_document_range() else {
+        return Ok(None);
+    };
+    // One over the cap, so a document sitting exactly on the boundary is not
+    // reported as truncated.
+    let limit = i32::try_from(budget.max_bytes.saturating_add(1)).unwrap_or(i32::MAX);
+    let Ok(text) = range.get_text(limit) else {
+        return Ok(None);
+    };
+    if text.trim().is_empty() {
+        return Ok(None);
+    }
+    let truncated = text.len() > budget.max_bytes;
+    let text = if truncated {
+        text[..floor_char_boundary(&text, budget.max_bytes)].to_owned()
+    } else {
+        text
+    };
+    Ok(Some(DocumentText {
+        text,
+        truncated,
+        nodes_visited: 1,
+    }))
+}
+
+/// Largest char boundary at or below `index`.
+///
+/// `str::floor_char_boundary` is unstable, and slicing at an arbitrary byte
+/// offset panics mid-codepoint — which for a document read means the capture
+/// dies on the first multi-byte character near the cap, i.e. the CJK case §9
+/// says the product cannot afford to break.
+fn floor_char_boundary(text: &str, index: usize) -> usize {
+    if index >= text.len() {
+        return text.len();
+    }
+    let mut end = index;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    end
 }
 
 fn focused_element_id(automation: &UIAutomation, of: &AppRef) -> WinResult<Option<String>> {

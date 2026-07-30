@@ -150,6 +150,20 @@ pub fn announce_accessibility(message: &str) {
     crate::windows::overlay::announce_accessibility(message);
 }
 
+/// Make aibo the active application.
+///
+/// Returns whether the platform could do it. Only needed after an
+/// out-of-process capture takes activation away; see the macOS implementation
+/// for why this is not part of the ordinary show path.
+pub fn activate_self() -> bool {
+    #[cfg(target_os = "macos")]
+    return crate::macos::overlay::activate_self();
+    // Windows has no equivalent problem: the region picker there is in-process,
+    // and `WS_EX_TOOLWINDOW` panels take activation on show anyway (§8).
+    #[cfg(not(target_os = "macos"))]
+    false
+}
+
 fn wrong_handle(expected: &'static str, actual: RawWindowHandle) -> OverlayWindowError {
     OverlayWindowError::UnsupportedHandle {
         expected,

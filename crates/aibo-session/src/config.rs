@@ -197,6 +197,10 @@ pub enum Backend {
     Groq,
     /// xAI / Grok. Not Groq.
     Xai,
+    /// OpenRouter: one key fronting many upstream vendors.
+    OpenRouter,
+    /// Google Gemini on the direct Generative Language API.
+    Gemini,
     /// OpenAI on its native Responses format.
     OpenAi,
     /// OpenAI on Chat Completions, for deployments that need it.
@@ -211,6 +215,22 @@ pub enum Backend {
     Custom,
 }
 
+/// The [`ProviderId`] a `backend = "…"` string will be addressed by.
+///
+/// **The credential store must be keyed by this, not by the backend string.**
+/// The two differ for `open-ai`, `open-router` and `samba-nova` — serde's
+/// kebab-case spelling is not the provider's id — so storing a key under the
+/// backend name files it where nothing will ever look. `Config::build` then
+/// reports a missing credential and the provider is silently never constructed,
+/// which from the settings window looks like "saving did nothing".
+pub fn provider_id_for_backend(backend: &str) -> Option<ProviderId> {
+    let parsed: Backend = serde::Deserialize::deserialize(serde::de::IntoDeserializer::<
+        serde::de::value::Error,
+    >::into_deserializer(backend))
+    .ok()?;
+    Some(parsed.default_id())
+}
+
 impl Backend {
     fn default_id(self) -> ProviderId {
         match self {
@@ -218,6 +238,8 @@ impl Backend {
             Self::SambaNova => ProviderId::SAMBANOVA,
             Self::Groq => ProviderId::GROQ,
             Self::Xai => ProviderId::XAI,
+            Self::OpenRouter => ProviderId::OPENROUTER,
+            Self::Gemini => ProviderId::GEMINI,
             Self::OpenAi | Self::OpenAiChatCompletions => ProviderId::OPENAI,
             Self::Anthropic => ProviderId::ANTHROPIC,
             Self::Azure => ProviderId::AZURE_OPENAI,
@@ -469,6 +491,22 @@ pub struct Config {
 pub struct UiSettings {
     /// BCP-47 language tag. Unsupported tags fall back in the UI layer.
     pub language: Option<String>,
+    /// Let aibo switch on an application's accessibility tree so its content
+    /// can be read (§8, macOS only).
+    ///
+    /// Off by default, and that default is a judgement rather than caution for
+    /// its own sake. Chrome honours `AXEnhancedUserInterface` and Electron
+    /// honours `AXManualAccessibility`; §8 records that the Chrome flag "breaks
+    /// window positioning and makes resizing sluggish", so a tray utility
+    /// setting it unasked degrades an app the user did not consent to have
+    /// touched.
+    ///
+    /// Leaving it off has a cost the user should get to weigh: Chrome, Edge,
+    /// Slack, VS Code, Discord and every other Electron app return **no
+    /// context at all**. That is most of the surface this product is sold
+    /// into, which is why this is a setting and not a permanent no.
+    #[serde(default)]
+    pub allow_ax_tree_activation: bool,
 }
 
 impl Config {
@@ -528,6 +566,7 @@ impl Config {
         let mut registry = ProviderRegistry::new();
         let mut trust = TrustMap::new();
         let mut tiers = BTreeMap::new();
+        let mut failures: Vec<ConfigError> = Vec::new();
 
         for provider in &self.providers {
             let id = provider
@@ -554,11 +593,66 @@ impl Config {
                 tiers.insert(id.clone(), ProviderTier::new(tier.clone()));
             }
 
-            let spec = self.spec_for(provider, &id, credentials)?;
-            registry.insert(id, aibo_provider::registry::build(spec)?);
+            // **One bad provider must not take the others down with it.**
+            //
+            // These two `?`s used to propagate, and `Bootstrap::config` treats a
+            // failed build as "the configuration could not be applied" and
+            // hands back an *empty* registry. So a single `[[providers]]` entry
+            // whose key was missing disabled every other provider — including a
+            // signed-in Codex, which needs no key at all. Adding a provider and
+            // mistyping its key logged one line and silently unconfigured the
+            // product.
+            //
+            // §13 wants a misconfiguration to "show up in settings rather than
+            // on the first hotkey press", and §17's onboarding is built around
+            // per-provider state. Skipping the entry gives both: the working
+            // providers stay, and the broken one is absent from the registry,
+            // which is exactly what the settings row renders as unconfigured.
+            match self
+                .spec_for(provider, &id, credentials)
+                .and_then(|spec| aibo_provider::registry::build(spec).map_err(Into::into))
+            {
+                Ok(built) => {
+                    registry.insert(id, built);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        provider = %id,
+                        %error,
+                        "a provider could not be built; continuing with the others"
+                    );
+                    // Kept, not discarded: if it turns out *nothing* could be
+                    // built, this is the message the user needs — it names the
+                    // provider and the environment variable to set. Reported
+                    // below, once whether anything survived is known.
+                    failures.push(error);
+                }
+            }
         }
 
         let codex_authenticated = self.insert_codex(&mut registry, codex_tokens)?;
+
+        // **The rule, and why it is this one.**
+        //
+        // A provider that cannot be built must not disable the ones that can:
+        // `Bootstrap::config` falls back to an empty registry on error, so
+        // propagating unconditionally meant one `[[providers]]` entry with a
+        // missing key unconfigured the whole product — including a signed-in
+        // Codex, which needs no key at all. That was observed in the wild.
+        //
+        // But skipping unconditionally is also wrong. On a first run with a
+        // single misconfigured provider, the error is the *only* thing that
+        // tells the user which provider failed and which environment variable
+        // to set; swallowing it leaves an app that starts and does nothing.
+        //
+        // So: report the failure when nothing at all survived, and skip when
+        // something did. Checked after Codex is inserted, because Codex
+        // surviving is precisely the case that must not be sacrificed.
+        if registry.is_empty()
+            && let Some(error) = failures.into_iter().next()
+        {
+            return Err(error);
+        }
         let bindings = self.bindings(&registry, codex_authenticated)?;
 
         Ok((
@@ -582,7 +676,14 @@ impl Config {
                 },
                 trust,
                 tiers,
-                catalogue: BTreeMap::new(),
+                // The shipped half of §10's catalogue. A live
+                // `Provider::models()` refresh merges over this once the
+                // network has answered; until then these are the only per-model
+                // capabilities there are, and an empty map here means every
+                // binding silently inherits `Capabilities::default()` — an
+                // 8 192-token context window applied to models with twenty-five
+                // times that.
+                catalogue: aibo_provider::ModelCatalogue::shipped().capabilities_by_binding(),
                 do_verbs: aibo_core::router::DoVerbRegistry::builtin(),
                 max_payload_chars: self.max_payload_chars.unwrap_or(DEFAULT_MAX_PAYLOAD_CHARS),
                 request_deadline: self
@@ -652,6 +753,8 @@ impl Config {
             Backend::SambaNova => ProviderKind::SambaNova,
             Backend::Groq => ProviderKind::Groq,
             Backend::Xai => ProviderKind::Xai,
+            Backend::OpenRouter => ProviderKind::OpenRouter,
+            Backend::Gemini => ProviderKind::Gemini,
             Backend::OpenAi => ProviderKind::OpenAi,
             Backend::OpenAiChatCompletions => ProviderKind::OpenAiChatCompletions,
             Backend::Anthropic => ProviderKind::Anthropic,
@@ -830,6 +933,110 @@ fn parse_role(name: &str) -> Result<Role, ConfigError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// A provider that cannot be built must not disable the ones that can.
+    ///
+    /// `Bootstrap::config` treats a failed build as "the configuration could not
+    /// be applied" and falls back to an *empty* registry, so propagating here
+    /// meant one `[[providers]]` entry with a missing key unconfigured the whole
+    /// product — including a signed-in Codex, which needs no key at all.
+    /// Observed in the wild: adding an OpenAI key whose secret was filed under
+    /// the wrong account silently killed Codex.
+    #[test]
+    fn a_provider_with_no_credential_does_not_take_the_others_with_it() {
+        let config = Config::from_toml_str(
+            "[[providers]]\nbackend = \"groq\"\n\n[[providers]]\nbackend = \"open-ai\"\n",
+        )
+        .expect("valid toml");
+
+        // Only Groq has a key; OpenAI's is missing.
+        struct OnlyGroq;
+        impl CredentialSource for OnlyGroq {
+            fn api_key(&self, provider: &ProviderId) -> Option<secrecy::SecretString> {
+                (provider.as_str() == "groq")
+                    .then(|| secrecy::SecretString::from("gsk-test".to_owned()))
+            }
+        }
+
+        let (registry, _) = config
+            .build(&OnlyGroq, PriceTable::default())
+            .expect("the build must succeed despite one unbuildable provider");
+
+        let ids: Vec<String> = registry
+            .ids()
+            .iter()
+            .map(|id| id.as_str().to_owned())
+            .collect();
+        assert!(
+            ids.contains(&"groq".to_owned()),
+            "the working provider survives"
+        );
+        assert!(
+            !ids.contains(&"openai".to_owned()),
+            "the one with no credential is absent, which is what settings renders as unconfigured"
+        );
+    }
+
+    /// The other half of the rule: with nothing left standing, the error is the
+    /// only thing that tells a first-run user what to fix, so it must surface.
+    #[test]
+    fn a_lone_unbuildable_provider_still_reports_why() {
+        let config =
+            Config::from_toml_str("[[providers]]\nbackend = \"open-ai\"\n").expect("valid toml");
+
+        let error = config
+            .build(&NoCredentials, PriceTable::default())
+            .expect_err("nothing could be built, so the reason must reach the caller");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("AIBO_OPENAI_API_KEY"),
+            "the message must name the variable to set, got: {message}"
+        );
+    }
+
+    /// The credential store is keyed by [`ProviderId`], not by the
+    /// `backend = "…"` string, and for three backends those differ.
+    ///
+    /// Getting this wrong is silent in the worst way: the key is written, the
+    /// config entry is written, `Save` reports nothing amiss, and then
+    /// `Config::build` cannot find a credential for `openai` because the secret
+    /// was filed under `open-ai`. The provider is never constructed and the
+    /// settings window shows a row that does nothing.
+    #[test]
+    fn a_backend_string_maps_to_the_id_the_registry_uses() {
+        // The three that differ — the whole reason this function exists.
+        assert_eq!(
+            provider_id_for_backend("open-ai")
+                .as_ref()
+                .map(ProviderId::as_str),
+            Some("openai")
+        );
+        assert_eq!(
+            provider_id_for_backend("open-router")
+                .as_ref()
+                .map(ProviderId::as_str),
+            Some("openrouter")
+        );
+        assert_eq!(
+            provider_id_for_backend("samba-nova")
+                .as_ref()
+                .map(ProviderId::as_str),
+            Some("sambanova")
+        );
+
+        // And the ones that match, so a future rename cannot quietly break them.
+        for backend in ["anthropic", "groq", "cerebras", "xai", "gemini", "ollama"] {
+            assert_eq!(
+                provider_id_for_backend(backend)
+                    .as_ref()
+                    .map(ProviderId::as_str),
+                Some(backend),
+                "{backend} should address itself"
+            );
+        }
+
+        assert!(provider_id_for_backend("not-a-backend").is_none());
+    }
 
     struct FixedKey;
     impl CredentialSource for FixedKey {

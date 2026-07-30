@@ -26,6 +26,7 @@
 pub mod cerebras;
 pub mod groq;
 pub mod openai;
+pub mod openrouter;
 pub mod sambanova;
 pub mod xai;
 
@@ -218,6 +219,29 @@ impl Quirks {
             done_sentinel: false,
             reasoning_effort: true,
             json_schema: true,
+            // **No sampling parameters on the Responses wire.**
+            //
+            // Measured against the live endpoint on 2026-07-30: `gpt-5` on
+            // `/v1/responses` answers a request carrying `temperature` with
+            //
+            //     HTTP 400 — Unsupported parameter: 'temperature' is not
+            //     supported with this model.
+            //
+            // Reasoning models do not take sampling params, and the gpt-5 family
+            // is both the modern default and §4's `VISION_CHAIN` binding — so
+            // sending it broke every image request against OpenAI outright.
+            //
+            // The asymmetry decides it. Sending it is a hard 400, and §4 refuses
+            // to move a 4xx down the role chain, so the request simply dies.
+            // Omitting it costs §5's per-surface temperature (0.2 for Complete
+            // and Transform, 0.7 for Ask) on the models that *would* have
+            // honoured it, which is a quality nudge rather than a failure.
+            //
+            // `Quirks` is per provider, not per model, so this cannot yet be
+            // narrowed to "reasoning models only". The Codex path already
+            // disabled it for the same reason; this generalises that to the wire
+            // format where the constraint actually lives.
+            sampling_params: false,
             ..Self::chat_completions()
         }
     }
@@ -486,9 +510,11 @@ impl Provider for OpenAiCompat {
         Ok(body
             .data
             .into_iter()
+            .filter(|m| is_chat_model(&m.id))
             .map(|m| ModelInfo {
                 provider: self.id.clone(),
                 display_name: m.id.clone(),
+                released_at: m.created,
                 id: m.id,
                 // No provider in the §10 matrix returns capability information
                 // from `/models`. The authoritative values come from the signed
@@ -546,6 +572,10 @@ struct ModelsResponse {
 #[derive(Debug, Deserialize)]
 struct ModelEntry {
     id: String,
+    /// Unix timestamp. Present on OpenAI and most compatible endpoints; absent
+    /// ones sort last rather than pretending to be new.
+    #[serde(default)]
+    created: Option<u64>,
 }
 
 // ---------------------------------------------------------------------------
@@ -759,6 +789,41 @@ pub fn build_responses_body(req: &ChatRequest, q: &Quirks) -> Value {
     }
 
     body
+}
+
+/// Whether an id from `/models` names something aibo can hold a conversation
+/// with.
+///
+/// **A correctness filter, not a cosmetic one.** OpenAI's `/models` returns the
+/// whole account catalogue: of 125 entries measured on 2026-07-30, 45 were not
+/// chat models at all — embeddings, TTS, transcription, DALL·E, moderation,
+/// realtime, Sora, and the legacy `davinci-002`/`babbage-002` completions
+/// models. Offering `text-embedding-3-small` in a model picker is offering a
+/// row whose only possible outcome is a 400, and §17 treats an action that
+/// cannot work as worse than an absent one.
+///
+/// Gemini gets this for free: its `/models` reports
+/// `supportedGenerationMethods`, so `gemini.rs` filters on `generateContent`.
+/// The OpenAI-compatible endpoint publishes no capability field at all, so the
+/// id is the only signal available — hence a denylist of families rather than
+/// an allowlist of ids, which would go stale with every model release.
+fn is_chat_model(id: &str) -> bool {
+    const NOT_CHAT: [&str; 12] = [
+        "embedding",
+        "tts",
+        "whisper",
+        "transcribe",
+        "dall-e",
+        "moderation",
+        "realtime",
+        "sora",
+        "image",
+        "audio",
+        "davinci",
+        "babbage",
+    ];
+    let id = id.to_ascii_lowercase();
+    !NOT_CHAT.iter().any(|marker| id.contains(marker))
 }
 
 fn responses_message(msg: &Message) -> Value {
@@ -1281,6 +1346,9 @@ pub fn model(
         id: id.to_string(),
         display_name: display_name.to_string(),
         capabilities,
+        // A statically declared model carries no release date; the ordering
+        // falls back to the name, which is right for a short curated list.
+        released_at: None,
         deprecated: false,
         replaced_by: None,
     }
@@ -1294,6 +1362,54 @@ pub fn boxed(p: OpenAiCompat) -> Arc<dyn Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `/models` returns the whole account catalogue, not the chat models.
+    ///
+    /// Measured on 2026-07-30: 45 of OpenAI's 125 entries were embeddings, TTS,
+    /// transcription, image, moderation, realtime, Sora or legacy completions.
+    /// Every one of them in a model picker is a row whose only outcome is a 400.
+    #[test]
+    fn the_model_list_excludes_everything_that_is_not_a_chat_model() {
+        for id in [
+            "text-embedding-3-small",
+            "text-embedding-ada-002",
+            "tts-1-hd",
+            "whisper-1",
+            "gpt-4o-transcribe",
+            "gpt-transcribe",
+            "dall-e-3",
+            "omni-moderation-latest",
+            "gpt-realtime",
+            "gpt-4o-realtime-preview",
+            "sora-2-pro",
+            "davinci-002",
+            "babbage-002",
+            "gpt-image-1",
+            "gpt-4o-audio-preview",
+        ] {
+            assert!(!is_chat_model(id), "{id} is not a chat model");
+        }
+    }
+
+    /// And it keeps the ones that are — including the reasoning families, whose
+    /// ids share no common prefix with the gpt line.
+    #[test]
+    fn the_model_list_keeps_the_chat_models() {
+        for id in [
+            "gpt-5",
+            "gpt-5-mini",
+            "gpt-5.6-sol",
+            "gpt-4o",
+            "chatgpt-4o-latest",
+            "o3",
+            "o4-mini",
+            "claude-sonnet-4-5",
+            "llama-3.3-70b",
+            "deepseek-chat",
+        ] {
+            assert!(is_chat_model(id), "{id} is a chat model");
+        }
+    }
     use futures_util::StreamExt as _;
 
     fn base() -> Url {

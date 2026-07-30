@@ -225,6 +225,7 @@ impl Provider for Anthropic {
                 display_name: e.display_name.unwrap_or_else(|| e.id.clone()),
                 id: e.id,
                 capabilities: self.capabilities.clone(),
+                released_at: None,
                 deprecated: false,
                 replaced_by: None,
             })
