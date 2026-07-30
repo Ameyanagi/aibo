@@ -725,8 +725,32 @@ impl Aibo {
         }
     }
 
+    /// Reopen the panel on the conversation it was last showing.
+    ///
+    /// The hotkey used to discard the session every time, so dismissing the
+    /// panel to look something up lost the thread — the one thing a person
+    /// reliably wants back. Continuing is now the default and the session id is
+    /// kept, which is what makes it work: the backend holds the history against
+    /// that id, so reusing it *is* the continuation.
+    ///
+    /// A fresh start still happens whenever new context arrives, because that
+    /// is a different question rather than a follow-up: a selection (see the
+    /// `UiEvent::Context` arm) or a screen capture. `⌘N` forces one on demand.
+    fn resume_panel_session(&mut self) {
+        // §13 unchanged: reopening mid-stream cancels the request. What is
+        // dropped is the in-flight answer, not the conversation above it.
+        if matches!(self.panel.phase, Phase::Loading | Phase::Streaming) {
+            self.send(UiRequest::Cancel {
+                session: self.panel.session,
+            });
+        }
+        self.panel.phase = Phase::Idle;
+        let session = self.panel.session;
+        self.send(UiRequest::CaptureContext { session });
+    }
+
     fn open_panel(&mut self) -> Task<Message> {
-        self.begin_panel_session();
+        self.resume_panel_session();
         self.present_panel()
     }
 
@@ -2129,8 +2153,23 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             if session != state.panel.session {
                 return Task::none();
             }
-            state.panel.clipboard = clipboard_offer(clipboard.as_deref());
             let selection = selection.filter(|text| !text.is_empty());
+
+            // A selection is a new question, not a follow-up to the last one.
+            // Reopening the panel keeps the conversation
+            // ([`Aibo::resume_panel_session`]); arriving with text selected
+            // discards it, because the alternative is asking about this
+            // selection with an unrelated exchange still above it and in the
+            // model's history.
+            if selection.is_some() && state.panel.has_conversation() {
+                state.begin_panel_session();
+                // `begin_panel_session` re-requests context against the new
+                // id, so this event now belongs to a session that is gone.
+                // Letting it fall through would file the selection under the
+                // old conversation it just replaced.
+                return resize_panel_if_visible(state);
+            }
+            state.panel.clipboard = clipboard_offer(clipboard.as_deref());
             state.panel.context = match field.as_deref() {
                 // §9: while composing, aibo neither reads nor inserts.
                 Some(field) if field.ime_active => ContextState::ImeActive,
@@ -3495,8 +3534,12 @@ mod tests {
         ));
     }
 
+    /// The hotkey used to discard the session every time, so dismissing the
+    /// panel to look something up lost the thread. Reusing the id is what makes
+    /// continuation work — the backend holds the history against it — so a
+    /// `DiscardSession` here would silently break the feature.
     #[test]
-    fn resetting_the_panel_discards_the_previous_session() {
+    fn reopening_the_panel_continues_the_previous_conversation() {
         let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
         let (mut state, _boot) = boot(UiConfig::default(), requests);
         let previous = state.panel.session;
@@ -3504,13 +3547,61 @@ mod tests {
         let _ = state.open_panel();
         assert!(matches!(
             events.try_recv(),
-            Ok(UiRequest::DiscardSession { session }) if session == previous
+            Ok(UiRequest::CaptureContext { session }) if session == previous
         ));
+        assert_eq!(state.panel.session, previous, "same session, same history");
+    }
+
+    /// An explicit new (`⌘N`) and a screen capture both go through
+    /// `begin_panel_session`, which must still throw the old one away.
+    #[test]
+    fn asking_for_a_new_session_still_discards_the_previous_one() {
+        let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _boot) = boot(UiConfig::default(), requests);
+        let previous = state.panel.session;
+
+        state.begin_panel_session();
         assert!(matches!(
             events.try_recv(),
-            Ok(UiRequest::CaptureContext { .. })
+            Ok(UiRequest::DiscardSession { session }) if session == previous
         ));
         assert_ne!(state.panel.session, previous);
+    }
+
+    /// Arriving with text selected is a new question. Answering it with an
+    /// unrelated exchange still above it — and still in the model's history —
+    /// is the case this rule exists for.
+    #[test]
+    fn a_selection_starts_a_new_conversation_but_an_empty_context_does_not() {
+        let mut state = app();
+        state.panel.active_user = Some("what is this".to_owned());
+        assert!(state.panel.has_conversation());
+        let before = state.panel.session;
+
+        let _ = backend_update(&mut state, context_with_selection(before, None));
+        assert_eq!(
+            state.panel.session, before,
+            "nothing selected: this is a follow-up"
+        );
+
+        let _ = backend_update(
+            &mut state,
+            context_with_selection(before, Some("fn main() {}")),
+        );
+        assert_ne!(
+            state.panel.session, before,
+            "a selection is a new question, not a follow-up"
+        );
+    }
+
+    fn context_with_selection(session: SessionId, selection: Option<&str>) -> UiEvent {
+        UiEvent::Context {
+            session,
+            app: None,
+            field: None,
+            selection: selection.map(str::to_owned),
+            clipboard: None,
+        }
     }
 
     #[test]
