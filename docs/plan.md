@@ -2019,7 +2019,12 @@ is what makes the product worth buying on day one.
    Windows implementation stays additive rather than a rewrite. Worth
    reconsidering the lock, given that Windows also carries the nastier stories
    (UIPI, no `ITextProvider2` in Chromium, `WS_EX_NOACTIVATE`).
-2. Cut tier-1 sandboxed code execution — also fixes the binary budget.
+2. Cut tier-1 sandboxed code execution. **No longer a size lever**: measured
+   2026-07-30, `wasmtime` is not linked in the shipped binary at all —
+   `aibo-tools` declares it `optional` behind the `python` feature and is
+   depended on with `default = []`, so the tier already costs nothing. Cut it
+   for scope if scope is the reason; the 26.6 MB Windows binary is inside
+   both the 60 MB budget and the 40 MB stretch either way.
 3. Cut the native agent loop; Codex-only **Do**.
 4. Cut Bedrock and Vertex to v1.1, keeping Azure as the single "secure" option.
 5. Cut the direct Codex endpoint (§3a) if S6 comes back negative. Device-code
