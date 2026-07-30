@@ -1,0 +1,234 @@
+# Build the binaries and attach them to a GitHub Release.
+#
+# **This is not §19.** §19 wants a Developer ID signed, notarised DMG and an
+# Authenticode signed MSI, and puts both in P8. Nothing here is signed, so
+# Gatekeeper and SmartScreen will object on first run — that is expected, and the
+# release notes say so rather than leaving someone to guess whether the download
+# is broken.
+#
+# What it is for: getting a build onto a Windows machine to test. Two ways in:
+#
+#   * Push a tag — `git tag v0.1.0-beta.1 && git push origin v0.1.0-beta.1`.
+#     Produces a release named after the tag. Any tag containing `-` is marked
+#     prerelease, so `v0.1.0-beta.1` cannot be mistaken for `v0.1.0`.
+#   * Run it from the Actions tab. Produces a rolling `dev` prerelease that is
+#     replaced each time, so the download URL stays put:
+#     https://github.com/<owner>/<repo>/releases/tag/dev
+#
+# CI already builds both targets on every push. This exists because an artifact
+# from a workflow run needs a GitHub login and expires in 14 days, which makes it
+# useless for handing a build to a tester.
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+# Read-only by default; only `publish` gets `contents: write`.
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  build:
+    name: Build ${{ matrix.name }}
+    strategy:
+      # Both platforms are reported even if one fails to link, so a Windows-only
+      # break does not hide whether macOS still builds.
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows
+            os: windows-2022
+            binary: target/release/aibo.exe
+            # Shipped as a bare `.exe`: the entire point is that a tester can
+            # download it and double-click. A zip would add an extraction step
+            # and buys nothing — Windows applies Mark-of-the-Web to either.
+            asset: aibo-windows-x86_64.exe
+          - name: macOS
+            os: macos-14
+            binary: target/release/aibo
+            # Shipped as a tarball, unlike Windows, because a bare download
+            # loses the executable bit and `tar` preserves it. A raw file that
+            # needs `chmod +x` before it will start reads as a broken build.
+            asset: aibo-macos-aarch64.tar.gz
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+        with:
+          key: release-${{ matrix.os }}
+
+      - name: Build the release binary
+        run: cargo build --release --bin aibo --locked
+
+      # `--locked` above is the load-bearing flag: a release built from a
+      # resolver that quietly picked different versions is not the thing CI
+      # tested.
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          case "${{ matrix.asset }}" in
+            *.tar.gz)
+              # -C so the archive holds `aibo`, not `target/release/aibo`.
+              tar -czf "dist/${{ matrix.asset }}" -C "$(dirname '${{ matrix.binary }}')" \
+                "$(basename '${{ matrix.binary }}')"
+              ;;
+            *)
+              cp "${{ matrix.binary }}" "dist/${{ matrix.asset }}"
+              ;;
+          esac
+
+      # Nothing is signed, so a checksum is the only integrity claim a tester
+      # can actually check. Cheap to produce and worth having.
+      - name: Checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd dist
+          if command -v sha256sum >/dev/null; then
+            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          else
+            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
+          fi
+          cat "${{ matrix.asset }}.sha256"
+
+      # §15 budgets the shipped binary at 25 MB. Reported, not enforced: Windows
+      # measured 27 MB on the first real link and §21's second lever ("cut tier-1
+      # sandboxed code execution") names the cause. Failing here would block a
+      # test build behind a scope decision.
+      - name: Report the binary size against the §15 budget
+        shell: bash
+        run: |
+          size=$(wc -c < "${{ matrix.binary }}")
+          mb=$(( size / 1048576 ))
+          echo "### ${{ matrix.name }}: ${mb} MB (§15 budget: 25 MB)" >> "$GITHUB_STEP_SUMMARY"
+          if [ "$mb" -gt 25 ]; then
+            echo ":warning: over the §15 budget by $(( mb - 25 )) MB" >> "$GITHUB_STEP_SUMMARY"
+          fi
+
+      - name: Upload for the publish job
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: release-${{ matrix.asset }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish the release
+    needs: build
+    runs-on: ubuntu-24.04
+    # The only job that can write to the repository, and the only reason this
+    # workflow needs more than read.
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+
+      - name: Collect the built assets
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: dist
+
+      - name: Work out what is being released
+        id: target
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            tag="${{ github.ref_name }}"
+            # A tag with a hyphen is a prerelease by semver convention, so
+            # `v0.1.0-beta.1` cannot be mistaken for `v0.1.0` in the releases
+            # list.
+            case "$tag" in
+              *-*) prerelease=true ;;
+              *)   prerelease=false ;;
+            esac
+          else
+            # Manual runs go to one rolling release so the download URL is
+            # stable for whoever is testing.
+            tag=dev
+            prerelease=true
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+
+      - name: Write the release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          {
+            echo "Built from \`${{ github.sha }}\`."
+            echo
+            echo "## Unsigned"
+            echo
+            echo "These binaries are **not code-signed or notarised** (§19 puts that in P8)."
+            echo "That is expected, not a broken download:"
+            echo
+            echo "* **Windows** shows a SmartScreen warning. More info → Run anyway."
+            echo "* **macOS** is blocked by Gatekeeper. Open it once from"
+            echo "  System Settings → Privacy & Security → Open Anyway,"
+            echo "  or clear the quarantine flag:"
+            echo '  `xattr -d com.apple.quarantine ./aibo`'
+            echo
+            echo "Verify what you downloaded against the \`.sha256\` file beside it."
+            echo
+            echo "## First run"
+            echo
+            echo "aibo needs Accessibility permission to read the focused field and"
+            echo "insert text (§8), and no provider is configured until you add one."
+            echo "Open the tray icon → Settings to sign in with ChatGPT or paste an"
+            echo "API key. The hotkey is \`Alt+Space\` (\`⌥Space\` on macOS)."
+          } > notes.md
+          cat notes.md
+
+      # `gh` rather than a third-party release action: it is preinstalled, and it
+      # is one fewer thing with write access to the repository.
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.target.outputs.tag }}
+          PRERELEASE: ${{ steps.target.outputs.prerelease }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -la dist
+
+          flags=(--title "$TAG" --notes-file notes.md)
+          if [ "$PRERELEASE" = "true" ]; then
+            flags+=(--prerelease)
+          fi
+
+          if [ "$TAG" = "dev" ] && gh release view "$TAG" >/dev/null 2>&1; then
+            # Deleted and recreated rather than edited, because `gh release edit`
+            # cannot move a tag: editing in place would leave `dev` pointing at
+            # whatever commit it was first cut from while serving assets built
+            # from a newer one. The URL is unchanged either way — it is keyed on
+            # the tag name, not the release id.
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # A real version tag already exists: add to it, never replace it.
+            # Deleting a published release breaks anyone who has the link.
+            gh release upload "$TAG" dist/* --clobber
+          else
+            gh release create "$TAG" dist/* "${flags[@]}" --target "${{ github.sha }}"
+          fi
+
+          echo "### Released [$TAG]($(gh release view "$TAG" --json url --jq .url))" \
+            >> "$GITHUB_STEP_SUMMARY"
