@@ -69,7 +69,19 @@ zeroize = "1"                        # §12
 keyring = "4.1"                      # §8 [plan note: 4.x is a facade over keyring-core]
 
 # --- network / providers ----------------------------------------------------
-reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "gzip"] }
+# `rustls-tls-native-roots` is not optional in an enterprise network, and its
+# absence is what made every request fail behind a TLS-inspecting proxy.
+# `rustls-tls` alone trusts **webpki-roots** — a Mozilla CA bundle compiled into
+# the binary — and never consults the OS trust store. Zscaler, Netskope and every
+# other inspecting proxy terminate TLS and re-sign with a private root that IT
+# installed *into that store*, so the browser trusts it and aibo cannot even see
+# it. The handshake fails, `is_connect()` is true, and §13 reports "offline" on a
+# machine that is plainly online.
+#
+# Both are enabled: native roots so a corporate root is honoured, and the
+# built-ins retained (see `tls_built_in_root_certs` in `http.rs`) so a machine
+# with an unreadable or empty store still works.
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls", "rustls-tls-native-roots", "gzip"] }
 eventsource-stream = "0.2"
 http = "1"
 base64 = "0.22"

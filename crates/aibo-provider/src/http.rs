@@ -86,6 +86,11 @@ pub fn build_client(cfg: &HttpConfig) -> Result<Client> {
         .pool_idle_timeout(cfg.pool_idle_timeout)
         .pool_max_idle_per_host(cfg.pool_max_idle_per_host)
         .https_only(cfg.https_only)
+        // Keep the compiled-in Mozilla roots *as well as* the OS store, which
+        // the `rustls-tls-native-roots` feature adds. Native-only would trade
+        // one failure for another: a machine whose store is empty or
+        // unreadable would then trust nothing at all.
+        .tls_built_in_root_certs(true)
         .tcp_nodelay(true)
         .build()
         .map_err(|e| AiboError::Internal(Box::new(e)))
@@ -121,6 +126,21 @@ pub async fn prewarm(client: &Client, url: &Url) {
 /// Offline is inferred from connect failures, never from a reachability API,
 /// and is per-provider — the caller applies the hysteresis.
 pub fn map_transport_error(provider: &ProviderId, err: &reqwest::Error) -> AiboError {
+    // The classification below is deliberately coarse, and that coarseness cost
+    // a real debugging session: a TLS handshake rejected because a corporate
+    // root was not trusted arrives here as `is_connect()`, becomes `Offline`,
+    // and surfaces as "offline" on a machine with working internet. `Offline`
+    // is a unit variant with nowhere to carry why, so the reason is logged with
+    // its full source chain instead of being discarded.
+    let mut chain = err.to_string();
+    let mut source = std::error::Error::source(err);
+    while let Some(cause) = source {
+        chain.push_str(": ");
+        chain.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    tracing::warn!(provider = %provider.as_str(), error = %chain, "transport failure");
+
     if err.is_timeout() {
         let phase = if err.is_connect() {
             TimeoutPhase::Connect
