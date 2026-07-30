@@ -1661,14 +1661,29 @@ fn lane_column(state: &PanelState) -> Element<'_, Message> {
         let active = *lane == state.picker.lane;
         list = list.push(
             container(
-                text(crate::model_picker::lane_label(lane))
-                    .size(type_scale::META)
-                    .font(theme::MONO_FONT)
-                    .style(if active {
-                        theme::text_accent
-                    } else {
-                        theme::text_dim
-                    }),
+                row![
+                    match lane {
+                        crate::model_picker::Lane::Named(p) =>
+                            widgets::mark(crate::model_picker::provider_mark(p), active),
+                        // `all` and `pinned` are not providers, so they get no
+                        // mark — but they keep the column, or the provider
+                        // labels below would sit at a different x.
+                        _ => Space::new()
+                            .width(widgets::MARK_SIZE)
+                            .height(widgets::MARK_SIZE)
+                            .into(),
+                    },
+                    text(crate::model_picker::lane_label(lane))
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(if active {
+                            theme::text_accent
+                        } else {
+                            theme::text_dim
+                        }),
+                ]
+                .spacing(space(0.75))
+                .align_y(Alignment::Center),
             )
             .padding([space(0.75), space(1.0)])
             .width(Length::Fill)
@@ -1680,7 +1695,7 @@ fn lane_column(state: &PanelState) -> Element<'_, Message> {
         );
     }
     container(list)
-        .width(Length::Fixed(104.0))
+        .width(Length::Fixed(132.0))
         .padding(iced::Padding {
             top: 0.0,
             right: space(1.0),
@@ -1713,7 +1728,23 @@ fn model_row<'a>(
     show_provider: bool,
     highlighted: bool,
 ) -> Element<'a, Message> {
-    let mut name = row![
+    // The mark carries the provider when no heading above does. It occupies
+    // the column either way, so names stay aligned down the whole list —
+    // pinned rows and grouped rows included.
+    let identity: Element<'a, Message> = if show_provider {
+        widgets::mark(
+            crate::model_picker::provider_mark(option.binding.provider.as_str()),
+            highlighted,
+        )
+    } else {
+        Space::new()
+            .width(widgets::MARK_SIZE)
+            .height(widgets::MARK_SIZE)
+            .into()
+    };
+
+    let name = row![
+        identity,
         text(option.display_name.clone())
             .size(type_scale::ANSWER)
             .style(if highlighted {
@@ -1724,15 +1755,6 @@ fn model_row<'a>(
     ]
     .spacing(space(1.0))
     .align_y(Alignment::Center);
-
-    if show_provider {
-        name = name.push(
-            text(option.binding.provider.as_str().to_owned())
-                .size(type_scale::META)
-                .font(theme::MONO_FONT)
-                .style(theme::text_dim),
-        );
-    }
 
     // The right-hand column, built in fixed widths so it aligns across rows
     // even when a model reports no latency or no price.

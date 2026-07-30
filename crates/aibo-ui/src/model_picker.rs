@@ -83,6 +83,44 @@ impl Item for ModelOption {
     }
 }
 
+/// The two-letter mark for a provider.
+///
+/// Initials alone collide badly — three providers begin with `o`, two each with
+/// `c`, `g` and `a` — and a column where `openai` and `openrouter` look
+/// identical is worse than the words it replaced. Two letters separate all
+/// thirteen.
+///
+/// Table rather than derivation, because the useful second letter is not
+/// mechanical: `groq` wants its `q`, `cerebras` its `b`, `xai` its `a`. The
+/// fallback keeps an unrecognised provider — a custom OpenAI-compatible
+/// endpoint (§10) — showing something rather than nothing.
+pub fn provider_mark(provider: &str) -> String {
+    match provider {
+        "codex" => "CX",
+        "openai" => "OA",
+        "openrouter" => "OR",
+        "ollama" => "OL",
+        "gemini" => "GE",
+        "groq" => "GQ",
+        "anthropic" => "AN",
+        "azure-openai" => "AZ",
+        "cerebras" => "CB",
+        "sambanova" => "SN",
+        "xai" => "XA",
+        "vertex" => "VX",
+        "bedrock" => "BR",
+        other => {
+            return other
+                .chars()
+                .filter(|c| c.is_alphanumeric())
+                .take(2)
+                .collect::<String>()
+                .to_uppercase();
+        }
+    }
+    .to_owned()
+}
+
 /// The label shown in the lane column.
 ///
 /// t3's equivalent is a rail of vendor icons. This is the same affordance in
@@ -226,6 +264,46 @@ pub fn selectable(rows: &[Row]) -> Vec<&ModelOption> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The entire reason the marks are a table and not `provider[..2]`: three
+    /// providers begin with `o`, and a column where `openai` and `openrouter`
+    /// look the same is worse than the words it replaced.
+    #[test]
+    fn every_provider_mark_is_distinct() {
+        let providers = [
+            "codex",
+            "openai",
+            "openrouter",
+            "ollama",
+            "gemini",
+            "groq",
+            "anthropic",
+            "azure-openai",
+            "cerebras",
+            "sambanova",
+            "xai",
+            "vertex",
+            "bedrock",
+        ];
+        let mut marks: Vec<String> = providers.iter().map(|p| provider_mark(p)).collect();
+        let count = marks.len();
+        marks.sort();
+        marks.dedup();
+        assert_eq!(marks.len(), count, "two providers share a mark: {marks:?}");
+        assert!(
+            marks.iter().all(|m| m.chars().count() == 2),
+            "the column only aligns if every mark is the same width: {marks:?}"
+        );
+    }
+
+    /// A custom OpenAI-compatible endpoint (§10) is not in the table and must
+    /// still get a mark, or its rows lose the column entirely.
+    #[test]
+    fn an_unknown_provider_still_gets_a_two_letter_mark() {
+        assert_eq!(provider_mark("my-llama-box"), "MY");
+        assert_eq!(provider_mark("z"), "Z");
+    }
+
     use aibo_core::types::ProviderId;
 
     fn option(provider: &str, model: &str) -> ModelOption {

@@ -131,6 +131,65 @@ pub fn railed_with<'a, Message: 'a>(
     .into()
 }
 
+/// A small square identity mark — the picker's provider column (§16).
+///
+/// **Why letterforms and not vendor logos.** `design.md` §9 cut icons on the
+/// grounds that "the rail plus a key hint carries every meaning an icon would",
+/// and for *state* that holds: an amber rail says "here" better than any glyph.
+/// Identity is the case it does not cover. Thirteen providers down a list are a
+/// thing you recognise, not a thing you read, and a column of dim lowercase
+/// words is the slowest possible way to present it.
+///
+/// Real logos would be faster still, and are deliberately not used:
+///
+/// * They are other people's trademarks, and aibo would be redistributing the
+///   artwork in a signed binary (§19) — a licence question per vendor, for a
+///   decoration.
+/// * Drawn from memory they come out subtly wrong, and a mangled logo reads as
+///   a broken build.
+/// * A logo carries brand colour, and the palette has seven values on purpose.
+///
+/// So: two letters, mono, in a filled tile. Nothing to learn — `OR` beside
+/// `OA` is unambiguous at a glance in a way an unlabelled pair of glyphs is
+/// not — and it stays inside the palette. If licensed marks ever ship, they
+/// drop in behind this same call.
+///
+/// `on_raised` inverts the fill. The tile is one elevation step from whatever
+/// it sits on: raised against the ground, inset against a highlighted row.
+/// Without the inversion the mark disappears into exactly the row the user is
+/// looking at.
+pub fn mark<'a, Message: 'a>(label: impl Into<String>, on_raised: bool) -> Element<'a, Message> {
+    container(
+        iced::widget::text(label.into())
+            .size(theme::type_scale::CHIP)
+            .font(theme::MONO_FONT)
+            .style(if on_raised {
+                theme::text_primary
+            } else {
+                theme::text_dim
+            })
+            .align_x(Alignment::Center),
+    )
+    .width(Length::Fixed(MARK_SIZE))
+    .height(Length::Fixed(MARK_SIZE))
+    .align_x(Alignment::Center)
+    .align_y(Alignment::Center)
+    .style(move |t: &iced::Theme| {
+        if on_raised {
+            theme::inset(t)
+        } else {
+            theme::raised(t)
+        }
+    })
+    .into()
+}
+
+/// Side of a [`mark`]'s tile.
+///
+/// Square, and fixed rather than derived from the label, so the marks form a
+/// column that the eye can run down — the only reason to have them.
+pub const MARK_SIZE: f32 = 22.0;
+
 /// Render a shortcut using the platform's primary-modifier convention.
 pub const fn primary_shortcut(macos: &'static str, other: &'static str) -> &'static str {
     if cfg!(target_os = "macos") {

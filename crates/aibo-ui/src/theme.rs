@@ -494,6 +494,27 @@ pub fn raised(theme: &Theme) -> container::Style {
     }
 }
 
+/// Elevation −1: a mark sitting on a raised row.
+///
+/// The same single step as [`raised`], taken downwards. Needed because the
+/// quick-pick highlights a row by raising it, and a raised tile on a raised row
+/// is no tile at all — the one place the palette needs to go the other way to
+/// keep saying the same thing.
+pub fn inset(theme: &Theme) -> container::Style {
+    let p = palette_of(theme);
+    container::Style {
+        text_color: Some(p.text),
+        background: Some(Background::Color(p.surface)),
+        border: Border {
+            color: Color::TRANSPARENT,
+            width: 0.0,
+            radius: Radius::new(RADIUS_SMALL),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
 /// The source line — `ghostty · "…and screencapture works"`.
 ///
 /// No fill and no border. `design.md` §1 calls this "the most interesting
