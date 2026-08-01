@@ -58,7 +58,7 @@ pub fn segments(text: &str) -> Vec<Segment> {
     for piece in split_display_math(text) {
         match piece {
             Piece::Text(t) => prose.push_str(t),
-            Piece::Math(tex) => match render(tex) {
+            Piece::Math { tex, source } => match render(tex) {
                 Some(segment) => {
                     if !prose.trim().is_empty() {
                         out.push(Segment::Markdown(markdown::parse(&prose).collect()));
@@ -66,8 +66,10 @@ pub fn segments(text: &str) -> Vec<Segment> {
                     prose.clear();
                     out.push(segment);
                 }
-                // Unrenderable: keep the source text in place.
-                None => prose.push_str(tex),
+                // Unrenderable: the author's text goes back *exactly* as
+                // written, fences included — correctness of the markdown
+                // beats prettiness of the failure.
+                None => prose.push_str(source),
             },
         }
     }
@@ -93,7 +95,12 @@ pub fn extra_height(segments: &[Segment]) -> f32 {
 
 enum Piece<'a> {
     Text(&'a str),
-    Math(&'a str),
+    Math {
+        /// The formula body, fence-stripped and trimmed.
+        tex: &'a str,
+        /// The original span including its fences, for lossless fallback.
+        source: &'a str,
+    },
 }
 
 /// Split on `$$…$$` and `\[…\]` display-math fences. Unterminated fences are
@@ -118,7 +125,10 @@ fn split_display_math(text: &str) -> Vec<Piece<'_>> {
         if start > 0 {
             pieces.push(Piece::Text(&rest[..start]));
         }
-        pieces.push(Piece::Math(after_open[..end].trim()));
+        pieces.push(Piece::Math {
+            tex: after_open[..end].trim(),
+            source: &rest[start..start + open_len + end + close.len()],
+        });
         rest = &after_open[end + close.len()..];
     }
     if !rest.is_empty() {
@@ -211,5 +221,9 @@ mod tests {
 
         let bad_tex = segments("$$\\undefinedmacro{x}$$ tail");
         assert_eq!(bad_tex.len(), 1, "unrenderable math folds back to text");
+        // And it folds back losslessly, fences included.
+        let source = "before $$\\undefinedmacro{x}$$ after";
+        let folded = segments(source);
+        assert_eq!(folded.len(), 1);
     }
 }
