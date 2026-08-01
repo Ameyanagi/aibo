@@ -265,6 +265,30 @@ pub enum Key {
     ActionEnableHistory,
     /// Copy the one-time recovery code.
     ActionCopyRecoveryCode,
+    /// Second-press label after a destructive Forget was armed.
+    ActionConfirmForget,
+    /// Momentary label confirming a copy affordance fired (`design.md` §6b).
+    ActionCopied,
+    /// Drop the conversation and start a fresh session (`⌘N`).
+    ActionNewChat,
+    /// The `@` finder's search placeholder (§P9+).
+    FinderPlaceholder,
+    /// Attach the highlighted file from the `@` finder.
+    ActionAttachFile,
+    /// A picked file's content reached the selection slot: `{}` = name.
+    ToastFileAttached,
+    /// A picked file could not be read: `{}` = name.
+    ToastFileAttachFailed,
+    /// Begin push-to-talk dictation (§P9+).
+    ActionDictate,
+    /// Finish dictation and keep the transcript.
+    ActionStopDictation,
+    /// Dictation needs an OpenAI key it does not have.
+    ToastDictationNoKey,
+    /// The microphone could not be opened.
+    ToastDictationMicrophone,
+    /// The transcription websocket failed.
+    ToastDictationConnection,
 
     // --- error treatments (§13) ------------------------------------------
     /// Secure input mode blocks every read and every synthetic keystroke.
@@ -354,6 +378,8 @@ pub enum Key {
     ToastRecoveredFromCrash,
     /// Confirmation after copying a redacted diagnostics bundle.
     ToastDiagnosticsCopied,
+    /// Confirmation after the answer reached the clipboard.
+    ToastCopied,
 
     // --- tray ------------------------------------------------------------
     /// Tray tooltip.
@@ -376,6 +402,8 @@ pub enum Key {
     HotkeyFailedBody,
     /// macOS 15 rejects some modifier combinations outright (§8).
     HotkeyRejectedByOs,
+    /// The way to change the binding while no in-app picker exists (§9).
+    HotkeyChangeHint,
 
     // --- task window (§6) -------------------------------------------------
     /// Task window title.
@@ -406,6 +434,10 @@ pub enum Key {
     SettingsTitle,
     /// Section: providers.
     SettingsProviders,
+    /// Section: the model catalogue and its pins.
+    SettingsModels,
+    /// One line explaining what a pin does, above the model list.
+    SettingsModelsHint,
     /// Section: roles.
     SettingsRoles,
     /// Section: budgets.
@@ -574,7 +606,7 @@ fn en(key: Key) -> &'static str {
         K::ContextSelectedText => "Selected text",
         K::ContextChipFrom => "{}",
         K::ContextChipNone => "No context",
-        K::PanelEmptyInvitation => "ask, or ⇥ for actions",
+        K::PanelEmptyInvitation => "ask, or ⇥ for models",
         K::ContextChipReading => "no context — reading…",
         K::ContextChipUnavailable => "no context available",
 
@@ -635,6 +667,18 @@ fn en(key: Key) -> &'static str {
         K::ActionRemoveImage => "Remove image",
         K::ActionEnableHistory => "Enable encrypted history",
         K::ActionCopyRecoveryCode => "Copy recovery code",
+        K::ActionConfirmForget => "Press again to forget",
+        K::ActionCopied => "✓ copied",
+        K::ActionNewChat => "New chat",
+        K::FinderPlaceholder => "search files — romaji finds Japanese names",
+        K::ActionAttachFile => "Attach file",
+        K::ToastFileAttached => "Attached {}.",
+        K::ToastFileAttachFailed => "Could not read {}.",
+        K::ActionDictate => "Dictate",
+        K::ActionStopDictation => "Stop dictation",
+        K::ToastDictationNoKey => "Dictation needs an OpenAI API key. Add one in settings.",
+        K::ToastDictationMicrophone => "The microphone could not be started.",
+        K::ToastDictationConnection => "Dictation lost its connection.",
 
         K::ErrSecureInput => "A password field has focus, so nothing can be read.",
         K::ErrNoProvider => "No provider configured.",
@@ -668,6 +712,7 @@ fn en(key: Key) -> &'static str {
             "aibo recovered from a previous crash. Copy diagnostics if this keeps happening."
         }
         K::ToastDiagnosticsCopied => "Diagnostics copied.",
+        K::ToastCopied => "Copied.",
 
         K::TrayTooltip => "aibo",
         K::TrayOpenPanel => "Open aibo",
@@ -677,10 +722,9 @@ fn en(key: Key) -> &'static str {
         K::TrayBusy => "aibo — working",
 
         K::HotkeyFailedTitle => "The shortcut {} is unavailable",
-        K::HotkeyFailedBody => {
-            "Another app has already claimed it. Pick a different shortcut in settings."
-        }
+        K::HotkeyFailedBody => "Another app has already claimed it.",
         K::HotkeyRejectedByOs => "macOS does not accept this combination as a global shortcut.",
+        K::HotkeyChangeHint => "Set hotkey = \"…\" in config.toml to change it, then restart aibo.",
 
         K::TaskWindowTitle => "aibo — task",
         K::TaskSteps => "Steps",
@@ -696,6 +740,8 @@ fn en(key: Key) -> &'static str {
 
         K::SettingsTitle => "aibo — settings",
         K::SettingsProviders => "Providers",
+        K::SettingsModels => "Models",
+        K::SettingsModelsHint => "★ pinned models appear first in the panel's quick-pick.",
         K::SettingsRoles => "Roles",
         K::SettingsBudgets => "Budgets",
         K::SettingsPermissions => "Permissions",
@@ -707,7 +753,7 @@ fn en(key: Key) -> &'static str {
         K::SettingsWelcomeBody => "Three quick steps, then aibo is ready wherever you write.",
         K::SettingsSetupConnect => "Connect ChatGPT",
         K::SettingsSetupPermissions => "Review permissions",
-        K::SettingsSetupTryHotkey => "Try ⌥Space",
+        K::SettingsSetupTryHotkey => "Try {}",
         K::SettingsHistorySetupTitle => "Encrypted history is off",
         K::SettingsHistorySetupBody => {
             "Enable it to save conversations in a local SQLCipher database. The encryption key stays in your OS credential store."
@@ -774,7 +820,7 @@ fn ja(key: Key) -> &'static str {
         K::ContextSelectedText => "選択したテキスト",
         K::ContextChipFrom => "{}",
         K::ContextChipNone => "コンテキストなし",
-        K::PanelEmptyInvitation => "質問するか、⇥ で操作を選択",
+        K::PanelEmptyInvitation => "質問するか、⇥ でモデルを選択",
         K::ContextChipReading => "コンテキストを読み取り中…",
         K::ContextChipUnavailable => "コンテキストを取得できません",
 
@@ -833,6 +879,20 @@ fn ja(key: Key) -> &'static str {
         K::ActionRemoveImage => "画像を削除",
         K::ActionEnableHistory => "暗号化履歴を有効にする",
         K::ActionCopyRecoveryCode => "復旧コードをコピー",
+        K::ActionConfirmForget => "もう一度押すと削除します",
+        K::ActionCopied => "✓ コピーしました",
+        K::ActionNewChat => "新しいチャット",
+        K::FinderPlaceholder => "ファイルを検索 — ローマ字でも探せます",
+        K::ActionAttachFile => "ファイルを添付",
+        K::ToastFileAttached => "{} を添付しました。",
+        K::ToastFileAttachFailed => "{} を読み込めませんでした。",
+        K::ActionDictate => "音声入力",
+        K::ActionStopDictation => "音声入力を停止",
+        K::ToastDictationNoKey => {
+            "音声入力には OpenAI API キーが必要です。設定で追加してください。"
+        }
+        K::ToastDictationMicrophone => "マイクを起動できませんでした。",
+        K::ToastDictationConnection => "音声入力の接続が切れました。",
 
         K::ErrSecureInput => "パスワード入力中のため読み取れません。",
         K::ErrNoProvider => "プロバイダーが未設定です。",
@@ -870,6 +930,7 @@ fn ja(key: Key) -> &'static str {
             "前回のクラッシュから復旧しました。繰り返す場合は診断情報をコピーしてください。"
         }
         K::ToastDiagnosticsCopied => "診断情報をコピーしました。",
+        K::ToastCopied => "コピーしました。",
 
         K::TrayTooltip => "aibo",
         K::TrayOpenPanel => "aibo を開く",
@@ -879,11 +940,12 @@ fn ja(key: Key) -> &'static str {
         K::TrayBusy => "aibo — 実行中",
 
         K::HotkeyFailedTitle => "ショートカット {} を使用できません",
-        K::HotkeyFailedBody => {
-            "他のアプリが使用しています。設定で別のショートカットを選んでください。"
-        }
+        K::HotkeyFailedBody => "他のアプリが使用しています。",
         K::HotkeyRejectedByOs => {
             "macOS はこの組み合わせをグローバルショートカットとして受け付けません。"
+        }
+        K::HotkeyChangeHint => {
+            "変更するには config.toml に hotkey = \"…\" を設定し、aibo を再起動してください。"
         }
 
         K::TaskWindowTitle => "aibo — タスク",
@@ -900,6 +962,8 @@ fn ja(key: Key) -> &'static str {
 
         K::SettingsTitle => "aibo — 設定",
         K::SettingsProviders => "プロバイダー",
+        K::SettingsModels => "モデル",
+        K::SettingsModelsHint => "★ を付けたモデルはクイックピックの先頭に表示されます。",
         K::SettingsRoles => "ロール",
         K::SettingsBudgets => "予算",
         K::SettingsPermissions => "権限",
@@ -913,7 +977,7 @@ fn ja(key: Key) -> &'static str {
         }
         K::SettingsSetupConnect => "ChatGPT に接続",
         K::SettingsSetupPermissions => "権限を確認",
-        K::SettingsSetupTryHotkey => "⌥Space を試す",
+        K::SettingsSetupTryHotkey => "{} を試す",
         K::SettingsHistorySetupTitle => "暗号化履歴はオフです",
         K::SettingsHistorySetupBody => {
             "会話をローカルの SQLCipher データベースに保存するには有効にしてください。暗号化キーは OS の資格情報ストアに保管されます。"
@@ -1071,6 +1135,21 @@ mod tests {
             Key::SettingsHistoryFailed,
             Key::ActionEnableHistory,
             Key::ActionCopyRecoveryCode,
+            Key::ActionConfirmForget,
+            Key::ActionCopied,
+            Key::ActionNewChat,
+            Key::HotkeyChangeHint,
+            Key::SettingsModels,
+            Key::SettingsModelsHint,
+            Key::ActionDictate,
+            Key::ActionStopDictation,
+            Key::ToastDictationNoKey,
+            Key::ToastDictationMicrophone,
+            Key::ToastDictationConnection,
+            Key::FinderPlaceholder,
+            Key::ActionAttachFile,
+            Key::ToastFileAttached,
+            Key::ToastFileAttachFailed,
         ];
         for key in SETTINGS {
             assert!(!lookup(*key, Lang::En).is_empty(), "{key:?} / en");
@@ -1085,7 +1164,11 @@ mod tests {
 
     #[test]
     fn recovery_toasts_ship_in_every_language() {
-        for key in [Key::ToastRecoveredFromCrash, Key::ToastDiagnosticsCopied] {
+        for key in [
+            Key::ToastRecoveredFromCrash,
+            Key::ToastDiagnosticsCopied,
+            Key::ToastCopied,
+        ] {
             assert!(!lookup(key, Lang::En).is_empty());
             assert!(!lookup(key, Lang::Ja).is_empty());
             assert_ne!(lookup(key, Lang::En), lookup(key, Lang::Ja));

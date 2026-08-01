@@ -57,11 +57,22 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# §P9+ voice input: microphone capture for push-to-talk dictation.
+cpal = "0.15"
+# The realtime transcription websocket. rustls with the OS trust store, for the
+# same enterprise-proxy reason as reqwest above.
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-native-roots"] }
 toml = "0.9"
 uuid = { version = "1", features = ["v7", "serde"] }
 url = "2"
 unicode-segmentation = "1"           # §5 grapheme-safe middle-out truncation
 nucleo-matcher = "0.3"               # fzf-style history search; Unicode-aware, returns match indices
+# §P9+ @ file mentions: the owner's Japanese-aware fuzzy finder, as a library.
+# yuru-ja's default reading mode embeds Lindera for kanji readings — that is
+# what makes `toukei` find `統計資料.pdf`, and it is the point of using yuru
+# over plain nucleo.
+yuru-core = "0.1"
+yuru-ja = "0.1"
 
 # --- secrets ----------------------------------------------------------------
 secrecy = "0.10.3"                   # §12 [plan note: no release in 21 months]
@@ -207,6 +218,11 @@ keyring = { workspace = true }
 # `aibo_provider::StoredTokens` is `serde`-shaped; credential storage holds one
 # JSON document per token pair.
 serde_json = { workspace = true }
+
+# §P9+ dictation: microphone → OpenAI realtime transcription (`src/stt.rs`).
+cpal = { workspace = true }
+tokio-tungstenite = { workspace = true }
+base64 = { workspace = true }
 # `aibo_provider::TokenStore` is an `#[async_trait]`, and the binary implements
 # it over credential files.
 async-trait = { workspace = true }
@@ -218,3 +234,19 @@ unicode-segmentation = { workspace = true }
 [dev-dependencies]
 # The panic-boundary test in `diagnostics` needs `#[tokio::test]`.
 tokio = { workspace = true, features = ["macros", "rt"] }
+# The file-finder walk tests build throwaway directory trees.
+tempfile = { workspace = true }
+
+# cosmic-text 0.15.0 (the newest iced 0.14 accepts) panics in debug builds
+# when a glyph lands at a saturated x-position — `SubpixelBin::new` does
+# `trunc + 1` on an `i32` that is already `i32::MAX`, which aborted the whole
+# app the first time Japanese dictation text hit the input (2026-08-01 crash
+# report). The vendored copy is identical except that arithmetic saturates;
+# drop the patch when an upstream release contains the fix.
+[patch.crates-io]
+cosmic-text = { path = "vendor/cosmic-text" }
+# Same defect one layer down: cryoglyph (iced's glyphon fork) adds the atlas
+# offsets to that saturated position before its own bounds check would have
+# clipped the glyph out. Saturating the adds lets the degenerate glyph fall
+# into the clip path instead of aborting the app.
+cryoglyph = { path = "vendor/cryoglyph" }

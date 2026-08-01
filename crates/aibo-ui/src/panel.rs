@@ -28,8 +28,8 @@ use aibo_core::types::{
 };
 use aibo_core::{AiboError, types::Usage};
 use iced::widget::{
-    Space, column, container, image, markdown, pick_list, row, rule, scrollable, text, text_editor,
-    text_input,
+    Space, button, column, container, image, markdown, mouse_area, pick_list, row, rule,
+    scrollable, stack, text, text_editor, text_input,
 };
 use iced::{Alignment, Element, Length};
 use uuid::Uuid;
@@ -41,6 +41,9 @@ use crate::widgets::{self, Action, RailState};
 
 /// The id of the panel's text input, so focus can be requested on show.
 pub const INPUT_ID: &str = "aibo.panel.input";
+
+/// The `@` file finder's search field, for focus operations.
+pub const FINDER_ID: &str = "aibo.panel.finder";
 
 /// The id of the model quick-pick's search field.
 pub const PICKER_ID: &str = "aibo.panel.picker";
@@ -164,29 +167,26 @@ pub enum ContextState {
 /// claimed instead. Declared here because this is the module that shows it.
 pub const ATTACH_KEY: &str = widgets::primary_shortcut("⌘V", "Ctrl+V");
 
-/// The shortcut that removes the most recently attached image: backspace with
-/// nothing left in the instruction to delete.
+/// The key hint on the remove-image affordances: deliberately blank.
 ///
-/// The convention every composer with chips already uses — mail recipients,
-/// chat attachments — so it needs no learning. It is also the only binding here
-/// that is *safe*, and the alternatives are worth recording because each looks
-/// fine until it is tried:
+/// Backspace-with-empty-input used to remove the most recent image — the
+/// chips-composer convention. In practice it destroyed attachments by
+/// accident: a screen capture opens the panel with the image *already
+/// attached* and the input empty, so the very first reflexive backspace threw
+/// the screenshot away. Removing an attachment is destructive enough that it
+/// now takes a deliberate pointer act — the `×` on the chip, or this footer
+/// action — and a fresh start is explicit via `⌘N`.
 ///
-/// * `⌘⌫` — on macOS `text_input` reads it as "delete to the start of the line"
-///   and captures it, so removal would silently eat the typed instruction.
-/// * `⌘⇧V`, the tidy inverse of [`ATTACH_KEY`] — `text_input` matches shortcuts
-///   on `to_latin`, which yields `'V'` and misses its `'v'` arm, so the chord
-///   falls through to the widget's plain text insertion. That insertion has no
-///   modifier guard, and `iced_winit` feeds it winit's
-///   `text_with_all_modifiers()`, which on macOS is `NSEvent.characters` — `"V"`.
-///   The chord would remove the image *and* type a `V` into the instruction.
+/// The rejected alternatives are worth keeping on record:
 ///
-/// Backspace reaches the widget's own handler, which on an empty value moves a
-/// cursor that is already at zero and inserts nothing. The panel therefore only
-/// claims it while [`PanelState::input`] is empty; with text in the field the
-/// key belongs to the text, which is what the user expects and what every other
-/// composer does.
-pub const DETACH_KEY: &str = "⌫";
+/// * `⌫` — the accident above.
+/// * `⌘⌫` — on macOS `text_input` reads it as "delete to the start of the
+///   line", and the subscription cannot tell "the field just became empty"
+///   from "the field was empty", so the same accident returns by another door.
+/// * `⌘⇧V` — `text_input` matches shortcuts on `to_latin`, which yields `'V'`
+///   and misses its `'v'` arm, so the chord falls through to plain text
+///   insertion and types a literal `V`.
+pub const DETACH_KEY: &str = "";
 
 /// An attachment plus the render-side handle used to draw its chip.
 ///
@@ -741,12 +741,28 @@ pub struct PanelState {
     pub selected_model: Option<ModelOption>,
     /// The quick-pick's own state (§4).
     pub picker: crate::model_picker::ModelPicker,
+    /// The `@` file finder's state (§P9+).
+    pub file_finder: crate::file_finder::FileFinder,
     /// Models the user has pinned, newest first.
     ///
     /// Persisted, unlike [`PanelState::recent_models`]: a pin is a deliberate
     /// statement about what the user works with, and losing it on quit would
     /// make pinning pointless.
     pub favourite_models: Vec<aibo_core::types::ModelBinding>,
+    /// The user has toggled a pin at least once, so [`PanelState::pins`] must
+    /// honour [`PanelState::favourite_models`] literally — including empty —
+    /// instead of falling back to the derived defaults.
+    pub pins_customised: bool,
+    /// Editing state for the composer widget. [`PanelState::input`] stays the
+    /// canonical string; every programmatic write goes through
+    /// [`PanelState::set_input`] so the two cannot drift.
+    input_editor: text_editor::Content,
+    /// The microphone is live and deltas are streaming into the input (§P9+).
+    pub dictating: bool,
+    /// Insert one space before the first dictation delta, because the input
+    /// already ends mid-word. Set on `DictationStarted`, spent on the first
+    /// delta.
+    pub dictation_pad: bool,
     /// Models used this session, most recent first.
     ///
     /// Session-scoped on purpose. Recency is an observation, not a preference,
@@ -790,7 +806,12 @@ impl PanelState {
             model_options: Vec::new(),
             selected_model: None,
             picker: crate::model_picker::ModelPicker::default(),
+            file_finder: crate::file_finder::FileFinder::default(),
             favourite_models: Vec::new(),
+            pins_customised: false,
+            input_editor: text_editor::Content::new(),
+            dictating: false,
+            dictation_pad: false,
             recent_models: Vec::new(),
             // Constructed once at boot, not per session, so recall survives
             // closing and reopening the panel — which is the whole point.
@@ -816,12 +837,20 @@ impl PanelState {
         let display_width = self.display_width;
         // Neither favourites nor recents belong to a panel session: a pin is a
         // durable preference, and recency describes the user's day rather than
-        // one invocation.
+        // one invocation. `pins_customised` travels with the pins — dropping
+        // it would resurrect the default pins over an explicitly emptied set.
         let favourite_models = std::mem::take(&mut self.favourite_models);
+        let pins_customised = self.pins_customised;
         let recent_models = std::mem::take(&mut self.recent_models);
+        // The finder's candidate index describes the disk, not the session;
+        // rebuilding it on every ⌘N would make the next `@` needlessly slow.
+        let file_finder = std::mem::take(&mut self.file_finder);
         *self = Self::new(session);
         self.favourite_models = favourite_models;
+        self.pins_customised = pins_customised;
         self.recent_models = recent_models;
+        self.file_finder = file_finder;
+        self.file_finder.close();
         self.model_options = model_options;
         self.selected_model = selected_model;
         self.display_height = display_height;
@@ -898,6 +927,7 @@ impl PanelState {
         }
         self.active_user = Some(user);
         self.input.clear();
+        self.input_editor = text_editor::Content::new();
         self.phase = Phase::Loading;
         self.clear_response();
         self.reasoning.clear();
@@ -1085,19 +1115,38 @@ impl PanelState {
         }
     }
 
-    /// Whether the response may be inserted into the source app.
+    /// The most recent completed answer: the active turn's when it finished
+    /// cleanly, otherwise the last settled turn's.
     ///
-    /// False while streaming, false on any non-`EndTurn` stop reason, false
-    /// while an IME composition is active. §13: "a partial stream is never
-    /// auto-inserted … silent insertion of half a rewrite over a user's
-    /// selection is the worst failure this product can have."
-    pub fn can_accept(&self) -> bool {
-        matches!(
+    /// `⌘↩` pastes this *always* (owner request, 2026-08-01). The panel keeps
+    /// its conversation across reopens — phase comes back as `Idle` — and an
+    /// answer that is visibly on screen above a dead Replace reads as broken.
+    /// Settled turns only ever contain clean `EndTurn` answers (`begin_turn`
+    /// gates what it retires), so §13's "a partial stream is never inserted"
+    /// holds by construction.
+    pub fn latest_answer(&self) -> Option<&str> {
+        if matches!(
             self.phase,
             Phase::Finished {
                 reason: StopReason::EndTurn
             }
         ) && !self.response.is_empty()
+        {
+            return Some(&self.response);
+        }
+        self.turns.last().map(|turn| turn.assistant.as_str())
+    }
+
+    /// Whether the latest answer may be inserted into the source app.
+    ///
+    /// False while a stream is in flight — inserting mid-stream would discard
+    /// the session under the answer being generated. §13: "a partial stream is
+    /// never auto-inserted … silent insertion of half a rewrite over a user's
+    /// selection is the worst failure this product can have";
+    /// [`PanelState::latest_answer`] never yields one.
+    pub fn can_accept(&self) -> bool {
+        !matches!(self.phase, Phase::Loading | Phase::Streaming)
+            && self.latest_answer().is_some()
             // Replace needs somewhere to replace *into*, and this used to only
             // exclude `ImeActive`. Every other non-`Available` state — a
             // terminal or Electron app that exposes no field, a capture still
@@ -1113,6 +1162,64 @@ impl PanelState {
             // `None` throughout, so requiring them would disable replace
             // everywhere.
             && matches!(self.context, ContextState::Available { .. })
+    }
+
+    /// The composer's editing state, for the view.
+    pub(crate) fn input_editor(&self) -> &text_editor::Content {
+        &self.input_editor
+    }
+
+    /// Set the composer text programmatically — history recall, dictation
+    /// deltas, accessibility — keeping the widget's editing state in sync
+    /// with the canonical string and the caret at the end.
+    pub fn set_input(&mut self, text: &str) {
+        self.input = text.to_owned();
+        self.input_editor = text_editor::Content::with_text(text);
+        self.input_editor
+            .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+    }
+
+    /// Apply a user edit from the composer widget.
+    pub fn perform_input_action(&mut self, action: text_editor::Action) {
+        self.input_editor.perform(action);
+        let mut text = self.input_editor.text();
+        // `Content::text` always reports a trailing newline that is not
+        // really in the document.
+        if text.ends_with('\n') {
+            text.pop();
+        }
+        self.input = text;
+    }
+
+    /// Height the composer needs beyond its single-line baseline.
+    ///
+    /// Dictation produces paragraphs, not lines (§P9+), and the composer
+    /// wraps them; the window has to grow with it or the wrapped lines paint
+    /// over the panel's bottom edge.
+    pub(crate) fn input_extra_height(&self) -> f32 {
+        (estimated_text_height(&self.input, CHAT_USER_CHARS_PER_LINE) - 24.0).max(0.0)
+    }
+
+    /// Put a picked file's content into the fenced selection slot.
+    ///
+    /// File bytes are §5 untrusted context, and the selection pipeline
+    /// already does everything they need: the structural fence on the wire,
+    /// the visible card in the panel, and the user's ability to remove it.
+    /// Reusing it means the `@` finder adds no new trust path at all.
+    pub fn attach_file_selection(&mut self, content: String) {
+        match &mut self.context {
+            ContextState::Available { selection, .. } => *selection = Some(content),
+            other => {
+                *other = ContextState::Available {
+                    app: None,
+                    excerpt: None,
+                    selection: Some(content),
+                    truncated: false,
+                    caret_bounds: None,
+                };
+            }
+        }
+        self.context_expanded = false;
     }
 
     /// Whether the response ended early and must be marked truncated.
@@ -1132,7 +1239,16 @@ impl PanelState {
     /// including a partial one. §13 keeps the partial result in the panel
     /// precisely so the user can copy it manually.
     pub fn can_copy(&self) -> bool {
-        !self.response.is_empty()
+        !self.response.is_empty() || !self.turns.is_empty()
+    }
+
+    /// What `⌘C` copies: the in-flight or just-finished text when there is
+    /// any — the partial-copy case §13 protects — else the latest answer.
+    pub fn copyable_text(&self) -> Option<&str> {
+        if !self.response.is_empty() {
+            return Some(&self.response);
+        }
+        self.latest_answer()
     }
 
     /// Grow the reserved answer height in discrete steps, never per token.
@@ -1186,30 +1302,41 @@ impl PanelState {
 
     /// The height the panel wants, for [`crate::placement::PlacementRequest`].
     pub fn desired_height(&self) -> f32 {
-        // The quick-pick replaces the body, so it sets its own height. Falling
-        // through to the transcript arithmetic sized the window for content that
-        // is not on screen, and clipped the list after its first row.
-        if self.picker.open {
-            return PICKER_PANEL_HEIGHT.min(self.max_panel_height());
+        let base = self.height_without_overlay();
+        if self.picker.open || self.file_finder.open {
+            // The quick-pick floats over the panel. The window grows only when
+            // the panel is too short to contain the menu, and never shrinks
+            // for it — mid-conversation, opening the picker moves nothing.
+            return base.max(PICKER_PANEL_HEIGHT.min(self.max_panel_height()));
         }
+        base
+    }
+
+    /// The panel's height with no floating menu in play.
+    fn height_without_overlay(&self) -> f32 {
         // The chips are their own row above the input, so they add height in
         // every phase — including the collapsed one, which is otherwise a
         // constant. Attaching an image into a fixed-height panel would push the
         // input out from under the caret.
         let attachments = self.attachment_block_height();
         let selection = self.selection_preview_height();
+        // Wrapped composer lines add height in every phase; see
+        // `input_extra_height`.
+        let input_extra = self.input_extra_height();
         if self.has_conversation() {
             return (theme::PANEL_HEIGHT_COLLAPSED
                 + attachments
                 + selection
+                + input_extra
                 + self.transcript_height()
+                + self.chat_error_height()
                 + self.footer_height())
             .clamp(CHAT_PANEL_MIN_HEIGHT, self.max_panel_height());
         }
 
         match self.phase {
             Phase::Hidden | Phase::WarmingUp { .. } | Phase::Idle => {
-                (theme::PANEL_HEIGHT_COLLAPSED + attachments + selection)
+                (theme::PANEL_HEIGHT_COLLAPSED + attachments + selection + input_extra)
                     .min(self.max_panel_height())
             }
             // `COLLAPSED` is input-plus-chrome only. Everything `footer()`
@@ -1220,6 +1347,7 @@ impl PanelState {
             _ => (theme::PANEL_HEIGHT_COLLAPSED
                 + attachments
                 + selection
+                + input_extra
                 + self.answer_height()
                 + self.footer_height())
             .min(self.max_panel_height()),
@@ -1241,8 +1369,11 @@ const WARMUP_FRAMES: u8 = 2;
 /// What the panel emits. Mapped into the app message in [`crate::app`].
 #[derive(Debug, Clone)]
 pub enum Message {
-    /// The instruction changed.
+    /// The instruction was replaced wholesale — the accessibility tree's
+    /// `SetValue`, never the widget.
     InputChanged(String),
+    /// A user edit inside the composer widget.
+    InputEdited(text_editor::Action),
     /// `⏎` on the input.
     Submit,
     /// Persist and activate a model chosen in the popup.
@@ -1286,6 +1417,10 @@ pub enum Message {
     CopyLink(String),
     /// Selection, cursor, or an ignored edit attempt in the read-only answer.
     ResponseAction(text_editor::Action),
+    /// `⌘N`: drop the conversation and start a fresh session, deliberately.
+    NewChat,
+    /// `⌘L`, or the composer action: start or finish push-to-talk dictation.
+    ToggleDictation,
     /// Open the model quick-pick.
     OpenPicker,
     /// Close it without choosing.
@@ -1300,6 +1435,22 @@ pub enum Message {
     PickerToggleFavourite,
     /// Move to the next lane.
     PickerCycleLane,
+    /// The `@` finder's query changed.
+    FinderQuery(String),
+    /// Move the `@` finder's highlight.
+    FinderMove(isize),
+    /// Attach the highlighted file.
+    FinderCommit,
+    /// A finder row was clicked: highlight and attach in one gesture.
+    FinderChoose(usize),
+    /// Close the `@` finder without choosing.
+    FinderClose,
+    /// A row was clicked: highlight and commit it in one gesture.
+    PickerChoose(usize),
+    /// A row's star was clicked: toggle that row's pin without selecting it.
+    PickerPin(usize),
+    /// A lane was clicked.
+    PickerLane(crate::model_picker::Lane),
 }
 
 /// Render the panel.
@@ -1327,18 +1478,6 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
     // The rest of §3 is unaffected: the rail still runs the full height and is
     // amber on whichever row holds attention, which is the part of the spec
     // doing the real work.
-    // While the quick-pick is open it *is* the panel. Rendering it alongside the
-    // transcript would put two focusable text fields on screen at once, and the
-    // one that answers the keyboard would be whichever iced focused last.
-    if state.picker.open {
-        return container(widgets::railed(RailState::Active, picker_overlay(state)))
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .padding(space(4.0))
-            .style(theme::panel_surface)
-            .into();
-    }
-
     let has_result =
         state.has_conversation() || !matches!(state.phase, Phase::Hidden | Phase::Idle);
     let shows_content = has_result
@@ -1392,7 +1531,7 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
         stack = stack.push(widgets::toast(toast.severity, &toast.body, Some(action)));
     }
 
-    container(stack)
+    let base: Element<'_, Message> = container(stack)
         .width(Length::Fill)
         // The native visual-effect view fills the window. Filling the same
         // bounds here prevents a transparent strip of blur below the rounded
@@ -1400,7 +1539,112 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
         .height(Length::Fill)
         .padding(space(4.0))
         .style(theme::panel_surface)
-        .into()
+        .into();
+
+    // The quick-pick and the `@` finder float over the panel as menus
+    // (t3-style) instead of replacing the body: the panel stays where it was,
+    // the menu arrives and leaves, and mid-conversation the window does not
+    // move at all. Keyboard routing while one is open is owned by that menu
+    // (see `window_shortcut`), and focus is moved onto its search field
+    // explicitly on open — which is what keeps multiple text fields on
+    // screen from fighting over keystrokes.
+    let menu: Option<(Element<'_, Message>, Message)> = if state.picker.open {
+        Some((picker_overlay(state), Message::ClosePicker))
+    } else if state.file_finder.open {
+        Some((finder_overlay(state), Message::FinderClose))
+    } else {
+        None
+    };
+    if let Some((overlay, dismiss)) = menu {
+        return stack![
+            base,
+            // A transparent scrim between the panel and the menu: clicking
+            // anywhere that is not the menu dismisses it, which is what every
+            // dropdown teaches the hand to expect.
+            mouse_area(Space::new().width(Length::Fill).height(Length::Fill)).on_press(dismiss),
+            container(
+                container(overlay)
+                    .max_width(PICKER_MENU_WIDTH)
+                    .padding(space(2.0))
+                    .style(theme::overlay_menu),
+            )
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .align_x(Alignment::End)
+            .padding(iced::Padding {
+                top: PICKER_MENU_TOP,
+                right: space(3.0),
+                bottom: space(3.0),
+                left: space(3.0),
+            }),
+        ]
+        .into();
+    }
+
+    base
+}
+
+/// The `@` file finder's contents (§P9+): yuru-matched files, name first and
+/// home-relative path beneath, in the same menu chrome as the quick-pick.
+fn finder_overlay(state: &PanelState) -> Element<'_, Message> {
+    let results = state.file_finder.results();
+    let mut list = column![].spacing(space(0.5));
+    for (index, file) in results.iter().enumerate() {
+        let highlighted = index == state.file_finder.highlight;
+        let name = file
+            .display
+            .rsplit('/')
+            .next()
+            .unwrap_or(file.display.as_str())
+            .to_owned();
+        list = list.push(widgets::railed_with(
+            if highlighted {
+                RailState::Active
+            } else {
+                RailState::Inactive
+            },
+            theme::ground,
+            button(
+                column![
+                    text(name).size(type_scale::ANSWER).style(if highlighted {
+                        theme::text_primary
+                    } else {
+                        theme::text_dim
+                    }),
+                    text(file.display.clone())
+                        .size(type_scale::META)
+                        .style(theme::text_faint),
+                ]
+                .spacing(space(0.25)),
+            )
+            .width(Length::Fill)
+            .padding([space(0.5), space(1.0)])
+            .style(theme::list_row_button(highlighted))
+            .on_press(Message::FinderChoose(index)),
+        ));
+    }
+
+    column![
+        text_input(i18n::t(Key::FinderPlaceholder), &state.file_finder.query)
+            .id(FINDER_ID)
+            .on_input(Message::FinderQuery)
+            .on_submit(Message::FinderCommit)
+            .size(type_scale::BODY)
+            // The CJK-capable face; queries and paths are routinely Japanese.
+            .font(theme::UI_FONT)
+            .padding(space(1.0))
+            .style(theme::input),
+        scrollable(list)
+            .height(Length::Fixed(PICKER_LIST_HEIGHT))
+            .width(Length::Fill)
+            .style(theme::scroller),
+        widgets::action_list(vec![
+            Action::new(Key::ActionAttachFile, "⏎", Message::FinderCommit).primary(),
+            Action::new(Key::ActionDismiss, "esc", Message::FinderClose),
+        ]),
+    ]
+    .spacing(space(1.5))
+    .into()
 }
 
 impl PanelState {
@@ -1412,26 +1656,12 @@ impl PanelState {
     /// while the request went to OpenAI, because Codex declares no vision
     /// support, and nothing on screen explained the discrepancy.
     pub fn capable_models(&self) -> Vec<ModelOption> {
-        if !self.has_attachments() {
-            return self.model_options.clone();
-        }
-        self.model_options
-            .iter()
-            .filter(|option| self.model_supports_vision(&option.binding))
-            .cloned()
-            .collect()
-    }
-
-    /// Whether the catalogue says this binding accepts image input.
-    ///
-    /// The UI cannot reach `ModelCatalogue`, so the runtime has to have said so.
-    /// Until `UiEvent::ModelOptions` carries capabilities, the one thing known
-    /// for certain is §3a's measurement that the Codex endpoint has never been
-    /// sent an image — so that provider is excluded and everything else is
-    /// assumed capable, which matches the modern reality that most chat models
-    /// take images.
-    fn model_supports_vision(&self, binding: &aibo_core::types::ModelBinding) -> bool {
-        binding.provider.as_str() != "codex"
+        // Codex was excluded here while its image support was unmeasured; the
+        // owner has since confirmed the ChatGPT-plan models read images, and
+        // the wire path already sends `input_image` parts. Every offered
+        // model is now assumed capable until `UiEvent::ModelOptions` carries
+        // real capability bits.
+        self.model_options.clone()
     }
 
     /// The quick-pick's rows for the current state.
@@ -1441,13 +1671,16 @@ impl PanelState {
             .rows(&capable, &self.pins(&capable), &self.recent_models)
     }
 
-    /// The pinned set, falling back to a derived starter set.
+    /// The pinned set, falling back to a derived starter set only before the
+    /// user has ever touched a pin.
     ///
-    /// The fallback applies only while nothing is pinned, so unpinning the last
-    /// model does bring the defaults back — which is the right behaviour for a
-    /// *default* and the reason they are not written into state on first run.
+    /// Once a pin is toggled, the set is literal — **including empty**. The
+    /// previous rule brought the defaults back the moment the set emptied, so
+    /// unpinning the last model conjured `gpt-5.6-terra` back out of thin air
+    /// (owner report, 2026-08-01): a default that cannot be declined is not a
+    /// default, it is an imposition.
     pub fn pins(&self, capable: &[ModelOption]) -> Vec<aibo_core::types::ModelBinding> {
-        if self.favourite_models.is_empty() {
+        if !self.pins_customised && self.favourite_models.is_empty() {
             return crate::model_picker::default_pins(capable);
         }
         self.favourite_models.clone()
@@ -1464,13 +1697,15 @@ impl PanelState {
 
     /// Pin or unpin a model.
     ///
-    /// Materialises the derived defaults first when nothing is pinned yet:
-    /// without that, unpinning one of the visible default pins would edit an
-    /// empty list and appear to do nothing at all.
+    /// The first toggle materialises the derived defaults — without that,
+    /// unpinning one of the visible default pins would edit an empty list and
+    /// appear to do nothing — and marks the set as the user's own from then
+    /// on, so it can honestly be emptied.
     pub fn toggle_favourite(&mut self, binding: aibo_core::types::ModelBinding) {
-        if self.favourite_models.is_empty() {
+        if !self.pins_customised && self.favourite_models.is_empty() {
             self.favourite_models = crate::model_picker::default_pins(&self.capable_models());
         }
+        self.pins_customised = true;
         match self.favourite_models.iter().position(|b| b == &binding) {
             Some(at) => {
                 self.favourite_models.remove(at);
@@ -1558,30 +1793,51 @@ fn chip_row(state: &PanelState) -> Element<'_, Message> {
         .map(ToString::to_string)
         .unwrap_or_else(|| i18n::t(Key::PanelModel).to_owned());
 
+    // One clickable cluster — logo, name, key hint — rather than a hint over
+    // here and an inert label over there. The pointer route and the keyboard
+    // route land on the same control, which is what makes it read as one.
+    let mut cluster = row![].spacing(space(1.0)).align_y(Alignment::Center);
+    if let Some(model) = &state.selected_model {
+        let provider = model.binding.provider.as_str();
+        cluster = cluster.push(widgets::provider_logo(
+            provider,
+            crate::model_picker::provider_mark(provider),
+            false,
+        ));
+    }
+    cluster = cluster
+        .push(
+            text(current)
+                .size(type_scale::META)
+                .font(theme::MONO_FONT)
+                .style(theme::text_dim),
+        )
+        .push(
+            text(widgets::primary_shortcut("⌘K", "Ctrl+K"))
+                .size(type_scale::META)
+                .font(theme::MONO_FONT)
+                .style(theme::text_faint),
+        );
+
     row![
         context,
         Space::new().width(Length::Fill),
-        widgets::action_list(vec![Action::new(
-            Key::PanelModel,
-            widgets::primary_shortcut("⌘K", "Ctrl+K"),
-            Message::OpenPicker,
-        )]),
-        text(current)
-            .size(type_scale::META)
-            .font(theme::MONO_FONT)
-            .style(theme::text_dim),
+        button(cluster)
+            .padding([space(0.5), space(1.0)])
+            .style(theme::list_row_button(false))
+            .on_press(Message::OpenPicker),
     ]
     .spacing(space(1.5))
     .align_y(Alignment::Center)
     .into()
 }
 
-/// The model quick-pick overlay (§4).
+/// The model quick-pick's contents (§4).
 ///
-/// Replaces the panel's body while open rather than floating over it: the panel
-/// is already an overlay, and a popover inside an overlay reads as a rendering
-/// fault. The search field takes focus, so the first keystroke filters instead
-/// of being lost.
+/// Rendered inside the floating menu `view` stacks over the panel. The search
+/// field takes focus on open, so the first keystroke filters instead of being
+/// lost; every row and lane is also a pointer target, because a menu that can
+/// only be driven by keys is a menu with a missing half.
 fn picker_overlay(state: &PanelState) -> Element<'_, Message> {
     let rows = state.picker_rows();
     let choices = crate::model_picker::selectable(&rows);
@@ -1621,12 +1877,21 @@ fn picker_overlay(state: &PanelState) -> Element<'_, Message> {
                     } else {
                         RailState::Inactive
                     },
-                    if highlighted {
-                        theme::raised
-                    } else {
-                        theme::ground
-                    },
-                    model_row(option, *favourite, *show_provider, highlighted),
+                    theme::ground,
+                    // The button carries the click and the hover/highlight
+                    // fill; the rail beside it still carries the keyboard
+                    // position, so mouse and keys read as one list.
+                    button(model_row(
+                        option,
+                        *favourite,
+                        *show_provider,
+                        highlighted,
+                        index,
+                    ))
+                    .width(Length::Fill)
+                    .padding(0)
+                    .style(theme::list_row_button(highlighted))
+                    .on_press(Message::PickerChoose(index)),
                 ));
                 index += 1;
             }
@@ -1645,7 +1910,10 @@ fn picker_overlay(state: &PanelState) -> Element<'_, Message> {
             .on_input(Message::PickerQuery)
             .on_submit(Message::PickerCommit)
             .size(type_scale::BODY)
-            .font(theme::MONO_FONT)
+            // Same CJK-safety swap as the main input: this field takes typed
+            // queries, and `Font::MONOSPACE` breaks the moment they are
+            // Japanese. See `input_row`.
+            .font(theme::UI_FONT)
             .padding(space(1.0))
             .style(theme::input),
         text(count)
@@ -1682,40 +1950,45 @@ fn lane_column(state: &PanelState) -> Element<'_, Message> {
     let mut list = column![].spacing(space(0.25));
     for lane in &lanes {
         let active = *lane == state.picker.lane;
-        list = list.push(
-            container(
-                row![
-                    match lane {
-                        crate::model_picker::Lane::Named(p) =>
-                            widgets::mark(crate::model_picker::provider_mark(p), active),
-                        // `all` and `pinned` are not providers, so they get no
-                        // mark — but they keep the column, or the provider
-                        // labels below would sit at a different x.
-                        _ => Space::new()
-                            .width(widgets::MARK_SIZE)
-                            .height(widgets::MARK_SIZE)
-                            .into(),
-                    },
-                    text(crate::model_picker::lane_label(lane))
-                        .size(type_scale::META)
-                        .font(theme::MONO_FONT)
-                        .style(if active {
-                            theme::text_accent
-                        } else {
-                            theme::text_dim
-                        }),
-                ]
-                .spacing(space(0.75))
-                .align_y(Alignment::Center),
-            )
-            .padding([space(0.75), space(1.0)])
-            .width(Length::Fill)
-            // The active lane is a fill, not a rail. Rails here would put a
-            // second column of amber bars beside the list's own, and two
-            // parallel tracks of the same signal read as a rendering fault
-            // rather than as two states.
-            .style(if active { theme::raised } else { theme::ground }),
-        );
+        list =
+            list.push(
+                button(
+                    row![
+                        match lane {
+                            crate::model_picker::Lane::Named(p) => widgets::provider_logo(
+                                p,
+                                crate::model_picker::provider_mark(p),
+                                active
+                            ),
+                            // `all` and `pinned` are not providers, so they get no
+                            // mark — but they keep the column, or the provider
+                            // labels below would sit at a different x.
+                            _ => Space::new()
+                                .width(widgets::MARK_SIZE)
+                                .height(widgets::MARK_SIZE)
+                                .into(),
+                        },
+                        text(crate::model_picker::lane_label(lane))
+                            .size(type_scale::META)
+                            .font(theme::MONO_FONT)
+                            .style(if active {
+                                theme::text_accent
+                            } else {
+                                theme::text_dim
+                            }),
+                    ]
+                    .spacing(space(0.75))
+                    .align_y(Alignment::Center),
+                )
+                .padding([space(0.75), space(1.0)])
+                .width(Length::Fill)
+                // The active lane is a fill, not a rail. Rails here would put a
+                // second column of amber bars beside the list's own, and two
+                // parallel tracks of the same signal read as a rendering fault
+                // rather than as two states.
+                .style(theme::list_row_button(active))
+                .on_press(Message::PickerLane(lane.clone())),
+            );
     }
     container(list)
         .width(Length::Fixed(132.0))
@@ -1750,21 +2023,17 @@ fn model_row<'a>(
     favourite: bool,
     show_provider: bool,
     highlighted: bool,
+    index: usize,
 ) -> Element<'a, Message> {
-    // The mark carries the provider when no heading above does. It occupies
-    // the column either way, so names stay aligned down the whole list —
-    // pinned rows and grouped rows included.
-    let identity: Element<'a, Message> = if show_provider {
-        widgets::mark(
-            crate::model_picker::provider_mark(option.binding.provider.as_str()),
-            highlighted,
-        )
-    } else {
-        Space::new()
-            .width(widgets::MARK_SIZE)
-            .height(widgets::MARK_SIZE)
-            .into()
-    };
+    // The official mark rides every row (t3-style), not just ungrouped ones:
+    // an icon is scanned rather than read, so unlike the old two-letter tile
+    // it is not "noise competing with the name" under a provider heading.
+    let _ = show_provider;
+    let identity: Element<'a, Message> = widgets::provider_logo(
+        option.binding.provider.as_str(),
+        crate::model_picker::provider_mark(option.binding.provider.as_str()),
+        highlighted,
+    );
 
     let name = row![
         identity,
@@ -1827,10 +2096,21 @@ fn model_row<'a>(
     let _ = &option.abilities;
 
     row![
-        text(if favourite { "\u{2605}" } else { " " })
-            .width(Length::Fixed(space(2.0)))
-            .size(type_scale::META)
-            .style(theme::text_accent),
+        // The pin is a control, not just an indicator: clicking the star
+        // toggles it without selecting the row, which is how the favourites
+        // list gets curated in place.
+        button(
+            text(if favourite { "\u{2605}" } else { "\u{2606}" })
+                .size(type_scale::META)
+                .style(if favourite {
+                    theme::text_accent
+                } else {
+                    theme::text_faint
+                }),
+        )
+        .padding([space(0.25), space(0.5)])
+        .style(theme::list_row_button(false))
+        .on_press(Message::PickerPin(index)),
         name,
         Space::new().width(Length::Fill),
         meta,
@@ -1846,13 +2126,21 @@ fn model_row<'a>(
     .into()
 }
 
-/// Total panel height while the quick-pick is open.
+/// Minimum window height while the quick-pick menu is open.
 ///
-/// The list plus the search field, the result count, the action row and the
-/// panel's own padding. Fixed rather than derived from the number of matches: a
-/// window that resizes on every keystroke is unreadable while typing, which is
-/// the one thing this widget exists to make easy.
-const PICKER_PANEL_HEIGHT: f32 = 400.0;
+/// The menu's top offset plus its contents — search, count, lanes beside the
+/// list, the action row — plus the panel's padding. Fixed rather than derived
+/// from the number of matches: a window that resizes on every keystroke is
+/// unreadable while typing, which is the one thing this widget exists to make
+/// easy.
+const PICKER_PANEL_HEIGHT: f32 = 500.0;
+
+/// Widest the floating quick-pick menu grows.
+const PICKER_MENU_WIDTH: f32 = 560.0;
+
+/// Where the floating menu's top edge sits: just below the source/model row,
+/// so it reads as dropping down from the model cluster it opened from.
+const PICKER_MENU_TOP: f32 = 56.0;
 
 /// Height of the quick-pick's scrolling list.
 ///
@@ -1996,13 +2284,35 @@ fn input_row(state: &PanelState) -> Element<'_, Message> {
         i18n::t(Key::PanelPlaceholder)
     };
 
-    let input = text_input(placeholder, &state.input)
+    // A multi-line editor, not a `text_input`: dictation produces paragraphs
+    // (§P9+), and a single-line field scrolled them off into the void (owner
+    // report, 2026-08-01). ⏎ still submits — the key binding suppresses the
+    // editor's own newline and the window chord carries the submit — while
+    // ⇧⏎ makes a line break.
+    let input = text_editor(state.input_editor())
         .id(INPUT_ID)
-        .on_input(Message::InputChanged)
+        .placeholder(placeholder)
+        .on_action(Message::InputEdited)
         .size(type_scale::BODY)
-        .font(theme::MONO_FONT)
+        // Deliberately NOT the §2 mono face. `Font::MONOSPACE` has no CJK
+        // coverage, and cosmic-text's fallback shaping for it produced broken
+        // glyph metrics the moment dictated Japanese landed here — first as an
+        // app-aborting overflow, then as mangled, vertically-clipped text
+        // (owner reports, 2026-08-01). The mono input returns when real fonts
+        // with a CJK companion ship (§2 names IBM Plex Mono + Plex Sans JP).
+        .font(theme::UI_FONT)
         .padding(space(1.0))
-        .style(theme::input);
+        .key_binding(|key_press| {
+            if matches!(
+                key_press.key.as_ref(),
+                iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
+            ) && !key_press.modifiers.shift()
+            {
+                return None;
+            }
+            text_editor::Binding::from_key_press(key_press)
+        })
+        .style(theme::answer_editor);
 
     // No well. `design.md` §3's mock puts the caret directly on the panel
     // ground with the rail beside it — the input is the line you were already
@@ -2027,6 +2337,18 @@ fn shows_empty_invitation(state: &PanelState) -> bool {
 }
 
 fn composer_actions_for(state: &PanelState) -> Vec<Action<Message>> {
+    // Push-to-talk (§P9+): one toggle whose label always states what pressing
+    // it does next, same rule as the Codex sign-in button.
+    let dictate = Action::new(
+        if state.dictating {
+            Key::ActionStopDictation
+        } else {
+            Key::ActionDictate
+        },
+        widgets::primary_shortcut("⌘L", "Ctrl+L"),
+        Message::ToggleDictation,
+    );
+
     let attach = Action::new(Key::ActionAttachImage, ATTACH_KEY, Message::Attach);
     let attach = if state.clipboard.is_attachable() {
         attach
@@ -2048,7 +2370,7 @@ fn composer_actions_for(state: &PanelState) -> Vec<Action<Message>> {
     } else {
         primary
     };
-    vec![attach, primary]
+    vec![dictate, attach, primary]
 }
 
 fn user_bubble(message: &str) -> Element<'_, Message> {
@@ -2189,7 +2511,8 @@ fn active_assistant_bubble(
 }
 
 fn conversation(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Message> {
-    let mut transcript = column![].spacing(space(2.0));
+    // The spacing constant is shared with `transcript_content_height`; see it.
+    let mut transcript = column![].spacing(CHAT_MESSAGE_SPACING);
     for turn in &state.turns {
         transcript = transcript
             .push(user_bubble(&turn.user))
@@ -2205,17 +2528,22 @@ fn conversation(state: &PanelState, appearance: theme::Appearance) -> Element<'_
         }
     }
 
-    let height = Length::Fixed(state.transcript_height());
     if state.transcript_content_height() > state.max_transcript_height() {
         scrollable(transcript)
-            .height(height)
+            .height(Length::Fixed(state.transcript_height()))
             .style(theme::scroller)
             .into()
     } else {
         // Avoid retaining a scroll offset while retrying or replacing a short
         // answer. On macOS that stale offset can yield an invalid glyph
         // position after the window shrinks.
-        container(transcript).height(height).into()
+        //
+        // Content-sized, deliberately: this box was pinned to the *estimated*
+        // height, which painted every estimation error as dead space between
+        // the last bubble and the hairline (owner report, 2026-08-01). When
+        // nothing scrolls, the real content is the right height — the
+        // estimate's only job is sizing the window.
+        container(transcript).into()
     }
 }
 
@@ -2317,10 +2645,16 @@ fn error_action(action: ErrorAction) -> Option<Action<Message>> {
             widgets::primary_shortcut("⌘C", "Ctrl+C"),
         ),
         ErrorAction::RemoveAttachment { .. } => (Key::ActionRemoveImage, DETACH_KEY),
-        // These actions do not have a backing `UiRequest` yet. Rendering a
+        // The error names a model that works; the quick-pick is where one is
+        // chosen, so the action opens it. The key hint is the picker's own.
+        ErrorAction::UseModel { .. } => (
+            Key::ActionSwitchModel,
+            widgets::primary_shortcut("⌘K", "Ctrl+K"),
+        ),
+        // These two do not have a backing `UiRequest` yet. Rendering a
         // primary button that is known to do nothing is worse than leaving the
         // recovery unavailable, especially on a blocking error.
-        ErrorAction::TrimSelection | ErrorAction::UseModel { .. } | ErrorAction::ContinueAnyway => {
+        ErrorAction::TrimSelection | ErrorAction::ContinueAnyway => {
             return None;
         }
     };
@@ -2360,12 +2694,40 @@ impl PanelState {
         if let Some(user) = &self.active_user {
             height += chat_bubble_height(user, false);
             messages += 1;
-            if matches!(
-                self.phase,
-                Phase::Loading | Phase::Streaming | Phase::Finished { .. } | Phase::Failed
-            ) {
-                height += CHAT_BUBBLE_CHROME_HEIGHT + self.chat_answer_height();
-                messages += 1;
+            match self.phase {
+                // §16: while the answer can still grow, the reserved height
+                // stands so streaming never reflows the transcript. The
+                // reservation is floored well ahead of the text: tracking it
+                // line by line made every few tokens a window resize, and each
+                // resize is a visible flicker (owner report, 2026-08-01). One
+                // grow at dispatch and one settle at the finish is two resizes
+                // per turn instead of six.
+                Phase::Loading | Phase::Streaming => {
+                    height += CHAT_BUBBLE_CHROME_HEIGHT
+                        + self
+                            .chat_answer_height()
+                            .max(CHAT_STREAM_RESERVE.min(self.max_chat_answer_height()));
+                    messages += 1;
+                }
+                // Settled: the bubble is as tall as what is actually in it.
+                // Keeping the streaming reservation here left a bubble-sized
+                // hole of dead space under every short finished answer.
+                Phase::Finished { .. } | Phase::Failed => {
+                    let mut body = if self.response.is_empty() {
+                        0.0
+                    } else {
+                        estimated_text_height(&self.response, CHAT_ASSISTANT_CHARS_PER_LINE)
+                    };
+                    // The truncation marker `active_assistant_bubble` appends.
+                    if !self.response.is_empty()
+                        && (self.is_truncated() || matches!(self.phase, Phase::Failed))
+                    {
+                        body += theme::META_LINE_HEIGHT;
+                    }
+                    height += CHAT_BUBBLE_CHROME_HEIGHT + body;
+                    messages += 1;
+                }
+                Phase::Hidden | Phase::WarmingUp { .. } | Phase::Idle => {}
             }
         }
         if messages > 1 {
@@ -2459,12 +2821,16 @@ impl PanelState {
     /// mode when they drift is silent clipping at the window edge rather than a
     /// layout error anyone would notice in a test.
     fn footer_height(&self) -> f32 {
-        let mut rows = 0.0;
+        // The action list is always the last row.
+        let mut rows = 1.0_f32;
+        let mut height = theme::ACTION_ROW_HEIGHT;
         if self.attribution.provider.is_some() && self.attribution.model.is_some() {
-            rows += theme::META_LINE_HEIGHT;
+            rows += 1.0;
+            height += theme::META_LINE_HEIGHT;
         }
         if self.attribution.substituted_for.is_some() && self.attribution.provider.is_some() {
-            rows += theme::META_LINE_HEIGHT;
+            rows += 1.0;
+            height += theme::META_LINE_HEIGHT;
         }
         if matches!(
             self.context,
@@ -2473,9 +2839,39 @@ impl PanelState {
                 ..
             }
         ) {
-            rows += theme::META_LINE_HEIGHT;
+            rows += 1.0;
+            height += theme::META_LINE_HEIGHT;
         }
-        rows + theme::ACTION_ROW_HEIGHT
+        // `footer`'s column spacing between the rows, plus the 1 pt hairline
+        // the view draws above the whole block. Uncounted, these were among
+        // the points that pushed the input row past the window edge.
+        height + (rows - 1.0) * FOOTER_ROW_SPACING + 1.0
+    }
+
+    /// Height of the inline error block [`content`] renders under a transcript.
+    ///
+    /// Mirrors `content`'s own gate exactly: only a `Failed` phase with an
+    /// error and no partial response gets the block. Left uncounted, an error
+    /// arriving mid-conversation pushed the whole footer and input past the
+    /// window edge — the exact state the §13 error was trying to explain.
+    fn chat_error_height(&self) -> f32 {
+        if !matches!(self.phase, Phase::Failed) || !self.response.is_empty() {
+            return 0.0;
+        }
+        let Some(error) = &self.error else {
+            return 0.0;
+        };
+        // `state_block`: 24 pt padding twice, a body-size title line, then
+        // optional body and action rows at 12 pt spacing — plus the 16 pt
+        // column gap `content` puts above the block.
+        let mut height = 48.0 + 20.0 + 16.0;
+        if error.body.is_some() {
+            height += theme::META_LINE_HEIGHT + FOOTER_ROW_SPACING;
+        }
+        if error.action.clone().and_then(error_action).is_some() {
+            height += theme::ACTION_ROW_HEIGHT + FOOTER_ROW_SPACING;
+        }
+        height
     }
 
     /// Height the attachments add, wherever the panel is in its lifecycle.
@@ -2522,6 +2918,9 @@ impl PanelState {
 /// composition — a 20 pt thumbnail plus the chip's vertical padding — rather
 /// than a shared token.
 const ATTACHMENT_ROW_HEIGHT: f32 = 36.0;
+/// [`footer`]'s column spacing — [`space`]`(1.5)`. Shared with
+/// [`PanelState::footer_height`] so the estimate cannot drift from the render.
+const FOOTER_ROW_SPACING: f32 = 12.0;
 const SELECTION_CARD_COLLAPSED_HEIGHT: f32 = 64.0;
 const SELECTION_CARD_EXPANDED_HEIGHT: f32 = 132.0;
 const CHAT_PANEL_MIN_HEIGHT: f32 = 320.0;
@@ -2548,8 +2947,23 @@ const PANEL_HEIGHT_DISPLAY_FRACTION: f32 = 0.60;
 const ANSWER_HEIGHT_STEP: f32 = 48.0;
 
 const CHAT_ANSWER_MAX_HEIGHT: f32 = 172.0;
-const CHAT_BUBBLE_CHROME_HEIGHT: f32 = 38.0;
-const CHAT_MESSAGE_SPACING: f32 = 8.0;
+/// Height reserved for the active answer while it streams, so a typical reply
+/// fits without a single mid-stream resize. Short answers give the space back
+/// when they settle; long ones grow past it in [`estimated_text_height`]'s
+/// whole-line steps.
+const CHAT_STREAM_RESERVE: f32 = 96.0;
+/// Everything a bubble adds around its body text: 16 pt vertical padding twice
+/// ([`space`]`(2.0)` in [`user_bubble`]/[`assistant_text_bubble`]), the ~15 pt
+/// `META` role label, and the 8 pt column gap between label and body.
+///
+/// This must track the bubble composition. It was 38 while the real chrome was
+/// ~54, and the drift, summed over a transcript, is exactly the kind of error
+/// that clipped the input row off the bottom of the window.
+const CHAT_BUBBLE_CHROME_HEIGHT: f32 = 54.0;
+/// Gap between transcript messages. [`conversation`] must use this same value
+/// as its column spacing — the estimate and the render disagreeing about the
+/// gaps is invisible per message and fatal in sum.
+const CHAT_MESSAGE_SPACING: f32 = 16.0;
 const CHAT_USER_CHARS_PER_LINE: usize = 72;
 const CHAT_ASSISTANT_CHARS_PER_LINE: usize = 68;
 
@@ -2634,16 +3048,29 @@ fn actions_for(state: &PanelState) -> Vec<Action<Message>> {
         ));
     }
 
-    let replace = Action::new(
-        Key::ActionReplace,
-        widgets::primary_shortcut("⌘↩", "Ctrl+Enter"),
-        Message::Accept,
-    );
-    actions.push(if state.can_accept() {
-        replace
+    // `design.md` §4: on a truncated stop the footer swaps `⏎ replace` for
+    // `⏎ retry`. A partial answer can never be inserted, so a disabled
+    // Replace in the primary slot — with the real recovery relegated to a
+    // secondary ⌘R — advertised the one action that cannot work.
+    let truncated_retry = state.is_truncated() && state.active_user.is_some();
+    if truncated_retry {
+        actions.push(Action::new(
+            Key::ActionRetry,
+            widgets::primary_shortcut("⌘↩", "Ctrl+Enter"),
+            Message::Retry,
+        ));
     } else {
-        replace.disabled()
-    });
+        let replace = Action::new(
+            Key::ActionReplace,
+            widgets::primary_shortcut("⌘↩", "Ctrl+Enter"),
+            Message::Accept,
+        );
+        actions.push(if state.can_accept() {
+            replace
+        } else {
+            replace.disabled()
+        });
+    }
 
     let copy = Action::new(
         Key::ActionCopy,
@@ -2656,20 +3083,24 @@ fn actions_for(state: &PanelState) -> Vec<Action<Message>> {
         copy.disabled()
     });
 
-    let retry = Action::new(
-        Key::ActionRegenerate,
-        widgets::primary_shortcut("⌘R", "Ctrl+R"),
-        Message::Retry,
-    );
-    actions.push(
-        if matches!(state.phase, Phase::Finished { .. } | Phase::Failed)
-            && state.active_user.is_some()
-        {
-            retry
-        } else {
-            retry.disabled()
-        },
-    );
+    // Skipped during the truncated swap: the primary slot already carries
+    // this exact message, and two entries for one action is noise.
+    if !truncated_retry {
+        let retry = Action::new(
+            Key::ActionRegenerate,
+            widgets::primary_shortcut("⌘R", "Ctrl+R"),
+            Message::Retry,
+        );
+        actions.push(
+            if matches!(state.phase, Phase::Finished { .. } | Phase::Failed)
+                && state.active_user.is_some()
+            {
+                retry
+            } else {
+                retry.disabled()
+            },
+        );
+    }
 
     // Removal is listed only while there is something to remove. It is not the
     // "disabled rather than absent" case: unlike Replace and Copy, this action
@@ -2681,6 +3112,16 @@ fn actions_for(state: &PanelState) -> Vec<Action<Message>> {
             Key::ActionRemoveImage,
             DETACH_KEY,
             Message::DetachLast,
+        ));
+    }
+
+    // The answer to "how do I start over": visible the moment there is
+    // something to start over from.
+    if state.has_conversation() {
+        actions.push(Action::new(
+            Key::ActionNewChat,
+            widgets::primary_shortcut("⌘N", "Ctrl+N"),
+            Message::NewChat,
         ));
     }
 
@@ -3411,15 +3852,92 @@ mod tests {
     #[test]
     fn recovery_actions_without_backend_wiring_are_not_rendered() {
         assert!(error_action(ErrorAction::TrimSelection).is_none());
-        assert!(
-            error_action(ErrorAction::UseModel {
-                provider: ProviderId::OPENAI,
-                model: "gpt-5".to_owned(),
-            })
-            .is_none()
-        );
         assert!(error_action(ErrorAction::ContinueAnyway).is_none());
         assert!(error_action(ErrorAction::Retry).is_some());
+    }
+
+    /// `ModelRejected` names a model that works, so the treatment must offer a
+    /// way to choose it — the quick-pick — rather than dead-ending. The route
+    /// through settings needs a `UiRequest` the bridge does not carry yet; the
+    /// picker does not.
+    #[test]
+    fn a_model_rejection_offers_the_picker() {
+        let action = error_action(ErrorAction::UseModel {
+            provider: ProviderId::OPENAI,
+            model: "gpt-5".to_owned(),
+        })
+        .expect("the named fix must be actionable");
+        assert_eq!(action.label, Key::ActionSwitchModel);
+        assert!(action.on_press.is_some());
+    }
+
+    /// `⌘↩` pastes the latest completed answer even after the panel reopens
+    /// into `Idle`, and falls back to the last settled turn while a new one
+    /// streams — but never yields a partial (owner request, 2026-08-01).
+    #[test]
+    fn the_latest_answer_survives_reopen_and_new_turns() {
+        let mut state = panel();
+        state.context = ContextState::Available {
+            app: None,
+            excerpt: None,
+            selection: None,
+            truncated: false,
+            caret_bounds: None,
+        };
+        state.begin_turn("first".to_owned());
+        state.response = "first answer".to_owned();
+        state.phase = Phase::Finished {
+            reason: StopReason::EndTurn,
+        };
+        assert_eq!(state.latest_answer(), Some("first answer"));
+        assert!(state.can_accept());
+
+        // Reopen: the conversation survives, the phase comes back Idle.
+        state.begin_turn("second".to_owned());
+        state.phase = Phase::Idle;
+        assert_eq!(
+            state.latest_answer(),
+            Some("first answer"),
+            "the settled turn's answer is still the latest"
+        );
+        assert!(state.can_accept());
+
+        // Mid-stream: paste is blocked, but the latest answer is unchanged
+        // and never the partial.
+        state.phase = Phase::Streaming;
+        state.response = "partial".to_owned();
+        assert_eq!(state.latest_answer(), Some("first answer"));
+        assert!(!state.can_accept());
+    }
+
+    /// `design.md` §4: on a truncated stop the footer swaps `⏎ replace` for
+    /// `⏎ retry`, and the duplicate ⌘R entry goes with it.
+    #[test]
+    fn a_truncated_answer_swaps_replace_for_retry() {
+        let mut state = panel();
+        state.begin_turn("summarise".to_owned());
+        state.phase = Phase::Finished {
+            reason: StopReason::Length,
+        };
+        state.response = "partial".to_owned();
+        assert!(state.is_truncated());
+
+        let actions = actions_for(&state);
+        let retry = actions
+            .iter()
+            .find(|a| a.label == Key::ActionRetry)
+            .expect("retry takes the primary slot");
+        assert!(retry.on_press.is_some());
+        assert!(actions.iter().all(|a| a.label != Key::ActionReplace));
+        assert!(actions.iter().all(|a| a.label != Key::ActionRegenerate));
+
+        // A clean stop keeps the ordinary footer.
+        state.phase = Phase::Finished {
+            reason: StopReason::EndTurn,
+        };
+        let actions = actions_for(&state);
+        assert!(actions.iter().any(|a| a.label == Key::ActionReplace));
+        assert!(actions.iter().all(|a| a.label != Key::ActionRetry));
     }
 
     /// §14: the user pays for every image, so the estimate is on screen before

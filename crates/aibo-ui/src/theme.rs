@@ -17,7 +17,9 @@
 use iced::border::Radius;
 use iced::overlay;
 use iced::theme::Base as _;
-use iced::widget::{button, container, pick_list, rule, scrollable, text, text_editor, text_input};
+use iced::widget::{
+    button, container, pick_list, rule, scrollable, svg, text, text_editor, text_input,
+};
 use iced::{Background, Border, Color, Font, Shadow, Theme, Vector};
 
 // ---------------------------------------------------------------------------
@@ -699,6 +701,72 @@ pub fn text_dim(theme: &Theme) -> text::Style {
 pub fn text_faint(theme: &Theme) -> text::Style {
     text::Style {
         color: Some(palette_of(theme).text_faint),
+    }
+}
+
+/// Provider marks at rest: the monochrome logos render in the dim text tone,
+/// so a column of them reads as UI structure rather than as advertising.
+pub fn icon_dim(theme: &Theme, _status: svg::Status) -> svg::Style {
+    svg::Style {
+        color: Some(palette_of(theme).text_dim),
+    }
+}
+
+/// Provider marks on the highlighted or selected row: full text strength,
+/// matching the name beside them.
+pub fn icon_primary(theme: &Theme, _status: svg::Status) -> svg::Style {
+    svg::Style {
+        color: Some(palette_of(theme).text),
+    }
+}
+
+/// A list-row click target: no chrome of its own at rest, the raised fill
+/// when active or hovered. Used for quick-pick rows, lanes and the model
+/// cluster — the gesture is the button's, the visual state stays in the fill.
+pub fn list_row_button(active: bool) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme: &Theme, status: button::Status| {
+        let p = palette_of(theme);
+        let lit = active || matches!(status, button::Status::Hovered | button::Status::Pressed);
+        button::Style {
+            text_color: p.text,
+            background: lit.then_some(Background::Color(p.surface_raised)),
+            border: Border {
+                color: Color::TRANSPARENT,
+                width: 0.0,
+                radius: Radius::new(RADIUS_SMALL),
+            },
+            shadow: Shadow::default(),
+            snap: true,
+        }
+    }
+}
+
+/// The floating quick-pick menu.
+///
+/// The one surface that gets a real border and shadow: it floats *over* the
+/// panel, and without an edge it would read as the panel's content jumping
+/// rather than as a menu that arrived. This is a deliberate, narrow exception
+/// to `design.md` §9's border cut — the rule exists so surfaces in the same
+/// plane don't box each other, and this surface is not in the same plane.
+pub fn overlay_menu(theme: &Theme) -> container::Style {
+    let p = palette_of(theme);
+    container::Style {
+        text_color: Some(p.text),
+        background: Some(Background::Color(p.surface_raised)),
+        border: Border {
+            color: p.border,
+            width: 1.0,
+            radius: Radius::new(RADIUS_SMALL),
+        },
+        shadow: Shadow {
+            color: Color {
+                a: 0.5,
+                ..Color::BLACK
+            },
+            offset: Vector::new(0.0, 8.0),
+            blur_radius: 32.0,
+        },
+        snap: true,
     }
 }
 

@@ -479,10 +479,36 @@ pub struct Config {
     pub health: HealthConfig,
     /// Non-secret desktop-shell preferences.
     pub ui: UiSettings,
+    /// Pinned quick-pick models (`[pins]`).
+    pub pins: PinsSettings,
+    /// The `@` file finder's search roots (`[files]`).
+    pub files: FilesSettings,
     /// Wall-clock ceiling for one request, in seconds.
     pub request_deadline_secs: Option<u64>,
     /// §13's large-selection refusal, in characters.
     pub max_payload_chars: Option<usize>,
+}
+
+/// Persisted quick-pick pins (`[pins]`).
+///
+/// `Some` — including `Some(vec![])` — means the user has curated the set and
+/// the derived defaults must stay out of the way; absent means never touched.
+/// A pin is "a deliberate statement about what the user works with, and losing
+/// it on quit would make pinning pointless", which is why this exists.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct PinsSettings {
+    /// `provider/model` entries — the same spelling role chains use.
+    pub models: Option<Vec<String>>,
+}
+
+/// The `@` file finder's search roots (`[files]`).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct FilesSettings {
+    /// Directories the finder indexes. Absent means the platform defaults
+    /// (Documents, Desktop, Downloads under the home directory).
+    pub roots: Option<Vec<String>>,
 }
 
 /// Persisted desktop-shell preferences.
@@ -509,11 +535,11 @@ pub struct UiSettings {
     pub allow_ax_tree_activation: bool,
     /// Override the panel hotkey, e.g. `"control+alt+Space"`.
     ///
-    /// **The only way to change it that works.** §9 planned a picker in
-    /// settings; `Message::RebindHotkey` is still `Task::none()`, so the button
-    /// there does nothing. Until it is built, a taken shortcut locked the user
-    /// out of their own app: the panel would not open, and the panel is how you
-    /// reach settings.
+    /// **The only way to change it.** §9 planned a picker in settings; it is
+    /// not built yet, and the settings window now says so and points here
+    /// rather than offering a dead rebind button. Without this override, a
+    /// taken shortcut locked the user out of their own app: the panel would
+    /// not open, and the panel is how you reach settings.
     ///
     /// The syntax is what `aibo_ui::hotkey::parse` accepts — modifiers
     /// from `control`, `alt`, `shift`, `super`, joined by `+`, then one key
