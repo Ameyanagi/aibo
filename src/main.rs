@@ -1769,14 +1769,171 @@ mod config_file {
 
     /// Persist the desktop-shell language without rewriting unrelated config.
     pub fn write_ui_language(path: &Path, language: &str) -> io::Result<()> {
+        write_ui_key(path, "language", Some(&quote(language)))
+    }
+
+    /// Persist the §8 accessibility-activation opt-in.
+    pub fn write_ui_ax_activation(path: &Path, enabled: bool) -> io::Result<()> {
+        write_ui_key(path, "allow_ax_tree_activation", Some(&enabled.to_string()))
+    }
+
+    /// Persist the panel hotkey override; `None` returns to the default.
+    pub fn write_ui_panel_hotkey(path: &Path, spec: Option<&str>) -> io::Result<()> {
+        write_ui_key(path, "panel_hotkey", spec.map(quote).as_deref())
+    }
+
+    /// Set or remove **one key** of `[ui]`, leaving its other keys standing.
+    ///
+    /// `[ui]` is the one multi-tenant table settings writes: `language`,
+    /// `allow_ax_tree_activation` and `panel_hotkey` all live there, owned by
+    /// different parts of the settings window. [`splice_table`] replaces a
+    /// table's whole body, so routing these through it meant changing the UI
+    /// language silently deleted the user's rebound hotkey from the file.
+    fn write_ui_key(path: &Path, key: &str, value: Option<&str>) -> io::Result<()> {
         let existing = match std::fs::read_to_string(path) {
             Ok(source) => source,
             Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(error),
         };
-        let body = format!("language = {}\n", quote(language));
-        let updated = splice_table(&existing, "ui", &body);
+        let updated = splice_key_in_table(&existing, "ui", key, value);
         crate::paths::atomic_write(path, updated.as_bytes())
+    }
+
+    /// Persist the `@` finder's search roots; `None` returns to the defaults.
+    pub fn write_files_roots(path: &Path, roots: Option<&[String]>) -> io::Result<()> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+        let updated = match roots {
+            Some(roots) => {
+                let mut body = String::from("roots = [");
+                for (index, root) in roots.iter().enumerate() {
+                    if index > 0 {
+                        body.push_str(", ");
+                    }
+                    body.push_str(&quote(root));
+                }
+                body.push_str("]\n");
+                splice_table(&existing, "files", &body)
+            }
+            None => splice_key_in_table(&existing, "files", "roots", None),
+        };
+        crate::paths::atomic_write(path, updated.as_bytes())
+    }
+
+    /// Persist the monthly budget; `None` removes the ceiling entirely.
+    pub fn write_budget(
+        path: &Path,
+        budget: Option<(u64, u8, bool)>, // (limit_micros, warn_at_percent, hard_stop)
+    ) -> io::Result<()> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+        let updated = match budget {
+            Some((limit_micros, warn_at_percent, hard_stop)) => {
+                let body = format!(
+                    "limit_micros = {limit_micros}\nwarn_at_percent = {warn_at_percent}\nhard_stop = {hard_stop}\n"
+                );
+                splice_table(&existing, "budget", &body)
+            }
+            // An absent table is "no budget" (`Option<BudgetConfig>`), and an
+            // empty one would fail `limit_micros`'s required deserialisation.
+            None => remove_table(&existing, "budget"),
+        };
+        crate::paths::atomic_write(path, updated.as_bytes())
+    }
+
+    /// Set (`Some`) or remove (`None`) one `key = …` line inside `[table]`,
+    /// leaving every other line of the table — keys and comments — untouched.
+    /// A missing table is created for `Some`, and a no-op for `None`.
+    fn splice_key_in_table(source: &str, table: &str, key: &str, value: Option<&str>) -> String {
+        let header = format!("[{table}]");
+        let mut out = String::with_capacity(source.len() + 64);
+        let mut in_table = false;
+        let mut table_seen = false;
+        let mut key_written = false;
+
+        let write_pending_key = |out: &mut String, key_written: &mut bool| {
+            if !*key_written && let Some(value) = value {
+                out.push_str(&format!("{key} = {value}\n"));
+                *key_written = true;
+            }
+        };
+
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if trimmed == header {
+                in_table = true;
+                table_seen = true;
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            if in_table {
+                if trimmed.starts_with('[') {
+                    // Leaving the table: a key that was never found is added
+                    // at its end, before the next header.
+                    write_pending_key(&mut out, &mut key_written);
+                    in_table = false;
+                } else if line_key(trimmed) == Some(key) {
+                    if let Some(value) = value {
+                        out.push_str(&format!("{key} = {value}\n"));
+                    }
+                    key_written = true;
+                    continue;
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        if in_table {
+            write_pending_key(&mut out, &mut key_written);
+        }
+
+        if !table_seen && value.is_some() {
+            if !out.is_empty() && !out.ends_with("\n\n") {
+                out.push('\n');
+            }
+            out.push_str(&header);
+            out.push('\n');
+            write_pending_key(&mut out, &mut key_written);
+        }
+        out
+    }
+
+    /// The key of a `key = value` TOML line, or `None` for anything else.
+    fn line_key(line: &str) -> Option<&str> {
+        let (key, _) = line.split_once('=')?;
+        let key = key.trim();
+        (!key.is_empty() && !key.starts_with('#')).then_some(key)
+    }
+
+    /// Drop `[table]` and its body entirely.
+    fn remove_table(source: &str, table: &str) -> String {
+        let header = format!("[{table}]");
+        let mut out = String::with_capacity(source.len());
+        let mut skipping = false;
+        for line in source.lines() {
+            let trimmed = line.trim();
+            if trimmed == header {
+                skipping = true;
+                continue;
+            }
+            if skipping {
+                if trimmed.starts_with('[') {
+                    skipping = false;
+                } else {
+                    continue;
+                }
+            }
+            out.push_str(line);
+            out.push('\n');
+        }
+        out
     }
 
     /// Persist the quick-pick pin set without rewriting unrelated config.
@@ -2046,6 +2203,55 @@ mod config_file {
     #[cfg(test)]
     mod tests {
         use super::*;
+
+        /// The bug this exists to prevent: `[ui]` is multi-tenant, and writing
+        /// the language through the whole-table splice deleted the user's
+        /// `panel_hotkey` — changing language cost them their shortcut.
+        #[test]
+        fn setting_one_ui_key_leaves_its_neighbours_standing() {
+            let source = "[ui]\n# my hotkey\npanel_hotkey = \"control+alt+Space\"\nlanguage = \"en\"\n\n[pins]\nmodels = []\n";
+            let updated = splice_key_in_table(source, "ui", "language", Some("\"ja\""));
+            assert!(updated.contains("panel_hotkey = \"control+alt+Space\""));
+            assert!(updated.contains("# my hotkey"));
+            assert!(updated.contains("language = \"ja\""));
+            assert!(!updated.contains("language = \"en\""));
+            assert!(updated.contains("[pins]"));
+        }
+
+        #[test]
+        fn a_new_ui_key_lands_inside_the_table_not_after_the_next_one() {
+            let source = "[ui]\nlanguage = \"en\"\n\n[pins]\nmodels = []\n";
+            let updated =
+                splice_key_in_table(source, "ui", "allow_ax_tree_activation", Some("true"));
+            let ui_end = updated.find("[pins]").expect("pins survives");
+            let key_at = updated
+                .find("allow_ax_tree_activation = true")
+                .expect("key added");
+            assert!(
+                key_at < ui_end,
+                "the key must join [ui], not [pins]:\n{updated}"
+            );
+        }
+
+        #[test]
+        fn a_missing_table_is_created_and_a_removal_of_nothing_is_a_noop() {
+            let updated = splice_key_in_table("", "ui", "panel_hotkey", Some("\"alt+Space\""));
+            assert!(updated.contains("[ui]\npanel_hotkey = \"alt+Space\"\n"));
+            assert_eq!(
+                splice_key_in_table("x = 1\n", "ui", "panel_hotkey", None),
+                "x = 1\n"
+            );
+        }
+
+        #[test]
+        fn removing_the_budget_removes_the_whole_table() {
+            let source =
+                "[ui]\nlanguage = \"en\"\n\n[budget]\nlimit_micros = 5\n\n[pins]\nmodels = []\n";
+            let updated = remove_table(source, "budget");
+            assert!(!updated.contains("limit_micros"));
+            assert!(updated.contains("[ui]"));
+            assert!(updated.contains("[pins]"));
+        }
 
         /// The property that matters most: editing one provider must leave the
         /// user's other providers, their comments, and their unrelated tables
@@ -3063,6 +3269,9 @@ mod runtime {
         children: ChildRegistry,
         /// The one live dictation turn, if any (§P9+). Dropping it commits.
         dictation: Option<crate::stt::DictationHandle>,
+        /// The `@` finder's roots as currently configured — the live copy
+        /// settings edits, so a change applies to the very next walk.
+        file_roots: Option<Vec<String>>,
     }
 
     impl Backend {
@@ -3116,6 +3325,7 @@ mod runtime {
                 // Shipped entries only until the first refresh answers.
                 catalogue: aibo_provider::ModelCatalogue::shipped(),
                 dictation: None,
+                file_roots: config.files.roots.clone(),
             }
         }
 
@@ -3186,6 +3396,30 @@ mod runtime {
                     .await
                     .is_err()
             {
+                return;
+            }
+            // The runtime-owned settings, so the settings window edits real
+            // values. Defaults are computed with no configured roots on
+            // purpose: they are what an absent `[files]` falls back to.
+            let startup_settings = {
+                let config = self.bootstrap.config();
+                UiEvent::SettingsLoaded {
+                    ax_tree_activation: config.ui.allow_ax_tree_activation,
+                    file_roots: self.file_roots.clone(),
+                    default_file_roots: crate::files::roots(None)
+                        .iter()
+                        .map(|root| root.to_string_lossy().into_owned())
+                        .collect(),
+                    budget: config.budget.map(|budget| {
+                        (
+                            budget.limit_micros,
+                            budget.warn_at_percent,
+                            budget.hard_stop,
+                        )
+                    }),
+                }
+            };
+            if self.events.send(startup_settings).await.is_err() {
                 return;
             }
             if self.onboarding_required {
@@ -3333,7 +3567,7 @@ mod runtime {
                 // §P9+ @ file mentions. The walk and the read are blocking
                 // filesystem work and stay off the async workers.
                 UiRequest::ListFiles => {
-                    let roots = crate::files::roots(self.bootstrap.config().files.roots.as_deref());
+                    let roots = crate::files::roots(self.file_roots.as_deref());
                     let events = self.events.clone();
                     tokio::spawn(crate::diagnostics::supervise("file-walk", async move {
                         if let Ok(files) =
@@ -3371,6 +3605,59 @@ mod runtime {
                     ) {
                         tracing::warn!(%error, "could not persist the pinned models");
                     }
+                }
+
+                UiRequest::SetPanelHotkey { spec } => {
+                    if let Err(error) = crate::config_file::write_ui_panel_hotkey(
+                        &self.bootstrap.paths().config(),
+                        spec.as_deref(),
+                    ) {
+                        tracing::warn!(%error, "could not persist the panel hotkey");
+                    }
+                }
+
+                UiRequest::SetAxTreeActivation { enabled } => {
+                    // Persist only: the flag is baked into the platform worker
+                    // at construction and the settings row says it applies at
+                    // the next start.
+                    if let Err(error) = crate::config_file::write_ui_ax_activation(
+                        &self.bootstrap.paths().config(),
+                        enabled,
+                    ) {
+                        tracing::warn!(%error, "could not persist the AX activation opt-in");
+                    }
+                }
+
+                UiRequest::SetFileRoots { roots } => {
+                    if let Err(error) = crate::config_file::write_files_roots(
+                        &self.bootstrap.paths().config(),
+                        roots.as_deref(),
+                    ) {
+                        tracing::warn!(%error, "could not persist the finder roots");
+                    }
+                    // The live copy: the next `ListFiles` walks the new set.
+                    self.file_roots = roots;
+                }
+
+                UiRequest::SetMonthlyBudget {
+                    limit_micros,
+                    warn_at_percent,
+                    hard_stop,
+                } => {
+                    let budget = limit_micros.map(|limit| (limit, warn_at_percent, hard_stop));
+                    if let Err(error) =
+                        crate::config_file::write_budget(&self.bootstrap.paths().config(), budget)
+                    {
+                        tracing::warn!(%error, "could not persist the monthly budget");
+                    }
+                    // Enforcement reads the meter, so the next request sees it.
+                    self.engine.set_monthly_budget(limit_micros.map(|limit| {
+                        aibo_core::cost::MonthlyBudget {
+                            limit_micros: limit,
+                            warn_at_percent,
+                            hard_stop,
+                        }
+                    }));
                 }
 
                 UiRequest::SetModel { binding } => self.set_model(binding),
@@ -4126,7 +4413,16 @@ mod runtime {
             tokio::spawn(crate::diagnostics::supervise("submit", async move {
                 let pump = {
                     let events = events.clone();
-                    tokio::spawn(forward_session_events(session, session_events, events))
+                    let budget: BudgetSource = {
+                        let engine = engine.clone();
+                        std::sync::Arc::new(move || engine.monthly_budget())
+                    };
+                    tokio::spawn(forward_session_events(
+                        session,
+                        session_events,
+                        events,
+                        budget,
+                    ))
                 };
 
                 let outcome = engine.run(submission, &sink).await;
@@ -4557,10 +4853,17 @@ mod runtime {
     /// cannot collapse a real stream into one synchronous-looking repaint.
     /// The first remainder or different event is retained in one fixed pending
     /// slot, so ordering and the hard memory bound remain unchanged.
+    /// Where the spend meter's denominator comes from, read per cost event
+    /// rather than snapshotted at spawn: settings can change the budget while
+    /// a stream is in flight, and the meter must follow.
+    type BudgetSource =
+        std::sync::Arc<dyn Fn() -> Option<aibo_core::cost::MonthlyBudget> + Send + Sync>;
+
     async fn forward_session_events(
         session: SessionId,
         mut source: Receiver<SessionEvent>,
         events: Sender<UiEvent>,
+        budget: BudgetSource,
     ) {
         let mut pending = None;
         let mut text_batches = 0usize;
@@ -4585,7 +4888,7 @@ mod runtime {
                     if matches!(stream.as_ref(), StreamEvent::Text(text) if !text.is_empty())
             );
 
-            for ui in translate(session, event) {
+            for ui in translate(session, event, budget()) {
                 if events.send(ui).await.is_err() {
                     return;
                 }
@@ -4688,7 +4991,11 @@ mod runtime {
     /// Currency formatting lives here rather than in `aibo-session` because
     /// `UiEvent::Cost` carries an *already formatted* label and the display
     /// currency is a settings concern.
-    fn translate(session: SessionId, event: SessionEvent) -> Vec<UiEvent> {
+    fn translate(
+        session: SessionId,
+        event: SessionEvent,
+        budget: Option<aibo_core::cost::MonthlyBudget>,
+    ) -> Vec<UiEvent> {
         match event {
             SessionEvent::Routed {
                 surface,
@@ -4759,11 +5066,18 @@ mod runtime {
                 },
                 UiEvent::Spend {
                     label: format_micros(Some(committed_micros)),
-                    // TODO(settings): the fraction needs the configured monthly
-                    // cap, which lives in `EngineConfig`. Left `None` rather
-                    // than guessed — a meter showing a made-up percentage is
-                    // worse than one showing none.
-                    fraction_of_cap: None,
+                    // The live budget from the engine's meter; `None` when no
+                    // ceiling is set, so the meter shows spend without a
+                    // made-up percentage.
+                    #[expect(
+                        clippy::cast_precision_loss,
+                        reason = "a display fraction, clamped to 1"
+                    )]
+                    fraction_of_cap: budget.and_then(|budget| {
+                        (budget.limit_micros > 0).then(|| {
+                            (committed_micros as f64 / budget.limit_micros as f64).min(1.0) as f32
+                        })
+                    }),
                 },
             ],
 
@@ -5760,6 +6074,7 @@ mod runtime {
                     role: Role::Smart,
                     rule: "ask_is_smart",
                 },
+                None,
             );
             assert!(events.is_empty(), "routing is a log line, not a UI state");
         }
@@ -5789,7 +6104,12 @@ mod runtime {
             drop(source_tx);
 
             let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(1);
-            let pump = tokio::spawn(forward_session_events(session, source_rx, events_tx));
+            let pump = tokio::spawn(forward_session_events(
+                session,
+                source_rx,
+                events_tx,
+                std::sync::Arc::new(|| None),
+            ));
             tokio::task::yield_now().await;
             assert!(
                 !pump.is_finished(),
@@ -5835,7 +6155,12 @@ mod runtime {
             drop(source_tx);
 
             let (events_tx, mut events_rx) = tokio::sync::mpsc::channel(8);
-            let pump = tokio::spawn(forward_session_events(session, source_rx, events_tx));
+            let pump = tokio::spawn(forward_session_events(
+                session,
+                source_rx,
+                events_tx,
+                std::sync::Arc::new(|| None),
+            ));
             let mut rendered = String::new();
             let mut batch_sizes = Vec::new();
             while let Some(event) = events_rx.recv().await {
@@ -5869,15 +6194,39 @@ mod runtime {
 
         #[test]
         fn a_cost_event_feeds_both_meters() {
-            let events = translate(
-                SessionId::nil(),
-                SessionEvent::Cost {
-                    usage: aibo_core::types::Usage::default(),
-                    cost_micros: Some(300),
-                    committed_micros: 300,
-                },
-            );
+            let cost = || SessionEvent::Cost {
+                usage: aibo_core::types::Usage::default(),
+                cost_micros: Some(300),
+                committed_micros: 300,
+            };
+            let events = translate(SessionId::nil(), cost(), None);
             assert_eq!(events.len(), 2);
+            assert!(
+                matches!(
+                    events[1],
+                    UiEvent::Spend {
+                        fraction_of_cap: None,
+                        ..
+                    }
+                ),
+                "no budget, no made-up percentage"
+            );
+
+            // With a live budget the meter gets its real denominator (§14).
+            let budget = aibo_core::cost::MonthlyBudget {
+                limit_micros: 1_200,
+                warn_at_percent: 80,
+                hard_stop: false,
+            };
+            let events = translate(SessionId::nil(), cost(), Some(budget));
+            let UiEvent::Spend {
+                fraction_of_cap: Some(fraction),
+                ..
+            } = events[1]
+            else {
+                panic!("a budget must yield a fraction: {:?}", events[1]);
+            };
+            assert!((fraction - 0.25).abs() < 1e-6, "{fraction}");
         }
     }
 }

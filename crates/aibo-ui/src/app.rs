@@ -2464,6 +2464,150 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             state.send(UiRequest::SetLanguage(lang));
             Task::none()
         }
+        M::AxTreeToggle(enabled) => {
+            state.settings.ax_tree_activation = enabled;
+            state.send(UiRequest::SetAxTreeActivation { enabled });
+            Task::none()
+        }
+        M::RootDraft(draft) => {
+            if state.command_held && is_single_char_insertion(&state.settings.root_draft, &draft) {
+                return Task::none();
+            }
+            state.settings.root_draft = draft;
+            Task::none()
+        }
+        M::RootAdd => {
+            let root = state.settings.root_draft.trim().to_owned();
+            if root.is_empty() {
+                return Task::none();
+            }
+            // First edit materialises the defaults, so removing a default and
+            // adding a folder compose the way the list on screen implies.
+            let mut roots = state
+                .settings
+                .file_roots
+                .clone()
+                .unwrap_or_else(|| state.settings.default_file_roots.clone());
+            if !roots.contains(&root) {
+                roots.push(root);
+            }
+            state.settings.root_draft.clear();
+            state.settings.file_roots = Some(roots.clone());
+            state.send(UiRequest::SetFileRoots { roots: Some(roots) });
+            Task::none()
+        }
+        M::RootRemove(index) => {
+            let mut roots = state
+                .settings
+                .file_roots
+                .clone()
+                .unwrap_or_else(|| state.settings.default_file_roots.clone());
+            if index < roots.len() {
+                roots.remove(index);
+            }
+            state.settings.file_roots = Some(roots.clone());
+            state.send(UiRequest::SetFileRoots { roots: Some(roots) });
+            Task::none()
+        }
+        M::RootsReset => {
+            state.settings.file_roots = None;
+            state.send(UiRequest::SetFileRoots { roots: None });
+            Task::none()
+        }
+        M::HotkeyDraft(draft) => {
+            if state.command_held && is_single_char_insertion(&state.settings.hotkey_draft, &draft)
+            {
+                return Task::none();
+            }
+            state.settings.hotkey_draft = draft;
+            state.settings.hotkey_draft_invalid = false;
+            Task::none()
+        }
+        M::HotkeyApply => {
+            let spec = state.settings.hotkey_draft.trim().to_owned();
+            if spec.is_empty() {
+                return Task::none();
+            }
+            let Ok(parsed) = hotkey::parse(&spec) else {
+                state.settings.hotkey_draft_invalid = true;
+                return Task::none();
+            };
+            state.settings.hotkey_draft_invalid = false;
+            let Some(hotkeys) = state.hotkeys.as_mut() else {
+                // No registrar (it failed at startup): persist so the next
+                // launch picks the combination up, and claim nothing more.
+                state.send(UiRequest::SetPanelHotkey { spec: Some(spec) });
+                return Task::none();
+            };
+            // `rebind` restores the previous combination if the OS refuses
+            // this one; either way its status is the truth the block renders.
+            let status = hotkeys.rebind(hotkey::HotkeyAction::TogglePanel, parsed);
+            let registered = matches!(status, hotkey::HotkeyStatus::Registered { .. });
+            state.hotkey_status = Some(status.clone());
+            state.settings.hotkey = Some(status);
+            if registered {
+                state.settings.hotkey_draft.clear();
+                state.send(UiRequest::SetPanelHotkey { spec: Some(spec) });
+            }
+            Task::none()
+        }
+        M::BudgetLimitDraft(draft) => {
+            if state.command_held
+                && is_single_char_insertion(&state.settings.budget_limit_draft, &draft)
+            {
+                return Task::none();
+            }
+            state.settings.budget_limit_draft = draft;
+            Task::none()
+        }
+        M::BudgetWarnDraft(draft) => {
+            if state.command_held
+                && is_single_char_insertion(&state.settings.budget_warn_draft, &draft)
+            {
+                return Task::none();
+            }
+            state.settings.budget_warn_draft = draft;
+            Task::none()
+        }
+        M::BudgetHardStop(hard_stop) => {
+            state.settings.budget_hard_stop = hard_stop;
+            // Live only while a ceiling is in force; otherwise it rides the
+            // next Apply.
+            if state.settings.budget_configured
+                && let Some((limit_micros, warn_at_percent)) =
+                    settings::parsed_budget(&state.settings)
+            {
+                state.send(UiRequest::SetMonthlyBudget {
+                    limit_micros: Some(limit_micros),
+                    warn_at_percent,
+                    hard_stop,
+                });
+            }
+            Task::none()
+        }
+        M::BudgetApply => {
+            let Some((limit_micros, warn_at_percent)) = settings::parsed_budget(&state.settings)
+            else {
+                return Task::none();
+            };
+            state.settings.budget_configured = true;
+            state.send(UiRequest::SetMonthlyBudget {
+                limit_micros: Some(limit_micros),
+                warn_at_percent,
+                hard_stop: state.settings.budget_hard_stop,
+            });
+            Task::none()
+        }
+        M::BudgetRemove => {
+            state.settings.budget_configured = false;
+            state.settings.spend_fraction = None;
+            state.send(UiRequest::SetMonthlyBudget {
+                limit_micros: None,
+                warn_at_percent: 80,
+                hard_stop: false,
+            });
+            Task::none()
+        }
         M::CopyDiagnostics => {
             state.send(UiRequest::CopyDiagnostics);
             Task::none()
@@ -3018,6 +3162,34 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             state.panel.favourite_models = pins;
             state.panel.pins_customised = true;
             sync_settings_models(state);
+            Task::none()
+        }
+
+        UiEvent::SettingsLoaded {
+            ax_tree_activation,
+            file_roots,
+            default_file_roots,
+            budget,
+        } => {
+            state.settings.ax_tree_activation = ax_tree_activation;
+            state.settings.file_roots = file_roots;
+            state.settings.default_file_roots = default_file_roots;
+            state.settings.budget_configured = budget.is_some();
+            if let Some((limit_micros, warn_at_percent, hard_stop)) = budget {
+                // Micros back to whole units for the draft; trailing zeros
+                // trimmed so "20" round-trips as "20", not "20.000000".
+                let limit = limit_micros as f64 / 1_000_000.0;
+                let mut draft = format!("{limit:.6}");
+                while draft.ends_with('0') {
+                    draft.pop();
+                }
+                if draft.ends_with('.') {
+                    draft.pop();
+                }
+                state.settings.budget_limit_draft = draft;
+                state.settings.budget_warn_draft = warn_at_percent.to_string();
+                state.settings.budget_hard_stop = hard_stop;
+            }
             Task::none()
         }
 
@@ -3580,6 +3752,103 @@ mod tests {
             abilities: Default::default(),
             cost: None,
         }
+    }
+
+    /// The settings-coverage rules that must not regress: editing the root
+    /// list materialises the defaults first (so the list on screen and the
+    /// list persisted agree), every edit is sent for persistence, and reset
+    /// returns to "no configuration" rather than to a frozen copy of it.
+    #[test]
+    fn editing_finder_roots_materialises_defaults_and_persists_each_step() {
+        let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+        let _ = backend_update(
+            &mut state,
+            UiEvent::SettingsLoaded {
+                ax_tree_activation: false,
+                file_roots: None,
+                default_file_roots: vec!["/d/Documents".to_owned(), "/d/Desktop".to_owned()],
+                budget: None,
+            },
+        );
+
+        let _ = settings_update(&mut state, settings::Message::RootRemove(0));
+        assert_eq!(
+            state.settings.file_roots,
+            Some(vec!["/d/Desktop".to_owned()]),
+            "removing a default must start from the default list, not empty"
+        );
+        assert!(matches!(
+            received.try_recv(),
+            Ok(UiRequest::SetFileRoots { roots: Some(roots) }) if roots == ["/d/Desktop"]
+        ));
+
+        let _ = settings_update(&mut state, settings::Message::RootDraft("~/dev".to_owned()));
+        let _ = settings_update(&mut state, settings::Message::RootAdd);
+        assert_eq!(
+            state.settings.file_roots,
+            Some(vec!["/d/Desktop".to_owned(), "~/dev".to_owned()])
+        );
+        assert!(
+            state.settings.root_draft.is_empty(),
+            "the draft is consumed"
+        );
+        let _ = received.try_recv();
+
+        let _ = settings_update(&mut state, settings::Message::RootsReset);
+        assert_eq!(state.settings.file_roots, None);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(UiRequest::SetFileRoots { roots: None })
+        ));
+    }
+
+    #[test]
+    fn an_unparseable_hotkey_marks_the_draft_and_persists_nothing() {
+        let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+        let _ = settings_update(
+            &mut state,
+            settings::Message::HotkeyDraft("bogus+++nope".to_owned()),
+        );
+        let _ = settings_update(&mut state, settings::Message::HotkeyApply);
+        assert!(state.settings.hotkey_draft_invalid);
+        assert!(
+            received.try_recv().is_err(),
+            "a rejected spec must never reach config.toml"
+        );
+    }
+
+    #[test]
+    fn an_applied_budget_sends_micros_and_remove_clears_the_meter() {
+        let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+        let _ = settings_update(
+            &mut state,
+            settings::Message::BudgetLimitDraft("15".to_owned()),
+        );
+        let _ = settings_update(&mut state, settings::Message::BudgetApply);
+        assert!(state.settings.budget_configured);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(UiRequest::SetMonthlyBudget {
+                limit_micros: Some(15_000_000),
+                warn_at_percent: 80,
+                hard_stop: false,
+            })
+        ));
+
+        state.settings.spend_fraction = Some(0.4);
+        let _ = settings_update(&mut state, settings::Message::BudgetRemove);
+        assert!(!state.settings.budget_configured);
+        assert_eq!(state.settings.spend_fraction, None);
+        assert!(matches!(
+            received.try_recv(),
+            Ok(UiRequest::SetMonthlyBudget {
+                limit_micros: None,
+                ..
+            })
+        ));
     }
 
     #[test]
