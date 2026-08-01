@@ -27,10 +27,22 @@ const MAX_FILE_BYTES: u64 = 256 * 1024;
 /// swamp the candidate budget with files nobody attaches.
 const SKIPPED_DIRS: &[&str] = &["node_modules", "target", "Library", ".git", ".venv", "venv"];
 
+/// The home directory across both shipping targets: `HOME` on Unix,
+/// `USERPROFILE` on Windows. Missing this made the finder walk *nothing* on
+/// Windows, which CI caught before a user could.
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(PathBuf::from)
+}
+
 /// The roots to index: the configured `[files] roots`, else Documents,
 /// Desktop and Downloads under the home directory. `~/` prefixes expand.
 pub fn roots(configured: Option<&[String]>) -> Vec<PathBuf> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    roots_with_home(configured, home_dir())
+}
+
+fn roots_with_home(configured: Option<&[String]>, home: Option<PathBuf>) -> Vec<PathBuf> {
     match configured {
         Some(roots) => roots
             .iter()
@@ -57,7 +69,7 @@ pub fn roots(configured: Option<&[String]>) -> Vec<PathBuf> {
 /// skipped: dotfiles are configuration, not documents, and the depth cap
 /// already keeps the walk out of most machinery.
 pub fn walk(roots: &[PathBuf]) -> Vec<FileCandidate> {
-    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let home = home_dir();
     let mut out = Vec::new();
     // A real queue, popped from the front. The first cut of this used
     // `Vec::pop`, which is depth-first from the LAST root — Downloads alone
@@ -201,11 +213,20 @@ mod tests {
         assert_eq!(read_bounded(&text).expect("text"), "こんにちは");
     }
 
+    /// Deterministic across platforms: the previous version read the real
+    /// `HOME`, which does not exist on Windows and failed CI there.
     #[test]
     fn tilde_roots_expand_and_defaults_exist() {
-        let roots = roots(Some(&["~/Documents".to_owned(), "/tmp".to_owned()]));
-        assert_eq!(roots.len(), 2);
-        assert!(roots[0].is_absolute());
-        assert_eq!(roots[1], PathBuf::from("/tmp"));
+        let home = Some(PathBuf::from("/home/x"));
+        let roots = roots_with_home(
+            Some(&["~/Documents".to_owned(), "/tmp".to_owned()]),
+            home.clone(),
+        );
+        assert_eq!(
+            roots,
+            vec![PathBuf::from("/home/x/Documents"), PathBuf::from("/tmp")]
+        );
+        assert_eq!(roots_with_home(None, home).len(), 3, "the default roots");
+        assert!(roots_with_home(None, None).is_empty(), "no home, no walk");
     }
 }
