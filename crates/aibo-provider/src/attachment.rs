@@ -288,6 +288,7 @@ pub fn fold_into_messages(req: &ChatRequest) -> Cow<'_, [Message]> {
                 role: MessageRole::User,
                 parts: Vec::new(),
                 tool_call_id: None,
+                tool_name: None,
             });
             messages.len() - 1
         }

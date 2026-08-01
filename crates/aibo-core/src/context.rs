@@ -449,6 +449,11 @@ impl Tokens {
                 // from the base64 length. Callers that know the real figure
                 // should override; this is a floor, not an estimate.
                 ContentPart::Image { data_base64, .. } => Tokens::new(data_base64.len() / 1_000),
+                // The serialized call the model itself produced; estimate it
+                // like text of the same length.
+                ContentPart::ToolCall { name, args, .. } => {
+                    Tokens::estimate(name) + Tokens::estimate(&args.to_string())
+                }
             })
             .sum::<Tokens>()
             // Per-message envelope: role, separators, and the provider's own

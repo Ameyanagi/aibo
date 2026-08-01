@@ -470,6 +470,12 @@ pub enum Key {
     SettingsBudgetHardStop,
     /// Remove the monthly ceiling.
     ActionRemoveBudget,
+    /// Composer toggle: enter agent mode.
+    ActionAgentMode,
+    /// Composer toggle while agent mode is on.
+    ActionAgentModeOn,
+    /// Composer placeholder while agent mode is on.
+    PanelAgentPlaceholder,
     /// Section: roles.
     SettingsRoles,
     /// Section: budgets.
@@ -800,6 +806,9 @@ fn en(key: Key) -> &'static str {
         K::SettingsBudgetWarnLabel => "Warn at (% of ceiling)",
         K::SettingsBudgetHardStop => "Refuse new requests past the ceiling",
         K::ActionRemoveBudget => "Remove ceiling",
+        K::ActionAgentMode => "Agent",
+        K::ActionAgentModeOn => "✓ Agent",
+        K::PanelAgentPlaceholder => "describe a task — the agent asks before it acts",
         K::SettingsRoles => "Roles",
         K::SettingsBudgets => "Budgets",
         K::SettingsPermissions => "Permissions",
@@ -1046,6 +1055,9 @@ fn ja(key: Key) -> &'static str {
         K::SettingsBudgetWarnLabel => "警告する割合（上限の %）",
         K::SettingsBudgetHardStop => "上限を超えたら新しいリクエストを拒否する",
         K::ActionRemoveBudget => "上限を削除",
+        K::ActionAgentMode => "エージェント",
+        K::ActionAgentModeOn => "✓ エージェント",
+        K::PanelAgentPlaceholder => "タスクを入力 — エージェントは実行前に確認します",
         K::SettingsRoles => "ロール",
         K::SettingsBudgets => "予算",
         K::SettingsPermissions => "権限",
@@ -1184,6 +1196,9 @@ mod tests {
             Key::SettingsBudgetWarnLabel,
             Key::SettingsBudgetHardStop,
             Key::ActionRemoveBudget,
+            Key::ActionAgentMode,
+            Key::ActionAgentModeOn,
+            Key::PanelAgentPlaceholder,
         ];
         for key in ADDED {
             for lang in Lang::ALL {

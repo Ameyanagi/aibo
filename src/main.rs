@@ -2839,6 +2839,19 @@ mod runtime {
         }
     }
 
+    /// The instruction behind a leading `/agent` command, if the input has
+    /// one (§1's "⌥Space then a verb", spelled as a slash command).
+    ///
+    /// A slash command rather than a bare verb, on the owner's ruling: `do`
+    /// as a trigger word turns ordinary questions — "do you think…" — into
+    /// agent runs. `/agent` cannot be typed by accident. Bare `/agent` with
+    /// nothing after it is not a task and stays an Ask.
+    fn strip_agent_command(instruction: &str) -> Option<&str> {
+        let rest = instruction.trim_start().strip_prefix("/agent")?;
+        let rest = rest.strip_prefix(char::is_whitespace)?.trim();
+        (!rest.is_empty()).then_some(rest)
+    }
+
     /// Project captured ambient context into the agent protocol's explicitly
     /// untrusted blocks.
     ///
@@ -3272,6 +3285,72 @@ mod runtime {
         /// The `@` finder's roots as currently configured — the live copy
         /// settings edits, so a change applies to the very next walk.
         file_roots: Option<Vec<String>>,
+        /// Approval prompts parked mid-agent-run, keyed by `(task, call id)`.
+        ///
+        /// [`TaskApprovalBroker::request`] parks here and the task window's
+        /// answer ([`UiRequest::Approve`]) resolves it. Dropping an entry —
+        /// cancellation, shutdown — resolves as Deny, never as a hang.
+        pending_approvals: PendingApprovals,
+    }
+
+    /// Shared parking lot for in-flight approval prompts.
+    type PendingApprovals = Arc<
+        std::sync::Mutex<
+            HashMap<
+                (uuid::Uuid, String),
+                tokio::sync::oneshot::Sender<aibo_agent::ApprovalResponse>,
+            >,
+        >,
+    >;
+
+    /// The [`aibo_agent::ApprovalUi`] that turns a gate prompt into a task
+    /// window question (§11).
+    ///
+    /// Emits the pending request as `AgentStep::AwaitingApproval` — the step
+    /// the task window folds into its approval pane — then parks until
+    /// [`UiRequest::Approve`] answers or the run is torn down.
+    struct TaskApprovalBroker {
+        task: uuid::Uuid,
+        events: Sender<UiEvent>,
+        pending: PendingApprovals,
+    }
+
+    impl std::fmt::Debug for TaskApprovalBroker {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("TaskApprovalBroker")
+                .field("task", &self.task)
+                .finish_non_exhaustive()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl aibo_agent::ApprovalUi for TaskApprovalBroker {
+        async fn request(
+            &self,
+            request: aibo_core::types::ApprovalRequest,
+        ) -> aibo_core::error::Result<aibo_agent::ApprovalResponse> {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            self.pending
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert((self.task, request.id.clone()), tx);
+            let shown = self
+                .events
+                .send(UiEvent::TaskStep {
+                    task: self.task,
+                    step: Box::new(AgentStep::AwaitingApproval(request)),
+                })
+                .await;
+            if shown.is_err() {
+                // No UI to ask means no consent to be had.
+                return Ok(aibo_agent::ApprovalResponse::decision(
+                    aibo_core::types::ApprovalDecision::Deny,
+                ));
+            }
+            Ok(rx.await.unwrap_or_else(|_| {
+                aibo_agent::ApprovalResponse::decision(aibo_core::types::ApprovalDecision::Deny)
+            }))
+        }
     }
 
     impl Backend {
@@ -3326,6 +3405,7 @@ mod runtime {
                 catalogue: aibo_provider::ModelCatalogue::shipped(),
                 dictation: None,
                 file_roots: config.files.roots.clone(),
+                pending_approvals: Arc::new(std::sync::Mutex::new(HashMap::new())),
             }
         }
 
@@ -3662,8 +3742,31 @@ mod runtime {
 
                 UiRequest::SetModel { binding } => self.set_model(binding),
 
-                UiRequest::Approve { task, .. } => {
-                    tracing::warn!(%task, "approval ignored because no native agent run is active");
+                UiRequest::Approve {
+                    task,
+                    approval,
+                    decision,
+                    typed_confirmation,
+                } => {
+                    let parked = self
+                        .pending_approvals
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .remove(&(task, approval));
+                    match parked {
+                        Some(tx) => {
+                            let mut response = aibo_agent::ApprovalResponse::decision(decision);
+                            if let Some(typed) = typed_confirmation {
+                                response = response.with_typed_confirmation(typed);
+                            }
+                            // A dropped receiver means the run was already torn
+                            // down; the decision is then moot, not an error.
+                            let _ = tx.send(response);
+                        }
+                        None => {
+                            tracing::warn!(%task, "approval arrived for no pending request");
+                        }
+                    }
                 }
 
                 UiRequest::CancelTask { task } => {
@@ -4379,6 +4482,16 @@ mod runtime {
                 include_selection,
             } = request;
 
+            // §1: "⌥Space then a verb", spelled `/agent`. The panel freezes
+            // its surface before routing, so the trigger is applied here: a
+            // leading `/agent` makes the run agentic, and the command — a
+            // trigger, not content — is stripped from the instruction the
+            // agent receives.
+            let (surface, instruction) = match strip_agent_command(&instruction) {
+                Some(rest) => (Surface::Do, rest.to_owned()),
+                None => (surface, instruction),
+            };
+
             if surface == Surface::Do {
                 let context = captured_agent_context(state);
                 self.submit_agent(instruction, role_override, context).await;
@@ -4517,10 +4630,14 @@ mod runtime {
                 return;
             };
 
-            let tools = match aibo_agent_tools_adapter::ToolRegistryExecutor::tier_zero_builtins() {
+            // §11: writes are scoped to directories the user added. The same
+            // roots the settings window's Files section edits are the agent's
+            // workspace — one list, one mental model, already user-curated.
+            let roots = crate::files::roots(self.file_roots.as_deref());
+            let tools = match aibo_agent_tools_adapter::WorkspaceExecutor::new(roots.clone()) {
                 Ok(tools) => Arc::new(tools) as Arc<dyn aibo_agent::ToolExecutor>,
                 Err(error) => {
-                    tracing::error!(%error, "could not construct the audited tool adapter");
+                    tracing::error!(%error, "could not construct the workspace tool adapter");
                     let _ = events
                         .send(UiEvent::TaskStarted {
                             task: task_id,
@@ -4531,32 +4648,48 @@ mod runtime {
                         .send(UiEvent::TaskStep {
                             task: task_id,
                             step: Box::new(AgentStep::Done(failed_agent_outcome(
-                                "The built-in tool runtime is unavailable.",
+                                "No usable workspace folder. Add one under Settings → Files.",
                             ))),
                         })
                         .await;
                     return;
                 }
             };
-            let approval_ui = Arc::new(aibo_agent::permission_gate::DenyAll);
-            let gate = Arc::new(aibo_agent::PermissionGate::new(
-                approval_ui,
-                std::iter::empty(),
-            ));
+            // The broker turns gate prompts into task-window questions; the
+            // answers come back through `UiRequest::Approve`.
+            let approval_ui = Arc::new(TaskApprovalBroker {
+                task: task_id,
+                events: events.clone(),
+                pending: Arc::clone(&self.pending_approvals),
+            });
+            let gate = Arc::new(aibo_agent::PermissionGate::new(approval_ui, roots.clone()));
             let mut native_config = aibo_agent::NativeLoopConfig::new(binding.clone());
             native_config.budget.deadline = self.engine.config().request_deadline;
+            // pi-sized system prompt: the tools speak for themselves through
+            // their schemas; the prompt only sets the frame.
+            native_config.system_prompt = Some(
+                "You are aibo's agent. Complete the user's task using the read, ls, write, \
+                 edit and bash tools, which are scoped to the user's chosen folders. Work in \
+                 small steps: inspect before you change, prefer edit over rewriting whole \
+                 files, and check your work (run the tests or the command the task implies). \
+                 Some tool calls need the user's approval — a denial is an answer, not an \
+                 error; adapt or ask. When the task is done, summarise what changed in one \
+                 short paragraph."
+                    .to_owned(),
+            );
             let backend: Arc<dyn aibo_core::traits::AgentBackend> = Arc::new(
                 aibo_agent::NativeLoop::new(provider, tools, gate, native_config),
             );
             let task = AgentTask {
                 id: task_id,
                 instruction,
-                workspace: None,
+                workspace: roots.first().cloned(),
                 context,
                 binding: Some(binding),
                 conversation_id: None,
             };
             let engine = Arc::clone(&self.engine);
+            let pending = Arc::clone(&self.pending_approvals);
             let (sink, mut agent_events) = AgentSink::channel();
             tokio::spawn(crate::diagnostics::supervise("native-agent", async move {
                 let pump_events = events.clone();
@@ -4605,8 +4738,28 @@ mod runtime {
                     }
                 });
                 let _ = engine
-                    .run_agent(task, AgentLimits::default(), backend, &sink)
+                    .run_agent(
+                        task,
+                        AgentLimits {
+                            // The engine's independent tracker (§14) cannot
+                            // see approval waits, so its wall clock is a
+                            // gross backstop with room for a human reading
+                            // prompts; the loop's own tracker credits waits
+                            // back and the step/tool/token ceilings still
+                            // bound the actual work.
+                            max_wall_clock: std::time::Duration::from_secs(30 * 60),
+                            ..AgentLimits::default()
+                        },
+                        backend,
+                        &sink,
+                    )
                     .await;
+                // Any prompt still parked belongs to a run that no longer
+                // exists; dropping its sender resolves the gate as Deny.
+                pending
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|(task, _), _| *task != task_id);
                 drop(sink);
                 let _ = pump.await;
             }));
@@ -6190,6 +6343,29 @@ mod runtime {
                 assert!(size <= maximum);
             }
             assert_eq!(rendered, original);
+        }
+
+        /// The `/agent` trigger: explicit, whole-token, and never a task when
+        /// there is no task. "do you think…" was the reason a bare verb lost.
+        #[test]
+        fn slash_agent_strips_the_command_and_nothing_else_triggers() {
+            assert_eq!(
+                strip_agent_command("/agent fix the failing test"),
+                Some("fix the failing test")
+            );
+            assert_eq!(
+                strip_agent_command("  /agent   spaced out  "),
+                Some("spaced out")
+            );
+            assert_eq!(strip_agent_command("/agent"), None, "no task, no run");
+            assert_eq!(strip_agent_command("/agent   "), None);
+            assert_eq!(strip_agent_command("/agents plural"), None, "whole token");
+            assert_eq!(strip_agent_command("do you think this works?"), None);
+            assert_eq!(
+                strip_agent_command("use /agent for this"),
+                None,
+                "leading only"
+            );
         }
 
         #[test]

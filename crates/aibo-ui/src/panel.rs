@@ -759,6 +759,11 @@ pub struct PanelState {
     input_editor: text_editor::Content,
     /// The microphone is live and deltas are streaming into the input (§P9+).
     pub dictating: bool,
+    /// Agent mode (§1 Do): submissions run the coding agent in a task window
+    /// instead of chat. Session-scoped on purpose — `reset` clears it, so a
+    /// forgotten toggle cannot silently make tomorrow's first question
+    /// agentic. `/agent` remains the one-shot spelling.
+    pub agent_mode: bool,
     /// Insert one space before the first dictation delta, because the input
     /// already ends mid-word. Set on `DictationStarted`, spent on the first
     /// delta.
@@ -811,6 +816,7 @@ impl PanelState {
             pins_customised: false,
             input_editor: text_editor::Content::new(),
             dictating: false,
+            agent_mode: false,
             dictation_pad: false,
             recent_models: Vec::new(),
             // Constructed once at boot, not per session, so recall survives
@@ -1429,6 +1435,8 @@ pub enum Message {
     NewChat,
     /// `⌘L`, or the composer action: start or finish push-to-talk dictation.
     ToggleDictation,
+    /// `⌘J`, or the composer action: flip agent mode for this session.
+    ToggleAgentMode,
     /// Open the model quick-pick.
     OpenPicker,
     /// Close it without choosing.
@@ -2296,7 +2304,10 @@ fn input_row(state: &PanelState) -> Element<'_, Message> {
     // with the amber rail beside it — the rail pointing at nothing, which is the
     // opposite of "at a glance, the rail tells you where the panel thinks you
     // are" (`design.md` §3).
-    let placeholder = if shows_empty_invitation(state) {
+    let placeholder = if state.agent_mode {
+        // The mode must be unmistakable at the point of typing (§16).
+        i18n::t(Key::PanelAgentPlaceholder)
+    } else if shows_empty_invitation(state) {
         i18n::t(Key::PanelEmptyInvitation)
     } else {
         i18n::t(Key::PanelPlaceholder)
@@ -2367,6 +2378,19 @@ fn composer_actions_for(state: &PanelState) -> Vec<Action<Message>> {
         Message::ToggleDictation,
     );
 
+    // The agent toggle: a mode, so the *state* is shown (checkmark), unlike
+    // dictate's label-says-what-happens-next pattern — "stop agent" would
+    // misdescribe a toggle that only affects future submissions.
+    let agent = Action::new(
+        if state.agent_mode {
+            Key::ActionAgentModeOn
+        } else {
+            Key::ActionAgentMode
+        },
+        widgets::primary_shortcut("⌘J", "Ctrl+J"),
+        Message::ToggleAgentMode,
+    );
+
     let attach = Action::new(Key::ActionAttachImage, ATTACH_KEY, Message::Attach);
     let attach = if state.clipboard.is_attachable() {
         attach
@@ -2388,7 +2412,7 @@ fn composer_actions_for(state: &PanelState) -> Vec<Action<Message>> {
     } else {
         primary
     };
-    vec![dictate, attach, primary]
+    vec![dictate, agent, attach, primary]
 }
 
 fn user_bubble(message: &str) -> Element<'_, Message> {

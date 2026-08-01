@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use accesskit::{NodeId, TreeUpdate};
-use aibo_core::types::{DisplayInfo, StreamEvent};
+use aibo_core::types::{DisplayInfo, StreamEvent, Surface};
 use aibo_platform::{AccessibilityEvent, AccessibilitySurface};
 use iced::widget::operation;
 use iced::window::{self, Mode};
@@ -273,6 +273,8 @@ pub enum WindowChord {
     NextLane,
     /// Start or finish push-to-talk dictation (`⌘L`, §P9+).
     Dictate,
+    /// Flip agent mode for the session (`⌘J`, §1 Do).
+    AgentMode,
     /// Pin or unpin the highlighted model. Only meaningful while the quick-pick
     /// is open; the subscription cannot see panel state, so the meaning is
     /// decided where the chord is handled.
@@ -1553,6 +1555,7 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
                 // The fresh start `resume_panel_session`'s doc promises.
                 WindowChord::New => panel::Message::NewChat,
                 WindowChord::Dictate => panel::Message::ToggleDictation,
+                WindowChord::AgentMode => panel::Message::ToggleAgentMode,
                 WindowChord::Escape if state.panel.toast.is_some() => panel::Message::DismissToast,
                 WindowChord::Escape => panel::Message::Dismiss,
                 WindowChord::Enter {
@@ -1967,7 +1970,13 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             state.send(UiRequest::Submit {
                 session: state.panel.session,
                 instruction,
-                surface: state.panel.surface,
+                // The toggle overrides the frozen surface: agent mode makes
+                // every submission a Do until turned off or the session ends.
+                surface: if state.panel.agent_mode {
+                    Surface::Do
+                } else {
+                    state.panel.surface
+                },
                 role_override: None,
                 attachments,
                 history,
@@ -2128,6 +2137,10 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
         }
 
+        M::ToggleAgentMode => {
+            state.panel.agent_mode = !state.panel.agent_mode;
+            Task::none()
+        }
         M::ToggleDictation => {
             if state.panel.dictating {
                 state.panel.dictating = false;
@@ -3546,6 +3559,7 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
                     'r' => Some(WindowChord::Retry),
                     't' => Some(WindowChord::ShowTask),
                     'l' => Some(WindowChord::Dictate),
+                    'j' => Some(WindowChord::AgentMode),
                     ',' => Some(WindowChord::OpenSettings),
                     _ => None,
                 };
@@ -3752,6 +3766,39 @@ mod tests {
             abilities: Default::default(),
             cost: None,
         }
+    }
+
+    /// The agent-mode toggle (owner, 2026-08-01): ⌘J makes submissions Do,
+    /// the mode is visible in state, and a new chat clears it — a toggle
+    /// forgotten yesterday must not make today's first question agentic.
+    #[test]
+    fn agent_mode_routes_submissions_to_do_and_dies_with_the_session() {
+        let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+        state.panel.phase = Phase::Idle;
+
+        let _ = panel_update(&mut state, panel::Message::ToggleAgentMode);
+        assert!(state.panel.agent_mode);
+
+        state.panel.set_input("tidy the downloads folder");
+        let _ = panel_update(&mut state, panel::Message::Submit);
+        let sent = received.try_recv().expect("a submission");
+        assert!(
+            matches!(
+                sent,
+                UiRequest::Submit {
+                    surface: Surface::Do,
+                    ..
+                }
+            ),
+            "{sent:?}"
+        );
+
+        state.panel.reset(SessionId::from_u128(2));
+        assert!(
+            !state.panel.agent_mode,
+            "the toggle is session-scoped by design"
+        );
     }
 
     /// The settings-coverage rules that must not regress: editing the root

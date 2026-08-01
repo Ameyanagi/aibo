@@ -466,22 +466,29 @@ impl PermissionGate {
     /// Steps 1–4 run before any prompt so that a call which will be refused
     /// anyway never trains the user to click through dialogs.
     pub async fn authorise(&self, call: &GatedCall) -> Result<Authorisation> {
-        // 1. Capture-origin rule (§5 rule 2).
-        if !call.origin.may_authorise_tools() {
-            tracing::warn!(
-                tool = %call.tool,
-                origin = ?call.origin,
-                "denied: tool call authorised by captured content"
-            );
-            return Ok(Authorisation::Denied(DenyReason::CaptureOrigin(
-                call.origin,
-            )));
-        }
+        // 1. Capture-origin rule (§5 rule 2), refined for the native loop.
+        //
+        // The first cut denied outright here, which read as the safest
+        // possible line — and made the loop single-round by construction:
+        // every call after the first tool result carries `ToolResult`
+        // provenance, and a run with any captured context was dead before its
+        // first call. The §5 sentence is "captured content can never
+        // *authorise* a tool call", and a prompt the *user* answers is not
+        // the content authorising anything. So untrusted provenance now
+        // means: the call may be **requested**, but only an explicit user
+        // decision may grant it — consent memory is neither consulted nor
+        // written, and a policy that would auto-allow is escalated to a
+        // prompt. Tier 0 stays exempt: a pure builtin holds no authority for
+        // an injection to abuse.
+        let untrusted_origin = !call.origin.may_authorise_tools();
 
         // 2. Tier policy.
-        let policy = self.tiers.policy(call.tier);
+        let mut policy = self.tiers.policy(call.tier);
         if policy == ConsentPolicy::Deny {
             return Ok(Authorisation::Denied(DenyReason::TierDenied(call.tier)));
+        }
+        if untrusted_origin && call.tier != ToolTier::Builtin && policy == ConsentPolicy::Never {
+            policy = ConsentPolicy::Always;
         }
 
         // 3. Path containment, after resolution.
@@ -501,9 +508,11 @@ impl PermissionGate {
         //    without typed confirmation"). Never remembered, always prompted.
         let destructive = call.command.as_deref().is_some_and(is_destructive_command);
 
-        // 5. Consent memory.
+        // 5. Consent memory. An untrusted-provenance call never reads it: a
+        //    grant the user gave their own earlier call must not be spendable
+        //    by whatever a web page wrote into a tool result.
         let key = self.consent_key(call);
-        if !destructive && policy == ConsentPolicy::FirstUse {
+        if !destructive && !untrusted_origin && policy == ConsentPolicy::FirstUse {
             let remembered = self
                 .memory
                 .lock()
@@ -525,11 +534,20 @@ impl PermissionGate {
         }
 
         // 6. Ask. The request carries the resolved paths, so the prompt shows
-        //    where the write actually lands rather than where it claimed to.
+        //    where the write actually lands rather than where it claimed to —
+        //    and an untrusted-provenance request says what asked for it.
+        let summary = if untrusted_origin {
+            format!(
+                "{} — requested by tool output, not typed by you",
+                call.summary
+            )
+        } else {
+            call.summary.clone()
+        };
         let request = ApprovalRequest {
             id: call.call_id.clone(),
             kind: call.kind,
-            summary: call.summary.clone(),
+            summary,
             command: call.command.clone(),
             paths: resolved.clone(),
             originating_instruction: call.instruction.clone(),
@@ -549,8 +567,10 @@ impl PermissionGate {
             }),
             ApprovalDecision::ApproveForSession => {
                 // A destructive command is never remembered, whatever the user
-                // clicked — the typed confirmation is the point.
-                if !destructive && policy == ConsentPolicy::FirstUse {
+                // clicked — the typed confirmation is the point. Neither is an
+                // untrusted-provenance grant: remembering it would let the next
+                // injected request spend it silently.
+                if !destructive && !untrusted_origin && policy == ConsentPolicy::FirstUse {
                     self.memory
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
@@ -570,9 +590,10 @@ impl PermissionGate {
     /// pointing somewhere else. This re-resolves and re-checks containment; it
     /// never prompts, because a prompt here would just be the same dialog twice.
     pub fn revalidate(&self, call: &GatedCall) -> std::result::Result<Vec<PathBuf>, DenyReason> {
-        if !call.origin.may_authorise_tools() {
-            return Err(DenyReason::CaptureOrigin(call.origin));
-        }
+        // No origin check here any more: provenance was adjudicated by
+        // `authorise` (untrusted origins reach execution only through an
+        // explicit user grant), and re-denying it here would revoke exactly
+        // the calls the user just approved. TOCTOU is about paths.
         self.resolve_paths(&call.paths)
     }
 
@@ -842,25 +863,53 @@ mod tests {
         }
     }
 
+    /// §5 rule 2, the native-loop refinement: captured content may *request*
+    /// a call, but only an explicit user decision grants it — the user's "no"
+    /// is final, and the prompt tells them the request is not their own.
     #[tokio::test]
-    async fn capture_origin_is_denied_without_prompting() {
-        // ApproveAll would say yes to anything; the origin rule runs first.
-        let gate = PermissionGate::new(Arc::new(ApproveAll), []);
+    async fn capture_origin_reaches_the_user_and_only_the_user() {
+        let gate = PermissionGate::new(Arc::new(DenyAll), []);
         let mut c = call("ls");
         c.origin = ContentOrigin::Selection;
-        let a = gate.authorise(&c).await.unwrap();
         assert_eq!(
-            a,
-            Authorisation::Denied(DenyReason::CaptureOrigin(ContentOrigin::Selection))
+            gate.authorise(&c).await.unwrap(),
+            Authorisation::Denied(DenyReason::UserDenied),
+            "denied by the user's answer, not silently before it"
         );
-    }
 
-    #[tokio::test]
-    async fn mcp_results_cannot_authorise_either() {
         let gate = PermissionGate::new(Arc::new(ApproveAll), []);
         let mut c = call("ls");
         c.origin = ContentOrigin::McpResult;
-        assert!(!gate.authorise(&c).await.unwrap().is_allowed());
+        assert!(
+            gate.authorise(&c).await.unwrap().is_allowed(),
+            "an explicit user grant is exactly what §5 leaves possible"
+        );
+    }
+
+    /// The prompt for an injected request must say so, or the user is
+    /// approving what they believe is their own instruction.
+    #[tokio::test]
+    async fn an_untrusted_request_is_labelled_in_its_prompt() {
+        #[derive(Debug)]
+        struct Capture(Mutex<Vec<ApprovalRequest>>);
+        #[async_trait::async_trait]
+        impl ApprovalUi for Capture {
+            async fn request(&self, req: ApprovalRequest) -> Result<ApprovalResponse> {
+                self.0.lock().unwrap().push(req);
+                Ok(ApprovalResponse::decision(ApprovalDecision::Deny))
+            }
+        }
+        let ui = Arc::new(Capture(Mutex::new(Vec::new())));
+        let gate = PermissionGate::new(ui.clone(), []);
+        let mut c = call("ls");
+        c.origin = ContentOrigin::ToolResult;
+        let _ = gate.authorise(&c).await.unwrap();
+        let seen = ui.0.lock().unwrap();
+        assert!(
+            seen[0].summary.contains("not typed by you"),
+            "{}",
+            seen[0].summary
+        );
     }
 
     #[tokio::test]
@@ -927,8 +976,12 @@ mod tests {
         );
     }
 
+    /// The property the old blanket deny protected, kept under the new rule:
+    /// a session grant the user gave their own call is not spendable by an
+    /// injected one — the injected call must go back to the user, and its own
+    /// session grant must not enter the memory either.
     #[tokio::test]
-    async fn captured_content_cannot_reuse_remembered_consent() {
+    async fn captured_content_cannot_reuse_or_create_remembered_consent() {
         let gate = PermissionGate::new(Arc::new(SessionApprover { typed: None }), []);
         let direct = call("ls");
         assert!(gate.authorise(&direct).await.unwrap().is_allowed());
@@ -936,9 +989,20 @@ mod tests {
 
         let mut injected = direct;
         injected.origin = ContentOrigin::ToolResult;
-        assert_eq!(
-            gate.authorise(&injected).await.unwrap(),
-            Authorisation::Denied(DenyReason::CaptureOrigin(ContentOrigin::ToolResult))
+        match gate.authorise(&injected).await.unwrap() {
+            Authorisation::Allowed { remembered, .. } => {
+                assert!(!remembered, "the stored grant must not have been consulted");
+            }
+            denied => panic!("SessionApprover said yes, so: {denied:?}"),
+        }
+
+        let fresh = PermissionGate::new(Arc::new(SessionApprover { typed: None }), []);
+        let mut injected_first = call("ls");
+        injected_first.origin = ContentOrigin::ToolResult;
+        assert!(fresh.authorise(&injected_first).await.unwrap().is_allowed());
+        assert!(
+            fresh.memory.lock().unwrap().is_empty(),
+            "an untrusted-origin ApproveForSession must not be remembered"
         );
     }
 

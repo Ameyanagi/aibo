@@ -143,6 +143,19 @@ impl LimitTracker {
         self.check_wall_clock()
     }
 
+    /// Give back time spent waiting on the user.
+    ///
+    /// An approval prompt can sit for minutes while the user reads it, and
+    /// that time is the *user's*, not the agent's — charging it to
+    /// [`AgentLimits::max_wall_clock`] killed the first interactive run at
+    /// 436 s of mostly waiting (observed 2026-08-01). The start instant moves
+    /// forward by the wait, clamped so a bogus duration cannot push the
+    /// deadline past "now plus the full budget".
+    pub fn credit_wait(&mut self, wait: Duration) {
+        let now = Instant::now();
+        self.started = (self.started + wait).min(now);
+    }
+
     /// Re-check the wall clock without charging anything.
     pub fn check_wall_clock(&mut self) -> Result<(), BudgetKind> {
         if let Some(kind) = self.exceeded {
@@ -187,6 +200,31 @@ impl LimitTracker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Approval waits are the user's time: crediting them moves the deadline
+    /// out by the wait, and a wait longer than the elapsed run cannot move
+    /// the start into the future.
+    #[test]
+    fn credited_waits_extend_the_deadline_but_never_past_now() {
+        let mut t = LimitTracker::new(AgentLimits {
+            max_wall_clock: Duration::from_secs(60),
+            ..AgentLimits::default()
+        });
+        let before = t.deadline();
+        t.credit_wait(Duration::from_millis(1));
+        // A 1 ms credit on a run that has barely started clamps to "now":
+        // the deadline may only move forward, and by at most the credit.
+        assert!(t.deadline() >= before);
+        assert!(t.deadline() <= before + Duration::from_secs(1));
+        assert!(t.check_wall_clock().is_ok());
+
+        // An absurd credit must not mint future start time.
+        t.credit_wait(Duration::from_secs(3600));
+        assert!(
+            t.elapsed() <= Duration::from_secs(1),
+            "started clamps to now"
+        );
+    }
 
     fn tight() -> AgentLimits {
         AgentLimits {

@@ -387,6 +387,11 @@ fn content_blocks(msg: &Message) -> Vec<Value> {
                 "type": "image",
                 "source": {"type": "base64", "media_type": mime, "data": data_base64},
             }),
+            // The assistant turn that made a tool call; the `tool_result`
+            // user turn that follows answers this block's `id`.
+            ContentPart::ToolCall { id, name, args } => json!({
+                "type": "tool_use", "id": id, "name": name, "input": args,
+            }),
         })
         .collect()
 }
@@ -677,6 +682,31 @@ impl SseDecoder for MessagesDecoder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The assistant turn that called a tool becomes a `tool_use` block, so
+    /// the `tool_result` user turn that follows has an id to answer.
+    #[test]
+    fn an_assistant_tool_call_becomes_a_tool_use_block() {
+        let assistant = Message {
+            role: MessageRole::Assistant,
+            parts: vec![ContentPart::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                args: json!({"command": "ls"}),
+            }],
+            tool_call_id: None,
+            tool_name: None,
+        };
+        let blocks = content_blocks(&assistant);
+        assert_eq!(blocks[0]["type"], json!("tool_use"));
+        assert_eq!(blocks[0]["id"], json!("c1"));
+        assert_eq!(blocks[0]["name"], json!("bash"));
+        assert_eq!(
+            blocks[0]["input"],
+            json!({"command": "ls"}),
+            "input stays a JSON object here, unlike OpenAI's stringified spelling"
+        );
+    }
 
     fn event(value: Value) -> Event {
         Event {

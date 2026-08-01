@@ -247,7 +247,13 @@ fn build_generate_body(req: &ChatRequest) -> Value {
                 "role": "user",
                 "parts": [{
                     "functionResponse": {
-                        "name": message.tool_call_id.clone().unwrap_or_default(),
+                        // Gemini correlates by *name*; the id is a fallback
+                        // for history recorded before `tool_name` existed.
+                        "name": message
+                            .tool_name
+                            .clone()
+                            .or_else(|| message.tool_call_id.clone())
+                            .unwrap_or_default(),
                         "response": {"content": crate::wire::flatten_text(message)},
                     }
                 }],
@@ -302,6 +308,9 @@ fn parts_of(message: &Message) -> Vec<Value> {
             ContentPart::Untrusted(block) => json!({"text": render_untrusted(block)}),
             ContentPart::Image { mime, data_base64 } => json!({
                 "inlineData": {"mimeType": mime, "data": data_base64},
+            }),
+            ContentPart::ToolCall { name, args, .. } => json!({
+                "functionCall": {"name": name, "args": args},
             }),
         })
         .collect()
@@ -584,6 +593,39 @@ mod tests {
             id: String::new(),
             retry: None,
         }
+    }
+
+    /// A tool round-trip in Gemini's spelling: the model turn carries
+    /// `functionCall`, and the result answers by *name* (`tool_name`), not id.
+    #[test]
+    fn a_tool_round_trip_uses_function_call_and_name_keyed_response() {
+        let assistant = Message {
+            role: MessageRole::Assistant,
+            parts: vec![ContentPart::ToolCall {
+                id: "c1".into(),
+                name: "bash".into(),
+                args: serde_json::json!({"command": "ls"}),
+            }],
+            tool_call_id: None,
+            tool_name: None,
+        };
+        let result = Message {
+            role: MessageRole::Tool,
+            parts: vec![ContentPart::Text("ok".into())],
+            tool_call_id: Some("c1".into()),
+            tool_name: Some("bash".into()),
+        };
+        let body = build_generate_body(&request(vec![assistant, result]));
+        let contents = body["contents"].as_array().expect("contents");
+        assert_eq!(
+            contents[0]["parts"][0]["functionCall"]["name"],
+            serde_json::json!("bash")
+        );
+        assert_eq!(
+            contents[1]["parts"][0]["functionResponse"]["name"],
+            serde_json::json!("bash"),
+            "correlated by tool_name, not by the id"
+        );
     }
 
     /// Gemini has no `system` role. Leaving §5's assembled system prompt in the
