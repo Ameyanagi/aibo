@@ -229,7 +229,8 @@ mod exact_repro {
         let mut finder = FileFinder::default();
         finder.set_candidates(vec![
             FileCandidate {
-                display: "~/Downloads/followup-テスト フォローアップ報告書-2026-04-03.csv".to_owned(),
+                display: "~/Downloads/followup-テスト フォローアップ報告書-2026-04-03.csv"
+                    .to_owned(),
                 path: "/x/a.csv".to_owned(),
             },
             FileCandidate {
@@ -244,7 +245,13 @@ mod exact_repro {
         for query in ["tesutofo", "tesuto", "fo-roappu", "houkokusho"] {
             finder.set_query(query.to_owned());
             let results = finder.results();
-            eprintln!("QUERY {query:?} => {:?}", results.iter().map(|f| f.display.as_str()).collect::<Vec<_>>());
+            eprintln!(
+                "QUERY {query:?} => {:?}",
+                results
+                    .iter()
+                    .map(|f| f.display.as_str())
+                    .collect::<Vec<_>>()
+            );
         }
         finder.set_query("tesutofo".to_owned());
         assert!(!finder.results().is_empty(), "tesutofo matched nothing");
