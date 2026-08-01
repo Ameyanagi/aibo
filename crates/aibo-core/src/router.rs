@@ -460,18 +460,18 @@ pub fn infer_surface(input: &SurfaceInput<'_>, do_verbs: &DoVerbRegistry) -> Sur
 /// this is a registry rather than an enum, and it is matched case-insensitively
 /// against the first word of the panel input.
 ///
-// TODO(plan §1/§12): the plan describes Do as "⌥Space then a verb" but never
-// enumerates the shipped seed vocabulary, and inventing one here would change
-// product behaviour on a guess. Until onboarding defines it, `builtin()` is
-// empty: Do is reached through a saved action's trigger word or the `⇥`
-// override, and is never inferred by accident.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct DoVerbRegistry {
     verbs: Vec<String>,
 }
 
 impl DoVerbRegistry {
-    /// The seed vocabulary shipped with aibo. Empty — see the type's note.
+    /// The seed vocabulary shipped with aibo. Empty on purpose.
+    ///
+    /// The shipped trigger is the `/agent` slash command, parsed by the shell
+    /// before routing (owner decision, 2026-08-01: a bare verb like `do`
+    /// would misfire on ordinary questions — "do you think…"). This registry
+    /// remains the seam for §12 saved-action trigger words.
     pub fn builtin() -> Self {
         Self::default()
     }
@@ -1295,19 +1295,28 @@ mod tests {
     }
 
     #[test]
-    fn builtin_do_verb_registry_is_empty_so_do_is_never_inferred_by_accident() {
-        // See the TODO on `DoVerbRegistry`: the shipped vocabulary is not
-        // specified by the plan. Until it is, Do is reached only via a saved
-        // action's trigger word or the ⇥ override.
-        assert!(DoVerbRegistry::builtin().is_empty());
-        let input = SurfaceInput {
-            panel_input: "anything at all",
-            ..Default::default()
+    fn the_builtin_do_vocabulary_is_empty_because_the_trigger_is_slash_agent() {
+        // The shell parses `/agent …` before routing; a verb here would make
+        // ordinary sentences agentic ("do you think…"). Saved actions are the
+        // only thing that populates this registry.
+        let verbs = DoVerbRegistry::builtin();
+        assert!(verbs.is_empty());
+        let surface = |text: &str| {
+            infer_surface(
+                &SurfaceInput {
+                    panel_input: text,
+                    ..Default::default()
+                },
+                &verbs,
+            )
         };
+        assert_eq!(surface("do fix the failing test"), Surface::Ask);
         assert_eq!(
-            infer_surface(&input, &DoVerbRegistry::builtin()),
-            Surface::Ask
+            surface("dotfiles cleanup?"),
+            Surface::Ask,
+            "whole word only"
         );
+        assert_eq!(surface("anything at all"), Surface::Ask);
     }
 
     #[test]

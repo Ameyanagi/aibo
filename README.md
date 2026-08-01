@@ -27,6 +27,14 @@ measured in milliseconds: no dock icon, no browser tab, no context switch.
 - **`@` file attach** — type `@` in the composer to fuzzy-find a file by
   name and attach its text. Matching is [yuru](https://crates.io/crates/yuru-core),
   so romaji finds kanji and kana filenames: `toukei` → `統計資料.pdf`.
+- **Agent runs** — toggle agent mode with `⌘J` (or prefix one request with
+  `/agent`) and submissions run a minimal coding agent (pi's harness:
+  `read`, `bash`, `edit`, `write`) in a task window, scoped to the folders
+  from Settings → Files. The toggle is per-session; a new chat returns to
+  plain asks. Commands and writes run without prompts (diffs shown as they
+  land, scoped to your folders); destructive commands — the `rm -rf` /
+  force-push class — are refused once and run only after the agent restates
+  its intent and confirms, with the exchange visible in the task window.
 - **Budget** — an optional monthly spend ceiling with warnings, priced from
   a user-correctable TOML table.
 - **English and Japanese UI**, following the system language.
@@ -47,6 +55,8 @@ measured in milliseconds: no dock icon, no browser tab, no context switch.
 | `⌘L` | Start or stop dictation |
 | `⌘R` / `⌘.` | Retry / cancel |
 | `@` | File finder |
+| `⌘J` | Toggle agent mode for this session |
+| `/agent …` | Run the coding agent once, on what follows |
 | `⇥` | Cycle lanes |
 | `↑` / `↓` | Prompt history |
 | `⌘T` | Task window (agent runs) |

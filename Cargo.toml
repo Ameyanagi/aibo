@@ -149,6 +149,7 @@ uiautomation = "0.25"                # §8 [!Send + !Sync — dedicated MTA thre
 # --- dev --------------------------------------------------------------------
 insta = "1"
 proptest = "1"
+similar = "2"
 tempfile = "3"
 
 # §15: the release profile. `panic = "abort"` is deliberately ABSENT — §6 requires

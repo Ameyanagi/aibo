@@ -15,6 +15,9 @@
 
 #![forbid(unsafe_code)]
 
+mod workspace;
+pub use workspace::{WorkspaceError, WorkspaceExecutor};
+
 use aibo_agent::{
     AuthorizedToolInvocation, ToolExecutor, ToolIntent, ToolInvocation,
     ToolOutput as AgentToolOutput,

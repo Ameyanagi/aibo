@@ -335,6 +335,11 @@ fn prefix_key(messages: &[Message]) -> u64 {
                 ContentPart::Text(t) => feed(t.as_bytes()),
                 ContentPart::Untrusted(b) => feed(b.content.as_bytes()),
                 ContentPart::Image { data_base64, .. } => feed(data_base64.as_bytes()),
+                ContentPart::ToolCall { id, name, args } => {
+                    feed(id.as_bytes());
+                    feed(name.as_bytes());
+                    feed(args.to_string().as_bytes());
+                }
             }
             feed(b"\x1e");
         }
@@ -952,6 +957,7 @@ fn render_messages(kind: PromptKind, fitted: &FittedContext) -> Vec<Message> {
         role: MessageRole::User,
         parts,
         tool_call_id: None,
+        tool_name: None,
     });
     messages
 }
@@ -1309,6 +1315,9 @@ mod tests {
                     }
                     ContentPart::Image { mime, data_base64 } => {
                         let _ = writeln!(s, "[image {mime} {} bytes]", data_base64.len());
+                    }
+                    ContentPart::ToolCall { id, name, args } => {
+                        let _ = writeln!(s, "[tool call {id} {name} {args}]");
                     }
                 }
             }

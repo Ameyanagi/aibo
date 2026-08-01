@@ -92,7 +92,8 @@ pub fn flatten_text(msg: &Message) -> String {
         match part {
             ContentPart::Text(t) => push_para(&mut out, t),
             ContentPart::Untrusted(b) => push_para(&mut out, &render_untrusted(b)),
-            ContentPart::Image { .. } => {}
+            // Carried structurally by each wire format, never as prose.
+            ContentPart::Image { .. } | ContentPart::ToolCall { .. } => {}
         }
     }
     out

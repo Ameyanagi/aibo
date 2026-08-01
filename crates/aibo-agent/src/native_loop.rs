@@ -80,6 +80,20 @@ impl AuthorizedToolInvocation {
         }
     }
 
+    /// Construct an authorized invocation **without** the gate.
+    ///
+    /// Test scaffolding for executor crates only — production authorization
+    /// has exactly one path, through [`crate::PermissionGate`] inside the
+    /// loop. Hidden rather than `cfg(test)` because a downstream crate's unit
+    /// tests cannot see this crate's test cfg.
+    #[doc(hidden)]
+    pub fn preauthorized_for_tests(
+        invocation: ToolInvocation,
+        resolved_paths: Vec<PathBuf>,
+    ) -> Self {
+        Self::new(invocation, resolved_paths)
+    }
+
     /// The provider-produced invocation and its untrusted non-path arguments.
     pub const fn invocation(&self) -> &ToolInvocation {
         &self.invocation
@@ -401,17 +415,41 @@ impl Driver {
                 }
             }
 
-            if !text.trim().is_empty() {
-                if !self.emit(AgentStep::Message(text.clone())).await {
-                    return;
-                }
-                messages.push(Message::text(MessageRole::Assistant, text));
+            if !text.trim().is_empty() && !self.emit(AgentStep::Message(text.clone())).await {
+                return;
             }
 
             if calls.is_empty() {
+                if !text.trim().is_empty() {
+                    messages.push(Message::text(MessageRole::Assistant, text));
+                }
                 self.finish(AgentStatus::Completed).await;
                 return;
             }
+
+            // The assistant turn enters the transcript *with its calls
+            // attached*: every wire protocol correlates the tool results that
+            // follow against these parts, and a result whose call is absent
+            // from the conversation is a protocol error — OpenAI's Responses
+            // API answers it with HTTP 400 (observed 2026-08-01, the first
+            // real multi-turn run this loop ever made).
+            let mut parts = Vec::new();
+            if !text.trim().is_empty() {
+                parts.push(aibo_core::types::ContentPart::Text(text));
+            }
+            for call in &calls {
+                parts.push(aibo_core::types::ContentPart::ToolCall {
+                    id: call.id.clone(),
+                    name: call.name.clone(),
+                    args: call.args.clone(),
+                });
+            }
+            messages.push(Message {
+                role: MessageRole::Assistant,
+                parts,
+                tool_call_id: None,
+                tool_name: None,
+            });
 
             for call in calls {
                 match self.run_tool(&task, call, call_origin, &cancel).await {
@@ -485,7 +523,25 @@ impl Driver {
         // Pre-write approval (§11). Nothing has happened yet at this point, and
         // that is the entire design: a rejection after the write cannot undo
         // processes started or network calls made.
-        let approved_paths = match self.gate.authorise(&gated).await? {
+        //
+        // The whole authorise call is credited back to the wall clock: when
+        // it prompts, its duration is the user deciding, and when it does
+        // not, the credit is microseconds. The user's thinking time must not
+        // starve the run (§14 measures the *agent*).
+        let authorise_started = std::time::Instant::now();
+        // Raced against cancellation: an approval can pend for minutes, and
+        // esc/Cancel must not have to wait for the user to answer a prompt
+        // they are abandoning.
+        let authorisation = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                self.finish(AgentStatus::Cancelled).await;
+                return Ok(None);
+            }
+            result = self.gate.authorise(&gated) => result?,
+        };
+        self.tracker.credit_wait(authorise_started.elapsed());
+        let approved_paths = match authorisation {
             Authorisation::Allowed { resolved_paths, .. } => resolved_paths,
             Authorisation::Denied(reason) => {
                 tracing::info!(tool = %call.name, %reason, "tool call refused");
@@ -552,6 +608,7 @@ impl Driver {
             role: MessageRole::User,
             parts,
             tool_call_id: None,
+            tool_name: None,
         });
         messages
     }
@@ -619,6 +676,7 @@ fn tool_result_message(call: &ToolInvocation, output: &ToolOutput) -> Message {
             truncated: false,
         })],
         tool_call_id: Some(call.id.clone()),
+        tool_name: Some(call.name.clone()),
     }
 }
 

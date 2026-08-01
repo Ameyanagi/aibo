@@ -273,6 +273,7 @@ fn multiple_attachments_keep_their_order_and_each_keeps_its_own_fence() {
             ContentPart::Text(_) => "text",
             ContentPart::Untrusted(_) => "fence",
             ContentPart::Image { .. } => "image",
+            ContentPart::ToolCall { .. } => "tool_call",
         })
         .collect();
     assert_eq!(

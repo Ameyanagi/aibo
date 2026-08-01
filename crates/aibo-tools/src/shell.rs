@@ -306,6 +306,12 @@ pub struct ShellRequest {
     pub cwd: PathBuf,
     /// Wall-clock limit.
     pub timeout: Duration,
+    /// Text written to the command's stdin, which is then closed.
+    ///
+    /// `None` closes stdin immediately — commands run non-interactively by
+    /// default, and one that prompts will read EOF rather than hang. `Some`
+    /// covers the `y`-confirmation class without opening a real TTY.
+    pub stdin: Option<String>,
 }
 
 impl ShellRequest {
@@ -315,6 +321,7 @@ impl ShellRequest {
             command: command.into(),
             cwd: cwd.into(),
             timeout: DEFAULT_COMMAND_TIMEOUT,
+            stdin: None,
         }
     }
 
@@ -491,7 +498,11 @@ impl ShellExecutor {
         };
         command
             .current_dir(&cwd)
-            .stdin(std::process::Stdio::null())
+            .stdin(if request.stdin.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped())
             // Without this a cancelled run leaves an orphan holding the pipes.
@@ -508,6 +519,16 @@ impl ShellExecutor {
         }
 
         let mut child = command.spawn()?;
+        if let Some(input) = &request.stdin {
+            // Write-then-drop: the command sees the text and then EOF. Done
+            // before draining starts; the payloads this exists for (a "y",
+            // a heredoc) are far below any pipe buffer.
+            if let Some(mut handle) = child.stdin().take() {
+                use tokio::io::AsyncWriteExt;
+                let _ = handle.write_all(input.as_bytes()).await;
+                let _ = handle.shutdown().await;
+            }
+        }
         let stdout = child.stdout().take().ok_or_else(|| {
             std::io::Error::other("spawned command did not expose its stdout pipe")
         })?;

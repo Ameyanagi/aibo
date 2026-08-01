@@ -679,18 +679,40 @@ fn chat_message(msg: &Message) -> Value {
         let parts: Vec<Value> = msg
             .parts
             .iter()
-            .map(|p| match p {
-                ContentPart::Text(t) => json!({"type": "text", "text": t}),
-                ContentPart::Untrusted(b) => json!({"type": "text", "text": render_untrusted(b)}),
-                ContentPart::Image { mime, data_base64 } => json!({
+            .filter_map(|p| match p {
+                ContentPart::Text(t) => Some(json!({"type": "text", "text": t})),
+                ContentPart::Untrusted(b) => {
+                    Some(json!({"type": "text", "text": render_untrusted(b)}))
+                }
+                ContentPart::Image { mime, data_base64 } => Some(json!({
                     "type": "image_url",
                     "image_url": { "url": data_uri(mime, data_base64) }
-                }),
+                })),
+                // Not content: carried in `tool_calls` below.
+                ContentPart::ToolCall { .. } => None,
             })
             .collect();
         obj.insert("content".into(), Value::Array(parts));
     } else {
         obj.insert("content".into(), json!(flatten_text(msg)));
+    }
+
+    // The assistant turn that made the calls. `arguments` is a JSON *string*
+    // in this protocol — the one spelling difference that matters.
+    let tool_calls: Vec<Value> = msg
+        .parts
+        .iter()
+        .filter_map(|p| match p {
+            ContentPart::ToolCall { id, name, args } => Some(json!({
+                "id": id,
+                "type": "function",
+                "function": { "name": name, "arguments": args.to_string() },
+            })),
+            _ => None,
+        })
+        .collect();
+    if !tool_calls.is_empty() {
+        obj.insert("tool_calls".into(), Value::Array(tool_calls));
     }
 
     if let Some(id) = &msg.tool_call_id {
@@ -727,7 +749,7 @@ pub fn build_responses_body(req: &ChatRequest, q: &Quirks) -> Value {
             instructions.push_str(&flatten_text(msg));
             continue;
         }
-        input.push(responses_message(msg));
+        input.extend(responses_items(msg));
     }
 
     let mut body = json!({
@@ -826,13 +848,18 @@ fn is_chat_model(id: &str) -> bool {
     !NOT_CHAT.iter().any(|marker| id.contains(marker))
 }
 
-fn responses_message(msg: &Message) -> Value {
+/// One [`Message`] as Responses input **items** — plural, because an
+/// assistant turn that called tools becomes one `message` item plus one
+/// `function_call` item per call. The API rejects a `function_call_output`
+/// whose `call_id` answers no `function_call` in the conversation with HTTP
+/// 400 (observed 2026-08-01, the native loop's first real multi-turn run).
+fn responses_items(msg: &Message) -> Vec<Value> {
     if msg.role == MessageRole::Tool {
-        return json!({
+        return vec![json!({
             "type": "function_call_output",
             "call_id": msg.tool_call_id.clone().unwrap_or_default(),
             "output": flatten_text(msg),
-        });
+        })];
     }
 
     let text_type = if msg.role == MessageRole::Assistant {
@@ -843,21 +870,38 @@ fn responses_message(msg: &Message) -> Value {
     let content: Vec<Value> = msg
         .parts
         .iter()
-        .map(|p| match p {
-            ContentPart::Text(t) => json!({"type": text_type, "text": t}),
-            ContentPart::Untrusted(b) => json!({"type": text_type, "text": render_untrusted(b)}),
-            ContentPart::Image { mime, data_base64 } => json!({
+        .filter_map(|p| match p {
+            ContentPart::Text(t) => Some(json!({"type": text_type, "text": t})),
+            ContentPart::Untrusted(b) => {
+                Some(json!({"type": text_type, "text": render_untrusted(b)}))
+            }
+            ContentPart::Image { mime, data_base64 } => Some(json!({
                 "type": "input_image",
                 "image_url": data_uri(mime, data_base64),
-            }),
+            })),
+            ContentPart::ToolCall { .. } => None,
         })
         .collect();
 
-    json!({
-        "type": "message",
-        "role": role_name(msg.role),
-        "content": content,
-    })
+    let mut items = Vec::new();
+    if !content.is_empty() {
+        items.push(json!({
+            "type": "message",
+            "role": role_name(msg.role),
+            "content": content,
+        }));
+    }
+    for part in &msg.parts {
+        if let ContentPart::ToolCall { id, name, args } = part {
+            items.push(json!({
+                "type": "function_call",
+                "call_id": id,
+                "name": name,
+                "arguments": args.to_string(),
+            }));
+        }
+    }
+    items
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,6 +1406,55 @@ pub fn boxed(p: OpenAiCompat) -> Arc<dyn Provider> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The regression behind HTTP 400 "No tool call found for function call
+    /// output": both wire formats must carry the assistant's calls, or the
+    /// results that follow answer nothing.
+    #[test]
+    fn an_assistant_tool_call_survives_both_wire_formats() {
+        let assistant = Message {
+            role: MessageRole::Assistant,
+            parts: vec![
+                ContentPart::Text("checking".into()),
+                ContentPart::ToolCall {
+                    id: "c1".into(),
+                    name: "bash".into(),
+                    args: json!({"command": "ls"}),
+                },
+            ],
+            tool_call_id: None,
+            tool_name: None,
+        };
+
+        // Chat Completions: a `tool_calls` array with *stringified* arguments.
+        let chat = chat_message(&assistant);
+        assert_eq!(chat["tool_calls"][0]["id"], json!("c1"));
+        let arguments = chat["tool_calls"][0]["function"]["arguments"]
+            .as_str()
+            .expect("arguments must be a JSON string, not an object");
+        assert!(arguments.contains("command"), "{arguments}");
+        assert_eq!(chat["content"], json!("checking"));
+
+        // Responses: one `message` item plus one `function_call` item.
+        let items = responses_items(&assistant);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["type"], json!("message"));
+        assert_eq!(items[1]["type"], json!("function_call"));
+        assert_eq!(items[1]["call_id"], json!("c1"));
+        assert!(items[1]["arguments"].is_string());
+
+        // And the result addresses that call.
+        let result = Message {
+            role: MessageRole::Tool,
+            parts: vec![ContentPart::Text("ok".into())],
+            tool_call_id: Some("c1".into()),
+            tool_name: Some("bash".into()),
+        };
+        let out = responses_items(&result);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0]["type"], json!("function_call_output"));
+        assert_eq!(out[0]["call_id"], json!("c1"));
+    }
 
     /// `/models` returns the whole account catalogue, not the chat models.
     ///

@@ -1111,6 +1111,20 @@ pub enum ContentPart {
         /// Base64-encoded bytes.
         data_base64: String,
     },
+    /// A tool call the assistant made, kept in the transcript.
+    ///
+    /// Providers reject a tool *result* whose call is absent from the
+    /// conversation — the result's `call_id` must answer something. The
+    /// native loop records each accepted call here on the assistant turn
+    /// that produced it (§7).
+    ToolCall {
+        /// Provider-assigned call id, matched by [`Message::tool_call_id`].
+        id: String,
+        /// Tool name.
+        name: String,
+        /// Arguments exactly as the model produced them.
+        args: serde_json::Value,
+    },
 }
 
 /// A conversation message.
@@ -1122,6 +1136,13 @@ pub struct Message {
     pub parts: Vec<ContentPart>,
     /// For [`MessageRole::Tool`]: the call this result answers.
     pub tool_call_id: Option<String>,
+    /// For [`MessageRole::Tool`]: the tool's name.
+    ///
+    /// Gemini correlates a `functionResponse` by *name*, not id, so the id
+    /// alone cannot address every wire protocol. `default` so §12 history
+    /// serialised before this field existed still deserialises.
+    #[serde(default)]
+    pub tool_name: Option<String>,
 }
 
 impl Message {
@@ -1131,6 +1152,7 @@ impl Message {
             role,
             parts: vec![ContentPart::Text(body.into())],
             tool_call_id: None,
+            tool_name: None,
         }
     }
 }

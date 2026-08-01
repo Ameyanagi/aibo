@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use accesskit::{NodeId, TreeUpdate};
-use aibo_core::types::{DisplayInfo, StreamEvent};
+use aibo_core::types::{DisplayInfo, StreamEvent, Surface};
 use aibo_platform::{AccessibilityEvent, AccessibilitySurface};
 use iced::widget::operation;
 use iced::window::{self, Mode};
@@ -273,6 +273,8 @@ pub enum WindowChord {
     NextLane,
     /// Start or finish push-to-talk dictation (`⌘L`, §P9+).
     Dictate,
+    /// Flip agent mode for the session (`⌘J`, §1 Do).
+    AgentMode,
     /// Pin or unpin the highlighted model. Only meaningful while the quick-pick
     /// is open; the subscription cannot see panel state, so the meaning is
     /// decided where the chord is handled.
@@ -1171,6 +1173,19 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
             if let Some(role) = state.role_of(id) {
                 aibo_platform::set_accessibility_focus(Aibo::accessibility_surface(role), focused);
             }
+            // Focusing the panel window is intent to type (owner, 2026-08-01:
+            // "when the focus is on aibo, it should immediately be able to
+            // start typing" — clicking the panel or ⌘-tabbing back left the
+            // caret nowhere until the text box was clicked). The composer
+            // takes the caret unless a menu's query field owns it.
+            if focused
+                && id == state.panel_window
+                && state.panel_visible
+                && !state.panel.picker.open
+                && !state.panel.file_finder.open
+            {
+                return operation::focus(panel::INPUT_ID);
+            }
             Task::none()
         }
 
@@ -1553,6 +1568,7 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
                 // The fresh start `resume_panel_session`'s doc promises.
                 WindowChord::New => panel::Message::NewChat,
                 WindowChord::Dictate => panel::Message::ToggleDictation,
+                WindowChord::AgentMode => panel::Message::ToggleAgentMode,
                 WindowChord::Escape if state.panel.toast.is_some() => panel::Message::DismissToast,
                 WindowChord::Escape => panel::Message::Dismiss,
                 WindowChord::Enter {
@@ -1963,11 +1979,26 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 .map(|attached| attached.attachment.clone())
                 .collect();
             state.panel.history.record(&instruction);
-            state.panel.begin_turn(instruction.clone());
+            if state.panel.agent_mode {
+                // The task window owns this run's transcript. Beginning a
+                // chat turn here too left the panel stuck on a spinner no
+                // stream would ever resolve, with Send disabled — a soft
+                // lock (owner screenshot, 2026-08-01). Just consume the
+                // input; `TaskStarted` brings the ⌘T affordance.
+                state.panel.consume_input();
+            } else {
+                state.panel.begin_turn(instruction.clone());
+            }
             state.send(UiRequest::Submit {
                 session: state.panel.session,
                 instruction,
-                surface: state.panel.surface,
+                // The toggle overrides the frozen surface: agent mode makes
+                // every submission a Do until turned off or the session ends.
+                surface: if state.panel.agent_mode {
+                    Surface::Do
+                } else {
+                    state.panel.surface
+                },
                 role_override: None,
                 attachments,
                 history,
@@ -2128,6 +2159,10 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
         }
 
+        M::ToggleAgentMode => {
+            state.panel.agent_mode = !state.panel.agent_mode;
+            Task::none()
+        }
         M::ToggleDictation => {
             if state.panel.dictating {
                 state.panel.dictating = false;
@@ -2848,6 +2883,9 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
         UiEvent::TaskStarted { task, instruction } => {
             // §6: the Do surface gets a real window that outlives the panel.
             state.panel.handed_off_to_task = true;
+            // A `/agent` submission looked like chat until this moment; take
+            // back the spinner turn the task window now narrates.
+            state.panel.retract_handed_off_turn();
             let task_state = match state
                 .pending_tasks
                 .iter()
@@ -3546,6 +3584,7 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
                     'r' => Some(WindowChord::Retry),
                     't' => Some(WindowChord::ShowTask),
                     'l' => Some(WindowChord::Dictate),
+                    'j' => Some(WindowChord::AgentMode),
                     ',' => Some(WindowChord::OpenSettings),
                     _ => None,
                 };
@@ -3752,6 +3791,77 @@ mod tests {
             abilities: Default::default(),
             cost: None,
         }
+    }
+
+    /// The agent-mode toggle (owner, 2026-08-01): ⌘J makes submissions Do,
+    /// the mode is visible in state, and a new chat clears it — a toggle
+    /// forgotten yesterday must not make today's first question agentic.
+    #[test]
+    fn agent_mode_routes_submissions_to_do_and_dies_with_the_session() {
+        let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+        state.panel.phase = Phase::Idle;
+
+        let _ = panel_update(&mut state, panel::Message::ToggleAgentMode);
+        assert!(state.panel.agent_mode);
+
+        state.panel.set_input("tidy the downloads folder");
+        let _ = panel_update(&mut state, panel::Message::Submit);
+        let sent = received.try_recv().expect("a submission");
+        assert!(
+            matches!(
+                sent,
+                UiRequest::Submit {
+                    surface: Surface::Do,
+                    ..
+                }
+            ),
+            "{sent:?}"
+        );
+
+        state.panel.reset(SessionId::from_u128(2));
+        assert!(
+            !state.panel.agent_mode,
+            "the toggle is session-scoped by design"
+        );
+    }
+
+    /// The soft lock from the owner's screenshot (2026-08-01): an agent-mode
+    /// submission must not open a chat turn the stream will never resolve —
+    /// the panel stays Idle and typing continues to work. And a `/agent`
+    /// submission, which the panel cannot recognise, is taken back the
+    /// moment `TaskStarted` claims it.
+    #[test]
+    fn an_agent_submission_never_strands_the_panel_in_loading() {
+        let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+        state.panel.phase = Phase::Idle;
+
+        let _ = panel_update(&mut state, panel::Message::ToggleAgentMode);
+        state.panel.set_input("hello");
+        let _ = panel_update(&mut state, panel::Message::Submit);
+        assert!(matches!(received.try_recv(), Ok(UiRequest::Submit { .. })));
+        assert!(
+            matches!(state.panel.phase, Phase::Idle),
+            "no spinner for a run the task window narrates"
+        );
+        assert!(state.panel.input.is_empty(), "the composer is consumed");
+
+        // The `/agent` path: the panel began an ordinary turn...
+        let _ = panel_update(&mut state, panel::Message::ToggleAgentMode);
+        state.panel.set_input("/agent do something");
+        let _ = panel_update(&mut state, panel::Message::Submit);
+        assert!(matches!(state.panel.phase, Phase::Loading));
+        // ...and TaskStarted takes it back.
+        let _ = backend_update(
+            &mut state,
+            UiEvent::TaskStarted {
+                task: uuid::Uuid::now_v7(),
+                instruction: "do something".to_owned(),
+            },
+        );
+        assert!(matches!(state.panel.phase, Phase::Idle), "turn retracted");
+        assert!(state.panel.handed_off_to_task);
     }
 
     /// The settings-coverage rules that must not regress: editing the root
