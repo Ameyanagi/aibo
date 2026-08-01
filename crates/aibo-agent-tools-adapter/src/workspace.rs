@@ -25,7 +25,7 @@ use aibo_agent::{
 use aibo_core::error::Result;
 use aibo_core::types::{ApprovalKind, ToolSchema, ToolTier};
 use aibo_tools::shell::{
-    CommandApproval, Scope, ShellExecutor, ShellRequest, list_dir, read_file, write_file,
+    CommandApproval, Scope, ShellExecutor, ShellRequest, read_file, write_file,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -122,61 +122,69 @@ impl WorkspaceExecutor {
 #[async_trait]
 impl ToolExecutor for WorkspaceExecutor {
     fn schemas(&self) -> Vec<ToolSchema> {
+        // pi's tool surface, spelled pi's way (owner: "use the same harness
+        // as pi coding agent"): read, bash, edit, write — no ls; the prompt
+        // tells the model to use bash for ls/rg/find, as pi's does. `edit`
+        // takes an ARRAY of {oldText, newText} replacements.
         let object = |properties: serde_json::Value, required: &[&str]| json!({ "type": "object", "properties": properties, "required": required });
         vec![
             ToolSchema {
                 name: "read".into(),
-                description: "Read a text file. Returns at most `limit` lines from `offset` (1-indexed).".into(),
+                description: "Read the contents of a text file. Output is truncated to 2000 lines. Use offset/limit for large files. When you need the full file, continue with offset until complete.".into(),
                 parameters: object(
                     json!({
-                        "path": { "type": "string" },
-                        "offset": { "type": "integer", "minimum": 1 },
-                        "limit": { "type": "integer", "minimum": 1 },
+                        "path": { "type": "string", "description": "Path to the file to read (relative or absolute)" },
+                        "offset": { "type": "integer", "description": "Line number to start reading from (1-indexed)" },
+                        "limit": { "type": "integer", "description": "Maximum number of lines to read" },
                     }),
                     &["path"],
                 ),
                 tier: 3,
             },
             ToolSchema {
-                name: "ls".into(),
-                description: "List a directory. Directories end with `/`, symlinks with `@`.".into(),
-                parameters: object(json!({ "path": { "type": "string" } }), &[]),
-                tier: 3,
-            },
-            ToolSchema {
-                name: "write".into(),
-                description: "Create or overwrite a file with exactly `content`.".into(),
+                name: "bash".into(),
+                description: "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated when very large. Optionally provide a timeout in seconds (default 60, max 600).".into(),
                 parameters: object(
                     json!({
-                        "path": { "type": "string" },
-                        "content": { "type": "string" },
+                        "command": { "type": "string", "description": "Bash command to execute" },
+                        "timeout": { "type": "integer", "description": "Timeout in seconds (optional)" },
                     }),
-                    &["path", "content"],
+                    &["command"],
                 ),
                 tier: 3,
             },
             ToolSchema {
                 name: "edit".into(),
-                description: "Replace one exact occurrence of `old_text` (whitespace included) with `new_text` in a file. Fails unless `old_text` matches exactly once.".into(),
+                description: "Edit a single file using exact text replacement. Every edits[].oldText must match a unique, non-overlapping region of the original file. If two changes affect the same block or nearby lines, merge them into one edit instead of emitting overlapping edits. Do not include large unchanged regions just to connect distant changes.".into(),
                 parameters: object(
                     json!({
-                        "path": { "type": "string" },
-                        "old_text": { "type": "string" },
-                        "new_text": { "type": "string" },
+                        "path": { "type": "string", "description": "Path to the file to edit (relative or absolute)" },
+                        "edits": {
+                            "type": "array",
+                            "description": "One or more targeted replacements. Each edit is matched against the original file, not incrementally.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "oldText": { "type": "string", "description": "Exact text for one targeted replacement. It must be unique in the original file and must not overlap with any other edits[].oldText in the same call." },
+                                    "newText": { "type": "string", "description": "Replacement text for this targeted edit." },
+                                },
+                                "required": ["oldText", "newText"],
+                            },
+                        },
                     }),
-                    &["path", "old_text", "new_text"],
+                    &["path", "edits"],
                 ),
                 tier: 3,
             },
             ToolSchema {
-                name: "bash".into(),
-                description: "Run a shell command in the workspace. Optional `timeout_secs` (default 60, max 600).".into(),
+                name: "write".into(),
+                description: "Write content to a file. Creates the file if it doesn't exist, overwrites if it does. Automatically creates parent directories.".into(),
                 parameters: object(
                     json!({
-                        "command": { "type": "string" },
-                        "timeout_secs": { "type": "integer", "minimum": 1 },
+                        "path": { "type": "string", "description": "Path to the file to write (relative or absolute)" },
+                        "content": { "type": "string", "description": "Content to write to the file" },
                     }),
-                    &["command"],
+                    &["path", "content"],
                 ),
                 tier: 3,
             },
@@ -204,19 +212,6 @@ impl ToolExecutor for WorkspaceExecutor {
                 command: None,
                 paths: path_of("path"),
             }),
-            "ls" => Some(ToolIntent {
-                tier: ToolTier::ShellFs,
-                kind: ApprovalKind::Command,
-                summary: format!(
-                    "List {}",
-                    Self::str_arg(&call.args, "path").unwrap_or("the workspace")
-                ),
-                command: None,
-                paths: match Self::str_arg(&call.args, "path") {
-                    Some(p) => vec![self.anchored(p)],
-                    None => vec![self.workspace.clone()],
-                },
-            }),
             "write" => Some(ToolIntent {
                 tier: ToolTier::ShellFs,
                 kind: ApprovalKind::FileWrite,
@@ -232,8 +227,10 @@ impl ToolExecutor for WorkspaceExecutor {
                 tier: ToolTier::ShellFs,
                 kind: ApprovalKind::FileWrite,
                 summary: format!(
-                    "Edit {}",
-                    Self::str_arg(&call.args, "path").unwrap_or("<missing path>")
+                    "Edit {} ({} replacement{})",
+                    Self::str_arg(&call.args, "path").unwrap_or("<missing path>"),
+                    edit_count(&call.args),
+                    if edit_count(&call.args) == 1 { "" } else { "s" },
                 ),
                 command: None,
                 paths: path_of("path"),
@@ -264,7 +261,6 @@ impl ToolExecutor for WorkspaceExecutor {
         let (invocation, resolved_paths) = call.into_parts();
         let result = match invocation.name.as_str() {
             "read" => run_read(&self.scope, &invocation.args, &resolved_paths),
-            "ls" => run_ls(&self.scope, &resolved_paths),
             "write" => run_write(&self.scope, &invocation.args, &resolved_paths),
             "edit" => run_edit(&self.scope, &invocation.args, &resolved_paths),
             "bash" => {
@@ -328,30 +324,6 @@ fn run_read(
     })
 }
 
-fn run_ls(scope: &Scope, resolved: &[PathBuf]) -> std::result::Result<AgentToolOutput, String> {
-    let path = bound_path(resolved)?;
-    let entries = list_dir(scope, path).map_err(|e| e.to_string())?;
-    let content = entries
-        .iter()
-        .map(|e| {
-            let marker = if e.is_dir {
-                "/"
-            } else if e.is_symlink {
-                "@"
-            } else {
-                ""
-            };
-            format!("{}{marker}", e.name)
-        })
-        .collect::<Vec<_>>()
-        .join("\n");
-    Ok(AgentToolOutput {
-        content: clamp(content),
-        is_error: false,
-        diffs: Vec::new(),
-    })
-}
-
 fn run_write(
     scope: &Scope,
     args: &serde_json::Value,
@@ -377,28 +349,65 @@ fn run_edit(
     resolved: &[PathBuf],
 ) -> std::result::Result<AgentToolOutput, String> {
     let path = bound_path(resolved)?;
-    let old_text = WorkspaceExecutor::str_arg(args, "old_text").ok_or("`old_text` is required")?;
-    let new_text = WorkspaceExecutor::str_arg(args, "new_text").ok_or("`new_text` is required")?;
-    if old_text.is_empty() {
-        return Err("`old_text` must not be empty".to_owned());
+    let edits = args
+        .get("edits")
+        .and_then(serde_json::Value::as_array)
+        .ok_or("`edits` is required and must be an array")?;
+    if edits.is_empty() {
+        return Err("`edits` must contain at least one replacement".to_owned());
     }
     let before = read_file(scope, path).map_err(|e| e.to_string())?;
-    let matches = before.matches(old_text).count();
-    if matches == 0 {
-        return Err("`old_text` was not found; it must match exactly, whitespace included".into());
+    // Every oldText is matched against the ORIGINAL file (pi's contract), so
+    // ranges are found first and applied back-to-front — an earlier edit
+    // must not shift or create a later match.
+    let mut ranges: Vec<(usize, usize, &str)> = Vec::with_capacity(edits.len());
+    for (index, edit) in edits.iter().enumerate() {
+        let old_text = edit
+            .get("oldText")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("edits[{index}].oldText is required"))?;
+        let new_text = edit
+            .get("newText")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| format!("edits[{index}].newText is required"))?;
+        if old_text.is_empty() {
+            return Err(format!("edits[{index}].oldText must not be empty"));
+        }
+        let matches = before.matches(old_text).count();
+        if matches == 0 {
+            return Err(format!(
+                "edits[{index}].oldText was not found; it must match exactly, whitespace included"
+            ));
+        }
+        if matches > 1 {
+            return Err(format!(
+                "edits[{index}].oldText matches {matches} times; include more context so it matches exactly once"
+            ));
+        }
+        let at = before.find(old_text).expect("counted above");
+        ranges.push((at, at + old_text.len(), new_text));
     }
-    if matches > 1 {
-        return Err(format!(
-            "`old_text` matches {matches} times; include more context so it matches exactly once"
-        ));
+    ranges.sort_by_key(|(at, ..)| *at);
+    if ranges.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err("edits overlap; merge changes that touch the same block into one edit".into());
     }
-    let after = before.replacen(old_text, new_text, 1);
+    let mut after = before.clone();
+    for (at, end, new_text) in ranges.into_iter().rev() {
+        after.replace_range(at..end, new_text);
+    }
     write_file(scope, path, &after, None).map_err(|e| e.to_string())?;
     Ok(AgentToolOutput {
-        content: format!("edited {}", path.display()),
+        content: format!("edited {} ({} replacement(s))", path.display(), edits.len()),
         is_error: false,
         diffs: vec![(path.to_path_buf(), unified_diff(path, &before, &after))],
     })
+}
+
+/// How many replacements an `edit` call carries, for its intent summary.
+fn edit_count(args: &serde_json::Value) -> usize {
+    args.get("edits")
+        .and_then(serde_json::Value::as_array)
+        .map_or(0, Vec::len)
 }
 
 async fn run_bash(
@@ -415,7 +424,7 @@ async fn run_bash(
         });
     };
     let mut request = ShellRequest::new(command, workspace);
-    if let Some(secs) = args.get("timeout_secs").and_then(serde_json::Value::as_u64) {
+    if let Some(secs) = args.get("timeout").and_then(serde_json::Value::as_u64) {
         request.timeout = Duration::from_secs(secs).min(MAX_TIMEOUT);
     } else {
         request.timeout = DEFAULT_TIMEOUT;
@@ -459,14 +468,16 @@ async fn run_bash(
 }
 
 /// A unified diff for the task window's review pane.
+///
+/// Plain absolute paths in the header: the `a/`-`b/` convention is for
+/// repo-relative paths, and prefixing an absolute one rendered as
+/// `a//Users/…` (owner screenshot, 2026-08-01).
 fn unified_diff(path: &Path, before: &str, after: &str) -> String {
+    let label = path.display().to_string();
     similar::TextDiff::from_lines(before, after)
         .unified_diff()
         .context_radius(3)
-        .header(
-            &format!("a/{}", path.display()),
-            &format!("b/{}", path.display()),
-        )
+        .header(&label, &label)
         .to_string()
 }
 
@@ -535,7 +546,7 @@ mod tests {
         let edit = authorized(
             &exec,
             "edit",
-            json!({ "path": "notes/hello.txt", "old_text": "world", "new_text": "aibo" }),
+            json!({ "path": "notes/hello.txt", "edits": [{ "oldText": "world", "newText": "aibo" }] }),
         );
         let out = exec.execute(edit, CancellationToken::new()).await.unwrap();
         assert!(!out.is_error, "{}", out.content);
@@ -545,7 +556,7 @@ mod tests {
         let ambiguous = authorized(
             &exec,
             "edit",
-            json!({ "path": "notes/hello.txt", "old_text": "l", "new_text": "L" }),
+            json!({ "path": "notes/hello.txt", "edits": [{ "oldText": "l", "newText": "L" }] }),
         );
         let out = exec
             .execute(ambiguous, CancellationToken::new())
@@ -609,12 +620,56 @@ mod tests {
         assert!(out.content.contains("(exit 0"), "{}", out.content);
     }
 
+    /// pi's multi-edit contract: all oldText matched against the ORIGINAL,
+    /// applied without earlier edits shifting later ones, overlaps refused.
+    #[tokio::test]
+    async fn multi_edits_apply_against_the_original_and_refuse_overlap() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical");
+        let exec = executor(&root);
+        std::fs::write(root.join("f.txt"), "alpha beta gamma\n").expect("write");
+
+        let multi = authorized(
+            &exec,
+            "edit",
+            json!({ "path": "f.txt", "edits": [
+                { "oldText": "gamma", "newText": "delta" },
+                { "oldText": "alpha", "newText": "omega" },
+            ]}),
+        );
+        let out = exec.execute(multi, CancellationToken::new()).await.unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert_eq!(
+            std::fs::read_to_string(root.join("f.txt")).unwrap(),
+            "omega beta delta\n"
+        );
+
+        let overlapping = authorized(
+            &exec,
+            "edit",
+            json!({ "path": "f.txt", "edits": [
+                { "oldText": "omega beta", "newText": "x" },
+                { "oldText": "beta delta", "newText": "y" },
+            ]}),
+        );
+        let out = exec
+            .execute(overlapping, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(out.is_error);
+        assert!(out.content.contains("overlap"), "{}", out.content);
+    }
+
     #[test]
-    fn the_surface_is_exactly_pi_plus_ls() {
+    fn the_surface_is_exactly_pis() {
         let dir = tempfile::tempdir().expect("tempdir");
         let exec = executor(&dir.path().canonicalize().expect("canonical"));
         let names: Vec<String> = exec.schemas().into_iter().map(|s| s.name).collect();
-        assert_eq!(names, ["read", "ls", "write", "edit", "bash"]);
+        assert_eq!(
+            names,
+            ["read", "bash", "edit", "write"],
+            "pi's order, pi's set"
+        );
         assert!(exec.schemas().iter().all(|s| s.tier == 3));
     }
 }

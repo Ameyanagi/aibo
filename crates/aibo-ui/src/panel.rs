@@ -943,6 +943,27 @@ impl PanelState {
         self.reserved_answer_height = theme::ANSWER_BOX_MIN_HEIGHT;
     }
 
+    /// Consume the composer without starting a chat turn — for submissions
+    /// another surface (the task window) will narrate.
+    pub fn consume_input(&mut self) {
+        self.input.clear();
+        self.input_editor = text_editor::Content::new();
+    }
+
+    /// Take back a chat turn that another surface claimed.
+    ///
+    /// The `/agent` spelling is routed runtime-side, so the panel has begun
+    /// an ordinary turn by the time `TaskStarted` reveals the submission was
+    /// agentic. Loading only: once tokens are streaming the turn is really a
+    /// chat and stays one.
+    pub fn retract_handed_off_turn(&mut self) {
+        if matches!(self.phase, Phase::Loading) {
+            self.active_user = None;
+            self.clear_response();
+            self.phase = Phase::Idle;
+        }
+    }
+
     /// Prepare the active turn to be generated again.
     pub fn begin_retry(&mut self) {
         self.phase = Phase::Loading;
@@ -1338,14 +1359,20 @@ impl PanelState {
         // `input_extra_height`.
         let input_extra = self.input_extra_height();
         if self.has_conversation() {
+            // `CHAT_ESTIMATE_SURPLUS`: the collapsed baseline and the footer
+            // estimate both over-count the chat composition slightly —
+            // measured 29 pt of slack on a native-resolution capture
+            // (2026-08-01). 24 of it is given back; the remainder is margin,
+            // because a window a few points roomy beats a clipped composer.
             return (theme::PANEL_HEIGHT_COLLAPSED
                 + attachments
                 + selection
                 + input_extra
                 + self.transcript_height()
                 + self.chat_error_height()
-                + self.footer_height())
-            .clamp(CHAT_PANEL_MIN_HEIGHT, self.max_panel_height());
+                + self.footer_height()
+                - CHAT_ESTIMATE_SURPLUS)
+                .min(self.max_panel_height());
         }
 
         match self.phase {
@@ -2782,7 +2809,7 @@ impl PanelState {
     /// Visible transcript height, content-sized until a useful scrolling cap.
     fn transcript_height(&self) -> f32 {
         self.transcript_content_height()
-            .clamp(CHAT_TRANSCRIPT_MIN_HEIGHT, self.max_transcript_height())
+            .min(self.max_transcript_height())
     }
 
     /// The tallest the panel may grow on this display (`design.md` §4).
@@ -2963,11 +2990,16 @@ const ATTACHMENT_ROW_HEIGHT: f32 = 36.0;
 /// [`footer`]'s column spacing — [`space`]`(1.5)`. Shared with
 /// [`PanelState::footer_height`] so the estimate cannot drift from the render.
 const FOOTER_ROW_SPACING: f32 = 12.0;
+/// Floor for the panel's *maximum* height on small displays, and for the
+/// transcript's scroll ceiling — no longer a floor on the panel's actual
+/// height: sizing a short chat up to a minimum painted the difference as
+/// dead space under the composer (owner screenshot, 2026-08-01).
+const CHAT_PANEL_MIN_HEIGHT: f32 = 320.0;
+/// See `height_without_overlay`'s chat branch.
+const CHAT_ESTIMATE_SURPLUS: f32 = 24.0;
+const CHAT_TRANSCRIPT_MIN_HEIGHT: f32 = 112.0;
 const SELECTION_CARD_COLLAPSED_HEIGHT: f32 = 64.0;
 const SELECTION_CARD_EXPANDED_HEIGHT: f32 = 132.0;
-const CHAT_PANEL_MIN_HEIGHT: f32 = 320.0;
-const CHAT_TRANSCRIPT_MIN_HEIGHT: f32 = 112.0;
-
 /// Fraction of the display the panel may occupy before the answer scrolls.
 ///
 /// `design.md` §4: "Long answer | Answer area scrolls internally at 60 % display
@@ -3001,7 +3033,11 @@ const CHAT_STREAM_RESERVE: f32 = 96.0;
 /// This must track the bubble composition. It was 38 while the real chrome was
 /// ~54, and the drift, summed over a transcript, is exactly the kind of error
 /// that clipped the input row off the bottom of the window.
-const CHAT_BUBBLE_CHROME_HEIGHT: f32 = 54.0;
+// Measured from a native-resolution capture (2026-08-01): a one-line
+// bubble renders 54 pt total, and `estimated_text_height` contributes 24 —
+// the previous 54 here double-counted the text and painted ~24 pt of dead
+// space per bubble.
+const CHAT_BUBBLE_CHROME_HEIGHT: f32 = 30.0;
 /// Gap between transcript messages. [`conversation`] must use this same value
 /// as its column spacing — the estimate and the render disagreeing about the
 /// gaps is invisible per message and fatal in sum.
@@ -4440,5 +4476,38 @@ mod tests {
                 ..
             }
         ));
+    }
+}
+
+#[cfg(test)]
+mod height_probe {
+    use super::*;
+
+    /// Calibration pinned to a native-resolution capture (2026-08-01): a
+    /// one-line bubble renders 54 pt, so two bubbles plus their spacing are
+    /// 132 — and the panel's height for a short finished chat is the plain
+    /// sum of its parts, floored by nothing. The 320 pt floor this replaces
+    /// painted its whole surplus as dead space under the composer.
+    #[test]
+    fn a_short_finished_chat_is_the_sum_of_its_parts() {
+        let mut state = PanelState::new(SessionId::from_u128(1));
+        state.phase = Phase::Idle;
+        state.begin_turn("hello".to_owned());
+        state.response = "hello!".to_owned();
+        state.phase = Phase::Finished {
+            reason: StopReason::EndTurn,
+        };
+        state.attribution.provider = Some(aibo_core::ProviderId::CODEX);
+        state.attribution.model = Some("gpt-5.6-sol".to_owned());
+
+        assert_eq!(state.transcript_content_height(), 124.0, "54 + 16 + 54");
+        assert_eq!(
+            state.desired_height(),
+            theme::PANEL_HEIGHT_COLLAPSED
+                + state.transcript_content_height()
+                + state.footer_height()
+                - CHAT_ESTIMATE_SURPLUS,
+            "no floor, no reserve: the window is exactly its content"
+        );
     }
 }

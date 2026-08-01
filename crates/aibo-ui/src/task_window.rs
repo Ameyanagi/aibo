@@ -273,13 +273,37 @@ fn header(state: &TaskState) -> Element<'_, Message> {
         (None, false) => (Severity::Info, i18n::t(Key::StateLoading).to_owned()),
     };
 
+    // One status line under the instruction: a state dot, the state, and the
+    // run's quiet numbers — steps and tokens belong up here where the eye
+    // checks progress, not in the footer next to Close.
+    let mut status_line = row![
+        text("●")
+            .size(type_scale::META)
+            .style(theme::text_severity(status.0)),
+        text(status.1)
+            .size(type_scale::META)
+            .style(theme::text_severity(status.0)),
+    ]
+    .spacing(space(1.0))
+    .align_y(iced::Alignment::Center);
+    if state.steps > 0 {
+        status_line = status_line.push(
+            text(format!(
+                "· {} {} · {} tok",
+                state.steps,
+                i18n::t(Key::TaskSteps),
+                state.usage.total()
+            ))
+            .size(type_scale::META)
+            .style(theme::text_faint),
+        );
+    }
+
     column![
         text(widgets::elide(&state.instruction, 160))
             .size(type_scale::HEADING)
             .style(theme::text_primary),
-        text(status.1)
-            .size(type_scale::META)
-            .style(theme::text_severity(status.0)),
+        status_line,
     ]
     .spacing(space(1.0))
     .into()
@@ -290,14 +314,27 @@ fn steps(state: &TaskState) -> Element<'_, Message> {
         return widgets::state_block(Severity::Info, i18n::t(Key::TaskEmpty), None, Vec::new());
     }
 
-    let mut list = column![widgets::section::<Message>(Key::TaskSteps)].spacing(space(2.0));
-
+    // The panel's rail, continued (`design.md` §3): every step is a railed
+    // row and the amber segment sits on the row that holds attention — the
+    // pending approval while blocked, otherwise the newest step of a live
+    // run. A separate "Steps" heading said nothing the timeline doesn't.
+    let mut list = column![].spacing(0);
+    let live_index = state.entries.len().saturating_sub(1);
     for (index, entry) in state.entries.iter().enumerate() {
-        list = list.push(step_view(index, entry));
+        let rail =
+            if state.pending_approval.is_none() && state.outcome.is_none() && index == live_index {
+                widgets::RailState::Active
+            } else {
+                widgets::RailState::Inactive
+            };
+        list = list.push(widgets::railed(rail, step_view(index, entry)));
     }
 
     if let Some(request) = &state.pending_approval {
-        list = list.push(approval_view(state, request));
+        list = list.push(widgets::railed(
+            widgets::RailState::Active,
+            approval_view(state, request),
+        ));
     }
 
     list.into()
@@ -328,21 +365,38 @@ fn step_view(index: usize, entry: &Entry) -> Element<'_, Message> {
             stack.into()
         }
 
-        AgentStep::ToolUse { name, tier, .. } => container(
-            row![
-                text(i18n::t1(Key::TaskRunningTool, name))
-                    .size(type_scale::META)
-                    .style(theme::text_primary),
-                text(tier_label(*tier))
-                    .size(type_scale::META)
-                    .style(theme::text_faint),
-            ]
-            .spacing(space(2.0)),
-        )
-        .padding(space(2.0))
-        .width(Length::Fill)
-        .style(theme::raised)
-        .into(),
+        AgentStep::ToolUse {
+            name, args, tier, ..
+        } => {
+            // "Running write shell/fs" told the user nothing. Name the tool in
+            // mono, pull the one argument a person wants (the command or the
+            // path) out of the args, and keep the tier as a faint suffix.
+            let detail = args
+                .get("command")
+                .or_else(|| args.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            container(
+                row![
+                    text(format!("› {name}"))
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_primary),
+                    text(widgets::elide(detail, 96))
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_dim),
+                    text(tier_label(*tier))
+                        .size(type_scale::META)
+                        .style(theme::text_faint),
+                ]
+                .spacing(space(2.0))
+                .align_y(iced::Alignment::Center),
+            )
+            .padding([space(1.0), space(0.0)])
+            .width(Length::Fill)
+            .into()
+        }
 
         AgentStep::FileDiff { path, unified_diff } => {
             widgets::diff_view(&path.to_string_lossy(), unified_diff)
@@ -373,17 +427,17 @@ const fn tier_label(tier: ToolTier) -> &'static str {
 }
 
 /// The blocking approval prompt (§11).
+///
+/// The redesign's one amber moment (`design.md` §2: spend the boldness in
+/// one place). Ordered by what the user must judge: what is being asked,
+/// the exact command, where it lands — and only then the provenance
+/// footnote proving where the request came from (§5 rule 3), quiet but
+/// present so an injected request can be spotted.
 fn approval_view<'a>(state: &'a TaskState, request: &'a ApprovalRequest) -> Element<'a, Message> {
     let mut stack = column![
-        text(i18n::t(Key::TaskApprovalProvenance))
+        text(i18n::t(Key::TaskAwaitingApproval))
             .size(type_scale::META)
-            .style(theme::text_dim),
-        // §5 rule 3: show the request traces back to the user's instruction and
-        // not to a selection a web page controlled.
-        text(widgets::elide(&request.originating_instruction, 200))
-            .size(type_scale::META)
-            .font(theme::MONO_FONT)
-            .style(theme::text_primary),
+            .style(theme::text_severity(Severity::Warning)),
         text(request.summary.clone())
             .size(type_scale::BODY)
             .style(theme::text_primary),
@@ -406,12 +460,22 @@ fn approval_view<'a>(state: &'a TaskState, request: &'a ApprovalRequest) -> Elem
 
     for path in &request.paths {
         stack = stack.push(
-            text(path.to_string_lossy().into_owned())
+            text(format!("→ {}", path.to_string_lossy()))
                 .size(type_scale::META)
                 .font(theme::MONO_FONT)
                 .style(theme::text_dim),
         );
     }
+
+    stack = stack.push(
+        text(format!(
+            "{} {}",
+            i18n::t(Key::TaskApprovalProvenance),
+            widgets::elide(&request.originating_instruction, 120)
+        ))
+        .size(type_scale::META)
+        .style(theme::text_faint),
+    );
 
     if request.requires_typed_confirmation {
         stack = stack.push(
@@ -479,18 +543,7 @@ fn footer(state: &TaskState) -> Element<'_, Message> {
         );
     }
     actions.push(Action::new(Key::ActionDismiss, "esc", Message::Close));
-
-    column![
-        widgets::meta_line::<Message>(
-            i18n::t(Key::TaskSteps),
-            &state.steps.to_string(),
-            None,
-            Some(&state.usage.total().to_string()),
-        ),
-        widgets::action_list(actions),
-    ]
-    .spacing(space(1.5))
-    .into()
+    widgets::action_list(actions)
 }
 
 #[cfg(test)]

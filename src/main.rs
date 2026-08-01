@@ -2839,6 +2839,61 @@ mod runtime {
         }
     }
 
+    /// The agent's system prompt, in the pi coding agent's shape.
+    ///
+    /// pi's prompt is an identity line, a one-line tool list, terse
+    /// guidelines, optional `<project_context>` from the workspace's
+    /// AGENTS.md/CLAUDE.md, and the working directory last. Ported rather
+    /// than paraphrased — the owner asked for the same harness — with one
+    /// §11 divergence: a guideline explaining approvals, which pi does not
+    /// have.
+    fn agent_system_prompt(workspace: Option<&std::path::Path>) -> String {
+        let mut prompt = String::from(
+            "You are an expert coding assistant operating inside aibo, a coding agent \
+             harness. You help users by reading files, executing commands, editing code, \
+             and writing new files.\n\n\
+             Available tools:\n\
+             - read: Read the contents of a file\n\
+             - bash: Execute a bash command in the current working directory\n\
+             - edit: Edit a single file using exact text replacement\n\
+             - write: Write content to a file\n\n\
+             Guidelines:\n\
+             - Use bash for file operations like ls, rg, find\n\
+             - Be concise in your responses\n\
+             - Show file paths clearly when working with files\n\
+             - Some tool calls need the user's approval; a denial is an answer, not an \
+             error — adapt or ask\n\
+             - If the message is conversation or a question that needs no files or \
+             commands, just answer it; do not invent a task",
+        );
+        if let Some(workspace) = workspace {
+            // pi's <project_context>: the workspace's own instructions, when
+            // it keeps any. Bounded read — a giant AGENTS.md is a context
+            // bomb, not a briefing.
+            for candidate in ["AGENTS.md", "AGENTS.MD", "CLAUDE.md", "CLAUDE.MD"] {
+                let path = workspace.join(candidate);
+                if let Ok(content) = crate::files::read_bounded(&path) {
+                    prompt.push_str("\n\n<project_context>\n\nProject-specific instructions and guidelines:\n\n");
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut prompt,
+                        format_args!(
+                            "<project_instructions path=\"{}\">\n{}\n</project_instructions>\n\n",
+                            path.display(),
+                            content.trim_end(),
+                        ),
+                    );
+                    prompt.push_str("</project_context>\n");
+                    break;
+                }
+            }
+            let _ = std::fmt::Write::write_fmt(
+                &mut prompt,
+                format_args!("\nCurrent working directory: {}", workspace.display()),
+            );
+        }
+        prompt
+    }
+
     /// The instruction behind a leading `/agent` command, if the input has
     /// one (§1's "⌥Space then a verb", spelled as a slash command).
     ///
@@ -4667,16 +4722,14 @@ mod runtime {
             native_config.budget.deadline = self.engine.config().request_deadline;
             // pi-sized system prompt: the tools speak for themselves through
             // their schemas; the prompt only sets the frame.
-            native_config.system_prompt = Some(
-                "You are aibo's agent. Complete the user's task using the read, ls, write, \
-                 edit and bash tools, which are scoped to the user's chosen folders. Work in \
-                 small steps: inspect before you change, prefer edit over rewriting whole \
-                 files, and check your work (run the tests or the command the task implies). \
-                 Some tool calls need the user's approval — a denial is an answer, not an \
-                 error; adapt or ask. When the task is done, summarise what changed in one \
-                 short paragraph."
-                    .to_owned(),
-            );
+            // pi's system prompt, ported (owner: "use the same harness as pi
+            // coding agent"): identity line, one-line tool list, guidelines,
+            // project context from AGENTS.md/CLAUDE.md, and — the line whose
+            // absence wrote `Documents/Documents` — the working directory.
+            // The approval guideline is aibo's one §11 divergence from pi.
+            native_config.system_prompt = Some(agent_system_prompt(
+                roots.first().map(std::path::PathBuf::as_path),
+            ));
             let backend: Arc<dyn aibo_core::traits::AgentBackend> = Arc::new(
                 aibo_agent::NativeLoop::new(provider, tools, gate, native_config),
             );
