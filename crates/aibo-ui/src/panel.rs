@@ -3120,8 +3120,14 @@ fn conversation(state: &PanelState, appearance: theme::Appearance) -> Element<'_
     }
 
     if state.transcript_content_height() > state.transcript_height() {
+        // Anchored to the end: while an answer streams, the viewport follows
+        // it (owner, 2026-08-02 — "the context should follow the last
+        // response"). iced's end anchor keeps following only while the user
+        // is at the bottom; scrolling up to reread detaches it, which is
+        // exactly the chat convention.
         scrollable(transcript)
             .height(Length::Fill)
+            .anchor_bottom()
             .style(theme::scroller)
             .into()
     } else {
