@@ -371,6 +371,23 @@ pub fn build_messages_body(req: &ChatRequest) -> Value {
             ),
         );
     }
+    // Anthropic's hosted web search (owner, 2026-08-02): a server-side tool
+    // the API executes itself — results stream back as ordinary text with
+    // `server_tool_use`/`web_search_tool_result` blocks the decoder skips.
+    // Capped so a single question cannot fan out into a research bill (§14).
+    if req.web_search {
+        let search = json!({
+            "type": "web_search_20250305",
+            "name": "web_search",
+            "max_uses": 5,
+        });
+        match obj.get_mut("tools").and_then(Value::as_array_mut) {
+            Some(tools) => tools.push(search),
+            None => {
+                obj.insert("tools".into(), json!([search]));
+            }
+        }
+    }
 
     body
 }

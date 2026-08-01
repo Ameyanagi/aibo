@@ -1191,6 +1191,7 @@ output = 1
                 deadline: Duration::from_secs(30),
             },
             tools: Vec::new(),
+            web_search: false,
             user_instruction: None,
             untrusted: Vec::new(),
             attachments: Vec::new(),

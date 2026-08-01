@@ -627,6 +627,7 @@ impl Driver {
             params: self.config.params.clone(),
             budget: self.config.budget,
             tools: self.tools.schemas(),
+            web_search: true,
             user_instruction: Some(task.instruction.clone()),
             untrusted: task.context.clone(),
             // Placeholder wired by the contract change only. `AgentTask` has no

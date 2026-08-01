@@ -148,6 +148,9 @@ pub struct Quirks {
     pub max_completion_tokens: bool,
     /// Function/tool calling is accepted.
     pub tools: bool,
+    /// Whether the wire supports the provider's *hosted* web-search tool.
+    /// Responses-API only: Chat Completions has no server-side search.
+    pub web_search: bool,
     /// `response_format: {type: json_schema, …}` is accepted.
     pub json_schema: bool,
     /// `seed` is accepted.
@@ -196,6 +199,7 @@ impl Quirks {
             done_sentinel: true,
             max_completion_tokens: false,
             tools: true,
+            web_search: false,
             json_schema: false,
             seed: false,
             stop: true,
@@ -218,6 +222,9 @@ impl Quirks {
             reasoning: ReasoningStyle::ResponsesItem,
             done_sentinel: false,
             reasoning_effort: true,
+            // Hosted web search is a Responses built-in (owner, 2026-08-02:
+            // enabled for chat too, not just agent runs).
+            web_search: true,
             json_schema: true,
             // **No sampling parameters on the Responses wire.**
             //
@@ -793,21 +800,25 @@ pub fn build_responses_body(req: &ChatRequest, q: &Quirks) -> Value {
             json!({"format": {"type": "json_schema", "schema": schema}}),
         );
     }
+    let mut tools: Vec<Value> = Vec::new();
     if q.tools && !req.tools.is_empty() {
-        obj.insert(
-            "tools".into(),
-            json!(
-                req.tools
-                    .iter()
-                    .map(|t| json!({
-                        "type": "function",
-                        "name": t.name,
-                        "description": t.description,
-                        "parameters": t.parameters,
-                    }))
-                    .collect::<Vec<_>>()
-            ),
-        );
+        tools.extend(req.tools.iter().map(|t| {
+            json!({
+                "type": "function",
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
+            })
+        }));
+    }
+    // The provider's own hosted search (owner, 2026-08-02): server-side, so
+    // it needs no executor, no gate, and no loop — the answer streams back
+    // already grounded.
+    if q.web_search && req.web_search {
+        tools.push(json!({ "type": "web_search" }));
+    }
+    if !tools.is_empty() {
+        obj.insert("tools".into(), Value::Array(tools));
     }
 
     body

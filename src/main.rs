@@ -4552,7 +4552,8 @@ mod runtime {
 
             if surface == Surface::Do {
                 let context = captured_agent_context(state);
-                self.submit_agent(instruction, role_override, context).await;
+                self.submit_agent(session, instruction, role_override, context)
+                    .await;
                 return;
             }
 
@@ -4645,6 +4646,7 @@ mod runtime {
         /// until their canonical-path executors and approval broker are wired.
         async fn submit_agent(
             &self,
+            session: SessionId,
             instruction: String,
             role_override: Option<Role>,
             context: Vec<UntrustedBlock>,
@@ -4657,6 +4659,7 @@ mod runtime {
                 let _ = events
                     .send(UiEvent::TaskStarted {
                         task: task_id,
+                        session,
                         instruction,
                     })
                     .await;
@@ -4674,6 +4677,7 @@ mod runtime {
                 let _ = events
                     .send(UiEvent::TaskStarted {
                         task: task_id,
+                        session,
                         instruction,
                     })
                     .await;
@@ -4699,6 +4703,7 @@ mod runtime {
                     let _ = events
                         .send(UiEvent::TaskStarted {
                             task: task_id,
+                            session,
                             instruction,
                         })
                         .await;
@@ -4753,9 +4758,11 @@ mod runtime {
                     let mut terminal_step_seen = false;
                     while let Some(event) = agent_events.recv().await {
                         let ui = match event {
-                            AgentEvent::Started { task, instruction } => {
-                                UiEvent::TaskStarted { task, instruction }
-                            }
+                            AgentEvent::Started { task, instruction } => UiEvent::TaskStarted {
+                                task,
+                                session,
+                                instruction,
+                            },
                             AgentEvent::Step(step) => {
                                 terminal_step_seen |= matches!(*step, AgentStep::Done(_));
                                 UiEvent::TaskStep {

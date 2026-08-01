@@ -498,7 +498,10 @@ pub enum UiEvent {
     TaskStarted {
         /// Task id.
         task: Uuid,
-        /// The instruction, shown as the window's subject and as approval
+        /// The panel session the run was started from — the conversation its
+        /// activity card renders in (owner redesign, 2026-08-02).
+        session: SessionId,
+        /// The instruction, shown as the card's subject and as approval
         /// provenance (§5 rule 3).
         instruction: String,
     },

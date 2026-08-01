@@ -58,7 +58,7 @@ pub mod palette;
 pub mod panel;
 pub mod placement;
 pub mod settings;
-pub mod task_window;
+pub mod tasks;
 pub mod theme;
 pub mod tray;
 pub mod widgets;

@@ -1298,6 +1298,12 @@ pub struct ChatRequest {
     pub budget: RequestBudget,
     /// Tools offered to the model. Empty for Complete/Transform/Ask.
     pub tools: Vec<ToolSchema>,
+    /// Ask the provider to use its *server-side* web search/fetch tools
+    /// where the wire supports them (owner, 2026-08-02: "these should be
+    /// enabled even on the non agent task"). Nothing runs locally — §5's
+    /// rule 2 concerns local authority, and a hosted search grants none.
+    #[serde(default)]
+    pub web_search: bool,
     /// The user's own typed instruction, verbatim.
     ///
     /// Kept separate from `messages` because it is the *origin check* for tool
@@ -1781,6 +1787,7 @@ mod tests {
                 deadline: Duration::from_secs(30),
             },
             tools: Vec::new(),
+            web_search: false,
             user_instruction: Some("what is in this image?".into()),
             untrusted: Vec::new(),
             attachments,
