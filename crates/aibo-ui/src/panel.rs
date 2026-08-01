@@ -1312,6 +1312,14 @@ impl PanelState {
         base
     }
 
+    /// The height of the visible chrome — the panel's height with no floating
+    /// menu in play. The shell keeps the native backdrop pinned to exactly
+    /// this many points ([`aibo_platform::set_panel_backdrop_height`]), so the
+    /// blur hugs the chrome while the window is taller for a menu.
+    pub fn chrome_height(&self) -> f32 {
+        self.height_without_overlay()
+    }
+
     /// The panel's height with no floating menu in play.
     fn height_without_overlay(&self) -> f32 {
         // The chips are their own row above the input, so they add height in
@@ -1531,16 +1539,6 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
         stack = stack.push(widgets::toast(toast.severity, &toast.body, Some(action)));
     }
 
-    let base: Element<'_, Message> = container(stack)
-        .width(Length::Fill)
-        // The native visual-effect view fills the window. Filling the same
-        // bounds here prevents a transparent strip of blur below the rounded
-        // panel when the window is resized for a chat transcript.
-        .height(Length::Fill)
-        .padding(space(4.0))
-        .style(theme::panel_surface)
-        .into();
-
     // The quick-pick and the `@` finder float over the panel as menus
     // (t3-style) instead of replacing the body: the panel stays where it was,
     // the menu arrives and leaves, and mid-conversation the window does not
@@ -1555,6 +1553,26 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
     } else {
         None
     };
+
+    // The chrome normally fills the window, matching the native backdrop
+    // behind it. While a menu is open the window is *taller than the panel* —
+    // the menu needs room below a short chrome — and on macOS the shell pins
+    // the backdrop to `chrome_height`, so the chrome renders at that height
+    // and the slack stays transparent: opening a menu changes nothing the eye
+    // can see. Windows' DWM backdrop cannot be clipped to a sub-rect, so the
+    // chrome keeps filling the window there and a short panel visibly grows —
+    // the pre-menu behaviour, kept rather than a frosted strip.
+    let chrome_height = if menu.is_some() && cfg!(target_os = "macos") {
+        Length::Fixed(state.chrome_height())
+    } else {
+        Length::Fill
+    };
+    let base: Element<'_, Message> = container(stack)
+        .width(Length::Fill)
+        .height(chrome_height)
+        .padding(space(4.0))
+        .style(theme::panel_surface)
+        .into();
     if let Some((overlay, dismiss)) = menu {
         return stack![
             base,
@@ -3201,6 +3219,32 @@ mod tests {
         let mut state = PanelState::new(SessionId::from_u128(1));
         state.phase = Phase::Idle;
         state
+    }
+
+    /// The owner's ruling behind the clipped backdrop: opening a menu may
+    /// grow the *window* (it needs room to float), but the visible chrome —
+    /// what the backdrop and `panel_surface` render — must not move at all.
+    /// Only text growth is allowed to change what the eye sees.
+    #[test]
+    fn a_menu_grows_the_window_but_never_the_chrome() {
+        let mut state = panel();
+        let closed_chrome = state.chrome_height();
+        let closed_window = state.desired_height();
+
+        state.picker.open = true;
+        assert!(
+            state.desired_height() > closed_window,
+            "a collapsed panel's window must make room for the menu"
+        );
+        assert_eq!(
+            state.chrome_height(),
+            closed_chrome,
+            "the chrome must not follow the window"
+        );
+
+        state.picker.open = false;
+        state.file_finder.open = true;
+        assert_eq!(state.chrome_height(), closed_chrome);
     }
 
     fn screenshot(label: &str) -> Attachment {

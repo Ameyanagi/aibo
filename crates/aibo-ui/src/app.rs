@@ -642,6 +642,10 @@ impl Aibo {
         let size = Size::new(placement.size.0, placement.size.1);
 
         window::resize(self.panel_window, size)
+            .chain(sync_backdrop_to_chrome(
+                self.panel_window,
+                self.panel.chrome_height(),
+            ))
             .chain(window::move_to(self.panel_window, position))
             .chain(window::set_mode(self.panel_window, Mode::Windowed))
             .chain(configure_or_present_panel(self.panel_window, false))
@@ -3139,14 +3143,19 @@ fn resize_panel_if_visible(state: &mut Aibo) -> Task<Message> {
     let previous = state.last_placement;
     state.last_placement = Some(placement);
 
+    // The backdrop is synced even when the window itself has not moved: with
+    // a menu open the window height is pinned above the chrome, so the chrome
+    // can grow (a wrapped composer line, a dictation delta) without any
+    // window-server geometry changing at all.
+    let backdrop = sync_backdrop_to_chrome(state.panel_window, state.panel.chrome_height());
     // Every window-server call is a visible flicker on a transparent overlay,
     // so none is sent redundantly: nothing at all when geometry is unchanged,
     // and no `move_to` when only the size moved.
     if previous == Some(placement) {
-        return Task::none();
+        return backdrop;
     }
     let size = Size::new(placement.size.0, placement.size.1);
-    let resize = window::resize(state.panel_window, size);
+    let resize = window::resize(state.panel_window, size).chain(backdrop);
     if previous.map(|p| p.position) == Some(placement.position) {
         return resize;
     }
@@ -3183,6 +3192,30 @@ fn configure_or_present_panel(id: window::Id, configure: bool) -> Task<Message> 
             });
         if let Err(error) = result {
             tracing::warn!(%error, configure, "native panel overlay operation failed");
+        }
+        Message::Ignored
+    })
+}
+
+/// Pin the native backdrop to the panel's visible chrome.
+///
+/// Chained wherever the panel's geometry is sent to the window server: the
+/// window may be taller than the chrome while a floating menu is open (§9),
+/// and the blur must track the chrome, not the window. Sending it when the
+/// height is unchanged is a cheap native no-op, which keeps this a blanket
+/// rule instead of a state machine.
+fn sync_backdrop_to_chrome(id: window::Id, height: f32) -> Task<Message> {
+    let height = f64::from(height);
+    window::run(id, move |window| {
+        let result = window
+            .window_handle()
+            .map_err(|error| error.to_string())
+            .and_then(|handle| {
+                aibo_platform::set_panel_backdrop_height(handle, height)
+                    .map_err(|error| error.to_string())
+            });
+        if let Err(error) = result {
+            tracing::warn!(%error, "backdrop height update failed");
         }
         Message::Ignored
     })
@@ -4529,8 +4562,8 @@ mod tests {
         let task = state.show_panel(placement);
         assert_eq!(
             task.units(),
-            6,
-            "resize, move, show, native present, focus window, focus input"
+            7,
+            "resize, backdrop pin, move, show, native present, focus window, focus input"
         );
     }
 
