@@ -26,5 +26,5 @@ pub use native_loop::{
 };
 pub use permission_gate::{
     ApprovalResponse, ApprovalUi, Authorisation, DenyReason, GatedCall, PermissionGate, TierTable,
-    resolve_for_containment, verify_approval_response,
+    is_destructive_command, resolve_for_containment, verify_approval_response,
 };

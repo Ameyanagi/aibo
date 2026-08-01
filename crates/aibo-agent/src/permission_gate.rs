@@ -500,13 +500,18 @@ impl PermissionGate {
             Err(reason) => return Ok(Authorisation::Denied(reason)),
         };
 
-        // 4. Destructive class (§11: "no `rm -rf` or force-push class commands
-        //    without typed confirmation"). Never remembered, always prompted —
-        //    and checked *before* the auto-allow below, because YOLO (owner,
-        //    2026-08-01) must never extend to this class.
+        // 4. Destructive class (§11's "no `rm -rf` class without
+        //    confirmation"), owner-amended twice on 2026-08-01: first to be
+        //    the one prompt YOLO kept, then to *agent self-confirmation* —
+        //    the tool layer refuses a destructive command once and requires
+        //    the model to restate its intent and re-call with an explicit
+        //    confirm flag (see the workspace adapter's `bash`). So a
+        //    YOLO-tier destructive command passes this gate; tiers that still
+        //    prompt (MCP first-use, delegate) keep the typed-confirmation
+        //    path below.
         let destructive = call.command.as_deref().is_some_and(is_destructive_command);
 
-        if policy == ConsentPolicy::Never && !destructive {
+        if policy == ConsentPolicy::Never {
             return Ok(Authorisation::Allowed {
                 resolved_paths: resolved,
                 remembered: false,
@@ -885,10 +890,13 @@ mod tests {
              and the scoped roots are the remaining lines"
         );
 
-        assert_eq!(
-            gate.authorise(&call("rm -rf build")).await.unwrap(),
-            Authorisation::Denied(DenyReason::UserDenied),
-            "destructive still reaches the user even under YOLO"
+        assert!(
+            gate.authorise(&call("rm -rf build"))
+                .await
+                .unwrap()
+                .is_allowed(),
+            "the destructive check moved to the tool layer's self-confirmation;
+             the gate no longer stops it on a YOLO tier"
         );
     }
 
@@ -907,9 +915,10 @@ mod tests {
         }
         let ui = Arc::new(Capture(Mutex::new(Vec::new())));
         let gate = PermissionGate::new(ui.clone(), []);
-        // Only the destructive class prompts under YOLO, so that is where
-        // the provenance label must appear.
+        // Shell/fs no longer prompts at all; the delegate tier still does,
+        // so that is where the provenance label must keep appearing.
         let mut c = call("rm -rf build");
+        c.tier = ToolTier::Delegate;
         c.origin = ContentOrigin::ToolResult;
         let _ = gate.authorise(&c).await.unwrap();
         let seen = ui.0.lock().unwrap();
@@ -932,7 +941,8 @@ mod tests {
     #[tokio::test]
     async fn destructive_commands_are_never_remembered() {
         let gate = PermissionGate::new(Arc::new(ApproveAll), []);
-        let c = call("rm -rf build");
+        let mut c = call("rm -rf build");
+        c.tier = ToolTier::Delegate;
         // ApproveAll supplies the typed proof required at the backend boundary,
         // and the memory must stay empty.
         assert!(gate.authorise(&c).await.unwrap().is_allowed());
@@ -941,9 +951,13 @@ mod tests {
 
     #[tokio::test]
     async fn session_approval_cannot_bypass_destructive_confirmation() {
+        // Shell/fs is YOLO now; the typed-confirmation invariant continues to
+        // hold for the tiers that still prompt.
         let gate = PermissionGate::new(Arc::new(SessionApprover { typed: None }), []);
+        let mut c = call("rm -rf build");
+        c.tier = ToolTier::Delegate;
         assert_eq!(
-            gate.authorise(&call("rm -rf build")).await.unwrap(),
+            gate.authorise(&c).await.unwrap(),
             Authorisation::Denied(DenyReason::TypedConfirmationRequired)
         );
     }
@@ -956,12 +970,9 @@ mod tests {
             }),
             [],
         );
-        assert!(
-            gate.authorise(&call("rm -rf build"))
-                .await
-                .unwrap()
-                .is_allowed()
-        );
+        let mut c = call("rm -rf build");
+        c.tier = ToolTier::Delegate;
+        assert!(gate.authorise(&c).await.unwrap().is_allowed());
         assert!(gate.memory.lock().unwrap().is_empty());
     }
 

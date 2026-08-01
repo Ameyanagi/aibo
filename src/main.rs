@@ -2861,8 +2861,11 @@ mod runtime {
              - Use bash for file operations like ls, rg, find\n\
              - Be concise in your responses\n\
              - Show file paths clearly when working with files\n\
-             - Destructive commands (rm -rf, force-push and the like) stop for the \
-             user's approval; a denial is an answer, not an error — adapt or ask\n\
+             - Destructive commands (rm -rf, force-push and the like) are refused \
+             once; if one is genuinely required, state why and retry with \
+             confirm_destructive: true\
+             - Commands run non-interactively; prefer flags like --yes, or pass a \
+             prompt's answer via bash's stdin parameter\n\
              - If the message is conversation or a question that needs no files or \
              commands, just answer it; do not invent a task",
         );

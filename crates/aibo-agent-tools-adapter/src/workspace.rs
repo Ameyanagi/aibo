@@ -143,11 +143,13 @@ impl ToolExecutor for WorkspaceExecutor {
             },
             ToolSchema {
                 name: "bash".into(),
-                description: "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated when very large. Optionally provide a timeout in seconds (default 60, max 600).".into(),
+                description: "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated when very large. Optionally provide a timeout in seconds (default 60, max 600). Commands run non-interactively (stdin is closed): prefer non-interactive flags (--yes, --no-edit); for a simple prompt, pass its answer via `stdin`. Commands classified destructive (recursive deletes, force pushes, privilege escalation, disk tools) are refused once — if genuinely required, state why and retry with `confirm_destructive: true`.".into(),
                 parameters: object(
                     json!({
                         "command": { "type": "string", "description": "Bash command to execute" },
                         "timeout": { "type": "integer", "description": "Timeout in seconds (optional)" },
+                        "stdin": { "type": "string", "description": "Text written to the command's stdin before it is closed (for y/n prompts and heredocs)" },
+                        "confirm_destructive": { "type": "boolean", "description": "Set true only after restating why a destructive command is required for the task" },
                     }),
                     &["command"],
                 ),
@@ -423,21 +425,58 @@ async fn run_bash(
             diffs: Vec::new(),
         });
     };
+    // Agent self-confirmation for the destructive class (owner, 2026-08-01:
+    // no user prompt — the model confirms its own intent). The first attempt
+    // is refused with instructions; the retry carries an explicit flag, and
+    // the model's restated reasoning lands in the transcript where a human
+    // can audit it afterwards.
+    if aibo_agent::is_destructive_command(command)
+        && !args
+            .get("confirm_destructive")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+    {
+        return Ok(AgentToolOutput {
+            content: format!(
+                "`{command}` is classified as destructive (deletes, force-push, \
+                 privilege escalation, or disk-level). If it is genuinely required \
+                 for the task, state why and call bash again with \
+                 \"confirm_destructive\": true. Otherwise choose a safer command."
+            ),
+            is_error: true,
+            diffs: Vec::new(),
+        });
+    }
+
     let mut request = ShellRequest::new(command, workspace);
+    request.stdin = WorkspaceExecutor::str_arg(args, "stdin").map(str::to_owned);
     if let Some(secs) = args.get("timeout").and_then(serde_json::Value::as_u64) {
         request.timeout = Duration::from_secs(secs).min(MAX_TIMEOUT);
     } else {
         request.timeout = DEFAULT_TIMEOUT;
     }
-    // The user's consent already happened at the gate, against this exact
-    // command and summary. This approval token re-binds the same text so the
-    // executor's own TOCTOU check (`revalidate`) has something to hold it to.
-    let approval = CommandApproval::granted(&request);
+    // Consent is the agent's own under YOLO (owner, 2026-08-01): a
+    // destructive command got here only through the confirm_destructive
+    // retry above, so the adapter supplies the executor's typed-confirmation
+    // binding itself. The token still binds the exact command text and cwd,
+    // so the TOCTOU revalidation keeps its teeth.
+    let approval = if aibo_agent::is_destructive_command(command) {
+        CommandApproval::typed(&request, command)
+    } else {
+        CommandApproval::granted(&request)
+    };
     let outcome = match shell.run(&request, &approval, cancel).await {
         Ok(outcome) => outcome,
         Err(error) => {
+            let mut content = error.to_string();
+            if content.contains("Timeout") || content.contains("timed out") {
+                content.push_str(
+                    "\nThe command may have been waiting for input; pass its answer \
+                     via `stdin` or use a non-interactive flag.",
+                );
+            }
             return Ok(AgentToolOutput {
-                content: error.to_string(),
+                content,
                 is_error: true,
                 diffs: Vec::new(),
             });
@@ -658,6 +697,55 @@ mod tests {
             .unwrap();
         assert!(out.is_error);
         assert!(out.content.contains("overlap"), "{}", out.content);
+    }
+
+    /// The self-confirmation dance: a destructive command is refused once
+    /// with instructions, and the confirmed retry runs — no user in the loop.
+    #[tokio::test]
+    async fn destructive_bash_requires_the_agents_own_confirmation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical");
+        std::fs::create_dir(root.join("junk")).expect("mkdir");
+        let exec = executor(&root);
+
+        let first = authorized(&exec, "bash", json!({ "command": "rm -rf junk" }));
+        let out = exec.execute(first, CancellationToken::new()).await.unwrap();
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("confirm_destructive"),
+            "{}",
+            out.content
+        );
+        assert!(root.join("junk").exists(), "nothing ran");
+
+        let confirmed = authorized(
+            &exec,
+            "bash",
+            json!({ "command": "rm -rf junk", "confirm_destructive": true }),
+        );
+        let out = exec
+            .execute(confirmed, CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(!root.join("junk").exists(), "the confirmed retry ran");
+    }
+
+    /// Interactive commands: stdin text is delivered and then closed, so a
+    /// prompt reads its answer instead of hanging.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn bash_stdin_feeds_a_prompt_and_then_eof() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exec = executor(&dir.path().canonicalize().expect("canonical"));
+        let call = authorized(
+            &exec,
+            "bash",
+            json!({ "command": "read answer && echo got:$answer", "stdin": "yes\n" }),
+        );
+        let out = exec.execute(call, CancellationToken::new()).await.unwrap();
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("got:yes"), "{}", out.content);
     }
 
     #[test]

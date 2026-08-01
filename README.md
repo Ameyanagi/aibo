@@ -31,9 +31,10 @@ measured in milliseconds: no dock icon, no browser tab, no context switch.
   `/agent`) and submissions run a minimal coding agent (pi's harness:
   `read`, `bash`, `edit`, `write`) in a task window, scoped to the folders
   from Settings → Files. The toggle is per-session; a new chat returns to
-  plain asks. Ordinary commands and writes run without asking (diffs shown
-  as they land); destructive commands — the `rm -rf` / force-push class —
-  stop for approval with the exact command typed back.
+  plain asks. Commands and writes run without prompts (diffs shown as they
+  land, scoped to your folders); destructive commands — the `rm -rf` /
+  force-push class — are refused once and run only after the agent restates
+  its intent and confirms, with the exchange visible in the task window.
 - **Budget** — an optional monthly spend ceiling with warnings, priced from
   a user-correctable TOML table.
 - **English and Japanese UI**, following the system language.
