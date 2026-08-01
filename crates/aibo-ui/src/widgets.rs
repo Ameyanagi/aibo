@@ -184,6 +184,42 @@ pub fn mark<'a, Message: 'a>(label: impl Into<String>, on_raised: bool) -> Eleme
     .into()
 }
 
+/// The provider's official mark, or the [`mark`] tile when none is bundled.
+///
+/// This is the "if licensed marks ever ship, they drop in behind this same
+/// call" the [`mark`] doc promised. The owner asked for the real logos
+/// (2026-08-01); the bundled sources are the monochrome SVGs the icon sets
+/// distribute, tinted into the text ramp so they stay inside the palette —
+/// which retires the brand-colour objection, and the redistribution question
+/// is the owner's to make for their own build.
+///
+/// `fallback` is the caller's two-letter tile label, so a custom endpoint
+/// (§10) still shows something in the column.
+pub fn provider_logo<'a, Message: 'a>(
+    provider: &str,
+    fallback: impl Into<String>,
+    on_raised: bool,
+) -> Element<'a, Message> {
+    let Some(handle) = crate::icons::provider_icon(provider) else {
+        return mark(fallback, on_raised);
+    };
+    container(
+        iced::widget::svg(handle)
+            .width(Length::Fixed(MARK_SIZE - 6.0))
+            .height(Length::Fixed(MARK_SIZE - 6.0))
+            .style(if on_raised {
+                theme::icon_primary
+            } else {
+                theme::icon_dim
+            }),
+    )
+    .width(Length::Fixed(MARK_SIZE))
+    .height(Length::Fixed(MARK_SIZE))
+    .align_x(Alignment::Center)
+    .align_y(Alignment::Center)
+    .into()
+}
+
 /// Side of a [`mark`]'s tile.
 ///
 /// Square, and fixed rather than derived from the label, so the marks form a

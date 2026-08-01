@@ -208,6 +208,13 @@ pub enum Message {
     WindowKey(window::Id, WindowChord),
     /// Whether this window currently holds non-empty IME preedit text.
     ImePreedit(window::Id, bool),
+    /// Whether the platform's command modifier is currently held.
+    ///
+    /// Tracked because iced's `text_input` on macOS inserts the raw character
+    /// of any ⌘-shortcut it does not itself recognise — ⌘L toggled dictation
+    /// *and* typed an `l` (owner report, 2026-08-01). The input handlers drop
+    /// single-character insertions that arrive while ⌘ is down.
+    CommandHeld(bool),
     /// A message from the panel.
     Panel(panel::Message),
     /// A message from a task window.
@@ -264,6 +271,8 @@ pub enum WindowChord {
     PickModel,
     /// Move to the next quick-pick lane. `⇥`, as the placeholder promises.
     NextLane,
+    /// Start or finish push-to-talk dictation (`⌘L`, §P9+).
+    Dictate,
     /// Pin or unpin the highlighted model. Only meaningful while the quick-pick
     /// is open; the subscription cannot see panel state, so the meaning is
     /// decided where the chord is handled.
@@ -328,6 +337,8 @@ pub struct Aibo {
     panel: PanelState,
     /// Whether the panel is currently on screen.
     panel_visible: bool,
+    /// The command modifier is currently down; see [`Message::CommandHeld`].
+    command_held: bool,
     /// Placement of the last show, so a display change can re-clamp (§9).
     last_placement: Option<Placement>,
     /// The window server's last answer about the panel's monitor (§9).
@@ -910,6 +921,7 @@ fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) 
         panel_window,
         panel: PanelState::new(Uuid::now_v7()),
         panel_visible: false,
+        command_held: false,
         last_placement: None,
         observed: None,
         pending_show: false,
@@ -1345,6 +1357,11 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
             Task::none()
         }
 
+        Message::CommandHeld(held) => {
+            state.command_held = held;
+            Task::none()
+        }
+
         Message::Panel(message) => panel_update(state, message),
         Message::Task(id, message) => task_update(state, id, message),
         Message::Settings(message) => settings_update(state, message),
@@ -1444,6 +1461,35 @@ fn open_settings(state: &mut Aibo) -> Task<Message> {
     opened.map(Message::WindowOpened)
 }
 
+/// Whether `new` is exactly `old` with one extra character inserted.
+///
+/// The shape of iced's ⌘-shortcut fallout: the shortcut's own letter, inserted
+/// at the cursor. Anything else — deletion, paste, IME commit of a word —
+/// passes through untouched.
+fn is_single_char_insertion(old: &str, new: &str) -> bool {
+    if new.chars().count() != old.chars().count() + 1 {
+        return false;
+    }
+    let prefix = old
+        .char_indices()
+        .zip(new.char_indices())
+        .take_while(|((_, a), (_, b))| a == b)
+        .last()
+        .map_or(0, |((at, ch), _)| at + ch.len_utf8());
+    let Some(inserted) = new[prefix..].chars().next() else {
+        return false;
+    };
+    new[prefix + inserted.len_utf8()..] == old[prefix..]
+}
+
+/// Wind down a live microphone before the panel state that owns it moves on.
+fn stop_dictation_if_active(state: &mut Aibo) {
+    if state.panel.dictating {
+        state.panel.dictating = false;
+        state.send(UiRequest::StopDictation);
+    }
+}
+
 fn discard_panel_session(state: &Aibo, cancel: bool) {
     let session = state.panel.session;
     if cancel {
@@ -1467,6 +1513,15 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
     match state.role_of(window) {
         Some(Role::Panel) if state.panel_visible => {
             let message = match chord {
+                // The `@` finder owns the keyboard while it is open, exactly
+                // like the quick-pick below.
+                _ if state.panel.file_finder.open => match chord {
+                    WindowChord::Escape => panel::Message::FinderClose,
+                    WindowChord::Enter { .. } => panel::Message::FinderCommit,
+                    WindowChord::HistoryOlder => panel::Message::FinderMove(-1),
+                    WindowChord::HistoryNewer => panel::Message::FinderMove(1),
+                    _ => return Task::none(),
+                },
                 // The quick-pick owns the keyboard while it is open, so its
                 // keys are matched before the panel's own. Otherwise ↑/↓ would
                 // recall history instead of moving the highlight, and ⏎ would
@@ -1481,12 +1536,19 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
                     _ => return Task::none(),
                 },
                 WindowChord::PickModel => panel::Message::OpenPicker,
+                // ⇥ opens the quick-pick. The empty state advertises "⇥ for
+                // models" and the picker's own placeholder promises "⇥ to
+                // browse", so a Tab that did nothing made the panel's first
+                // suggestion to a new user a lie.
+                WindowChord::NextLane => panel::Message::OpenPicker,
                 // Outside the picker ⌘D means nothing, and inventing a meaning
                 // for it would make the binding unpredictable.
-                WindowChord::PinModel | WindowChord::NextLane => return Task::none(),
+                WindowChord::PinModel => return Task::none(),
                 // Handled above, for every window.
                 WindowChord::OpenSettings => unreachable!("intercepted before the role match"),
-                WindowChord::New => return Task::none(),
+                // The fresh start `resume_panel_session`'s doc promises.
+                WindowChord::New => panel::Message::NewChat,
+                WindowChord::Dictate => panel::Message::ToggleDictation,
                 WindowChord::Escape if state.panel.toast.is_some() => panel::Message::DismissToast,
                 WindowChord::Escape => panel::Message::Dismiss,
                 WindowChord::Enter {
@@ -1496,7 +1558,23 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
                 WindowChord::Enter {
                     command: true,
                     shift: false,
-                } => panel::Message::Accept,
+                } => {
+                    // `design.md` §4: the truncated state swaps replace for
+                    // retry. A partial answer can never be inserted, so the
+                    // primary chord re-runs the turn instead of dead-ending
+                    // on a disabled Replace.
+                    if state.panel.is_truncated() && state.panel.active_user.is_some() {
+                        panel::Message::Retry
+                    } else {
+                        panel::Message::Accept
+                    }
+                }
+                // ⇧⏎ belongs to the composer: its key binding turns it into a
+                // line break, so the chord must not also submit.
+                WindowChord::Enter {
+                    command: false,
+                    shift: true,
+                } => return Task::none(),
                 WindowChord::Enter { command: false, .. } => panel::Message::Submit,
                 WindowChord::Copy => {
                     if state.panel.can_copy() {
@@ -1526,17 +1604,18 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
                     panel::Message::Attach
                 }
                 WindowChord::Attach => return Task::none(),
-                WindowChord::DetachLast
-                    if state.panel.input.is_empty() && !state.ime_preedit.contains(&window) =>
-                {
-                    panel::Message::DetachLast
-                }
                 WindowChord::ToggleContext if state.panel.includes_selection() => {
                     panel::Message::ToggleContext
                 }
                 WindowChord::RemoveSelection if state.panel.includes_selection() => {
                     panel::Message::RemoveSelection
                 }
+                // `DetachLast` is deliberately dead in the panel. Backspace
+                // with an empty input used to remove the newest image, and a
+                // screen capture opens the panel with the image attached and
+                // the input empty — so the first reflexive backspace threw the
+                // screenshot away. Removal is now a pointer act on the chip or
+                // the footer action; a fresh start is ⌘N.
                 WindowChord::DetachLast
                 | WindowChord::ToggleContext
                 | WindowChord::RemoveSelection
@@ -1578,6 +1657,12 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
             WindowChord::Escape if state.settings.draft.is_some() => {
                 settings_update(state, settings::Message::DraftCancel)
             }
+            // Likewise an armed Forget: Escape is the reflex for "no, wait",
+            // and it must disarm rather than close the window over it.
+            WindowChord::Escape if state.settings.forget_armed.is_some() => {
+                state.settings.forget_armed = None;
+                Task::none()
+            }
             WindowChord::Escape => settings_update(state, settings::Message::Close),
             WindowChord::New if state.settings.section == settings::Section::Providers => {
                 settings_update(
@@ -1588,8 +1673,60 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
             WindowChord::Enter { command: false, .. } if state.settings.draft.is_some() => {
                 settings_update(state, settings::Message::DraftSave)
             }
+            // §6b: while a device code is waiting for approval, ⏎ opens the
+            // verification page — exactly what the card's button advertises.
+            WindowChord::Enter { .. }
+                if state.settings.section == settings::Section::Providers
+                    && state.settings.device_code().is_some() =>
+            {
+                settings_update(state, settings::Message::OpenDeviceUrl)
+            }
+            // The history block labels its enable action "⏎"; make that true.
+            WindowChord::Enter { .. }
+                if state.settings.section == settings::Section::History
+                    && !state.settings.history_ready
+                    && !state.settings.history_initializing
+                    && state.settings.recovery_code.is_none() =>
+            {
+                settings_update(state, settings::Message::InitializeHistory)
+            }
             WindowChord::Copy if state.settings.section == settings::Section::About => {
                 settings_update(state, settings::Message::CopyDiagnostics)
+            }
+            // The recovery-code and device-code copy actions both label
+            // themselves ⌘C; these arms are what make the labels honest.
+            WindowChord::Copy
+                if state.settings.section == settings::Section::History
+                    && state.settings.recovery_code.is_some() =>
+            {
+                settings_update(state, settings::Message::CopyRecoveryCode)
+            }
+            WindowChord::Copy
+                if state.settings.section == settings::Section::Providers
+                    && state.settings.device_code().is_some() =>
+            {
+                let code = state.settings.device_code().unwrap_or_default().to_owned();
+                settings_update(state, settings::Message::CopyDeviceCode(code))
+            }
+            // ⌫ forgets a provider only while that is unambiguous: exactly one
+            // key-based row. With several, a global key cannot know which row
+            // it means, and the rows drop their ⌫ hint to match.
+            WindowChord::DetachLast
+                if state.settings.section == settings::Section::Providers
+                    && state.settings.draft.is_none() =>
+            {
+                let mut rows = state
+                    .settings
+                    .providers
+                    .iter()
+                    .filter(|row| row.id != aibo_core::types::ProviderId::CODEX);
+                match (rows.next(), rows.next()) {
+                    (Some(row), None) => {
+                        let id = row.id.clone();
+                        settings_update(state, settings::Message::ForgetProvider(id))
+                    }
+                    _ => Task::none(),
+                }
             }
             _ => Task::none(),
         },
@@ -1604,7 +1741,48 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
         M::CopyLink(url) => iced::clipboard::write(url),
 
         M::InputChanged(input) => {
-            state.panel.input = input;
+            // The accessibility tree's SetValue: a wholesale replacement.
+            state.panel.set_input(&input);
+            resize_panel_if_visible(state)
+        }
+
+        M::InputEdited(action) => {
+            // The ⌘-fallout guard, editor edition: while ⌘ is down, a raw
+            // character insertion can only be shortcut fallout (⌘L toggled
+            // dictation *and* typed an `l`), never intended typing.
+            if state.command_held
+                && matches!(
+                    &action,
+                    iced::widget::text_editor::Action::Edit(
+                        iced::widget::text_editor::Edit::Insert(_)
+                    )
+                )
+            {
+                return Task::none();
+            }
+            // `@` opens the file finder (§P9+): detected on the way in so the
+            // character still lands in the text — commit strips it back out.
+            let opens_finder = matches!(
+                &action,
+                iced::widget::text_editor::Action::Edit(iced::widget::text_editor::Edit::Insert(
+                    '@'
+                ))
+            );
+            let height_before = state.panel.desired_height();
+            state.panel.perform_input_action(action);
+            if opens_finder && !state.panel.picker.open && !state.panel.file_finder.open {
+                state.panel.file_finder.open();
+                // The walk is re-requested on every open, so a file created
+                // since the last one is findable.
+                state.send(UiRequest::ListFiles);
+                return resize_panel_if_visible(state).chain(operation::focus(panel::FINDER_ID));
+            }
+            // Wrapping is why the composer is an editor at all: the window
+            // has to follow the line count or the new lines paint past the
+            // bottom edge.
+            if (state.panel.desired_height() - height_before).abs() >= 1.0 {
+                return resize_panel_if_visible(state);
+            }
             Task::none()
         }
 
@@ -1623,6 +1801,11 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
         }
         M::PickerQuery(query) => {
+            // Same ⌘-fallout guard as the main input: ⌘D toggles a pin and
+            // must not also type a `d` into the search query.
+            if state.command_held && is_single_char_insertion(&state.panel.picker.query, &query) {
+                return Task::none();
+            }
             state.panel.picker.set_query(query);
             Task::none()
         }
@@ -1645,7 +1828,73 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 let binding = option.binding.clone();
                 state.panel.toggle_favourite(binding);
             }
+            sync_settings_models(state);
+            persist_pins(state);
             Task::none()
+        }
+        M::PickerChoose(index) => {
+            let count = crate::model_picker::selectable(&state.panel.picker_rows()).len();
+            if index >= count {
+                return Task::none();
+            }
+            state.panel.picker.highlight = index;
+            panel_update(state, M::PickerCommit)
+        }
+        M::PickerPin(index) => {
+            let rows = state.panel.picker_rows();
+            if let Some(option) = crate::model_picker::selectable(&rows).get(index) {
+                let binding = option.binding.clone();
+                state.panel.toggle_favourite(binding);
+            }
+            sync_settings_models(state);
+            persist_pins(state);
+            Task::none()
+        }
+        M::PickerLane(lane) => {
+            state.panel.picker.lane = lane;
+            // A new lane is a new result set; a stale highlight would commit
+            // something never looked at.
+            state.panel.picker.highlight = 0;
+            Task::none()
+        }
+
+        M::FinderQuery(query) => {
+            // The same ⌘-fallout guard as every other text field.
+            if state.command_held
+                && is_single_char_insertion(&state.panel.file_finder.query, &query)
+            {
+                return Task::none();
+            }
+            state.panel.file_finder.set_query(query);
+            Task::none()
+        }
+        M::FinderMove(delta) => {
+            state.panel.file_finder.move_highlight(delta);
+            Task::none()
+        }
+        M::FinderChoose(index) => {
+            state.panel.file_finder.highlight = index;
+            panel_update(state, M::FinderCommit)
+        }
+        M::FinderCommit => {
+            let Some(file) = state.panel.file_finder.highlighted() else {
+                return Task::none();
+            };
+            // Strip the `@` that opened the finder; it was a trigger, not
+            // text the user meant to send.
+            if let Some(stripped) = state.panel.input.strip_suffix('@') {
+                let stripped = stripped.to_owned();
+                state.panel.set_input(&stripped);
+            }
+            state.send(UiRequest::AttachFile { path: file.path });
+            state.panel.file_finder.close();
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
+        }
+        M::FinderClose => {
+            state.panel.file_finder.close();
+            // The trigger `@` stays if the user dismissed — they may have
+            // meant to type a literal one.
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
         }
         M::PickerCommit => {
             let rows = state.panel.picker_rows();
@@ -1729,8 +1978,9 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             if matches!(state.panel.phase, Phase::Idle)
                 && let Some(text) = state.panel.history.older(&state.panel.input)
             {
-                state.panel.input = text;
-                return operation::move_cursor_to_end(panel::INPUT_ID);
+                // `set_input` already leaves the caret at the end.
+                state.panel.set_input(&text);
+                return resize_panel_if_visible(state);
             }
             Task::none()
         }
@@ -1739,8 +1989,8 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             if matches!(state.panel.phase, Phase::Idle)
                 && let Some(text) = state.panel.history.newer()
             {
-                state.panel.input = text;
-                return operation::move_cursor_to_end(panel::INPUT_ID);
+                state.panel.set_input(&text);
+                return resize_panel_if_visible(state);
             }
             Task::none()
         }
@@ -1807,9 +2057,12 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             // confirm-and-retry loop against a window aibo has not given up
             // yet. Chaining rather than calling `send` first is what makes the
             // hide actually precede the request instead of racing it.
+            let Some(text) = state.panel.latest_answer().map(str::to_owned) else {
+                return Task::none();
+            };
             let request = UiRequest::Insert {
                 session: state.panel.session,
-                text: state.panel.response.clone(),
+                text,
             };
             let dispatch = state.deferred_send(vec![
                 request,
@@ -1821,9 +2074,9 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
         }
 
         M::Copy => {
-            state.send(UiRequest::Copy {
-                text: state.panel.response.clone(),
-            });
+            if let Some(text) = state.panel.copyable_text().map(str::to_owned) {
+                state.send(UiRequest::Copy { text });
+            }
             Task::none()
         }
 
@@ -1854,10 +2107,36 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
         }
 
         M::Dismiss => {
+            stop_dictation_if_active(state);
             // `esc` cancels in-flight work and closes the panel (§13). It never
             // cancels an agent run — that lives in its own window (§6).
             discard_panel_session(state, true);
             state.hide_panel()
+        }
+
+        M::NewChat => {
+            stop_dictation_if_active(state);
+            // `begin_panel_session` is the hotkey's fresh-start path: cancel
+            // and discard the old session, reset the panel, capture anew.
+            // Reusing it is what keeps ⌘N and a context-driven fresh start
+            // identical in behaviour.
+            state.begin_panel_session();
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
+        }
+
+        M::ToggleDictation => {
+            if state.panel.dictating {
+                state.panel.dictating = false;
+                state.send(UiRequest::StopDictation);
+            } else {
+                // Optimistic: the runtime confirms with `DictationStarted` or
+                // corrects with `DictationFailed`. Waiting for the round-trip
+                // would make the button feel dead for exactly the press that
+                // starts the microphone.
+                state.panel.dictating = true;
+                state.send(UiRequest::StartDictation);
+            }
+            Task::none()
         }
 
         M::DismissToast => {
@@ -1942,10 +2221,11 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 // TODO(§14): raising a budget ceiling mid-run is a settings
                 // write plus a resume, both runtime-side.
                 ErrorAction::ContinueAnyway => Task::none(),
-                // TODO(§4): rebinding the role chain to `model` is a settings
-                // write the runtime owns; until `UiRequest` carries one, take
-                // the user to the picker rather than dropping the action.
-                ErrorAction::UseModel { .. } => open_settings(state),
+                // Rebinding the role chain to `model` is a settings write the
+                // runtime owns; until `UiRequest` carries one, the quick-pick
+                // is the honest version of this action — the error names a
+                // model that works, and the picker is where one is chosen.
+                ErrorAction::UseModel { .. } => panel_update(state, M::OpenPicker),
             }
         }
     }
@@ -2007,12 +2287,51 @@ fn task_update(state: &mut Aibo, id: Uuid, message: task_window::Message) -> Tas
     }
 }
 
+/// Mirror the panel's model catalogue and pin set into the settings window.
+///
+/// The settings Models section curates the same favourites the quick-pick
+/// shows; one owner (the panel), one syncing point, or the two lists drift.
+fn sync_settings_models(state: &mut Aibo) {
+    state.settings.models = state.panel.model_options.clone();
+    let capable = state.panel.model_options.clone();
+    state.settings.favourite_models = state.panel.pins(&capable);
+}
+
+/// Persist the pin set after a deliberate toggle.
+///
+/// The literal customised list, not the derived view: `favourite_models` is
+/// what [`panel::PanelState::pins`] honours once `pins_customised` is set,
+/// and it is exactly what must come back at the next launch.
+fn persist_pins(state: &Aibo) {
+    state.send(UiRequest::SetPinnedModels {
+        pins: state.panel.favourite_models.clone(),
+    });
+}
+
+/// Arm the settings `✓ copied` badge and schedule its expiry.
+///
+/// §6b: a copy affordance confirms for a moment — "silent copying leaves
+/// people pressing it twice" — then reverts. The epoch keeps a stale expiry
+/// task from clearing the badge a newer copy just set.
+fn arm_copied_badge(state: &mut Aibo, badge: settings::CopiedBadge) -> Task<Message> {
+    state.settings.copied_epoch += 1;
+    state.settings.copied_badge = Some(badge);
+    let epoch = state.settings.copied_epoch;
+    Task::future(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+        Message::Settings(settings::Message::CopiedBadgeExpired(epoch))
+    })
+}
+
 fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message> {
     use settings::Message as M;
 
     match message {
         M::Select(section) => {
             state.settings.section = section;
+            // Navigating away is a second thought: an armed Forget must not
+            // survive it and go off when the user comes back.
+            state.settings.forget_armed = None;
             Task::none()
         }
         M::ToggleCodexDetails => {
@@ -2033,20 +2352,29 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             }
             Task::none()
         }
+        // The three draft fields share the panel input's ⌘-fallout guard: ⌘N
+        // with a focused field otherwise types an `n` into it — worst of all
+        // into the API key.
         M::DraftId(id) => {
-            if let Some(draft) = &mut state.settings.draft {
+            if let Some(draft) = &mut state.settings.draft
+                && !(state.command_held && is_single_char_insertion(&draft.id, &id))
+            {
                 draft.id = id;
             }
             Task::none()
         }
         M::DraftBaseUrl(url) => {
-            if let Some(draft) = &mut state.settings.draft {
+            if let Some(draft) = &mut state.settings.draft
+                && !(state.command_held && is_single_char_insertion(&draft.base_url, &url))
+            {
                 draft.base_url = url;
             }
             Task::none()
         }
         M::DraftKey(key) => {
-            if let Some(draft) = &mut state.settings.draft {
+            if let Some(draft) = &mut state.settings.draft
+                && !(state.command_held && is_single_char_insertion(draft.key_field(), &key))
+            {
                 draft.set_key(key);
             }
             Task::none()
@@ -2077,9 +2405,25 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             Task::none()
         }
         M::ForgetProvider(provider) => {
-            state.send(UiRequest::RemoveProvider {
-                id: provider.as_str().to_owned(),
-            });
+            // Irreversible — the credential leaves the OS store — so the first
+            // press arms and only a second press on the same provider sends.
+            // The task-window equivalent gets a typed confirmation (§5); a
+            // two-press with a relabelled button is the settings-scale version.
+            if state.settings.forget_armed.as_ref() == Some(&provider) {
+                state.settings.forget_armed = None;
+                state.send(UiRequest::RemoveProvider {
+                    id: provider.as_str().to_owned(),
+                });
+            } else {
+                state.settings.forget_armed = Some(provider);
+            }
+            Task::none()
+        }
+        M::ToggleFavourite(binding) => {
+            // The panel owns the pin set; the settings list is a mirror.
+            state.panel.toggle_favourite(binding);
+            sync_settings_models(state);
+            persist_pins(state);
             Task::none()
         }
         M::OpenSystemSettings(permission) => {
@@ -2089,7 +2433,11 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
         // Copy the code exactly as the server issued it, hyphen included — the
         // verification page expects that form, and a "helpfully" stripped or
         // re-spaced version silently fails to match.
-        M::CopyDeviceCode(code) => iced::clipboard::write(code),
+        M::CopyDeviceCode(code) => {
+            aibo_platform::announce_accessibility(i18n::t(crate::i18n::Key::ToastCopied));
+            let expiry = arm_copied_badge(state, settings::CopiedBadge::DeviceCode);
+            iced::clipboard::write(code).chain(expiry)
+        }
         M::DeviceCodeAction(action) => {
             state.settings.perform_device_code_action(action);
             Task::none()
@@ -2112,11 +2460,6 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             state.send(UiRequest::SetLanguage(lang));
             Task::none()
         }
-        // TODO(§9): the picker is scoped to one key plus modifiers — no
-        // sequences, no double-taps, no left/right modifier distinction —
-        // because that is all `RegisterHotKey` supports. `Hotkeys::rebind`
-        // already keeps the previous binding if the new one is refused.
-        M::RebindHotkey => Task::none(),
         M::CopyDiagnostics => {
             state.send(UiRequest::CopyDiagnostics);
             Task::none()
@@ -2127,13 +2470,21 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             state.send(UiRequest::InitializeHistory);
             Task::none()
         }
-        M::CopyRecoveryCode => state
-            .settings
-            .recovery_code
-            .as_ref()
-            .map_or_else(Task::none, |code| {
-                iced::clipboard::write(code.expose_secret().to_owned())
-            }),
+        M::CopyRecoveryCode => {
+            let Some(code) = state.settings.recovery_code.as_ref() else {
+                return Task::none();
+            };
+            let code = code.expose_secret().to_owned();
+            aibo_platform::announce_accessibility(i18n::t(crate::i18n::Key::ToastCopied));
+            let expiry = arm_copied_badge(state, settings::CopiedBadge::RecoveryCode);
+            iced::clipboard::write(code).chain(expiry)
+        }
+        M::CopiedBadgeExpired(epoch) => {
+            if state.settings.copied_epoch == epoch {
+                state.settings.copied_badge = None;
+            }
+            Task::none()
+        }
         M::Close => {
             state.settings.recovery_code = None;
             match state.settings_window {
@@ -2503,6 +2854,7 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                     .cloned()
             });
             state.panel.model_options = options;
+            sync_settings_models(state);
             Task::none()
         }
 
@@ -2548,6 +2900,23 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             resize_panel_if_visible(state)
         }
 
+        UiEvent::Copied => {
+            // The announcement is unconditional — a screen reader gets the
+            // confirmation whichever window the copy came from — but the toast
+            // only makes sense over a visible panel; parking it on a hidden one
+            // would surface a stale "Copied." at the next open.
+            aibo_platform::announce_accessibility(i18n::t(crate::i18n::Key::ToastCopied));
+            if state.panel_visible {
+                state.panel.toast = Some(panel::ToastView {
+                    severity: ui_theme::Severity::Success,
+                    body: i18n::t(crate::i18n::Key::ToastCopied).to_owned(),
+                    offer_diagnostics: false,
+                });
+                return resize_panel_if_visible(state);
+            }
+            Task::none()
+        }
+
         UiEvent::OnboardingRequired => {
             tracing::debug!("opening settings for first-run onboarding");
             aibo_platform::announce_accessibility(i18n::t(crate::i18n::Key::SettingsWelcomeTitle));
@@ -2580,6 +2949,94 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             state.settings.section = settings::Section::History;
             aibo_platform::announce_accessibility(i18n::t(crate::i18n::Key::SettingsHistoryFailed));
             Task::none()
+        }
+
+        UiEvent::DictationStarted => {
+            state.panel.dictating = true;
+            // If the input already ends mid-word, the first delta gets one
+            // space in front of it so speech never welds onto typed text.
+            state.panel.dictation_pad =
+                !state.panel.input.is_empty() && !state.panel.input.ends_with(char::is_whitespace);
+            aibo_platform::announce_accessibility(i18n::t(crate::i18n::Key::ActionDictate));
+            Task::none()
+        }
+
+        UiEvent::DictationDelta { text } => {
+            // Appended even just after a stop: the final fragments of a
+            // committed turn arrive between `StopDictation` and
+            // `DictationEnded`, and dropping them would eat the last words.
+            let mut updated = state.panel.input.clone();
+            if state.panel.dictation_pad {
+                updated.push(' ');
+                state.panel.dictation_pad = false;
+            }
+            updated.push_str(&text);
+            state.panel.set_input(&updated);
+            // Speech wraps into new composer lines; the window follows.
+            resize_panel_if_visible(state)
+        }
+
+        UiEvent::DictationEnded => {
+            state.panel.dictating = false;
+            operation::focus(panel::INPUT_ID)
+        }
+
+        UiEvent::FileCandidates { files } => {
+            state.panel.file_finder.set_candidates(files);
+            Task::none()
+        }
+
+        UiEvent::FileAttached { name, content } => {
+            state.panel.attach_file_selection(content);
+            let body = i18n::t1(crate::i18n::Key::ToastFileAttached, &name);
+            aibo_platform::announce_accessibility(&body);
+            state.panel.toast = Some(panel::ToastView {
+                severity: ui_theme::Severity::Success,
+                body,
+                offer_diagnostics: false,
+            });
+            resize_panel_if_visible(state)
+        }
+
+        UiEvent::FileAttachFailed { name } => {
+            let body = i18n::t1(crate::i18n::Key::ToastFileAttachFailed, &name);
+            aibo_platform::announce_accessibility(&body);
+            state.panel.toast = Some(panel::ToastView {
+                severity: ui_theme::Severity::Warning,
+                body,
+                offer_diagnostics: false,
+            });
+            resize_panel_if_visible(state)
+        }
+
+        UiEvent::PinnedModelsLoaded { pins } => {
+            // Receipt implies the user curated this set — including empty.
+            state.panel.favourite_models = pins;
+            state.panel.pins_customised = true;
+            sync_settings_models(state);
+            Task::none()
+        }
+
+        UiEvent::DictationFailed { failure } => {
+            state.panel.dictating = false;
+            let key = match failure {
+                crate::bridge::DictationFailure::NoOpenAiKey => {
+                    crate::i18n::Key::ToastDictationNoKey
+                }
+                crate::bridge::DictationFailure::Microphone => {
+                    crate::i18n::Key::ToastDictationMicrophone
+                }
+                crate::bridge::DictationFailure::Connection => {
+                    crate::i18n::Key::ToastDictationConnection
+                }
+            };
+            aibo_platform::announce_accessibility(i18n::t(key));
+            state.panel.toast = Some(panel::ToastView {
+                severity: ui_theme::Severity::Warning,
+                body: i18n::t(key).to_owned(),
+                offer_diagnostics: false,
+            });
+            resize_panel_if_visible(state)
         }
     }
 }
@@ -2646,13 +3103,55 @@ fn resize_panel_if_visible(state: &mut Aibo) -> Task<Message> {
     if !state.panel_visible {
         return Task::none();
     }
-    let placement = state.placement();
+    // A resize is not a re-placement. Recomputing `placement()` wholesale here
+    // re-anchored the panel on every height change — and the anchor moves: by
+    // the time an answer grows the transcript, the caret capture that placed
+    // the panel is long gone, so every submit visibly snapped the window back
+    // to the fallback position. The corner stays where the user last saw it;
+    // only the size follows the content, with the top edge pushed up just
+    // enough when growth would walk off the display's visible frame.
+    let fresh = state.placement();
+    let placement = match state.last_placement {
+        Some(previous) => {
+            let (width, height) = fresh.size;
+            let (x, mut y) = previous.position;
+            if let Some(display) = state
+                .displays
+                .iter()
+                .find(|display| display.id == previous.display_id)
+            {
+                let frame = display.visible_frame;
+                #[expect(clippy::cast_possible_truncation, reason = "logical points fit f32")]
+                {
+                    let top = frame.y as f32;
+                    let bottom = (frame.y + frame.height) as f32;
+                    y = y.min(bottom - height).max(top);
+                }
+            }
+            Placement {
+                position: (x, y),
+                size: (width, height),
+                ..previous
+            }
+        }
+        None => fresh,
+    };
+    let previous = state.last_placement;
     state.last_placement = Some(placement);
 
-    let position = Point::new(placement.position.0, placement.position.1);
+    // Every window-server call is a visible flicker on a transparent overlay,
+    // so none is sent redundantly: nothing at all when geometry is unchanged,
+    // and no `move_to` when only the size moved.
+    if previous == Some(placement) {
+        return Task::none();
+    }
     let size = Size::new(placement.size.0, placement.size.1);
-
-    window::resize(state.panel_window, size).chain(window::move_to(state.panel_window, position))
+    let resize = window::resize(state.panel_window, size);
+    if previous.map(|p| p.position) == Some(placement.position) {
+        return resize;
+    }
+    let position = Point::new(placement.position.0, placement.position.1);
+    resize.chain(window::move_to(state.panel_window, position))
 }
 
 fn capture_screen_region_task() -> Task<Message> {
@@ -2760,6 +3259,11 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
                 return Some(Message::ImePreedit(window, active));
             }
 
+            if let iced::Event::Keyboard(iced::keyboard::Event::ModifiersChanged(modifiers)) = event
+            {
+                return Some(Message::CommandHeld(modifiers.command()));
+            }
+
             let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
                 key,
                 physical_key,
@@ -2836,6 +3340,7 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
                     'd' => Some(WindowChord::PinModel),
                     'r' => Some(WindowChord::Retry),
                     't' => Some(WindowChord::ShowTask),
+                    'l' => Some(WindowChord::Dictate),
                     ',' => Some(WindowChord::OpenSettings),
                     _ => None,
                 };
@@ -3074,6 +3579,59 @@ mod tests {
             received.try_recv().is_err(),
             "changing models must not cancel an active response"
         );
+    }
+
+    /// The ⌘-fallout guard drops exactly the one-character edit a leaked
+    /// shortcut produces, and nothing else.
+    #[test]
+    fn command_fallout_is_a_single_char_insertion() {
+        assert!(is_single_char_insertion("", "l"));
+        assert!(is_single_char_insertion("call", "calll"));
+        assert!(is_single_char_insertion("こんにち", "こんにちは"));
+        assert!(is_single_char_insertion("ab", "alb"));
+
+        assert!(!is_single_char_insertion("call", "call"));
+        assert!(!is_single_char_insertion("call", "cal"));
+        assert!(!is_single_char_insertion("", "こんにちは"));
+        assert!(!is_single_char_insertion("ab", "cd"));
+    }
+
+    /// Deleting a credential is irreversible, so one press must never do it:
+    /// the first arms, the second sends, and navigating away stands down.
+    #[test]
+    fn forgetting_a_provider_takes_two_presses() {
+        let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+        let provider = ProviderId::OPENAI;
+
+        let _ = settings_update(
+            &mut state,
+            settings::Message::ForgetProvider(provider.clone()),
+        );
+        assert_eq!(state.settings.forget_armed, Some(provider.clone()));
+        assert!(received.try_recv().is_err(), "the first press only arms");
+
+        let _ = settings_update(
+            &mut state,
+            settings::Message::ForgetProvider(provider.clone()),
+        );
+        assert!(state.settings.forget_armed.is_none());
+        assert!(matches!(
+            received.try_recv(),
+            Ok(UiRequest::RemoveProvider { id }) if id == provider.as_str()
+        ));
+
+        // Arm again, then navigate away: the armed state must not survive to
+        // go off when the user comes back.
+        let _ = settings_update(
+            &mut state,
+            settings::Message::ForgetProvider(provider.clone()),
+        );
+        let _ = settings_update(
+            &mut state,
+            settings::Message::Select(settings::Section::About),
+        );
+        assert!(state.settings.forget_armed.is_none());
     }
 
     #[test]
@@ -4170,8 +4728,11 @@ mod tests {
             "⌫ is the text's while there is text"
         );
 
+        // Even with the input empty, the chord must not remove the image: a
+        // screen capture opens the panel with the image attached and the
+        // input empty, so backspace-detach destroyed screenshots by reflex.
+        // Removal is a deliberate act — the chip's `×` or the footer action.
         state.panel.input.clear();
-        let _ = update(&mut state, Message::ImePreedit(panel_window, true));
         let _ = update(
             &mut state,
             Message::WindowKey(panel_window, WindowChord::DetachLast),
@@ -4179,15 +4740,14 @@ mod tests {
         assert_eq!(
             state.panel.attachments().len(),
             1,
-            "uncommitted IME preedit owns backspace even while committed input is empty"
+            "no keystroke may destroy an attachment"
         );
 
-        let _ = update(&mut state, Message::ImePreedit(panel_window, false));
-        let _ = update(
-            &mut state,
-            Message::WindowKey(panel_window, WindowChord::DetachLast),
+        let _ = panel_update(&mut state, panel::Message::DetachLast);
+        assert!(
+            !state.panel.has_attachments(),
+            "the footer action still removes it deliberately"
         );
-        assert!(!state.panel.has_attachments());
     }
 
     /// §13's one action has to resolve the state. After it runs the panel is

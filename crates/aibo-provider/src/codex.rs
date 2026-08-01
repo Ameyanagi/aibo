@@ -779,31 +779,20 @@ pub fn token_provider(
 
 /// Provider defaults. Per-model values come from the §19 manifest.
 ///
-/// # SPIKE: `vision` is `false` because nothing measured it
+/// # `vision` is `true`: confirmed in use, not assumed
 ///
-/// §3a exercised this endpoint end-to-end and its measurements covered **text
-/// only** — five model ids, TTFT, and the account-constraint 400. No image input
-/// was ever sent, so image support here is unknown, and unknown is not a reason
-/// to declare a capability. `false` costs a refusal the user can act on ("switch
-/// model"); `true` costs a 400 *after* a multi-megabyte upload has been paid for,
-/// and §4 does not fall back on a 400 — so the wrong guess is not recoverable in
-/// the direction that matters.
-///
-/// This also keeps the provider's own statement consistent with §4, which
-/// already refuses to bind `Role::Vision` to Codex —
-/// `aibo_core::roles::assert_vision_never_binds_codex` makes that a compile
-/// error. A provider declaring `vision: true` while the routing table refuses to
-/// route vision to it is a contradiction of exactly the kind the attachment work
-/// exists to retire.
-///
-/// Revisit with a real probe — one `input_image` part against one allowlist id —
-/// not with an assumption. Flip this and
-/// [`crate::registry::CODEX_VISION_UNVERIFIED`] together.
+/// §3a's original measurements covered text only, so this shipped `false` as a
+/// SPIKE. The gap has since closed the only way it could: the owner confirmed
+/// the ChatGPT-plan models read attached images in practice, and
+/// [`crate::openai_compat::build_responses_body`] — the body this provider
+/// sends — already folds attachments into `input_image` parts in the Responses
+/// spelling. `Role::Vision` now binds Codex when authenticated, and
+/// [`crate::registry::CODEX_VISION_UNVERIFIED`] states the same fact; the two
+/// must stay in agreement.
 pub fn default_capabilities() -> Capabilities {
     Capabilities {
         tools: true,
-        // SPIKE: unmeasured; see the doc comment above before changing this.
-        vision: false,
+        vision: true,
         streaming: true,
         reasoning_effort: true,
         json_schema: true,

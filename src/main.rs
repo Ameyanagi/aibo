@@ -65,6 +65,9 @@
 
 use anyhow::Context as _;
 
+mod files;
+mod stt;
+
 /// How long the tokio runtime is given to finish in-flight work at shutdown.
 ///
 /// Long enough for a cancelled provider stream to unwind and a SQLite write to
@@ -199,9 +202,9 @@ fn main() -> anyhow::Result<()> {
             },
             // The seam for this was already read in `boot`; nothing ever fed
             // it, so the platform default was the only reachable value. With
-            // `Message::RebindHotkey` still a stub, a shortcut some other app
-            // had taken left no way at all to change it — and since the panel
-            // is how settings is reached, that locked the user out.
+            // no in-app rebind UI, a shortcut some other app had taken left no
+            // way at all to change it — and since the panel is how settings is
+            // reached, that locked the user out.
             //
             // A bad value is reported and dropped rather than fatal. Refusing
             // to start because a shortcut is mistyped is the same lockout by
@@ -1437,6 +1440,18 @@ mod bootstrap {
             }
         }
 
+        /// Resolve one provider's API key the way the engine build does:
+        /// credential files first, environment fallback (§12).
+        ///
+        /// For callers outside the engine — dictation's transcriber (§P9+) is
+        /// the first — so the key follows the same precedence everywhere.
+        pub fn api_key(&self, provider: &ProviderId) -> Option<secrecy::SecretString> {
+            Credentials {
+                storage: self.secrets.clone(),
+            }
+            .api_key(provider)
+        }
+
         /// Build the engine, degrading rather than failing.
         pub fn engine(&self) -> Arc<aibo_session::Engine> {
             let config_path = self.paths.config();
@@ -1761,6 +1776,29 @@ mod config_file {
         };
         let body = format!("language = {}\n", quote(language));
         let updated = splice_table(&existing, "ui", &body);
+        crate::paths::atomic_write(path, updated.as_bytes())
+    }
+
+    /// Persist the quick-pick pin set without rewriting unrelated config.
+    ///
+    /// Its own `[pins]` table rather than a `[ui]` key: [`splice_table`]
+    /// replaces a table's whole body, so co-tenancy with `language` would have
+    /// each write erase the other's key.
+    pub fn write_pinned_models(path: &Path, models: &[String]) -> io::Result<()> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+        let mut body = String::from("models = [");
+        for (index, model) in models.iter().enumerate() {
+            if index > 0 {
+                body.push_str(", ");
+            }
+            body.push_str(&quote(model));
+        }
+        body.push_str("]\n");
+        let updated = splice_table(&existing, "pins", &body);
         crate::paths::atomic_write(path, updated.as_bytes())
     }
 
@@ -2988,6 +3026,9 @@ mod runtime {
         codex: CodexAuth,
         /// Loaded off the UI thread and published after the shell starts.
         startup_language: Option<Lang>,
+        /// The persisted pin set, if the user has ever customised one.
+        /// Published once after the shell starts, like the language.
+        startup_pins: Option<Vec<aibo_core::types::ModelBinding>>,
         /// Fresh installs open the functional provider setup automatically.
         onboarding_required: bool,
         /// Publish the already-opened history state without another credential
@@ -3020,6 +3061,8 @@ mod runtime {
         /// TODO(P1): hand to the agent and MCP spawn sites (§6).
         #[allow(dead_code)]
         children: ChildRegistry,
+        /// The one live dictation turn, if any (§P9+). Dropping it commits.
+        dictation: Option<crate::stt::DictationHandle>,
     }
 
     impl Backend {
@@ -3033,6 +3076,25 @@ mod runtime {
             let config = bootstrap.config();
             let codex = CodexAuth::at_startup(&config);
             let startup_language = config.ui.language.as_deref().and_then(Lang::from_tag);
+            // `provider/model`, the role-chain spelling. Malformed entries are
+            // dropped with a note rather than taking the whole set down.
+            let startup_pins = config.pins.models.as_ref().map(|models| {
+                models
+                    .iter()
+                    .filter_map(|entry| match entry.split_once('/') {
+                        Some((provider, model)) if !provider.is_empty() && !model.is_empty() => {
+                            Some(aibo_core::types::ModelBinding {
+                                provider: ProviderId::new(provider),
+                                model: model.to_owned(),
+                            })
+                        }
+                        _ => {
+                            tracing::warn!(entry, "ignoring a malformed pinned model");
+                            None
+                        }
+                    })
+                    .collect()
+            });
             let onboarding_required = config.providers.is_empty() && !config.codex.enabled;
             let engine = bootstrap.engine();
             let startup_history_ready = bootstrap.history_ready();
@@ -3042,6 +3104,7 @@ mod runtime {
                 bootstrap,
                 codex,
                 startup_language,
+                startup_pins,
                 onboarding_required,
                 startup_history_ready,
                 history_initializing: false,
@@ -3052,6 +3115,7 @@ mod runtime {
                 internal: None,
                 // Shipped entries only until the first refresh answers.
                 catalogue: aibo_provider::ModelCatalogue::shipped(),
+                dictation: None,
             }
         }
 
@@ -3110,6 +3174,15 @@ mod runtime {
                 && self
                     .events
                     .send(UiEvent::LanguageChanged { language })
+                    .await
+                    .is_err()
+            {
+                return;
+            }
+            if let Some(pins) = self.startup_pins.take()
+                && self
+                    .events
+                    .send(UiEvent::PinnedModelsLoaded { pins })
                     .await
                     .is_err()
             {
@@ -3184,6 +3257,26 @@ mod runtime {
 
                 UiRequest::UiReady => self.prewarm_providers(),
 
+                // §P9+ dictation. One turn at a time: a second Start while one
+                // runs is the toggle racing itself and is ignored.
+                UiRequest::StartDictation => {
+                    if self.dictation.is_none() {
+                        match self.bootstrap.api_key(&ProviderId::OPENAI) {
+                            Some(key) => {
+                                self.dictation = Some(crate::stt::start(key, self.events.clone()));
+                            }
+                            None => self.emit(UiEvent::DictationFailed {
+                                failure: aibo_ui::DictationFailure::NoOpenAiKey,
+                            }),
+                        }
+                    }
+                }
+                UiRequest::StopDictation => {
+                    if let Some(dictation) = self.dictation.take() {
+                        dictation.finish();
+                    }
+                }
+
                 UiRequest::InitializeHistory => {
                     self.initialize_history(internal.clone());
                 }
@@ -3216,7 +3309,7 @@ mod runtime {
 
                 UiRequest::Insert { session, text } => self.insert(session, text),
 
-                UiRequest::Copy { text } => self.copy(text, None),
+                UiRequest::Copy { text } => self.copy(text, Some(UiEvent::Copied)),
 
                 UiRequest::CopyDiagnostics => {
                     self.copy(self.diagnostics_bundle(), Some(UiEvent::DiagnosticsCopied));
@@ -3234,6 +3327,45 @@ mod runtime {
                         language.tag(),
                     ) {
                         tracing::warn!(%error, "could not persist UI language");
+                    }
+                }
+
+                // §P9+ @ file mentions. The walk and the read are blocking
+                // filesystem work and stay off the async workers.
+                UiRequest::ListFiles => {
+                    let roots = crate::files::roots(self.bootstrap.config().files.roots.as_deref());
+                    let events = self.events.clone();
+                    tokio::spawn(crate::diagnostics::supervise("file-walk", async move {
+                        if let Ok(files) =
+                            tokio::task::spawn_blocking(move || crate::files::walk(&roots)).await
+                        {
+                            let _ = events.send(UiEvent::FileCandidates { files }).await;
+                        }
+                    }));
+                }
+                UiRequest::AttachFile { path } => {
+                    let events = self.events.clone();
+                    tokio::spawn(crate::diagnostics::supervise("file-attach", async move {
+                        if let Ok(event) = tokio::task::spawn_blocking(move || {
+                            crate::files::attach_event(std::path::Path::new(&path))
+                        })
+                        .await
+                        {
+                            let _ = events.send(event).await;
+                        }
+                    }));
+                }
+
+                UiRequest::SetPinnedModels { pins } => {
+                    let models: Vec<String> = pins
+                        .iter()
+                        .map(|binding| format!("{}/{}", binding.provider.as_str(), binding.model))
+                        .collect();
+                    if let Err(error) = crate::config_file::write_pinned_models(
+                        &self.bootstrap.paths().config(),
+                        &models,
+                    ) {
+                        tracing::warn!(%error, "could not persist the pinned models");
                     }
                 }
 

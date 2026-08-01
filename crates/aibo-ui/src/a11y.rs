@@ -187,6 +187,23 @@ pub fn settings_tree(
             ));
             content_children.extend([SETTINGS_STATUS, SETTINGS_PRIMARY_ACTION]);
         }
+        Section::Models => {
+            // A summary node rather than one node per model: the list can be
+            // hundreds of rows, and the semantic tree here is hand-positioned
+            // arithmetic that would drift against the scrolling list. The
+            // count plus the section heading tells a screen-reader user what
+            // the surface is; per-row semantics belong to the planned move to
+            // real layout-derived nodes.
+            nodes.push((
+                SETTINGS_STATUS,
+                semantic_node(
+                    Role::Label,
+                    &i18n::t1(Key::PickerCount, &state.models.len().to_string()),
+                    logical_rect(content_x, 68.0, content_width, 28.0),
+                ),
+            ));
+            content_children.push(SETTINGS_STATUS);
+        }
         // These sections are intentionally absent from `Section::VISIBLE`.
         Section::Roles | Section::Actions => {}
     }
@@ -801,6 +818,7 @@ fn section_node_id(section: Section) -> NodeId {
                 Section::History => 5,
                 Section::Language => 6,
                 Section::About => 7,
+                Section::Models => 8,
             },
     )
 }

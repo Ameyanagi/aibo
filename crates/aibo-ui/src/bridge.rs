@@ -341,6 +341,34 @@ pub enum UiRequest {
         binding: ModelBinding,
     },
 
+    /// Walk the configured file roots for the `@` finder (§P9+). Answered by
+    /// [`UiEvent::FileCandidates`]; the walk is bounded runtime-side.
+    ListFiles,
+
+    /// Read one picked file so it can ride the fenced selection pipeline.
+    /// Answered by [`UiEvent::FileAttached`] or [`UiEvent::FileAttachFailed`].
+    AttachFile {
+        /// Absolute path, exactly as [`UiEvent::FileCandidates`] reported it.
+        path: String,
+    },
+
+    /// Persist the quick-pick pin set. Sent on every deliberate toggle: a pin
+    /// must survive a restart, or pinning is pointless.
+    SetPinnedModels {
+        /// The full pinned set, in pin order. May be empty — an explicitly
+        /// emptied set is a choice, not an absence.
+        pins: Vec<ModelBinding>,
+    },
+
+    /// Begin push-to-talk dictation: microphone → realtime transcription,
+    /// streaming text back as [`UiEvent::DictationDelta`]s (§P9+).
+    StartDictation,
+
+    /// Finish dictation: commit the audio turn and close the stream. The final
+    /// text arrives through the same delta events before
+    /// [`UiEvent::DictationEnded`].
+    StopDictation,
+
     /// Begin an orderly shutdown: cancel runs, reap children, close the
     /// database. §6 — child processes must not outlive aibo.
     Quit,
@@ -511,6 +539,11 @@ pub enum UiEvent {
     /// A redacted diagnostics bundle reached the clipboard.
     DiagnosticsCopied,
 
+    /// Text from `UiRequest::Copy` reached the clipboard. §16: an action that
+    /// produces no visible change must still produce visible confirmation —
+    /// without this, the panel's most-used action is silent.
+    Copied,
+
     /// No usable provider is configured; open the functional setup surface.
     OnboardingRequired,
 
@@ -525,6 +558,77 @@ pub enum UiEvent {
 
     /// Encrypted history setup failed; details remain diagnostics-only.
     HistorySetupFailed,
+
+    /// The microphone is live and streaming to the transcriber (§P9+).
+    DictationStarted,
+
+    /// A fragment of transcribed speech. Appended to the panel input verbatim.
+    DictationDelta {
+        /// The new text, already in reading order.
+        text: String,
+    },
+
+    /// Dictation finished: the final transcript has been delivered through the
+    /// deltas and the microphone is closed.
+    DictationEnded,
+
+    /// Dictation could not start or died. Typed so the UI owns the copy; the
+    /// runtime never localises (§9).
+    DictationFailed {
+        /// What went wrong, in the panel's vocabulary.
+        failure: DictationFailure,
+    },
+
+    /// The persisted pin set, published once at startup — and only when the
+    /// user has ever customised pins. Its absence is what lets the derived
+    /// defaults apply on a fresh install.
+    PinnedModelsLoaded {
+        /// The pins, in pin order. May be empty.
+        pins: Vec<ModelBinding>,
+    },
+
+    /// The `@` finder's candidate list, answering [`UiRequest::ListFiles`].
+    FileCandidates {
+        /// Bounded by the runtime's walk limits.
+        files: Vec<FileCandidate>,
+    },
+
+    /// A picked file's content, size-capped and text-decoded. The UI routes
+    /// it into the fenced selection slot — file bytes are §5 untrusted
+    /// context, and the selection pipeline already treats them as exactly
+    /// that.
+    FileAttached {
+        /// The file's name, for the toast.
+        name: String,
+        /// The content, capped runtime-side.
+        content: String,
+    },
+
+    /// The picked file could not be read as bounded text.
+    FileAttachFailed {
+        /// The file's name, for the toast.
+        name: String,
+    },
+}
+
+/// One entry the `@` file finder can offer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileCandidate {
+    /// Home-relative display form, e.g. `~/Documents/統計資料.pdf`.
+    pub display: String,
+    /// Absolute path handed back to [`UiRequest::AttachFile`].
+    pub path: String,
+}
+
+/// Why dictation failed, small enough to map one-to-one onto §13 copy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DictationFailure {
+    /// No OpenAI API key is configured; the transcriber has nothing to talk to.
+    NoOpenAiKey,
+    /// The microphone could not be opened — missing device or OS permission.
+    Microphone,
+    /// The websocket to the transcriber failed to connect or dropped mid-turn.
+    Connection,
 }
 
 #[cfg(test)]

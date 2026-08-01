@@ -15,6 +15,8 @@ global-hotkey = { workspace = true }
 iced = { workspace = true }
 muda = { workspace = true }
 nucleo-matcher = { workspace = true }
+yuru-core = { workspace = true }
+yuru-ja = { workspace = true }
 secrecy = { workspace = true }
 zeroize = { workspace = true }
 serde = { workspace = true }

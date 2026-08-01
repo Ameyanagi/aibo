@@ -10,7 +10,7 @@
 //! configured — the permission states (§8, §17) and the hotkey status (§9).
 //! The forms themselves are per-section product work.
 
-use aibo_core::types::{Health, Permission, PermissionStatus, ProviderId, Role};
+use aibo_core::types::{Health, ModelBinding, Permission, PermissionStatus, ProviderId, Role};
 use iced::widget::{
     Space, button, column, container, pick_list, row, rule, scrollable, text, text_editor,
     text_input,
@@ -18,7 +18,7 @@ use iced::widget::{
 use iced::{Element, Length};
 use secrecy::{ExposeSecret as _, SecretString};
 
-use crate::hotkey::{FailureReason, HotkeyStatus};
+use crate::hotkey::{Binding, FailureReason, HotkeyAction, HotkeyStatus};
 use crate::i18n::{self, Key, Lang};
 use crate::theme::{self, Severity, space, type_scale};
 use crate::widgets::{self, Action};
@@ -29,6 +29,8 @@ pub enum Section {
     /// Provider credentials and endpoints (§10).
     #[default]
     Providers,
+    /// The model catalogue and its pinned favourites (§4).
+    Models,
     /// Role bindings and fallback chains (§4).
     Roles,
     /// Per-role and global spend caps (§14).
@@ -47,8 +49,9 @@ pub enum Section {
 
 impl Section {
     /// Every section, in navigation order.
-    pub const ALL: [Section; 8] = [
+    pub const ALL: [Section; 9] = [
         Section::Providers,
+        Section::Models,
         Section::Roles,
         Section::Budgets,
         Section::Permissions,
@@ -64,8 +67,9 @@ impl Section {
     /// showing them before their editors exist creates navigation that ends in
     /// unrelated generic empty-state copy. Add them here when their controls
     /// ship.
-    pub const VISIBLE: [Section; 6] = [
+    pub const VISIBLE: [Section; 7] = [
         Section::Providers,
+        Section::Models,
         Section::Budgets,
         Section::Permissions,
         Section::History,
@@ -77,6 +81,7 @@ impl Section {
     pub const fn title(self) -> Key {
         match self {
             Section::Providers => Key::SettingsProviders,
+            Section::Models => Key::SettingsModels,
             Section::Roles => Key::SettingsRoles,
             Section::Budgets => Key::SettingsBudgets,
             Section::Permissions => Key::SettingsPermissions,
@@ -339,6 +344,31 @@ pub struct SettingsState {
     pub recovery_code: Option<SecretString>,
     /// The provider being added or edited, if any.
     pub draft: Option<ProviderDraft>,
+    /// The provider a first Forget press armed. Deleting a credential is
+    /// irreversible, so the row's action asks to be pressed twice; navigating
+    /// away or Escape disarms it.
+    pub forget_armed: Option<ProviderId>,
+    /// The model catalogue, mirrored from the panel for the Models section.
+    pub models: Vec<crate::bridge::ModelOption>,
+    /// The pinned set the quick-pick shows, including derived defaults —
+    /// mirrored so the stars here and the pins there cannot disagree.
+    pub favourite_models: Vec<ModelBinding>,
+    /// Which copy affordance most recently fired, for the momentary
+    /// `✓ copied` confirmation (`design.md` §6b — "silent copying leaves
+    /// people pressing it twice").
+    pub copied_badge: Option<CopiedBadge>,
+    /// Monotonic copy count, so a stale expiry task cannot clear the badge a
+    /// newer copy just set.
+    pub copied_epoch: u64,
+}
+
+/// A copy affordance that confirms itself with a momentary `✓ copied`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CopiedBadge {
+    /// The §6b device code.
+    DeviceCode,
+    /// The one-time history recovery code.
+    RecoveryCode,
 }
 
 /// A key-based provider the user is part-way through configuring.
@@ -599,15 +629,14 @@ pub enum Message {
     DraftSave,
     /// Forget a configured provider.
     ForgetProvider(ProviderId),
+    /// Pin or unpin a model from the Models section.
+    ToggleFavourite(ModelBinding),
     /// Expand or collapse the detailed Codex sign-in explanation.
     ToggleCodexDetails,
     /// Open the OS privacy pane for a permission.
     OpenSystemSettings(Permission),
     /// Change the UI language.
     SetLanguage(Lang),
-    /// Rebind the panel hotkey. Opens the picker; §9 scopes it to one key plus
-    /// modifiers, with no sequences and no double-taps.
-    RebindHotkey,
     /// Copy the device-code to the clipboard.
     ///
     /// §3a's code looks like `RJF3-XIERE`, and the verification page expects it
@@ -626,6 +655,9 @@ pub enum Message {
     InitializeHistory,
     /// Copy the one-time recovery code.
     CopyRecoveryCode,
+    /// A `✓ copied` badge reached the end of its moment. Ignored unless the
+    /// epoch matches the most recent copy.
+    CopiedBadgeExpired(u64),
     /// Close the window.
     Close,
 }
@@ -711,6 +743,7 @@ fn section_body(state: &SettingsState) -> Element<'_, Message> {
     let heading = widgets::section::<Message>(state.section.title());
     let content: Element<'_, Message> = match state.section {
         Section::Providers => providers(state),
+        Section::Models => models(state),
         Section::Permissions => permissions(state),
         Section::Budgets => budgets(state),
         Section::Language => language(state),
@@ -749,7 +782,14 @@ fn history(state: &SettingsState) -> Element<'_, Message> {
             .padding(space(2.0))
             .style(theme::raised),
             widgets::action_list(vec![Action::new(
-                Key::ActionCopyRecoveryCode,
+                // §6b's rule, applied to the code it matters most for:
+                // silent copying of a one-time key leaves the user unsure
+                // whether they saved it.
+                if state.copied_badge == Some(CopiedBadge::RecoveryCode) {
+                    Key::ActionCopied
+                } else {
+                    Key::ActionCopyRecoveryCode
+                },
                 widgets::primary_shortcut("⌘C", "Ctrl+C"),
                 Message::CopyRecoveryCode,
             )]),
@@ -790,6 +830,70 @@ fn history(state: &SettingsState) -> Element<'_, Message> {
         Some(i18n::t(Key::SettingsHistorySetupBody)),
         actions,
     )
+}
+
+/// The model catalogue with its pins as clickable stars.
+///
+/// The quick-pick is where a pin is *used*; this is where the set is curated
+/// without racing a keyboard highlight. Same data, same toggle, mirrored by
+/// `sync_settings_models` so the two views cannot disagree.
+fn models(state: &SettingsState) -> Element<'_, Message> {
+    if state.models.is_empty() {
+        return widgets::state_block(
+            Severity::Info,
+            i18n::t(Key::StateEmptyTitle),
+            Some(i18n::t(Key::StateEmptyBody)),
+            Vec::new(),
+        );
+    }
+
+    let mut list = column![
+        text(i18n::t(Key::SettingsModelsHint))
+            .size(type_scale::META)
+            .style(theme::text_dim),
+    ]
+    .spacing(space(1.0));
+
+    for option in &state.models {
+        let pinned = state.favourite_models.contains(&option.binding);
+        let provider = option.binding.provider.as_str();
+        list = list.push(
+            container(
+                row![
+                    button(
+                        text(if pinned { "\u{2605}" } else { "\u{2606}" })
+                            .size(type_scale::BODY)
+                            .style(if pinned {
+                                theme::text_accent
+                            } else {
+                                theme::text_faint
+                            }),
+                    )
+                    .padding([space(0.5), space(1.0)])
+                    .style(theme::list_row_button(false))
+                    .on_press(Message::ToggleFavourite(option.binding.clone())),
+                    widgets::provider_logo(
+                        provider,
+                        crate::model_picker::provider_mark(provider),
+                        false
+                    ),
+                    text(option.display_name.clone())
+                        .size(type_scale::BODY)
+                        .style(theme::text_primary),
+                    Space::new().width(Length::Fill),
+                    text(provider.to_owned())
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_dim),
+                ]
+                .spacing(space(1.5))
+                .align_y(iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding([space(0.5), space(1.0)]),
+        );
+    }
+    list.into()
 }
 
 /// The Codex sign-in card (§3a).
@@ -900,10 +1004,23 @@ fn codex_card(state: &SettingsState) -> Element<'_, Message> {
                     .style(theme::text_accent),
             );
         }
+        // §6b: the code is copyable by button and by ⌘C, the page opens on ⏎,
+        // and a fired copy confirms itself — "silent copying leaves people
+        // pressing it twice". The key hints are real: `window_shortcut` routes
+        // both chords here while the code is on screen.
+        let copy_label = if state.copied_badge == Some(CopiedBadge::DeviceCode) {
+            i18n::t(Key::ActionCopied).to_owned()
+        } else {
+            format!(
+                "⧉ {} {}",
+                widgets::primary_shortcut("⌘C", "Ctrl+C"),
+                i18n::t(Key::SettingsCopyDeviceCode)
+            )
+        };
         body = body.push(
             row![
                 button(
-                    text(format!("⧉ {}", i18n::t(Key::SettingsCopyDeviceCode)))
+                    text(copy_label)
                         .size(type_scale::META)
                         .style(theme::text_accent)
                 )
@@ -912,7 +1029,7 @@ fn codex_card(state: &SettingsState) -> Element<'_, Message> {
                 .style(theme::action_button)
                 .on_press(Message::CopyDeviceCode(code)),
                 button(
-                    text(format!("↗ {}", i18n::t(Key::SettingsOpenDevicePage)))
+                    text(format!("⏎ {}", i18n::t(Key::SettingsOpenDevicePage)))
                         .size(type_scale::META)
                         .style(theme::text_accent)
                 )
@@ -971,6 +1088,7 @@ fn providers(state: &SettingsState) -> Element<'_, Message> {
         .iter()
         .filter(|p| p.id != ProviderId::CODEX)
         .collect();
+    let single_forgettable = others.len() == 1;
 
     for provider in others {
         // §13: health is per provider with hysteresis, never one global
@@ -1004,10 +1122,20 @@ fn providers(state: &SettingsState) -> Element<'_, Message> {
             .style(theme::raised),
         );
 
+        // Deleting a credential is irreversible, so the first press arms and
+        // the label says what the second one will do. The ⌫ hint is shown only
+        // while it is unambiguous — with several rows a global key cannot know
+        // which provider it means, and a hint that fires on the wrong row is
+        // worse than none.
+        let armed = state.forget_armed.as_ref() == Some(&provider.id);
         list = list.push(widgets::action_list(vec![
             Action::new(
-                Key::ActionForgetProvider,
-                "⌫",
+                if armed {
+                    Key::ActionConfirmForget
+                } else {
+                    Key::ActionForgetProvider
+                },
+                if single_forgettable { "⌫" } else { "" },
                 Message::ForgetProvider(provider.id.clone()),
             )
             .destructive(),
@@ -1109,10 +1237,24 @@ fn onboarding_steps(state: &SettingsState) -> Element<'_, Message> {
         row.permission == Permission::Accessibility && row.status == PermissionStatus::Granted
     });
     let completed = [connected, connected && permissions_ready, false];
+    // The hotkey step names the *live* binding. The hardcoded "⌥Space" this
+    // replaces was wrong on Windows (`Ctrl+Shift+Space`) and wrong for anyone
+    // whose config.toml rebinds it — an onboarding step that teaches a
+    // shortcut that does nothing is how first-run ends.
+    let combo = state
+        .hotkey
+        .as_ref()
+        .map(|status| match status {
+            HotkeyStatus::Registered { combo, .. } | HotkeyStatus::Failed { combo, .. } => {
+                combo.clone()
+            }
+        })
+        .or_else(|| Binding::default_for(HotkeyAction::TogglePanel).map(|binding| binding.display))
+        .unwrap_or_default();
     let labels = [
-        Key::SettingsSetupConnect,
-        Key::SettingsSetupPermissions,
-        Key::SettingsSetupTryHotkey,
+        i18n::t(Key::SettingsSetupConnect).to_owned(),
+        i18n::t(Key::SettingsSetupPermissions).to_owned(),
+        i18n::t1(Key::SettingsSetupTryHotkey, &combo),
     ];
     let current = completed.iter().position(|done| !done).unwrap_or(2);
 
@@ -1126,7 +1268,7 @@ fn onboarding_steps(state: &SettingsState) -> Element<'_, Message> {
     ]
     .spacing(space(1.5));
 
-    for (index, key) in labels.into_iter().enumerate() {
+    for (index, label) in labels.into_iter().enumerate() {
         let marker = if completed[index] {
             "✓".to_owned()
         } else {
@@ -1142,7 +1284,7 @@ fn onboarding_steps(state: &SettingsState) -> Element<'_, Message> {
                     } else {
                         theme::text_dim
                     }),
-                text(i18n::t(key))
+                text(label)
                     .size(type_scale::BODY)
                     .style(if index == current {
                         theme::text_primary
@@ -1169,18 +1311,16 @@ fn permissions(state: &SettingsState) -> Element<'_, Message> {
     // conflict detection surfaced at first run, and this is where a user who
     // has lost ⌥Space to Raycast will come looking.
     if let Some(status) = &state.hotkey {
-        let rebind = || {
-            vec![Action::new(
-                Key::ActionOpenSettings,
-                "⏎",
-                Message::RebindHotkey,
-            )]
-        };
+        // No rebind action here any more: `Message::RebindHotkey` was a
+        // no-op behind a button labelled "Open settings" *inside* settings —
+        // on a failed registration, the only advertised recovery did nothing.
+        // The audit plan's residual-risk policy says a nonfunctional control
+        // must be absent; the honest recovery is config.toml, so the failure
+        // body now says so.
         list = list.push(match status {
             // §9: a shift/option-only combination gets a **soft warning**, not
             // a rejection — it is registered and working, including the shipped
-            // `⌥Space` default. Warning severity, not Danger, and the rebind
-            // action stays optional rather than being the only way out.
+            // `⌥Space` default.
             HotkeyStatus::Registered { combo, caution } => widgets::state_block(
                 match caution {
                     Some(_) => Severity::Warning,
@@ -1188,14 +1328,21 @@ fn permissions(state: &SettingsState) -> Element<'_, Message> {
                 },
                 combo,
                 caution.map(|c| c.explanation()),
-                rebind(),
+                Vec::new(),
             ),
-            HotkeyStatus::Failed { combo, reason } => widgets::state_block(
-                Severity::Danger,
-                &i18n::t1(Key::HotkeyFailedTitle, combo),
-                Some(failure_body(reason)),
-                rebind(),
-            ),
+            HotkeyStatus::Failed { combo, reason } => {
+                let body = format!(
+                    "{} {}",
+                    failure_body(reason),
+                    i18n::t(Key::HotkeyChangeHint)
+                );
+                widgets::state_block(
+                    Severity::Danger,
+                    &i18n::t1(Key::HotkeyFailedTitle, combo),
+                    Some(&body),
+                    Vec::new(),
+                )
+            }
         });
     }
 
@@ -1415,10 +1562,12 @@ mod tests {
     #[test]
     fn the_information_architecture_matches_section_16() {
         // §16 names: providers, roles, budgets, permissions, actions, history,
-        // about/license. Language is the §9 addition. Unfinished editors stay
-        // in the durable enum without creating dead-end navigation.
-        assert_eq!(Section::ALL.len(), 8);
-        assert_eq!(Section::VISIBLE.len(), 6);
+        // about/license. Language is the §9 addition; Models is the owner's
+        // 2026-08-01 addition for curating quick-pick pins. Unfinished editors
+        // stay in the durable enum without creating dead-end navigation.
+        assert_eq!(Section::ALL.len(), 9);
+        assert_eq!(Section::VISIBLE.len(), 7);
+        assert!(Section::VISIBLE.contains(&Section::Models));
         assert!(!Section::VISIBLE.contains(&Section::Roles));
         assert!(!Section::VISIBLE.contains(&Section::Actions));
         assert_eq!(Section::default(), Section::Providers);

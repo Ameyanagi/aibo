@@ -1962,7 +1962,7 @@ platform feature is built twice. Revised:
 | **P6 · Native agent + tools** | 14–15 | `NativeLoop`, tier 0/1/2 tools, MCP client, tier 3 shell/fs with consent, undo snapshots. |
 | **P7 · Hardening** | 16–17 | Design pass (§16), full component inventory, onboarding + permission flows (§17), error copy, diagnostics export, accessibility of aibo itself, perf pass against §15. |
 | **P8 · Release engineering** | 18–19 | Notarisation, Authenticode, installers, updater, licensing, staged rollout, docs, support runbook. **v1.0.** |
-| **P9+ · Modalities** | post-v1 | Voice (`whisper-rs` out-of-process, weights downloaded) → Vision → Ambient awareness. Minor releases. |
+| **P9+ · Modalities** | post-v1 | Voice input / STT first (owner request, 2026-08-01): a push-to-talk mic capture in the panel, transcribed through OpenAI's transcription API (`gpt-4o-transcribe` family) on the existing `AIBO_OPENAI_API_KEY`, streaming text into the input field. The earlier `whisper-rs` out-of-process idea stays as the offline fallback, not the first implementation. Then Vision → Ambient awareness. Minor releases. |
 
 **The 19-week figure does not survive review, and neither did the 14-week one
 before it.** A review put the plan as written at **36–48 weeks** solo across

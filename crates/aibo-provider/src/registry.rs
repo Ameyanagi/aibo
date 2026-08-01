@@ -356,13 +356,14 @@ pub const CODEX_ACCOUNT_CONSTRAINT: &str = "not supported when using Codex with 
 /// from `Fast` — the constraint enforced in `aibo_core::roles`.
 pub const CODEX_TTFT_FLOOR_MS: u32 = 435;
 
-/// Whether §3a's Codex allowlist has **verified** image-input support.
+/// Whether §3a's Codex allowlist still lacks verified image-input support.
 ///
-/// `false`, and it is a measurement gap rather than a finding: §3a sent text and
-/// only text. Named as a constant so the claim has one home — `codex_models`
-/// asserts against it, `codex::default_capabilities` carries the same `SPIKE`
-/// note, and a future probe flips one place.
-pub const CODEX_VISION_UNVERIFIED: bool = true;
+/// `false` — image input is confirmed working on the ChatGPT-plan models
+/// (owner-verified in use, 2026-08-01), and the Responses body this provider
+/// sends already carries `input_image` parts. Named as a constant so the claim
+/// has one home: `codex_models` asserts against it and
+/// `codex::default_capabilities` states the same fact.
+pub const CODEX_VISION_UNVERIFIED: bool = false;
 
 /// The allowlist as ids, best (fastest) first — [`AiboError::ModelRejected`]'s
 /// `alternatives`, and the order the model picker offers them in.
@@ -983,30 +984,36 @@ mod tests {
     // -- vision truthfulness (§10) ------------------------------------------
 
     #[test]
-    fn every_codex_allowlist_entry_declares_no_vision() {
-        // SPIKE: §3a measured text only. Declaring `vision: true` here would
-        // cost a 400 after a multi-megabyte upload, and §4 does not fall back on
-        // a 400 — so the honest value is the unverified one.
-        // The constant and the provider's own declaration are two statements of
-        // one fact; a probe that verifies vision has to flip both.
+    fn every_codex_allowlist_entry_declares_vision() {
+        // Image input on the ChatGPT-plan models is confirmed in use, and the
+        // Responses body already carries `input_image` parts. The constant and
+        // the provider's own declaration are two statements of one fact and
+        // must continue to agree.
         assert_eq!(
             CODEX_VISION_UNVERIFIED,
             !crate::codex::default_capabilities().vision
         );
         for m in codex_models() {
             assert!(
-                !m.capabilities.vision,
-                "{} must not claim unmeasured image input",
+                m.capabilities.vision,
+                "{} should declare the confirmed image input",
                 m.id
             );
         }
     }
 
     #[test]
-    fn the_shipped_catalogue_offers_no_vision_alternative_it_cannot_stand_behind() {
-        // Codex is the only shipped catalogue, and none of it can see. An empty
-        // list is the correct answer; a populated one would be an invention.
-        assert!(ModelCatalogue::shipped().vision_alternatives().is_empty());
+    fn the_shipped_catalogue_offers_vision_alternatives_it_stands_behind() {
+        // Codex is the only shipped catalogue, and its image input is
+        // confirmed in use — so every live allowlist entry is a real
+        // vision alternative, not an invention.
+        let alternatives = ModelCatalogue::shipped().vision_alternatives();
+        assert!(!alternatives.is_empty());
+        assert!(alternatives.iter().all(|entry| {
+            entry
+                .strip_prefix("codex/")
+                .is_some_and(is_codex_model_allowed)
+        }));
     }
 
     #[test]
