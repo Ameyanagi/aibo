@@ -220,3 +220,33 @@ mod repro {
         );
     }
 }
+
+#[cfg(test)]
+mod exact_repro {
+    use super::*;
+    #[test]
+    fn exact_owner_filename() {
+        let mut finder = FileFinder::default();
+        finder.set_candidates(vec![
+            FileCandidate {
+                display: "~/Downloads/followup-テスト フォローアップ報告書-2026-04-03.csv".to_owned(),
+                path: "/x/a.csv".to_owned(),
+            },
+            FileCandidate {
+                display: "~/Downloads/テスト.dmg".to_owned(),
+                path: "/x/b.dmg".to_owned(),
+            },
+            FileCandidate {
+                display: "~/Documents/report.md".to_owned(),
+                path: "/x/c.md".to_owned(),
+            },
+        ]);
+        for query in ["tesutofo", "tesuto", "fo-roappu", "houkokusho"] {
+            finder.set_query(query.to_owned());
+            let results = finder.results();
+            eprintln!("QUERY {query:?} => {:?}", results.iter().map(|f| f.display.as_str()).collect::<Vec<_>>());
+        }
+        finder.set_query("tesutofo".to_owned());
+        assert!(!finder.results().is_empty(), "tesutofo matched nothing");
+    }
+}

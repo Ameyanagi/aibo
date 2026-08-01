@@ -3339,6 +3339,10 @@ mod runtime {
                         if let Ok(files) =
                             tokio::task::spawn_blocking(move || crate::files::walk(&roots)).await
                         {
+                            // The count is the first diagnostic question when
+                            // "the finder can't see my file": an absent file
+                            // and a starved walk look identical in the UI.
+                            tracing::info!(count = files.len(), "file walk complete");
                             let _ = events.send(UiEvent::FileCandidates { files }).await;
                         }
                     }));
