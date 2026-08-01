@@ -661,8 +661,9 @@ pub struct ConversationTurn {
     pub user: String,
     /// The assistant response.
     pub assistant: String,
-    /// Parsed assistant Markdown retained for zero-copy rendering.
-    assistant_markdown: Vec<markdown::Item>,
+    /// The response, pre-split into markdown and rendered display math
+    /// (`crate::math`), retained for zero-copy rendering.
+    assistant_segments: Vec<crate::math::Segment>,
 }
 
 /// Everything the panel renders from.
@@ -772,6 +773,9 @@ pub struct PanelState {
     pub tasks_open: bool,
     /// The task whose detail the overlay shows; `None` lists all.
     pub selected_task: Option<Uuid>,
+    /// The finished active response, split into markdown and typeset math.
+    /// Built once at `Done`; `None` while streaming.
+    pub active_segments: Option<Vec<crate::math::Segment>>,
     /// Insert one space before the first dictation delta, because the input
     /// already ends mid-word. Set on `DictationStarted`, spent on the first
     /// delta.
@@ -828,6 +832,7 @@ impl PanelState {
             tasks: Vec::new(),
             tasks_open: false,
             selected_task: None,
+            active_segments: None,
             dictation_pad: false,
             recent_models: Vec::new(),
             // Constructed once at boot, not per session, so recall survives
@@ -908,6 +913,15 @@ impl PanelState {
         self.response.clear();
         self.response_editor = text_editor::Content::new();
         self.response_markdown = markdown::Content::new();
+        self.active_segments = None;
+    }
+
+    /// Split the finished response into markdown and typeset display math.
+    /// Called once, at `Done` — never per view, never mid-stream.
+    pub fn segment_finished_response(&mut self) {
+        if !self.response.is_empty() {
+            self.active_segments = Some(crate::math::segments(&self.response));
+        }
     }
 
     /// Completed turns to include before the next user message.
@@ -951,7 +965,7 @@ impl PanelState {
             self.turns.push(ConversationTurn {
                 user: previous_user,
                 assistant: self.response.clone(),
-                assistant_markdown: self.response_markdown.items().to_vec(),
+                assistant_segments: crate::math::segments(&self.response),
             });
         }
         self.active_user = Some(user);
@@ -1779,19 +1793,22 @@ fn task_card(task: &crate::tasks::TaskState) -> Element<'_, Message> {
         .into()
 }
 
-/// A task's final message as a plain assistant bubble (no markdown state is
-/// kept for it — the timeline holds the detail).
-fn assistant_plain_bubble(message: &str) -> Element<'_, Message> {
+/// A task's final message as an assistant bubble, through the same
+/// markdown-and-math pipeline as chat answers — plain text showed literal
+/// `**bold**` asterisks (owner report, 2026-08-02). Segments were built once
+/// when the run finished; the view only borrows.
+fn assistant_markdown_bubble<'a>(
+    task: &'a crate::tasks::TaskState,
+    appearance: theme::Appearance,
+) -> Element<'a, Message> {
+    let rendered = segments_view(&task.final_segments, appearance);
     row![
         container(
             column![
                 text(i18n::t(Key::ChatAssistant))
                     .size(type_scale::META)
                     .style(theme::text_dim),
-                text(message.to_owned())
-                    .size(type_scale::BODY)
-                    .font(theme::UI_FONT)
-                    .style(theme::text_primary),
+                rendered,
             ]
             .spacing(space(1.0)),
         )
@@ -3007,6 +3024,33 @@ fn markdown_settings(appearance: theme::Appearance) -> markdown::Settings {
     settings
 }
 
+/// A finished response's segments: markdown interleaved with typeset
+/// display equations (`crate::math`).
+fn segments_view<'a>(
+    segments: &'a [crate::math::Segment],
+    appearance: theme::Appearance,
+) -> Element<'a, Message> {
+    let mut stack = column![].spacing(space(1.0));
+    for segment in segments {
+        stack = stack.push(match segment {
+            crate::math::Segment::Markdown(items) => markdown_view(items, appearance),
+            crate::math::Segment::Math {
+                handle,
+                width,
+                height,
+            } => container(
+                iced::widget::svg(handle.clone())
+                    .width(Length::Fixed(*width))
+                    .height(Length::Fixed(*height)),
+            )
+            .width(Length::Fill)
+            .padding([space(0.5), 0.0])
+            .into(),
+        });
+    }
+    stack.into()
+}
+
 fn markdown_view<'a>(
     items: impl IntoIterator<Item = &'a markdown::Item>,
     appearance: theme::Appearance,
@@ -3028,7 +3072,7 @@ fn assistant_text_bubble(
                 text(i18n::t(Key::ChatAssistant))
                     .size(type_scale::META)
                     .style(theme::text_dim),
-                markdown_view(&turn.assistant_markdown, appearance),
+                segments_view(&turn.assistant_segments, appearance),
             ]
             .spacing(space(1.0)),
         )
@@ -3047,7 +3091,12 @@ fn active_assistant_bubble(
     let body: Element<'_, Message> = match state.phase {
         Phase::Loading => widgets::thinking(Some(state.chat_answer_height())),
         Phase::Streaming | Phase::Finished { .. } => {
-            let rendered = markdown_view(state.response_markdown.items(), appearance);
+            let rendered = match (&state.phase, state.active_segments.as_deref()) {
+                // Finished and segmented: display math snaps to its typeset
+                // form. While streaming, the incremental markdown stands.
+                (Phase::Finished { .. }, Some(segments)) => segments_view(segments, appearance),
+                _ => markdown_view(state.response_markdown.items(), appearance),
+            };
             if state.is_truncated() {
                 column![
                     rendered,
@@ -3114,34 +3163,27 @@ fn conversation(state: &PanelState, appearance: theme::Appearance) -> Element<'_
     // surface. Heights mirror `transcript_content_height` exactly.
     for task in state.session_tasks() {
         transcript = transcript.push(task_card(task));
-        if let Some(message) = task.final_message() {
-            transcript = transcript.push(assistant_plain_bubble(message));
+        if task.final_message().is_some() {
+            transcript = transcript.push(assistant_markdown_bubble(task, appearance));
         }
     }
 
-    if state.transcript_content_height() > state.transcript_height() {
-        // Anchored to the end: while an answer streams, the viewport follows
-        // it (owner, 2026-08-02 — "the context should follow the last
-        // response"). iced's end anchor keeps following only while the user
-        // is at the bottom; scrolling up to reread detaches it, which is
-        // exactly the chat convention.
-        scrollable(transcript)
-            .height(Length::Fill)
-            .anchor_bottom()
-            .style(theme::scroller)
-            .into()
-    } else {
-        // Avoid retaining a scroll offset while retrying or replacing a short
-        // answer. On macOS that stale offset can yield an invalid glyph
-        // position after the window shrinks.
-        //
-        // Content-sized, deliberately: this box was pinned to the *estimated*
-        // height, which painted every estimation error as dead space between
-        // the last bubble and the hairline (owner report, 2026-08-01). When
-        // nothing scrolls, the real content is the right height — the
-        // estimate's only job is sizing the window.
-        container(transcript).into()
-    }
+    // Always the anchored scrollable — never a content-sized branch chosen
+    // by estimates. The owner's diagnosis (2026-08-02) was exact: the scroll
+    // used to engage only when the *estimate* said content beat the window,
+    // so anything between region height (window minus composer and footer)
+    // and the estimate's threshold overflowed with no scrollbar at all.
+    // Unconditionally scrollable, the threshold is the region's real edge:
+    // while the window still grows with content nothing scrolls, and the
+    // moment content exceeds what the region actually has, it scrolls.
+    //
+    // Anchored to the end so a streaming answer stays in view; iced detaches
+    // the anchor while the user scrolls up to reread, the chat convention.
+    scrollable(transcript)
+        .height(Length::Fill)
+        .anchor_bottom()
+        .style(theme::scroller)
+        .into()
 }
 
 fn content(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Message> {
@@ -5039,7 +5081,7 @@ mod tests {
         assert_eq!(state.turns.len(), 1);
         assert_eq!(state.turns[0].user, "first question");
         assert_eq!(state.turns[0].assistant, "first answer");
-        assert!(!state.turns[0].assistant_markdown.is_empty());
+        assert!(!state.turns[0].assistant_segments.is_empty());
         assert_eq!(state.active_user.as_deref(), Some("follow up"));
         assert!(state.response.is_empty());
         assert!(state.input.is_empty());

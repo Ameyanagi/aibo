@@ -59,6 +59,9 @@ pub struct TaskState {
     pub usage: Usage,
     /// Steps executed, against [`aibo_core::types::AgentLimits::max_steps`].
     pub steps: u32,
+    /// [`Self::final_message`], split once into markdown and typeset math
+    /// when the run finishes — the view must borrow, not parse.
+    pub final_segments: Vec<crate::math::Segment>,
 }
 
 impl TaskState {
@@ -74,6 +77,7 @@ impl TaskState {
             outcome: None,
             usage: Usage::default(),
             steps: 0,
+            final_segments: Vec::new(),
         }
     }
 
@@ -99,6 +103,9 @@ impl TaskState {
                 self.usage = outcome.usage;
                 self.steps = outcome.steps;
                 self.outcome = Some(outcome);
+                if let Some(message) = self.final_message().map(str::to_owned) {
+                    self.final_segments = crate::math::segments(&message);
+                }
             }
             other => {
                 // Reasoning arrives on its own channel and stays collapsed

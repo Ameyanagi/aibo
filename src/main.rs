@@ -2867,7 +2867,9 @@ mod runtime {
              - Commands run non-interactively; prefer flags like --yes, or pass a \
              prompt's answer via bash's stdin parameter\n\
              - If the message is conversation or a question that needs no files or \
-             commands, just answer it; do not invent a task",
+             commands, just answer it; do not invent a task\n\
+             - The panel cannot render LaTeX; write mathematics with Unicode \
+             symbols, never $...$ notation",
         );
         if let Some(workspace) = roots.first() {
             // pi's <project_context>: the workspace's own instructions, when

@@ -2718,6 +2718,9 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 }
                 StreamEvent::Done(reason) => {
                     state.panel.phase = Phase::Finished { reason };
+                    // Typeset any display equations now that the text is
+                    // final (`crate::math`); streaming showed the raw TeX.
+                    state.panel.segment_finished_response();
                     aibo_platform::announce_accessibility(i18n::t(crate::i18n::Key::TaskCompleted));
                     // Give the caret back, **once, on completion**.
                     //
