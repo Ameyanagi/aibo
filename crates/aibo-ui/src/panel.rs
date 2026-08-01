@@ -1268,7 +1268,8 @@ impl PanelState {
     /// wraps them; the window has to grow with it or the wrapped lines paint
     /// over the panel's bottom edge.
     pub(crate) fn input_extra_height(&self) -> f32 {
-        (estimated_text_height(&self.input, CHAT_USER_CHARS_PER_LINE) - 24.0).max(0.0)
+        (estimated_text_height(&self.input, CHAT_USER_CHARS_PER_LINE) - 24.0)
+            .clamp(0.0, INPUT_EXTRA_MAX_HEIGHT)
     }
 
     /// Put a picked file's content into the fenced selection slot.
@@ -1601,10 +1602,19 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
     }
 
     if shows_content {
-        body = body.push(widgets::railed(
-            content_rail_state(state),
-            content(state, appearance),
-        ));
+        let row = widgets::railed(content_rail_state(state), content(state, appearance));
+        if state.has_conversation() {
+            // The structural guarantee behind "the input box disappears"
+            // (owner screenshots, 2026-08-02, twice): the transcript region
+            // is the ONE flexible row, so the hairline, footer and composer
+            // — all content-sized — claim their height first and the
+            // transcript gets exactly what remains. Estimate drift can now
+            // only make the window roomy or the transcript tight; it can
+            // never evict the composer, whatever the arithmetic says.
+            body = body.push(container(row).height(Length::Fill));
+        } else {
+            body = body.push(row);
+        }
     }
     if has_result {
         // The one hairline `design.md` §9 leaves standing, and it sits in the
@@ -2707,6 +2717,9 @@ const PICKER_MENU_WIDTH: f32 = 560.0;
 const TASK_CARD_RUNNING_HEIGHT: f32 = 148.0;
 /// The settled card: one summary line in a quiet container.
 const TASK_CARD_DONE_HEIGHT: f32 = 34.0;
+/// The composer grows with wrapped lines up to this, then scrolls inside
+/// itself — a dictated essay must not displace the rest of the panel.
+const INPUT_EXTRA_MAX_HEIGHT: f32 = 120.0;
 
 /// Where the floating menu's top edge sits: just below the source/model row,
 /// so it reads as dropping down from the model cluster it opened from.
@@ -2886,6 +2899,12 @@ fn input_row(state: &PanelState) -> Element<'_, Message> {
             text_editor::Binding::from_key_press(key_press)
         })
         .style(theme::answer_editor);
+    // Bounded so a dictated essay scrolls inside the editor instead of
+    // displacing the footer and its own send button; mirrors
+    // `input_extra_height`'s clamp exactly.
+    let input = container(input)
+        .max_height(24.0 + INPUT_EXTRA_MAX_HEIGHT + 2.0 * space(1.0))
+        .width(Length::Fill);
 
     // No well. `design.md` §3's mock puts the caret directly on the panel
     // ground with the rail beside it — the input is the line you were already
@@ -3102,7 +3121,7 @@ fn conversation(state: &PanelState, appearance: theme::Appearance) -> Element<'_
 
     if state.transcript_content_height() > state.transcript_height() {
         scrollable(transcript)
-            .height(Length::Fixed(state.transcript_height()))
+            .height(Length::Fill)
             .style(theme::scroller)
             .into()
     } else {
