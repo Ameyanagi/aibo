@@ -1514,6 +1514,9 @@ pub enum AgentStep {
     },
     /// Assistant message to show the user.
     Message(String),
+    /// A mid-run instruction the user queued into the loop (steering). The
+    /// next model turn sees it as a fresh user message.
+    Steered(String),
     /// The run is blocked on the user.
     AwaitingApproval(ApprovalRequest),
     /// Terminal.

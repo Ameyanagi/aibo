@@ -1865,6 +1865,23 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 .map(|attached| attached.attachment.clone())
                 .collect();
             state.panel.history.record(&instruction);
+            // Steering (owner, 2026-08-02): typing while this session's run
+            // is still going joins that run rather than starting a rival.
+            if state.panel.agent_mode
+                && let Some(running) = state
+                    .panel
+                    .session_tasks()
+                    .filter(|task| task.is_running())
+                    .last()
+            {
+                let task = running.id;
+                state.panel.consume_input();
+                state.send(UiRequest::SteerTask {
+                    task,
+                    text: instruction,
+                });
+                return resize_panel_if_visible(state);
+            }
             if state.panel.agent_mode {
                 // The task window owns this run's transcript. Beginning a
                 // chat turn here too left the panel stuck on a spinner no

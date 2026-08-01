@@ -917,6 +917,14 @@ impl PanelState {
             .iter()
             .map(|turn| Turn::pair(turn.user.clone(), turn.assistant.clone()))
             .collect();
+        // Finished agent runs are turns of this conversation too: without
+        // them, "no, a *file* called テスト" arrives with no memory of the
+        // folder question it corrects (owner report, 2026-08-02).
+        for task in self.session_tasks() {
+            if let Some(message) = task.final_message() {
+                history.push(Turn::pair(task.instruction.clone(), message.to_owned()));
+            }
+        }
         if matches!(
             self.phase,
             Phase::Finished {
@@ -1862,6 +1870,10 @@ fn task_step_row(
             .size(type_scale::META)
             .style(theme::text_primary)
             .into(),
+        AgentStep::Steered(body) => text(format!("→ {}", widgets::elide(body, 110)))
+            .size(type_scale::META)
+            .style(theme::text_primary)
+            .into(),
         AgentStep::AwaitingApproval(_) | AgentStep::Done(_) => Space::new().into(),
     }
 }
@@ -2279,6 +2291,68 @@ fn chip_row(state: &PanelState) -> Element<'_, Message> {
     let mut cluster_row = row![context, Space::new().width(Length::Fill)]
         .spacing(space(1.0))
         .align_y(Alignment::Center);
+    // Mode toggles as persistent header chips (owner, 2026-08-02: "the
+    // status of the agent and dictation should be shown on the top as some
+    // icons (with toggles)"). Active state renders in the row's active
+    // treatment, so the mode is legible at a glance.
+    cluster_row = cluster_row.push(
+        button(
+            row![
+                text(if state.dictating { "●" } else { "○" })
+                    .size(type_scale::META)
+                    .style(move |t: &iced::Theme| {
+                        if state.dictating {
+                            theme::text_severity(Severity::Danger)(t)
+                        } else {
+                            theme::text_faint(t)
+                        }
+                    }),
+                text(i18n::t(if state.dictating {
+                    Key::ActionStopDictation
+                } else {
+                    Key::ActionDictate
+                }))
+                .size(type_scale::META)
+                .style(if state.dictating {
+                    theme::text_primary
+                } else {
+                    theme::text_dim
+                }),
+            ]
+            .spacing(space(0.5))
+            .align_y(Alignment::Center),
+        )
+        .padding([space(0.5), space(1.0)])
+        .style(theme::list_row_button(state.dictating))
+        .on_press(Message::ToggleDictation),
+    );
+    cluster_row = cluster_row.push(
+        button(
+            row![
+                text(if state.agent_mode { "◆" } else { "◇" })
+                    .size(type_scale::META)
+                    .style(move |t: &iced::Theme| {
+                        if state.agent_mode {
+                            theme::text_severity(Severity::Warning)(t)
+                        } else {
+                            theme::text_faint(t)
+                        }
+                    }),
+                text(i18n::t(Key::ActionAgentMode))
+                    .size(type_scale::META)
+                    .style(if state.agent_mode {
+                        theme::text_primary
+                    } else {
+                        theme::text_dim
+                    }),
+            ]
+            .spacing(space(0.5))
+            .align_y(Alignment::Center),
+        )
+        .padding([space(0.5), space(1.0)])
+        .style(theme::list_row_button(state.agent_mode))
+        .on_press(Message::ToggleAgentMode),
+    );
     if !state.tasks.is_empty() {
         let severity = if state.any_task_blocked() {
             Severity::Warning
@@ -2836,31 +2910,8 @@ fn shows_empty_invitation(state: &PanelState) -> bool {
 }
 
 fn composer_actions_for(state: &PanelState) -> Vec<Action<Message>> {
-    // Push-to-talk (§P9+): one toggle whose label always states what pressing
-    // it does next, same rule as the Codex sign-in button.
-    let dictate = Action::new(
-        if state.dictating {
-            Key::ActionStopDictation
-        } else {
-            Key::ActionDictate
-        },
-        widgets::primary_shortcut("⌘L", "Ctrl+L"),
-        Message::ToggleDictation,
-    );
-
-    // The agent toggle: a mode, so the *state* is shown (checkmark), unlike
-    // dictate's label-says-what-happens-next pattern — "stop agent" would
-    // misdescribe a toggle that only affects future submissions.
-    let agent = Action::new(
-        if state.agent_mode {
-            Key::ActionAgentModeOn
-        } else {
-            Key::ActionAgentMode
-        },
-        widgets::primary_shortcut("⌘J", "Ctrl+J"),
-        Message::ToggleAgentMode,
-    );
-
+    // Dictation and agent mode moved to the header chips (owner,
+    // 2026-08-02); the composer keeps only per-submission actions.
     let attach = Action::new(Key::ActionAttachImage, ATTACH_KEY, Message::Attach);
     let attach = if state.clipboard.is_attachable() {
         attach
@@ -2882,7 +2933,7 @@ fn composer_actions_for(state: &PanelState) -> Vec<Action<Message>> {
     } else {
         primary
     };
-    vec![dictate, agent, attach, primary]
+    vec![attach, primary]
 }
 
 fn user_bubble(message: &str) -> Element<'_, Message> {
@@ -3540,12 +3591,44 @@ fn chat_bubble_height(message: &str, assistant: bool) -> f32 {
 }
 
 fn estimated_text_height(message: &str, chars_per_line: usize) -> f32 {
+    // Counted in display *columns*, not characters: CJK glyphs are
+    // double-width, so a Japanese paragraph wraps at roughly half the
+    // character count — counting chars under-estimated its height by ~2×,
+    // the window came up short, and the composer was clipped off the bottom
+    // (owner screenshot, 2026-08-02).
     let lines = message
         .split('\n')
-        .map(|line| line.chars().count().max(1).div_ceil(chars_per_line))
+        .map(|line| {
+            let columns: usize = line.chars().map(char_columns).sum();
+            columns.max(1).div_ceil(chars_per_line)
+        })
         .sum::<usize>()
         .max(1);
     lines as f32 * 20.0 + 4.0
+}
+
+/// Display width of one character, per UAX #11's East Asian Wide/Fullwidth
+/// classes — the blocks this panel actually meets (kana, CJK ideographs,
+/// Hangul, fullwidth forms). Everything else counts 1; that under-counts
+/// rare wide blocks, which errs toward a slightly roomier window rather
+/// than a clipped one... and 1 for combining marks over-counts, same safe
+/// direction.
+const fn char_columns(c: char) -> usize {
+    match c as u32 {
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x20000..=0x2FA1F => 2,
+        _ => 1,
+    }
 }
 
 fn footer(state: &PanelState) -> Element<'_, Message> {
@@ -4973,6 +5056,29 @@ mod height_probe {
     /// 132 — and the panel's height for a short finished chat is the plain
     /// sum of its parts, floored by nothing. The 320 pt floor this replaces
     /// painted its whole surplus as dead space under the composer.
+    /// The CJK overflow (owner screenshot, 2026-08-02): Japanese glyphs are
+    /// double-width, and an estimate that counts characters instead of
+    /// columns halves a Japanese bubble's height — which clipped the
+    /// composer off the window. A CJK line must estimate twice the Latin
+    /// height for the same character count.
+    #[test]
+    fn cjk_text_is_estimated_at_its_real_width() {
+        let latin: String = "a".repeat(40);
+        let kana: String = "あ".repeat(40);
+        let latin_height = estimated_text_height(&latin, 40);
+        let kana_height = estimated_text_height(&kana, 40);
+        assert_eq!(latin_height, 24.0, "one line");
+        assert_eq!(kana_height, 44.0, "two lines: 80 columns at width 40");
+
+        // And the mixed case from the screenshot: mostly kana with Latin
+        // fragments must round up, never down.
+        let mixed = "ダウンロードフォルダ内を検索しましたが、テストという名前のフォルダは見つかりませんでした";
+        assert!(
+            estimated_text_height(mixed, 40) >= 44.0,
+            "44 kana chars are 88 columns — at least two lines"
+        );
+    }
+
     /// The "I cannot input" bug (owner screenshot, 2026-08-02): however tall
     /// the transcript wants to be, the window must always leave room for the
     /// footer and the composer.

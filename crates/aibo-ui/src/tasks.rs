@@ -190,6 +190,9 @@ impl TaskState {
                     out.push_str(unified_diff);
                 }
                 AgentStep::Message(body) => out.push_str(body),
+                AgentStep::Steered(body) => {
+                    let _ = writeln!(out, "→ {body}");
+                }
                 // Folded into `pending_approval` / `outcome` by `push`.
                 AgentStep::AwaitingApproval(_) | AgentStep::Done(_) => {}
             }

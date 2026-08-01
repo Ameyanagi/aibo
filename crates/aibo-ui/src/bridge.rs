@@ -323,6 +323,15 @@ pub enum UiRequest {
         typed_confirmation: Option<String>,
     },
 
+    /// Queue a mid-run instruction into a running agent task (steering,
+    /// pi's queuing model): consumed at the loop's next turn boundary.
+    SteerTask {
+        /// The run to steer.
+        task: Uuid,
+        /// The user's typed text, verbatim.
+        text: String,
+    },
+
     /// Cancel an agent run.
     CancelTask {
         /// Task id.
