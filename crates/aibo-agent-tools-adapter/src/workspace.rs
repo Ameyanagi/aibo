@@ -588,6 +588,10 @@ mod tests {
         assert!(intent.paths[0].starts_with(&root), "{:?}", intent.paths);
     }
 
+    /// Unix-only: the command spelling (`pwd`, `printf`, `>&2`) is /bin/sh's.
+    /// Windows process spawning itself is covered by `aibo-tools`' own
+    /// executor tests; this one asserts the adapter's plumbing.
+    #[cfg(unix)]
     #[tokio::test]
     async fn bash_runs_in_the_workspace_and_reports_exit() {
         let dir = tempfile::tempdir().expect("tempdir");

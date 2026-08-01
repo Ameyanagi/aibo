@@ -29,7 +29,7 @@ tracing = { workspace = true }
 regex = "1"
 sha2 = "0.10"
 hex = "0.4"
-similar = "2"
+similar = { workspace = true }
 
 # Tier 1's optional CPython-on-WASI path. §15: wasmtime is linked in whether or
 # not the feature is used, so it is the honest lever on binary size — keep it
