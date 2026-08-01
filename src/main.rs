@@ -2861,8 +2861,8 @@ mod runtime {
              - Use bash for file operations like ls, rg, find\n\
              - Be concise in your responses\n\
              - Show file paths clearly when working with files\n\
-             - Some tool calls need the user's approval; a denial is an answer, not an \
-             error — adapt or ask\n\
+             - Destructive commands (rm -rf, force-push and the like) stop for the \
+             user's approval; a denial is an answer, not an error — adapt or ask\n\
              - If the message is conversation or a question that needs no files or \
              commands, just answer it; do not invent a task",
         );

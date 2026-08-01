@@ -214,20 +214,26 @@ pub struct TierTable {
     pub sandboxed: ConsentPolicy,
     /// Tier 2 · MCP: per-server at add time, per-tool allow/ask/deny remembered.
     pub mcp: ConsentPolicy,
-    /// Tier 3 · shell + fs: always ask on first use, path-scoped.
+    /// Tier 3 · shell + fs: run without asking, path-scoped — except the
+    /// destructive class, which always prompts (see [`PermissionGate::authorise`]).
     pub shell_fs: ConsentPolicy,
     /// Tier 4 · agent delegate: Codex's approval protocol surfaced in aibo's UI.
     pub delegate: ConsentPolicy,
 }
 
 impl Default for TierTable {
-    /// The §11 table.
+    /// The §11 table, with one owner amendment (2026-08-01): shell/fs runs
+    /// YOLO — "it should be yolo by default, but check the dangerous
+    /// commands". Ordinary commands and writes run without a prompt, scoped
+    /// to the user's roots with diffs in the task window; the destructive
+    /// class still stops for typed confirmation, enforced in `authorise`
+    /// *before* any auto-allow.
     fn default() -> Self {
         Self {
             builtin: ConsentPolicy::Never,
             sandboxed: ConsentPolicy::Never,
             mcp: ConsentPolicy::FirstUse,
-            shell_fs: ConsentPolicy::FirstUse,
+            shell_fs: ConsentPolicy::Never,
             // Tier 4 prompts every time: the delegate's sandbox is the boundary
             // and each approval it raises is a distinct side effect.
             delegate: ConsentPolicy::Always,
@@ -483,12 +489,9 @@ impl PermissionGate {
         let untrusted_origin = !call.origin.may_authorise_tools();
 
         // 2. Tier policy.
-        let mut policy = self.tiers.policy(call.tier);
+        let policy = self.tiers.policy(call.tier);
         if policy == ConsentPolicy::Deny {
             return Ok(Authorisation::Denied(DenyReason::TierDenied(call.tier)));
-        }
-        if untrusted_origin && call.tier != ToolTier::Builtin && policy == ConsentPolicy::Never {
-            policy = ConsentPolicy::Always;
         }
 
         // 3. Path containment, after resolution.
@@ -497,16 +500,18 @@ impl PermissionGate {
             Err(reason) => return Ok(Authorisation::Denied(reason)),
         };
 
-        if policy == ConsentPolicy::Never {
+        // 4. Destructive class (§11: "no `rm -rf` or force-push class commands
+        //    without typed confirmation"). Never remembered, always prompted —
+        //    and checked *before* the auto-allow below, because YOLO (owner,
+        //    2026-08-01) must never extend to this class.
+        let destructive = call.command.as_deref().is_some_and(is_destructive_command);
+
+        if policy == ConsentPolicy::Never && !destructive {
             return Ok(Authorisation::Allowed {
                 resolved_paths: resolved,
                 remembered: false,
             });
         }
-
-        // 4. Destructive class (§11: "no `rm -rf` or force-push class commands
-        //    without typed confirmation"). Never remembered, always prompted.
-        let destructive = call.command.as_deref().is_some_and(is_destructive_command);
 
         // 5. Consent memory. An untrusted-provenance call never reads it: a
         //    grant the user gave their own earlier call must not be spendable
@@ -863,26 +868,27 @@ mod tests {
         }
     }
 
-    /// §5 rule 2, the native-loop refinement: captured content may *request*
-    /// a call, but only an explicit user decision grants it — the user's "no"
-    /// is final, and the prompt tells them the request is not their own.
+    /// The owner's YOLO ruling (2026-08-01): ordinary shell/fs calls run
+    /// without a prompt — whatever their provenance — and the destructive
+    /// class stops for the user regardless of everything else.
     #[tokio::test]
-    async fn capture_origin_reaches_the_user_and_only_the_user() {
+    async fn yolo_runs_ordinary_calls_and_stops_for_destructive_ones() {
+        // DenyAll would refuse any prompt; an ordinary command never prompts.
         let gate = PermissionGate::new(Arc::new(DenyAll), []);
-        let mut c = call("ls");
-        c.origin = ContentOrigin::Selection;
-        assert_eq!(
-            gate.authorise(&c).await.unwrap(),
-            Authorisation::Denied(DenyReason::UserDenied),
-            "denied by the user's answer, not silently before it"
+        assert!(gate.authorise(&call("ls")).await.unwrap().is_allowed());
+
+        let mut injected = call("cargo test");
+        injected.origin = ContentOrigin::ToolResult;
+        assert!(
+            gate.authorise(&injected).await.unwrap().is_allowed(),
+            "yolo applies to tool-result provenance too; the destructive class
+             and the scoped roots are the remaining lines"
         );
 
-        let gate = PermissionGate::new(Arc::new(ApproveAll), []);
-        let mut c = call("ls");
-        c.origin = ContentOrigin::McpResult;
-        assert!(
-            gate.authorise(&c).await.unwrap().is_allowed(),
-            "an explicit user grant is exactly what §5 leaves possible"
+        assert_eq!(
+            gate.authorise(&call("rm -rf build")).await.unwrap(),
+            Authorisation::Denied(DenyReason::UserDenied),
+            "destructive still reaches the user even under YOLO"
         );
     }
 
@@ -901,7 +907,9 @@ mod tests {
         }
         let ui = Arc::new(Capture(Mutex::new(Vec::new())));
         let gate = PermissionGate::new(ui.clone(), []);
-        let mut c = call("ls");
+        // Only the destructive class prompts under YOLO, so that is where
+        // the provenance label must appear.
+        let mut c = call("rm -rf build");
         c.origin = ContentOrigin::ToolResult;
         let _ = gate.authorise(&c).await.unwrap();
         let seen = ui.0.lock().unwrap();
@@ -976,20 +984,37 @@ mod tests {
         );
     }
 
-    /// The property the old blanket deny protected, kept under the new rule:
-    /// a session grant the user gave their own call is not spendable by an
-    /// injected one — the injected call must go back to the user, and its own
-    /// session grant must not enter the memory either.
+    /// The consent-memory property, kept where consent memory still exists
+    /// (MCP is FirstUse; shell/fs is YOLO now): a session grant the user gave
+    /// their own call is not spendable by an injected one, and an injected
+    /// call's own session grant is never remembered.
     #[tokio::test]
     async fn captured_content_cannot_reuse_or_create_remembered_consent() {
+        let mcp_call = |origin| GatedCall {
+            call_id: "c1".into(),
+            tool: "search".into(),
+            tier: ToolTier::Mcp,
+            kind: ApprovalKind::McpTool,
+            command: None,
+            paths: Vec::new(),
+            origin,
+            instruction: "look this up".into(),
+            summary: "search".into(),
+        };
         let gate = PermissionGate::new(Arc::new(SessionApprover { typed: None }), []);
-        let direct = call("ls");
-        assert!(gate.authorise(&direct).await.unwrap().is_allowed());
+        assert!(
+            gate.authorise(&mcp_call(ContentOrigin::UserInstruction))
+                .await
+                .unwrap()
+                .is_allowed()
+        );
         assert!(!gate.memory.lock().unwrap().is_empty());
 
-        let mut injected = direct;
-        injected.origin = ContentOrigin::ToolResult;
-        match gate.authorise(&injected).await.unwrap() {
+        match gate
+            .authorise(&mcp_call(ContentOrigin::ToolResult))
+            .await
+            .unwrap()
+        {
             Authorisation::Allowed { remembered, .. } => {
                 assert!(!remembered, "the stored grant must not have been consulted");
             }
@@ -997,9 +1022,13 @@ mod tests {
         }
 
         let fresh = PermissionGate::new(Arc::new(SessionApprover { typed: None }), []);
-        let mut injected_first = call("ls");
-        injected_first.origin = ContentOrigin::ToolResult;
-        assert!(fresh.authorise(&injected_first).await.unwrap().is_allowed());
+        assert!(
+            fresh
+                .authorise(&mcp_call(ContentOrigin::ToolResult))
+                .await
+                .unwrap()
+                .is_allowed()
+        );
         assert!(
             fresh.memory.lock().unwrap().is_empty(),
             "an untrusted-origin ApproveForSession must not be remembered"
