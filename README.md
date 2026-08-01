@@ -36,16 +36,31 @@ measured in milliseconds: no dock icon, no browser tab, no context switch.
 | Key | Action |
 |---|---|
 | `⌥Space` | Summon / dismiss the panel (Windows: `Ctrl+Shift+Space`) |
+| `⌥⇧Space` | Crop a screen region and open it as an attachment (macOS) |
 | `⏎` / `⇧⏎` | Send / newline |
 | `⌘⏎` | Paste the latest answer back into the app you came from |
+| `⌘⇧⏎` | Escalate the last question to the smart model |
 | `⌘C` | Copy the answer (when not editing text) |
+| `⌘V` | Attach the clipboard image |
 | `⌘N` | New chat |
 | `⌘K` / `⌘D` | Model picker / pin the current model |
 | `⌘L` | Start or stop dictation |
 | `⌘R` / `⌘.` | Retry / cancel |
 | `@` | File finder |
 | `⇥` | Cycle lanes |
+| `↑` / `↓` | Prompt history |
+| `⌘T` | Task window (agent runs) |
 | `⌘,` | Settings |
+| `esc` | Dismiss |
+
+## First run
+
+macOS asks for permissions as features are first used: Accessibility for
+reading the frontmost app's selection, Microphone for dictation, and Screen
+Recording for region capture. Each is optional — the panel works without it,
+minus that feature. Electron and Chrome apps expose no selection until
+`allow_ax_tree_activation` is enabled in settings; it is off by default
+because that flag can degrade window behaviour in those apps.
 
 ## Configuration
 
