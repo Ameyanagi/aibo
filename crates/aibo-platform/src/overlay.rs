@@ -87,6 +87,38 @@ pub fn configure_panel_window(
     }
 }
 
+/// Pin the native backdrop to the top `height` logical points of the panel.
+///
+/// The panel window can be taller than its visible chrome — a floating menu
+/// (§9) needs room below it — and a backdrop that filled the window would
+/// render the slack as a frosted strip. On macOS this resizes the installed
+/// visual-effect view; on Windows the DWM backdrop is inherently
+/// whole-window, so this is a no-op and the shell keeps its chrome
+/// window-sized there instead.
+pub fn set_panel_backdrop_height(
+    handle: WindowHandle<'_>,
+    height: f64,
+) -> Result<(), OverlayWindowError> {
+    let raw = handle.as_raw();
+    #[cfg(target_os = "macos")]
+    {
+        let RawWindowHandle::AppKit(handle) = raw else {
+            return Err(wrong_handle("AppKit", raw));
+        };
+        crate::macos::overlay::set_panel_backdrop_height(handle, height)
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (raw, height);
+        Ok(())
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        let _ = height;
+        Err(wrong_handle("AppKit or Win32", raw))
+    }
+}
+
 /// Show the panel without activating aibo or replacing the foreground app.
 ///
 /// The panel remains capable of becoming key/foreground later when the user

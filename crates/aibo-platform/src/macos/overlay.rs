@@ -12,7 +12,7 @@ use objc2_app_kit::{
     NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior,
     NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility, NSWorkspace,
 };
-use objc2_foundation::{NSDictionary, NSString};
+use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize, NSString};
 use raw_window_handle::AppKitWindowHandle;
 
 use crate::overlay::{BackdropStatus, OverlayWindowConfiguration, OverlayWindowError};
@@ -167,11 +167,76 @@ fn install_backdrop(mtm: MainThreadMarker, host: &NSView) -> BackdropStatus {
     // The panel is intentionally shown while aibo is inactive. Following the
     // window-active state would turn the HUD material into a flat grey surface.
     effect.setState(NSVisualEffectState::Active);
-    effect.setAutoresizingMask(
-        NSAutoresizingMaskOptions::ViewWidthSizable | NSAutoresizingMaskOptions::ViewHeightSizable,
-    );
+    // Top-anchored with a *fixed* height, not height-sizable: the window is
+    // sometimes taller than the visible panel (a floating menu needs room
+    // below the chrome, §9), and a backdrop that stretched with the window
+    // would render the slack as a frosted strip. The shell keeps the height
+    // in step with the chrome via [`set_panel_backdrop_height`].
+    effect.setAutoresizingMask(top_anchored_mask(frame_view.isFlipped()));
     frame_view.addSubview_positioned_relativeTo(&effect, NSWindowOrderingMode::Below, Some(host));
     BackdropStatus::Applied
+}
+
+/// Resize the installed backdrop to hug the top `height` points of the panel.
+///
+/// A no-op when no backdrop was installed (older OS, or configuration never
+/// ran) — the backdrop is cosmetic and its absence must stay harmless.
+#[allow(unsafe_code)]
+pub(crate) fn set_panel_backdrop_height(
+    handle: AppKitWindowHandle,
+    height: f64,
+) -> Result<(), OverlayWindowError> {
+    let _mtm = MainThreadMarker::new().ok_or(OverlayWindowError::MainThreadRequired)?;
+    with_native_view(handle.ns_view, |host| {
+        // SAFETY: as in `install_backdrop` — `host` is a live AppKit view
+        // borrowed from the window handle, on the main thread; reading its
+        // retained superview mutates nothing.
+        let Some(frame_view) = (unsafe { host.superview() }) else {
+            return Ok(());
+        };
+        let flipped = frame_view.isFlipped();
+        for view in frame_view.subviews().iter() {
+            if view
+                .identifier()
+                .as_deref()
+                .is_some_and(|identifier| identifier.to_string() == EFFECT_IDENTIFIER)
+            {
+                view.setFrame(top_anchored(host.frame(), height, flipped));
+                view.setAutoresizingMask(top_anchored_mask(flipped));
+            }
+        }
+        Ok(())
+    })
+}
+
+/// The frame pinning a subview to the top of `host` at `height` points.
+///
+/// "Top" depends on the superview's coordinate orientation: AppKit frame views
+/// may or may not be flipped, and guessing wrong anchors the blur to the
+/// bottom — which is exactly the strip this exists to prevent.
+fn top_anchored(host: NSRect, height: f64, flipped: bool) -> NSRect {
+    let height = height.clamp(0.0, host.size.height);
+    let y = if flipped {
+        host.origin.y
+    } else {
+        host.origin.y + host.size.height - height
+    };
+    NSRect::new(
+        NSPoint::new(host.origin.x, y),
+        NSSize::new(host.size.width, height),
+    )
+}
+
+/// The autoresizing mask that keeps a top-anchored, fixed-height subview
+/// pinned through window resizes that land after an explicit [`top_anchored`]
+/// placement.
+fn top_anchored_mask(flipped: bool) -> NSAutoresizingMaskOptions {
+    NSAutoresizingMaskOptions::ViewWidthSizable
+        | if flipped {
+            NSAutoresizingMaskOptions::ViewMaxYMargin
+        } else {
+            NSAutoresizingMaskOptions::ViewMinYMargin
+        }
 }
 
 /// Reinterpret the AppKit handle only for the duration of one operation.
@@ -226,8 +291,39 @@ fn post_accessibility_announcement(
 
 #[cfg(test)]
 mod tests {
-    use super::{overlay_collection_behavior, overlay_style_mask};
-    use objc2_app_kit::{NSWindowCollectionBehavior, NSWindowStyleMask};
+    use super::{overlay_collection_behavior, overlay_style_mask, top_anchored, top_anchored_mask};
+    use objc2_app_kit::{NSAutoresizingMaskOptions, NSWindowCollectionBehavior, NSWindowStyleMask};
+    use objc2_foundation::{NSPoint, NSRect, NSSize};
+
+    /// The backdrop hugs the top of the panel in either coordinate
+    /// orientation; anchoring to the wrong edge puts the blur under the
+    /// transparent slack instead of the chrome.
+    #[test]
+    fn the_backdrop_pins_to_the_top_whatever_the_orientation() {
+        let host = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(680.0, 500.0));
+
+        let unflipped = top_anchored(host, 140.0, false);
+        assert_eq!(unflipped.origin.y, 360.0, "top in bottom-left coordinates");
+        assert_eq!(unflipped.size.height, 140.0);
+
+        let flipped = top_anchored(host, 140.0, true);
+        assert_eq!(flipped.origin.y, 0.0, "top in top-left coordinates");
+        assert_eq!(flipped.size.height, 140.0);
+
+        // A chrome estimate taller than the window must clamp, not overflow.
+        let clamped = top_anchored(host, 900.0, false);
+        assert_eq!(clamped.size.height, 500.0);
+        assert_eq!(clamped.origin.y, 0.0);
+    }
+
+    /// Between explicit placements, autoresizing must flex the *bottom*
+    /// margin so window growth leaves the backdrop's height alone.
+    #[test]
+    fn the_backdrop_mask_keeps_height_fixed_through_window_growth() {
+        assert!(!top_anchored_mask(false).contains(NSAutoresizingMaskOptions::ViewHeightSizable));
+        assert!(top_anchored_mask(false).contains(NSAutoresizingMaskOptions::ViewMinYMargin));
+        assert!(top_anchored_mask(true).contains(NSAutoresizingMaskOptions::ViewMaxYMargin));
+    }
 
     #[test]
     fn utility_style_preserves_the_renderers_existing_style() {
