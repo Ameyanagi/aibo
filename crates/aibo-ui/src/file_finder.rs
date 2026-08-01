@@ -81,9 +81,16 @@ impl FileFinder {
     }
 
     /// Replace the candidate list and rebuild the reading index.
+    ///
+    /// Indexed by **file name**, not the full path. The first cut indexed the
+    /// display path, and at real scale the directory components were pure
+    /// ranking noise: `tesutofo` scattered across
+    /// `…/torture-test by CreativeTools…/files/3DBenchy….stl` outranked the
+    /// kana match in `テスト フォローアップ報告書` (owner screenshots,
+    /// 2026-08-01). A file picker matches names; the path is context.
     pub fn set_candidates(&mut self, files: Vec<FileCandidate>) {
         self.index = build_index(
-            files.iter().map(|file| file.display.clone()),
+            files.iter().map(|file| file_name(&file.display).to_owned()),
             &self.backend,
             &self.config,
         );
@@ -128,6 +135,11 @@ impl FileFinder {
             .get(self.highlight)
             .map(|file| (*file).clone())
     }
+}
+
+/// The last path component of a display path.
+pub fn file_name(display: &str) -> &str {
+    display.rsplit('/').next().unwrap_or(display)
 }
 
 #[cfg(test)]
@@ -193,6 +205,43 @@ mod tests {
 #[cfg(test)]
 mod repro {
     use super::*;
+
+    /// The ranking half of the owner's miss: at real scale, `tesutofo`
+    /// scattered across long junk paths beat the kana match. With names
+    /// indexed instead of paths, the kana file must win against a crowd of
+    /// 3DBenchy-style noise in deep directories.
+    #[test]
+    fn kana_names_outrank_scattered_latin_path_noise() {
+        let mut finder = FileFinder::default();
+        let mut files = vec![FileCandidate {
+            display: "~/Downloads/followup-テスト フォローアップ報告書-2026-04-03.csv".to_owned(),
+            path: "/x/report.csv".to_owned(),
+        }];
+        for index in 0..30 {
+            files.push(FileCandidate {
+                display: format!(
+                    "~/Downloads/#3DBenchy - The jolly 3D printing torture-test by \
+                     CreativeTools.se - 763622 - part 2 of 2/files/3DBenchy_-_Multi-part_-\
+                     _Single_-_Doorframe_port_{index}_-_3DBenchy.com.stl"
+                ),
+                path: format!("/x/{index}.stl"),
+            });
+        }
+        finder.set_candidates(files);
+        finder.set_query("tesutofo".to_owned());
+        let results = finder.results();
+        assert!(
+            results
+                .first()
+                .is_some_and(|file| file.display.contains("テスト")),
+            "the kana name must outrank path noise: {:?}",
+            results
+                .iter()
+                .take(3)
+                .map(|f| f.display.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
 
     /// The owner's exact miss (2026-08-01): katakana with an ideographic
     /// space, queried in romaji. Matching was never the problem — the walk
