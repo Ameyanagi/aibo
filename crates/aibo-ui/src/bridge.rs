@@ -360,6 +360,42 @@ pub enum UiRequest {
         pins: Vec<ModelBinding>,
     },
 
+    /// Persist a rebound panel hotkey (`[ui] panel_hotkey`), or `None` to
+    /// return to the platform default. Registration already happened UI-side —
+    /// the runtime's only job is the file.
+    SetPanelHotkey {
+        /// The spec in `aibo_ui::hotkey::parse` syntax, e.g.
+        /// `"control+alt+Space"`.
+        spec: Option<String>,
+    },
+
+    /// Persist the §8 accessibility-activation opt-in. Applies at the next
+    /// start: the flag is baked into the platform worker at construction, and
+    /// the settings row says so.
+    SetAxTreeActivation {
+        /// Whether aibo may switch on an app's AX tree to read its content.
+        enabled: bool,
+    },
+
+    /// Persist the `@` finder's search roots (`[files] roots`) and use them
+    /// for every walk from now on. `None` returns to the platform defaults.
+    SetFileRoots {
+        /// Directories, `~/` prefixes allowed. Empty means "index nothing",
+        /// which is a choice the user may make.
+        roots: Option<Vec<String>>,
+    },
+
+    /// Persist the §14 monthly budget and enforce it from the next request.
+    /// `None` removes the ceiling.
+    SetMonthlyBudget {
+        /// Ceiling in millionths of a currency unit.
+        limit_micros: Option<u64>,
+        /// Warn at this percentage of the limit.
+        warn_at_percent: u8,
+        /// Refuse new requests past the limit.
+        hard_stop: bool,
+    },
+
     /// Begin push-to-talk dictation: microphone → realtime transcription,
     /// streaming text back as [`UiEvent::DictationDelta`]s (§P9+).
     StartDictation,
@@ -591,6 +627,19 @@ pub enum UiEvent {
     FileCandidates {
         /// Bounded by the runtime's walk limits.
         files: Vec<FileCandidate>,
+    },
+
+    /// The persisted settings the runtime owns, published once at startup so
+    /// the settings window edits real values instead of blanks.
+    SettingsLoaded {
+        /// `[ui] allow_ax_tree_activation`.
+        ax_tree_activation: bool,
+        /// `[files] roots` exactly as configured; `None` means the defaults.
+        file_roots: Option<Vec<String>>,
+        /// The defaults those roots fall back to, for honest display.
+        default_file_roots: Vec<String>,
+        /// `[budget]`, as (limit_micros, warn_at_percent, hard_stop).
+        budget: Option<(u64, u8, bool)>,
     },
 
     /// A picked file's content, size-capped and text-decoded. The UI routes

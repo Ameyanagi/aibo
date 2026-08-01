@@ -68,8 +68,11 @@ Everything lives under one directory — `~/Library/Application Support/aibo`
 on macOS, `%APPDATA%\aibo` on Windows. Credentials are stored there in
 owner-only files, never in `config.toml`; environment variables
 (`AIBO_<PROVIDER>_API_KEY`, e.g. `AIBO_OPENAI_API_KEY` — dictation uses the
-OpenAI one) work as a fallback. Most settings are edited in the settings window; `config.toml`
-covers the rest:
+OpenAI one) work as a fallback. Everything below is editable in the settings
+window — providers, pins, the panel hotkey, `@` finder roots, the monthly
+budget, the accessibility opt-in, language — and `config.toml` remains the
+hand-editable equivalent (plus advanced knobs like role chains and request
+deadlines that have no UI yet):
 
 ```toml
 [ui]

@@ -215,6 +215,21 @@ impl Engine {
         self
     }
 
+    /// Replace the monthly budget while running (§14, settings).
+    ///
+    /// Enforcement reads the meter, not `EngineConfig`, so this is the whole
+    /// live path — the next request sees the new ceiling.
+    pub fn set_monthly_budget(&self, budget: Option<MonthlyBudget>) {
+        let mut meter = self.spend.lock().unwrap_or_else(|e| e.into_inner());
+        meter.set_budget(budget);
+    }
+
+    /// The budget currently enforced, for §14's meter fraction.
+    pub fn monthly_budget(&self) -> Option<MonthlyBudget> {
+        let meter = self.spend.lock().unwrap_or_else(|e| e.into_inner());
+        meter.budget()
+    }
+
     /// The §13 offline table, so the shell can re-probe on wake and render
     /// per-provider badges.
     pub fn health(&self) -> &Arc<HealthTable> {

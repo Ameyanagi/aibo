@@ -438,6 +438,38 @@ pub enum Key {
     SettingsModels,
     /// One line explaining what a pin does, above the model list.
     SettingsModelsHint,
+    /// "Files" (§P9+ finder roots).
+    SettingsFiles,
+    /// What the finder roots govern.
+    SettingsFilesHint,
+    /// Badge on a default root while none are configured.
+    SettingsFilesDefaultBadge,
+    /// Placeholder for a new root path.
+    SettingsFilesRootPlaceholder,
+    /// "Add" a finder root.
+    ActionAddRoot,
+    /// Return finder roots to the platform defaults.
+    ActionResetDefaults,
+    /// Syntax hint under the hotkey field.
+    SettingsHotkeyHint,
+    /// The typed hotkey did not parse.
+    SettingsHotkeyInvalid,
+    /// Generic apply.
+    ActionApply,
+    /// §8 AX activation toggle title.
+    SettingsAxTitle,
+    /// §8 AX activation toggle body, including the restart note.
+    SettingsAxBody,
+    /// What the budget section governs.
+    SettingsBudgetHint,
+    /// Monthly ceiling field label.
+    SettingsBudgetLimitLabel,
+    /// Warn threshold field label.
+    SettingsBudgetWarnLabel,
+    /// §14 hard stop toggle.
+    SettingsBudgetHardStop,
+    /// Remove the monthly ceiling.
+    ActionRemoveBudget,
     /// Section: roles.
     SettingsRoles,
     /// Section: budgets.
@@ -742,6 +774,32 @@ fn en(key: Key) -> &'static str {
         K::SettingsProviders => "Providers",
         K::SettingsModels => "Models",
         K::SettingsModelsHint => "★ pinned models appear first in the panel's quick-pick.",
+        K::SettingsFiles => "Files",
+        K::SettingsFilesHint => {
+            "The @ finder searches these folders. ~/ means your home directory."
+        }
+        K::SettingsFilesDefaultBadge => "default",
+        K::SettingsFilesRootPlaceholder => "~/Documents",
+        K::ActionAddRoot => "Add folder",
+        K::ActionResetDefaults => "Reset to defaults",
+        K::SettingsHotkeyHint => {
+            "Modifiers from control, alt, shift, super joined by +, then a key — e.g. control+alt+Space."
+        }
+        K::SettingsHotkeyInvalid => {
+            "That combination could not be read. Example: control+alt+Space."
+        }
+        K::ActionApply => "Apply",
+        K::SettingsAxTitle => "Read selections from Chrome and Electron apps",
+        K::SettingsAxBody => {
+            "Turns on those apps' accessibility trees so text can be captured. Can make them resize sluggishly. Takes effect the next time aibo starts."
+        }
+        K::SettingsBudgetHint => {
+            "A soft monthly ceiling on API spend. The meter above shows this month."
+        }
+        K::SettingsBudgetLimitLabel => "Monthly ceiling (in your billing currency)",
+        K::SettingsBudgetWarnLabel => "Warn at (% of ceiling)",
+        K::SettingsBudgetHardStop => "Refuse new requests past the ceiling",
+        K::ActionRemoveBudget => "Remove ceiling",
         K::SettingsRoles => "Roles",
         K::SettingsBudgets => "Budgets",
         K::SettingsPermissions => "Permissions",
@@ -964,6 +1022,30 @@ fn ja(key: Key) -> &'static str {
         K::SettingsProviders => "プロバイダー",
         K::SettingsModels => "モデル",
         K::SettingsModelsHint => "★ を付けたモデルはクイックピックの先頭に表示されます。",
+        K::SettingsFiles => "ファイル",
+        K::SettingsFilesHint => {
+            "@ ファインダーはこれらのフォルダを検索します。~/ はホームディレクトリです。"
+        }
+        K::SettingsFilesDefaultBadge => "デフォルト",
+        K::SettingsFilesRootPlaceholder => "~/Documents",
+        K::ActionAddRoot => "フォルダを追加",
+        K::ActionResetDefaults => "デフォルトに戻す",
+        K::SettingsHotkeyHint => {
+            "control・alt・shift・super を + でつなぎ、最後にキーを指定します。例: control+alt+Space"
+        }
+        K::SettingsHotkeyInvalid => "この組み合わせは読み取れませんでした。例: control+alt+Space",
+        K::ActionApply => "適用",
+        K::SettingsAxTitle => "Chrome や Electron アプリから選択テキストを読み取る",
+        K::SettingsAxBody => {
+            "対象アプリのアクセシビリティツリーを有効にしてテキストを取得します。ウィンドウ操作が重くなることがあります。次回の起動時に反映されます。"
+        }
+        K::SettingsBudgetHint => {
+            "API 支出のソフトな月間上限です。上のメーターは今月の支出を示します。"
+        }
+        K::SettingsBudgetLimitLabel => "月間上限（請求通貨）",
+        K::SettingsBudgetWarnLabel => "警告する割合（上限の %）",
+        K::SettingsBudgetHardStop => "上限を超えたら新しいリクエストを拒否する",
+        K::ActionRemoveBudget => "上限を削除",
         K::SettingsRoles => "ロール",
         K::SettingsBudgets => "予算",
         K::SettingsPermissions => "権限",
@@ -1085,6 +1167,23 @@ mod tests {
             Key::ErrAttachmentTooLarge,
             Key::ErrAttachmentUnusable,
             Key::ToastClipboardImageUnreadable,
+            // The settings-coverage work (§8, §9, §14, §P9+): every knob the
+            // window gained ships in both languages.
+            Key::SettingsFiles,
+            Key::SettingsFilesHint,
+            Key::SettingsFilesDefaultBadge,
+            Key::ActionAddRoot,
+            Key::ActionResetDefaults,
+            Key::SettingsHotkeyHint,
+            Key::SettingsHotkeyInvalid,
+            Key::ActionApply,
+            Key::SettingsAxTitle,
+            Key::SettingsAxBody,
+            Key::SettingsBudgetHint,
+            Key::SettingsBudgetLimitLabel,
+            Key::SettingsBudgetWarnLabel,
+            Key::SettingsBudgetHardStop,
+            Key::ActionRemoveBudget,
         ];
         for key in ADDED {
             for lang in Lang::ALL {

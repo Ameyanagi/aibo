@@ -187,6 +187,24 @@ pub fn settings_tree(
             ));
             content_children.extend([SETTINGS_STATUS, SETTINGS_PRIMARY_ACTION]);
         }
+        Section::Files => {
+            // The same summary-node treatment as Models, for the same
+            // hand-positioned-arithmetic reason: the heading plus a count of
+            // the roots tells a screen-reader user what this surface holds.
+            let count = state
+                .file_roots
+                .as_ref()
+                .map_or(state.default_file_roots.len(), Vec::len);
+            nodes.push((
+                SETTINGS_STATUS,
+                semantic_node(
+                    Role::Label,
+                    &i18n::t1(Key::PickerCount, &count.to_string()),
+                    logical_rect(content_x, 68.0, content_width, 28.0),
+                ),
+            ));
+            content_children.push(SETTINGS_STATUS);
+        }
         Section::Models => {
             // A summary node rather than one node per model: the list can be
             // hundreds of rows, and the semantic tree here is hand-positioned
@@ -819,6 +837,7 @@ fn section_node_id(section: Section) -> NodeId {
                 Section::Language => 6,
                 Section::About => 7,
                 Section::Models => 8,
+                Section::Files => 9,
             },
     )
 }

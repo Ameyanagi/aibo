@@ -41,6 +41,8 @@ pub enum Section {
     Actions,
     /// Conversation history and FTS search (§12).
     History,
+    /// The `@` finder's search roots (§P9+).
+    Files,
     /// UI language (§9).
     Language,
     /// Version, licence, diagnostics (§19).
@@ -49,7 +51,7 @@ pub enum Section {
 
 impl Section {
     /// Every section, in navigation order.
-    pub const ALL: [Section; 9] = [
+    pub const ALL: [Section; 10] = [
         Section::Providers,
         Section::Models,
         Section::Roles,
@@ -57,6 +59,7 @@ impl Section {
         Section::Permissions,
         Section::Actions,
         Section::History,
+        Section::Files,
         Section::Language,
         Section::About,
     ];
@@ -67,12 +70,13 @@ impl Section {
     /// showing them before their editors exist creates navigation that ends in
     /// unrelated generic empty-state copy. Add them here when their controls
     /// ship.
-    pub const VISIBLE: [Section; 7] = [
+    pub const VISIBLE: [Section; 8] = [
         Section::Providers,
         Section::Models,
         Section::Budgets,
         Section::Permissions,
         Section::History,
+        Section::Files,
         Section::Language,
         Section::About,
     ];
@@ -87,6 +91,7 @@ impl Section {
             Section::Permissions => Key::SettingsPermissions,
             Section::Actions => Key::SettingsActions,
             Section::History => Key::SettingsHistory,
+            Section::Files => Key::SettingsFiles,
             Section::Language => Key::SettingsLanguage,
             Section::About => Key::SettingsAbout,
         }
@@ -360,6 +365,30 @@ pub struct SettingsState {
     /// Monotonic copy count, so a stale expiry task cannot clear the badge a
     /// newer copy just set.
     pub copied_epoch: u64,
+    /// §8's accessibility-activation opt-in. Applies at the next start — the
+    /// flag is baked into the platform worker at construction — and the row
+    /// says so rather than pretending otherwise.
+    pub ax_tree_activation: bool,
+    /// The `@` finder's configured roots; `None` means the defaults apply.
+    pub file_roots: Option<Vec<String>>,
+    /// What those defaults are, so the unset state shows real paths instead
+    /// of the word "default".
+    pub default_file_roots: Vec<String>,
+    /// A root being typed, not yet added.
+    pub root_draft: String,
+    /// The hotkey spec being typed, in `hotkey::parse` syntax.
+    pub hotkey_draft: String,
+    /// Whether the current [`Self::hotkey_draft`] failed to parse on apply.
+    pub hotkey_draft_invalid: bool,
+    /// The monthly ceiling being typed, in whole currency units (`"15"`).
+    pub budget_limit_draft: String,
+    /// The warn threshold being typed, percent.
+    pub budget_warn_draft: String,
+    /// Refuse requests past the limit (§14 hard stop).
+    pub budget_hard_stop: bool,
+    /// Whether a monthly ceiling is currently applied, so "remove" is only
+    /// offered when there is something to remove.
+    pub budget_configured: bool,
 }
 
 /// A copy affordance that confirms itself with a momentary `✓ copied`.
@@ -658,6 +687,30 @@ pub enum Message {
     /// A `✓ copied` badge reached the end of its moment. Ignored unless the
     /// epoch matches the most recent copy.
     CopiedBadgeExpired(u64),
+    /// Toggle §8's accessibility-activation opt-in.
+    AxTreeToggle(bool),
+    /// The finder-root draft changed.
+    RootDraft(String),
+    /// Add the drafted finder root.
+    RootAdd,
+    /// Remove one finder root by position.
+    RootRemove(usize),
+    /// Return the finder roots to the platform defaults.
+    RootsReset,
+    /// The hotkey spec draft changed.
+    HotkeyDraft(String),
+    /// Parse, re-register and persist the drafted hotkey.
+    HotkeyApply,
+    /// The budget ceiling draft changed.
+    BudgetLimitDraft(String),
+    /// The warn-percent draft changed.
+    BudgetWarnDraft(String),
+    /// Toggle the §14 hard stop.
+    BudgetHardStop(bool),
+    /// Parse and apply the drafted budget.
+    BudgetApply,
+    /// Remove the monthly ceiling entirely.
+    BudgetRemove,
     /// Close the window.
     Close,
 }
@@ -749,6 +802,7 @@ fn section_body(state: &SettingsState) -> Element<'_, Message> {
         Section::Language => language(state),
         Section::About => about(state),
         Section::History => history(state),
+        Section::Files => files(state),
         // TODO(§4, §12, §14): role chains and saved actions
         // browser are per-section product work. The IA slot exists so
         // navigation is complete and the sections cannot drift from §16.
@@ -1346,6 +1400,49 @@ fn permissions(state: &SettingsState) -> Element<'_, Message> {
         });
     }
 
+    // The rebind that used to be missing: a field in `hotkey::parse` syntax,
+    // applied live through the one process-wide registrar and persisted to
+    // `[ui] panel_hotkey`. The status block above reports the outcome.
+    list = list.push(
+        row![
+            text_input("control+alt+Space", &state.hotkey_draft)
+                .on_input(Message::HotkeyDraft)
+                .on_submit(Message::HotkeyApply)
+                .size(type_scale::BODY)
+                .font(theme::MONO_FONT)
+                .padding([space(1.5), space(2.0)])
+                .style(theme::field),
+            {
+                let apply = button(
+                    text(i18n::t(Key::ActionApply))
+                        .size(type_scale::BODY)
+                        .style(theme::text_primary),
+                )
+                .padding([space(1.5), space(2.0)])
+                .style(theme::action_button);
+                match state.hotkey_draft.trim().is_empty() {
+                    true => apply,
+                    false => apply.on_press(Message::HotkeyApply),
+                }
+            },
+        ]
+        .align_y(iced::Alignment::Center)
+        .spacing(space(2.0)),
+    );
+    list = list.push(
+        text(i18n::t(if state.hotkey_draft_invalid {
+            Key::SettingsHotkeyInvalid
+        } else {
+            Key::SettingsHotkeyHint
+        }))
+        .size(type_scale::META)
+        .style(if state.hotkey_draft_invalid {
+            theme::text_primary
+        } else {
+            theme::text_dim
+        }),
+    );
+
     for row in &state.permissions {
         list = list.push(widgets::permission_banner(
             row.status,
@@ -1353,6 +1450,36 @@ fn permissions(state: &SettingsState) -> Element<'_, Message> {
             Some(Message::OpenSystemSettings(row.permission)),
         ));
     }
+
+    // §8's AX-tree opt-in, at last a control instead of a config key. The
+    // body says it applies at the next start — the flag is baked into the
+    // capture worker at construction, and a toggle that pretended to be live
+    // would be the dishonest control this window refuses to ship.
+    list = list.push(
+        button(
+            column![
+                row![
+                    text(selection_marker(state.ax_tree_activation))
+                        .width(Length::Fixed(space(3.0)))
+                        .size(type_scale::BODY)
+                        .style(theme::text_primary),
+                    text(i18n::t(Key::SettingsAxTitle))
+                        .size(type_scale::BODY)
+                        .style(theme::text_primary),
+                ]
+                .align_y(iced::Alignment::Center),
+                text(i18n::t(Key::SettingsAxBody))
+                    .size(type_scale::META)
+                    .style(theme::text_dim),
+            ]
+            .spacing(space(0.5)),
+        )
+        .width(Length::Fill)
+        .padding([space(1.5), space(2.0)])
+        .style(theme::action_button)
+        .on_press(Message::AxTreeToggle(!state.ax_tree_activation)),
+    );
+
     list.into()
 }
 
@@ -1389,13 +1516,203 @@ pub(crate) const fn permission_key(permission: Permission) -> Key {
 fn budgets(state: &SettingsState) -> Element<'_, Message> {
     // §14: BYOK means the user pays for every mistake aibo makes, so the meter
     // is the first thing in the section, not a footnote.
-    column![
-        widgets::spend_meter::<Message>(&state.spend_label, state.spend_fraction),
-        // TODO(§14): per-role `max_tokens` and context caps, the confirmation
-        // threshold, and the monthly ceiling.
+    let mut list = column![widgets::spend_meter::<Message>(
+        &state.spend_label,
+        state.spend_fraction
+    )]
+    .spacing(space(2.0));
+
+    list = list.push(
+        text(i18n::t(Key::SettingsBudgetHint))
+            .size(type_scale::META)
+            .style(theme::text_dim),
+    );
+    list = list.push(
+        row![
+            text(i18n::t(Key::SettingsBudgetLimitLabel))
+                .size(type_scale::BODY)
+                .style(theme::text_primary)
+                .width(Length::Fill),
+            text_input("20", &state.budget_limit_draft)
+                .on_input(Message::BudgetLimitDraft)
+                .size(type_scale::BODY)
+                .font(theme::MONO_FONT)
+                .width(Length::Fixed(120.0))
+                .padding([space(1.5), space(2.0)])
+                .style(theme::field),
+        ]
+        .align_y(iced::Alignment::Center)
+        .spacing(space(2.0)),
+    );
+    list = list.push(
+        row![
+            text(i18n::t(Key::SettingsBudgetWarnLabel))
+                .size(type_scale::BODY)
+                .style(theme::text_primary)
+                .width(Length::Fill),
+            text_input("80", &state.budget_warn_draft)
+                .on_input(Message::BudgetWarnDraft)
+                .size(type_scale::BODY)
+                .font(theme::MONO_FONT)
+                .width(Length::Fixed(120.0))
+                .padding([space(1.5), space(2.0)])
+                .style(theme::field),
+        ]
+        .align_y(iced::Alignment::Center)
+        .spacing(space(2.0)),
+    );
+    list = list.push(
+        button(
+            row![
+                text(selection_marker(state.budget_hard_stop))
+                    .width(Length::Fixed(space(3.0)))
+                    .size(type_scale::BODY)
+                    .style(theme::text_primary),
+                text(i18n::t(Key::SettingsBudgetHardStop))
+                    .size(type_scale::BODY)
+                    .style(theme::text_primary),
+            ]
+            .align_y(iced::Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([space(1.5), space(2.0)])
+        .style(theme::action_button)
+        .on_press(Message::BudgetHardStop(!state.budget_hard_stop)),
+    );
+
+    let mut actions = row![].spacing(space(2.0));
+    let apply = button(
+        text(i18n::t(Key::ActionApply))
+            .size(type_scale::BODY)
+            .style(theme::text_primary),
+    )
+    .padding([space(1.5), space(2.0)])
+    .style(theme::action_button);
+    actions = actions.push(if parsed_budget(state).is_some() {
+        apply.on_press(Message::BudgetApply)
+    } else {
+        apply
+    });
+    if state.budget_configured {
+        actions = actions.push(
+            button(
+                text(i18n::t(Key::ActionRemoveBudget))
+                    .size(type_scale::BODY)
+                    .style(theme::text_dim),
+            )
+            .padding([space(1.5), space(2.0)])
+            .style(theme::action_button)
+            .on_press(Message::BudgetRemove),
+        );
+    }
+    list.push(actions).into()
+}
+
+/// The drafted budget, if the drafts parse: (limit_micros, warn_at_percent).
+///
+/// The ceiling is typed in whole currency units and held in micros, §14's
+/// unit. Zero is not a budget — "spend nothing" is the file's `hard_stop`
+/// with a tiny limit, and a `0` here almost always means a cleared field.
+pub fn parsed_budget(state: &SettingsState) -> Option<(u64, u8)> {
+    let limit: f64 = state.budget_limit_draft.trim().parse().ok()?;
+    if !limit.is_finite() || limit <= 0.0 || limit > 1_000_000.0 {
+        return None;
+    }
+    let warn: u8 = match state.budget_warn_draft.trim() {
+        "" => 80,
+        raw => raw.parse().ok()?,
+    };
+    if warn == 0 || warn > 100 {
+        return None;
+    }
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "bounded above and positive"
+    )]
+    Some(((limit * 1_000_000.0).round() as u64, warn))
+}
+
+/// The `@` finder's search roots (§P9+): the walk indexes exactly these.
+fn files(state: &SettingsState) -> Element<'_, Message> {
+    let mut list = column![
+        text(i18n::t(Key::SettingsFilesHint))
+            .size(type_scale::META)
+            .style(theme::text_dim),
     ]
-    .spacing(space(2.0))
-    .into()
+    .spacing(space(1.0));
+
+    let (roots, customised): (&[String], bool) = match &state.file_roots {
+        Some(roots) => (roots, true),
+        None => (&state.default_file_roots, false),
+    };
+    for (index, root) in roots.iter().enumerate() {
+        let mut row = row![
+            text(root)
+                .size(type_scale::BODY)
+                .font(theme::MONO_FONT)
+                .style(theme::text_primary)
+                .width(Length::Fill),
+        ]
+        .align_y(iced::Alignment::Center)
+        .spacing(space(2.0));
+        if !customised {
+            row = row.push(
+                text(i18n::t(Key::SettingsFilesDefaultBadge))
+                    .size(type_scale::META)
+                    .style(theme::text_dim),
+            );
+        }
+        row = row.push(
+            button(text("✕").size(type_scale::BODY).style(theme::text_dim))
+                .padding([space(1.0), space(1.5)])
+                .style(theme::action_button)
+                .on_press(Message::RootRemove(index)),
+        );
+        list = list.push(
+            container(row)
+                .width(Length::Fill)
+                .padding([space(1.0), space(2.0)]),
+        );
+    }
+
+    list = list.push(
+        row![
+            text_input(
+                i18n::t(Key::SettingsFilesRootPlaceholder),
+                &state.root_draft
+            )
+            .on_input(Message::RootDraft)
+            .on_submit(Message::RootAdd)
+            .size(type_scale::BODY)
+            .font(theme::MONO_FONT)
+            .padding([space(1.5), space(2.0)])
+            .style(theme::field),
+            button(
+                text(i18n::t(Key::ActionAddRoot))
+                    .size(type_scale::BODY)
+                    .style(theme::text_primary),
+            )
+            .padding([space(1.5), space(2.0)])
+            .style(theme::action_button)
+            .on_press_maybe((!state.root_draft.trim().is_empty()).then_some(Message::RootAdd)),
+        ]
+        .align_y(iced::Alignment::Center)
+        .spacing(space(2.0)),
+    );
+    if customised {
+        list = list.push(
+            button(
+                text(i18n::t(Key::ActionResetDefaults))
+                    .size(type_scale::BODY)
+                    .style(theme::text_dim),
+            )
+            .padding([space(1.5), space(2.0)])
+            .style(theme::action_button)
+            .on_press(Message::RootsReset),
+        );
+    }
+    list.into()
 }
 
 fn language(state: &SettingsState) -> Element<'_, Message> {
@@ -1560,14 +1877,43 @@ mod tests {
     }
 
     #[test]
+    fn a_budget_draft_parses_in_currency_units_and_rejects_nonsense() {
+        let mut state = SettingsState {
+            budget_limit_draft: "15".to_owned(),
+            ..SettingsState::default()
+        };
+        assert_eq!(
+            parsed_budget(&state),
+            Some((15_000_000, 80)),
+            "warn defaults to §14's 80"
+        );
+
+        state.budget_limit_draft = "0.5".to_owned();
+        state.budget_warn_draft = "50".to_owned();
+        assert_eq!(parsed_budget(&state), Some((500_000, 50)));
+
+        for bad in ["", "0", "-3", "abc", "1e99", "NaN"] {
+            state.budget_limit_draft = bad.to_owned();
+            assert_eq!(parsed_budget(&state), None, "{bad:?} is not a ceiling");
+        }
+        state.budget_limit_draft = "10".to_owned();
+        for bad in ["0", "101", "x"] {
+            state.budget_warn_draft = bad.to_owned();
+            assert_eq!(parsed_budget(&state), None, "{bad:?} is not a percent");
+        }
+    }
+
+    #[test]
     fn the_information_architecture_matches_section_16() {
         // §16 names: providers, roles, budgets, permissions, actions, history,
-        // about/license. Language is the §9 addition; Models is the owner's
-        // 2026-08-01 addition for curating quick-pick pins. Unfinished editors
-        // stay in the durable enum without creating dead-end navigation.
-        assert_eq!(Section::ALL.len(), 9);
-        assert_eq!(Section::VISIBLE.len(), 7);
+        // about/license. Language is the §9 addition; Models and Files are the
+        // owner's 2026-08-01 additions (quick-pick pins, @ finder roots).
+        // Unfinished editors stay in the durable enum without creating
+        // dead-end navigation.
+        assert_eq!(Section::ALL.len(), 10);
+        assert_eq!(Section::VISIBLE.len(), 8);
         assert!(Section::VISIBLE.contains(&Section::Models));
+        assert!(Section::VISIBLE.contains(&Section::Files));
         assert!(!Section::VISIBLE.contains(&Section::Roles));
         assert!(!Section::VISIBLE.contains(&Section::Actions));
         assert_eq!(Section::default(), Section::Providers);
