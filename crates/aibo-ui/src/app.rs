@@ -52,7 +52,7 @@ use crate::i18n::{self, Lang};
 use crate::panel::{self, ContextState, PanelState, Phase};
 use crate::placement::{self, ObservedGeometry, Placement, PlacementRequest};
 use crate::settings::{self, SettingsState};
-use crate::task_window::{self, TaskState};
+use crate::tasks::TaskState;
 use crate::theme::{self as ui_theme, Appearance, motion::Motion};
 use crate::tray::{self, Tray, TrayCommand, TrayState};
 
@@ -127,7 +127,6 @@ const UI_REQUEST_CRITICAL_RESERVE: usize = 8;
 
 const PANEL_ACCESSIBILITY: AccessibilitySurface = AccessibilitySurface(1);
 const SETTINGS_ACCESSIBILITY: AccessibilitySurface = AccessibilitySurface(2);
-const TASK_ACCESSIBILITY_FLAG: u64 = 1 << 63;
 
 /// §6 requires single-instance behaviour across the machine; this only guards
 /// the far cheaper in-process case, which the global handlers make unavoidable.
@@ -218,7 +217,6 @@ pub enum Message {
     /// A message from the panel.
     Panel(panel::Message),
     /// A message from a task window.
-    Task(Uuid, task_window::Message),
     /// A message from the settings window.
     Settings(settings::Message),
     /// A semantic action from VoiceOver, Narrator, or another native client.
@@ -321,7 +319,6 @@ pub enum WindowChord {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Role {
     Panel,
-    Task(Uuid),
     Settings,
 }
 
@@ -365,8 +362,6 @@ pub struct Aibo {
     /// Open task windows. §6: an agent run outlives the panel and lives here.
     tasks: Vec<(window::Id, TaskState)>,
     /// Runs whose window has not been opened yet.
-    pending_tasks: Vec<TaskState>,
-
     tray: Option<Tray>,
     hotkeys: Option<Hotkeys>,
     hotkey_status: Option<HotkeyStatus>,
@@ -420,19 +415,13 @@ impl Aibo {
         if Some(id) == self.settings_window {
             return Some(Role::Settings);
         }
-        self.tasks
-            .iter()
-            .find(|(window_id, _)| *window_id == id)
-            .map(|(_, task)| Role::Task(task.id))
+        None
     }
 
     fn accessibility_surface(role: Role) -> AccessibilitySurface {
         match role {
             Role::Panel => PANEL_ACCESSIBILITY,
             Role::Settings => SETTINGS_ACCESSIBILITY,
-            Role::Task(id) => AccessibilitySurface(
-                TASK_ACCESSIBILITY_FLAG | (id.as_u128() as u64 & !TASK_ACCESSIBILITY_FLAG),
-            ),
         }
     }
 
@@ -443,10 +432,7 @@ impl Aibo {
         if surface == SETTINGS_ACCESSIBILITY && self.settings_window.is_some() {
             return Some(Role::Settings);
         }
-        self.tasks
-            .iter()
-            .find(|(_, task)| Self::accessibility_surface(Role::Task(task.id)) == surface)
-            .map(|(_, task)| Role::Task(task.id))
+        None
     }
 
     fn accessibility_tree(&self, surface: AccessibilitySurface) -> Option<TreeUpdate> {
@@ -470,14 +456,6 @@ impl Aibo {
         Some(match role {
             Role::Panel => a11y::panel_tree(&self.panel, size, scale, focus),
             Role::Settings => a11y::settings_tree(&self.settings, size, scale, focus),
-            Role::Task(task_id) => {
-                let task = self
-                    .tasks
-                    .iter()
-                    .find(|(_, task)| task.id == task_id)
-                    .map(|(_, task)| task)?;
-                a11y::task_tree(task, size, scale, focus)
-            }
         })
     }
 
@@ -775,21 +753,9 @@ impl Aibo {
         let Some(tray) = self.tray.as_mut() else {
             return;
         };
-        let state = if self
-            .tasks
-            .iter()
-            .map(|(_, task)| task)
-            .chain(self.pending_tasks.iter())
-            .any(TaskState::is_blocked)
-        {
+        let state = if self.panel.tasks.iter().any(TaskState::is_blocked) {
             TrayState::Attention
-        } else if self
-            .tasks
-            .iter()
-            .map(|(_, task)| task)
-            .chain(self.pending_tasks.iter())
-            .any(TaskState::is_running)
-        {
+        } else if self.panel.tasks.iter().any(TaskState::is_running) {
             TrayState::Busy
         } else {
             TrayState::Idle
@@ -802,7 +768,6 @@ fn accessibility_root(role: Role) -> NodeId {
     match role {
         Role::Panel => a11y::PANEL_ROOT,
         Role::Settings => a11y::SETTINGS_ROOT,
-        Role::Task(_) => a11y::TASK_ROOT,
     }
 }
 
@@ -810,7 +775,6 @@ fn default_accessibility_size(role: Role, panel: &PanelState) -> (f32, f32) {
     match role {
         Role::Panel => (ui_theme::PANEL_WIDTH_DEFAULT, panel.desired_height()),
         Role::Settings => (880.0, 520.0),
-        Role::Task(_) => (760.0, 640.0),
     }
 }
 
@@ -877,20 +841,6 @@ fn panel_platform_settings() -> window::settings::PlatformSpecific {
     }
 }
 
-/// Settings for a task window (§6): a real window, because an agent run has
-/// scrollback, diffs and blocking approvals.
-fn task_window_settings() -> window::Settings {
-    window::Settings {
-        size: Size::new(760.0, 640.0),
-        min_size: Some(Size::new(480.0, 360.0)),
-        // AccessKit must attach to the native view before it is first shown or
-        // focused. `WindowOpened` installs the adapter, then reveals the window.
-        visible: false,
-        exit_on_close_request: true,
-        ..Default::default()
-    }
-}
-
 /// Settings for the settings window.
 fn settings_window_settings() -> window::Settings {
     window::Settings {
@@ -934,7 +884,6 @@ fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) 
         settings_window: None,
         settings: SettingsState::default(),
         tasks: Vec::new(),
-        pending_tasks: Vec::new(),
         tray: None,
         hotkeys: None,
         hotkey_status: None,
@@ -1040,19 +989,6 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                     // setup disclosure, not a value retained for later visits.
                     state.settings.recovery_code = None;
                 }
-                Some(Role::Task(task_id)) => {
-                    // A running task outlives its window. Retain its scrollback
-                    // and any pending approval so the tray or panel can recreate
-                    // the window later. Terminal tasks are genuinely dismissed.
-                    if let Some(index) = state.tasks.iter().position(|(_, task)| task.id == task_id)
-                    {
-                        let (_, task) = state.tasks.remove(index);
-                        if task.is_running() {
-                            state.pending_tasks.push(task);
-                        }
-                    }
-                    state.refresh_tray();
-                }
                 None => {}
             }
             Task::none()
@@ -1119,21 +1055,6 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                     }
                     Role::Settings => {
                         window::set_mode(window, Mode::Windowed).chain(window::gain_focus(window))
-                    }
-                    Role::Task(task_id) => {
-                        let needs_confirmation = state
-                            .tasks
-                            .iter()
-                            .find(|(_, task)| task.id == task_id)
-                            .and_then(|(_, task)| task.pending_approval.as_ref())
-                            .is_some_and(|approval| approval.requires_typed_confirmation);
-                        let reveal = window::set_mode(window, Mode::Windowed)
-                            .chain(window::gain_focus(window));
-                        if needs_confirmation {
-                            reveal.chain(operation::focus(task_window::CONFIRMATION_ID))
-                        } else {
-                            reveal
-                        }
                     }
                 }
             }
@@ -1211,8 +1132,6 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                         .map_or_else(Task::none, |message| panel_update(state, message)),
                     Some(Role::Settings) => a11y::settings_message(&state.settings, &event.request)
                         .map_or_else(Task::none, |message| settings_update(state, message)),
-                    Some(Role::Task(task_id)) => a11y::task_message(&event.request)
-                        .map_or_else(Task::none, |message| task_update(state, task_id, message)),
                     None => Task::none(),
                 }
             }
@@ -1382,7 +1301,6 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
         }
 
         Message::Panel(message) => panel_update(state, message),
-        Message::Task(id, message) => task_update(state, id, message),
         Message::Settings(message) => settings_update(state, message),
         Message::Backend(event) => backend_update(state, *event),
     };
@@ -1432,43 +1350,25 @@ fn attach_accessibility_window(state: &Aibo, id: window::Id, role: Role) -> Task
     })
 }
 
+/// Bring the tasks overlay up, on the blocked run first (owner redesign,
+/// 2026-08-02: no task windows — the overlay is how any run is reached).
 fn focus_first_task(state: &mut Aibo) -> Task<Message> {
     let task = state
+        .panel
         .tasks
         .iter()
-        .map(|(_, task)| task)
-        .chain(state.pending_tasks.iter())
         .find(|task| task.is_blocked())
-        .or_else(|| {
-            state
-                .tasks
-                .first()
-                .map(|(_, task)| task)
-                .or_else(|| state.pending_tasks.first())
-        })
+        .or_else(|| state.panel.tasks.first())
         .map(|task| task.id);
-    task.map_or_else(Task::none, |task| focus_task(state, task))
-}
-
-fn focus_task(state: &mut Aibo, task: Uuid) -> Task<Message> {
-    if let Some((window_id, _)) = state.tasks.iter().find(|(_, state)| state.id == task) {
-        return Task::batch([
-            window::set_mode(*window_id, Mode::Windowed),
-            window::gain_focus(*window_id),
-        ]);
+    state.panel.selected_task = task;
+    state.panel.tasks_open = task.is_some();
+    if state.panel_visible {
+        resize_panel_if_visible(state)
+    } else {
+        // The overlay needs the panel on screen: the hotkey's own show path,
+        // with the overlay pre-armed above.
+        state.open_panel()
     }
-
-    let Some(index) = state
-        .pending_tasks
-        .iter()
-        .position(|state| state.id == task)
-    else {
-        return Task::none();
-    };
-    let task = state.pending_tasks.remove(index);
-    let (window_id, opened) = window::open(task_window_settings());
-    state.tasks.push((window_id, task));
-    opened.map(Message::WindowOpened)
 }
 
 fn open_settings(state: &mut Aibo) -> Task<Message> {
@@ -1642,34 +1542,6 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
                 | WindowChord::CancelTask => return Task::none(),
             };
             panel_update(state, message)
-        }
-        Some(Role::Task(task)) => {
-            let message = match chord {
-                WindowChord::Escape => {
-                    if state
-                        .tasks
-                        .iter()
-                        .find(|(_, state)| state.id == task)
-                        .is_some_and(|(_, state)| state.is_blocked())
-                    {
-                        task_window::Message::Decide(aibo_core::types::ApprovalDecision::Deny)
-                    } else {
-                        task_window::Message::Close
-                    }
-                }
-                WindowChord::Enter {
-                    command: false,
-                    shift,
-                } => task_window::Message::Decide(if shift {
-                    aibo_core::types::ApprovalDecision::ApproveForSession
-                } else {
-                    aibo_core::types::ApprovalDecision::Approve
-                }),
-                WindowChord::Copy => task_window::Message::CopyTranscript,
-                WindowChord::CancelTask => task_window::Message::Cancel,
-                _ => return Task::none(),
-            };
-            task_update(state, task, message)
         }
         Some(Role::Settings) => match chord {
             // Escape backs out of the draft before it closes the window: a
@@ -1906,7 +1778,21 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 let stripped = stripped.to_owned();
                 state.panel.set_input(&stripped);
             }
-            state.send(UiRequest::AttachFile { path: file.path });
+            if state.panel.agent_mode {
+                // Agent mode wants the *path*, not the bytes (owner,
+                // 2026-08-02: "@ shows could not read test.dmg — give it a
+                // path in agent mode"). The agent's own tools read what it
+                // needs, which also makes binaries attachable at all.
+                let mut input = state.panel.input.clone();
+                if !input.is_empty() && !input.ends_with(char::is_whitespace) {
+                    input.push(' ');
+                }
+                input.push_str(&file.path);
+                input.push(' ');
+                state.panel.set_input(&input);
+            } else {
+                state.send(UiRequest::AttachFile { path: file.path });
+            }
             state.panel.file_finder.close();
             resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
         }
@@ -1979,6 +1865,23 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 .map(|attached| attached.attachment.clone())
                 .collect();
             state.panel.history.record(&instruction);
+            // Steering (owner, 2026-08-02): typing while this session's run
+            // is still going joins that run rather than starting a rival.
+            if state.panel.agent_mode
+                && let Some(running) = state
+                    .panel
+                    .session_tasks()
+                    .filter(|task| task.is_running())
+                    .last()
+            {
+                let task = running.id;
+                state.panel.consume_input();
+                state.send(UiRequest::SteerTask {
+                    task,
+                    text: instruction,
+                });
+                return resize_panel_if_visible(state);
+            }
             if state.panel.agent_mode {
                 // The task window owns this run's transcript. Beginning a
                 // chat turn here too left the panel stuck on a spinner no
@@ -2163,6 +2066,69 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             state.panel.agent_mode = !state.panel.agent_mode;
             Task::none()
         }
+        M::TasksToggle => {
+            state.panel.tasks_open = !state.panel.tasks_open;
+            if state.panel.tasks_open {
+                state.panel.selected_task = None;
+            }
+            resize_panel_if_visible(state)
+        }
+        M::TasksClose => {
+            state.panel.tasks_open = false;
+            state.panel.selected_task = None;
+            resize_panel_if_visible(state)
+        }
+        M::TasksSelect(task) => {
+            state.panel.selected_task = task;
+            Task::none()
+        }
+        M::TaskToggleEntry(task, index) => {
+            if let Some(task) = state.panel.tasks.iter_mut().find(|t| t.id == task)
+                && let Some(entry) = task.entries.get_mut(index)
+            {
+                entry.collapsed = !entry.collapsed;
+            }
+            Task::none()
+        }
+        M::TaskConfirmation(task, value) => {
+            if let Some(task) = state.panel.tasks.iter_mut().find(|t| t.id == task) {
+                task.typed_confirmation = value;
+            }
+            Task::none()
+        }
+        M::TaskDecide(id, decision) => {
+            let Some(task) = state.panel.tasks.iter_mut().find(|t| t.id == id) else {
+                return Task::none();
+            };
+            if !task.decision_is_ready(decision) {
+                return Task::none();
+            }
+            let Some(approval) = task.pending_approval.take() else {
+                return Task::none();
+            };
+            let typed_confirmation = approval
+                .requires_typed_confirmation
+                .then(|| task.typed_confirmation.clone());
+            state.send(UiRequest::Approve {
+                task: id,
+                approval: approval.id,
+                decision,
+                typed_confirmation,
+            });
+            state.refresh_tray();
+            Task::none()
+        }
+        M::TaskCancel(id) => {
+            state.send(UiRequest::CancelTask { task: id });
+            Task::none()
+        }
+        M::TaskCopy(id) => {
+            if let Some(task) = state.panel.tasks.iter().find(|t| t.id == id) {
+                let text = task.transcript();
+                state.send(UiRequest::Copy { text });
+            }
+            Task::none()
+        }
         M::ToggleDictation => {
             if state.panel.dictating {
                 state.panel.dictating = false;
@@ -2267,62 +2233,6 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 ErrorAction::UseModel { .. } => panel_update(state, M::OpenPicker),
             }
         }
-    }
-}
-
-fn task_update(state: &mut Aibo, id: Uuid, message: task_window::Message) -> Task<Message> {
-    use task_window::Message as M;
-
-    let Some((window_id, task)) = state
-        .tasks
-        .iter_mut()
-        .find(|(_, task)| task.id == id)
-        .map(|(window_id, task)| (*window_id, task))
-    else {
-        return Task::none();
-    };
-
-    match message {
-        M::ToggleEntry(index) => {
-            if let Some(entry) = task.entries.get_mut(index) {
-                entry.collapsed = !entry.collapsed;
-            }
-            Task::none()
-        }
-        M::ConfirmationChanged(value) => {
-            task.typed_confirmation = value;
-            Task::none()
-        }
-        M::Decide(decision) => {
-            if !task.decision_is_ready(decision) {
-                return Task::none();
-            }
-            let Some(approval) = task.pending_approval.take() else {
-                return Task::none();
-            };
-            let typed_confirmation = approval
-                .requires_typed_confirmation
-                .then(|| task.typed_confirmation.clone());
-            state.send(UiRequest::Approve {
-                task: id,
-                approval: approval.id,
-                decision,
-                typed_confirmation,
-            });
-            state.refresh_tray();
-            Task::none()
-        }
-        M::Cancel => {
-            state.send(UiRequest::CancelTask { task: id });
-            Task::none()
-        }
-        M::CopyTranscript => {
-            let transcript = task.transcript();
-            state.send(UiRequest::Copy { text: transcript });
-            Task::none()
-        }
-        // §6: closing the window does not cancel the run.
-        M::Close => window::close(window_id),
     }
 }
 
@@ -2808,6 +2718,9 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 }
                 StreamEvent::Done(reason) => {
                     state.panel.phase = Phase::Finished { reason };
+                    // Typeset any display equations now that the text is
+                    // final (`crate::math`); streaming showed the raw TeX.
+                    state.panel.segment_finished_response();
                     aibo_platform::announce_accessibility(i18n::t(crate::i18n::Key::TaskCompleted));
                     // Give the caret back, **once, on completion**.
                     //
@@ -2880,85 +2793,68 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             Task::none()
         }
 
-        UiEvent::TaskStarted { task, instruction } => {
-            // §6: the Do surface gets a real window that outlives the panel.
+        UiEvent::TaskStarted {
+            task,
+            session,
+            instruction,
+        } => {
             state.panel.handed_off_to_task = true;
             // A `/agent` submission looked like chat until this moment; take
-            // back the spinner turn the task window now narrates.
+            // back the spinner turn the activity card now narrates.
             state.panel.retract_handed_off_turn();
-            let task_state = match state
-                .pending_tasks
-                .iter()
-                .position(|pending| pending.id == task)
-            {
-                Some(index) => {
-                    let mut pending = state.pending_tasks.remove(index);
-                    pending.instruction = instruction;
-                    pending
-                }
-                None => TaskState::new(task, instruction),
-            };
-            let (window_id, opened) = window::open(task_window_settings());
-            state.tasks.push((window_id, task_state));
+            match state.panel.tasks.iter_mut().find(|t| t.id == task) {
+                Some(existing) => existing.instruction = instruction,
+                None => state
+                    .panel
+                    .tasks
+                    .push(TaskState::new(task, session, instruction)),
+            }
             state.refresh_tray();
-            opened.map(Message::WindowOpened)
+            // The card enters this session's transcript; the window makes room.
+            resize_panel_if_visible(state)
         }
 
         UiEvent::TaskStep { task, step } => {
-            let mut became_blocked = false;
-            if let Some((_, existing)) = state.tasks.iter_mut().find(|(_, t)| t.id == task) {
-                let was_blocked = existing.is_blocked();
-                existing.push(*step);
-                // §11: nothing is executed until the user answers. A run that
-                // has just become blocked is not allowed to wait behind another
-                // window — it brings its own forward, once, on the transition.
-                let now_blocked = existing.is_blocked();
-                if now_blocked && !was_blocked {
-                    became_blocked = true;
+            let became_blocked;
+            match state.panel.tasks.iter_mut().find(|t| t.id == task) {
+                Some(existing) => {
+                    let was_blocked = existing.is_blocked();
+                    existing.push(*step);
+                    became_blocked = existing.is_blocked() && !was_blocked;
                 }
-            } else {
-                // A step for a run whose window is closed or has not opened yet:
-                // keep it so scrollback and approvals survive.
-                match state.pending_tasks.iter_mut().find(|t| t.id == task) {
-                    Some(pending) => {
-                        let was_blocked = pending.is_blocked();
-                        pending.push(*step);
-                        became_blocked = pending.is_blocked() && !was_blocked;
-                    }
-                    None => {
-                        let mut pending = TaskState::new(task, String::new());
-                        pending.push(*step);
-                        became_blocked = pending.is_blocked();
-                        state.pending_tasks.push(pending);
-                    }
+                None => {
+                    // A step for a run that raced its Started event: keep it
+                    // so scrollback and approvals survive.
+                    let mut orphan = TaskState::new(task, state.panel.session, String::new());
+                    orphan.push(*step);
+                    became_blocked = orphan.is_blocked();
+                    state.panel.tasks.push(orphan);
                 }
             }
             state.refresh_tray();
             if became_blocked {
+                // §11: nothing runs until the user answers. No window is
+                // popped (owner redesign) — the chip and tray turn amber, and
+                // the announcement tells a screen-reader user why.
                 aibo_platform::announce_accessibility(i18n::t(
                     crate::i18n::Key::TaskAwaitingApproval,
                 ));
-                let needs_confirmation = state
-                    .tasks
-                    .iter()
-                    .find(|(_, current)| current.id == task)
-                    .and_then(|(_, current)| current.pending_approval.as_ref())
-                    .or_else(|| {
-                        state
-                            .pending_tasks
-                            .iter()
-                            .find(|current| current.id == task)
-                            .and_then(|current| current.pending_approval.as_ref())
-                    })
-                    .is_some_and(|approval| approval.requires_typed_confirmation);
-                let focus = focus_task(state, task);
-                if needs_confirmation {
-                    focus.chain(operation::focus(task_window::CONFIRMATION_ID))
-                } else {
-                    focus
-                }
+            }
+            // A finished run settles its card and appends the final message —
+            // and gives the caret back, exactly like a finished chat answer:
+            // "after I get the result I cannot keep on typing" (owner,
+            // 2026-08-02). Once, on completion, current session only.
+            let finished_here = state
+                .panel
+                .tasks
+                .iter()
+                .find(|t| t.id == task)
+                .is_some_and(|t| !t.is_running() && t.session == state.panel.session);
+            let resize = resize_panel_if_visible(state);
+            if finished_here && state.panel_visible {
+                resize.chain(operation::focus(panel::INPUT_ID))
             } else {
-                Task::none()
+                resize
             }
         }
 
@@ -3437,12 +3333,6 @@ fn view(state: &Aibo, window: window::Id) -> Element<'_, Message> {
             panel::view(&state.panel, state.config.appearance).map(Message::Panel)
         }
         Some(Role::Settings) => settings::view(&state.settings).map(Message::Settings),
-        Some(Role::Task(id)) => match state.tasks.iter().find(|(_, task)| task.id == id) {
-            Some((_, task)) => {
-                task_window::view(task).map(move |message| Message::Task(id, message))
-            }
-            None => panel::view(&state.panel, state.config.appearance).map(Message::Panel),
-        },
     }
 }
 
@@ -3450,7 +3340,6 @@ fn title(state: &Aibo, window: window::Id) -> String {
     use crate::i18n::Key;
     match state.role_of(window) {
         Some(Role::Settings) => i18n::t(Key::SettingsTitle).to_owned(),
-        Some(Role::Task(_)) => i18n::t(Key::TaskWindowTitle).to_owned(),
         _ => i18n::t(Key::AppName).to_owned(),
     }
 }
@@ -3853,10 +3742,12 @@ mod tests {
         let _ = panel_update(&mut state, panel::Message::Submit);
         assert!(matches!(state.panel.phase, Phase::Loading));
         // ...and TaskStarted takes it back.
+        let session = state.panel.session;
         let _ = backend_update(
             &mut state,
             UiEvent::TaskStarted {
                 task: uuid::Uuid::now_v7(),
+                session,
                 instruction: "do something".to_owned(),
             },
         );
@@ -4267,69 +4158,64 @@ mod tests {
         );
     }
 
+    /// §6's guarantees, restated for the inline model (owner redesign,
+    /// 2026-08-02): a run outlives its panel session, ⌘N does not lose it,
+    /// and the ⌘T overlay is the thread back to it.
     #[test]
-    fn a_task_window_survives_the_panel_being_dismissed() {
+    fn a_run_survives_dismissal_and_new_chats_and_the_overlay_finds_it() {
         let mut state = app();
         let task = Uuid::now_v7();
+        let session = state.panel.session;
         let _ = backend_update(
             &mut state,
             UiEvent::TaskStarted {
                 task,
+                session,
                 instruction: "rename the flag".to_owned(),
             },
         );
-        assert_eq!(state.tasks.len(), 1);
+        assert_eq!(state.panel.tasks.len(), 1);
+        assert_eq!(state.panel.session_tasks().count(), 1, "inline card");
+
         let _ = panel_update(&mut state, panel::Message::Dismiss);
         assert!(!state.panel_visible);
         assert_eq!(
-            state.tasks.len(),
+            state.panel.tasks.len(),
             1,
             "§6: dismissing the panel never cancels a run"
         );
-    }
 
-    #[test]
-    fn closing_a_running_task_retains_it_and_show_task_reopens_it() {
-        let mut state = app();
-        let task = Uuid::now_v7();
-        let _ = backend_update(
-            &mut state,
-            UiEvent::TaskStarted {
-                task,
-                instruction: "rename the flag".to_owned(),
-            },
+        state.panel.reset(SessionId::from_u128(99));
+        assert_eq!(state.panel.tasks.len(), 1, "runs are not session state");
+        assert_eq!(
+            state.panel.session_tasks().count(),
+            0,
+            "but the card belongs to its own session"
         );
-        let window = state.tasks[0].0;
 
-        let _ = update(&mut state, Message::WindowClosed(window));
-        assert!(state.tasks.is_empty());
-        assert_eq!(state.pending_tasks.len(), 1);
-        assert_eq!(state.pending_tasks[0].id, task);
-
-        let reopen = focus_first_task(&mut state);
-        assert!(reopen.units() > 0);
-        assert_eq!(state.tasks.len(), 1);
-        assert!(state.pending_tasks.is_empty());
-        assert_eq!(state.tasks[0].1.id, task);
+        let _ = focus_first_task(&mut state);
+        assert!(state.panel.tasks_open, "the overlay is the thread back");
+        assert_eq!(state.panel.selected_task, Some(task));
     }
 
+    /// An approval arriving for any run turns the chip and tray amber; no
+    /// window is popped (owner redesign: nothing steals the screen).
     #[test]
-    fn a_closed_task_reopens_when_a_new_approval_arrives() {
+    fn a_new_approval_marks_the_run_blocked_without_stealing_focus() {
         use aibo_core::types::{ApprovalKind, ApprovalRequest};
 
         let mut state = app();
         let task = Uuid::now_v7();
+        let session = state.panel.session;
         let _ = backend_update(
             &mut state,
             UiEvent::TaskStarted {
                 task,
+                session,
                 instruction: "clean the build".to_owned(),
             },
         );
-        let window = state.tasks[0].0;
-        let _ = update(&mut state, Message::WindowClosed(window));
-
-        let focus = backend_update(
+        let _ = backend_update(
             &mut state,
             UiEvent::TaskStep {
                 task,
@@ -4346,11 +4232,9 @@ mod tests {
                 )),
             },
         );
-
-        assert!(focus.units() > 0);
-        assert_eq!(state.tasks.len(), 1);
-        assert!(state.tasks[0].1.is_blocked());
-        assert!(state.pending_tasks.is_empty());
+        assert!(state.panel.tasks[0].is_blocked());
+        assert!(state.panel.any_task_blocked(), "the chip turns amber");
+        assert!(!state.panel.tasks_open, "no surface is popped uninvited");
     }
 
     #[test]
@@ -4360,32 +4244,31 @@ mod tests {
         let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
         let (mut state, _boot) = boot(UiConfig::default(), requests);
         let task = Uuid::now_v7();
+        let session = state.panel.session;
         let _ = backend_update(
             &mut state,
             UiEvent::TaskStarted {
                 task,
+                session,
                 instruction: "clean the build".to_owned(),
             },
         );
-        state.tasks[0]
-            .1
-            .push(aibo_core::types::AgentStep::AwaitingApproval(
-                ApprovalRequest {
-                    id: "approval-1".to_owned(),
-                    kind: ApprovalKind::Command,
-                    summary: "remove generated files".to_owned(),
-                    command: Some("rm -rf ./build".to_owned()),
-                    paths: Vec::new(),
-                    originating_instruction: "clean the build".to_owned(),
-                    requires_typed_confirmation: true,
-                },
-            ));
-        state.tasks[0].1.typed_confirmation = "rm -rf ./build".to_owned();
+        state.panel.tasks[0].push(aibo_core::types::AgentStep::AwaitingApproval(
+            ApprovalRequest {
+                id: "approval-1".to_owned(),
+                kind: ApprovalKind::Command,
+                summary: "remove generated files".to_owned(),
+                command: Some("rm -rf ./build".to_owned()),
+                paths: Vec::new(),
+                originating_instruction: "clean the build".to_owned(),
+                requires_typed_confirmation: true,
+            },
+        ));
+        state.panel.tasks[0].typed_confirmation = "rm -rf ./build".to_owned();
 
-        let _ = task_update(
+        let _ = panel_update(
             &mut state,
-            task,
-            task_window::Message::Decide(ApprovalDecision::Approve),
+            panel::Message::TaskDecide(task, ApprovalDecision::Approve),
         );
         assert!(matches!(
             events.try_recv(),

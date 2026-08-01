@@ -476,6 +476,8 @@ pub enum Key {
     ActionAgentModeOn,
     /// Composer placeholder while agent mode is on.
     PanelAgentPlaceholder,
+    /// Heading of the ⌘T tasks overlay.
+    PanelTasksTitle,
     /// Section: roles.
     SettingsRoles,
     /// Section: budgets.
@@ -809,6 +811,7 @@ fn en(key: Key) -> &'static str {
         K::ActionAgentMode => "Agent",
         K::ActionAgentModeOn => "✓ Agent",
         K::PanelAgentPlaceholder => "describe a task — the agent asks before it acts",
+        K::PanelTasksTitle => "Agent runs",
         K::SettingsRoles => "Roles",
         K::SettingsBudgets => "Budgets",
         K::SettingsPermissions => "Permissions",
@@ -1058,6 +1061,7 @@ fn ja(key: Key) -> &'static str {
         K::ActionAgentMode => "エージェント",
         K::ActionAgentModeOn => "✓ エージェント",
         K::PanelAgentPlaceholder => "タスクを入力 — エージェントは実行前に確認します",
+        K::PanelTasksTitle => "エージェントの実行",
         K::SettingsRoles => "ロール",
         K::SettingsBudgets => "予算",
         K::SettingsPermissions => "権限",
@@ -1199,6 +1203,7 @@ mod tests {
             Key::ActionAgentMode,
             Key::ActionAgentModeOn,
             Key::PanelAgentPlaceholder,
+            Key::PanelTasksTitle,
         ];
         for key in ADDED {
             for lang in Lang::ALL {

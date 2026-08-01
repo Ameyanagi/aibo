@@ -15,6 +15,10 @@ global-hotkey = { workspace = true }
 iced = { workspace = true }
 muda = { workspace = true }
 nucleo-matcher = { workspace = true }
+ratex-layout = { workspace = true }
+ratex-parser = { workspace = true }
+ratex-svg = { workspace = true }
+ratex-types = { workspace = true }
 yuru-core = { workspace = true }
 yuru-ja = { workspace = true }
 secrecy = { workspace = true }

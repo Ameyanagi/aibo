@@ -9,16 +9,14 @@ use accesskit::{
     Action, ActionData, ActionRequest, Affine, Live, Node, NodeId, Rect, Role, Tree, TreeId,
     TreeUpdate,
 };
-use aibo_core::types::{ApprovalDecision, Health, Permission, PermissionStatus, ProviderId};
+use aibo_core::types::{Health, Permission, PermissionStatus, ProviderId};
 
 use crate::i18n::{self, Key, Lang};
 use crate::panel::{self, PanelState, Phase};
 use crate::settings::{self, CodexPhase, Section, SettingsState};
-use crate::task_window::{self, TaskState};
 
 pub const SETTINGS_ROOT: NodeId = NodeId(1);
 pub const PANEL_ROOT: NodeId = NodeId(1_000);
-pub const TASK_ROOT: NodeId = NodeId(2_000);
 
 const SETTINGS_NAVIGATION: NodeId = NodeId(2);
 const SETTINGS_CONTENT: NodeId = NodeId(3);
@@ -47,15 +45,6 @@ const PANEL_ACCEPT: NodeId = NodeId(1_010);
 const PANEL_COPY: NodeId = NodeId(1_011);
 const PANEL_DISMISS: NodeId = NodeId(1_012);
 const PANEL_SHOW_TASK: NodeId = NodeId(1_013);
-
-const TASK_TRANSCRIPT: NodeId = NodeId(2_001);
-const TASK_CONFIRMATION: NodeId = NodeId(2_002);
-const TASK_APPROVE: NodeId = NodeId(2_010);
-const TASK_APPROVE_SESSION: NodeId = NodeId(2_011);
-const TASK_DENY: NodeId = NodeId(2_012);
-const TASK_CANCEL: NodeId = NodeId(2_013);
-const TASK_CLOSE: NodeId = NodeId(2_014);
-const TASK_COPY: NodeId = NodeId(2_015);
 
 /// Build the current Settings semantic tree.
 pub fn settings_tree(
@@ -574,131 +563,6 @@ pub fn panel_tree(state: &PanelState, size: (f32, f32), scale: f32, focus: NodeI
     full_tree(nodes, PANEL_ROOT, focus)
 }
 
-/// Build one agent task window's semantic tree.
-pub fn task_tree(state: &TaskState, size: (f32, f32), scale: f32, focus: NodeId) -> TreeUpdate {
-    let width = size.0.max(480.0);
-    let height = size.1.max(360.0);
-    let mut nodes = Vec::new();
-    let mut children = vec![TASK_TRANSCRIPT];
-    let mut root = semantic_node(
-        Role::Window,
-        i18n::t(Key::TaskWindowTitle),
-        logical_rect(0.0, 0.0, width, height),
-    );
-    root.set_transform(Affine::scale(f64::from(scale.max(0.5))));
-
-    let mut transcript = semantic_node(
-        Role::Document,
-        i18n::t(Key::TaskWindowTitle),
-        logical_rect(
-            20.0,
-            20.0,
-            f64::from(width) - 40.0,
-            f64::from(height) - 112.0,
-        ),
-    );
-    transcript.set_value(state.transcript());
-    if state.is_running() {
-        transcript.set_live(Live::Polite);
-    }
-    nodes.push((TASK_TRANSCRIPT, transcript));
-
-    if let Some(approval) = &state.pending_approval {
-        if approval.requires_typed_confirmation {
-            let mut confirmation = semantic_node(
-                Role::TextInput,
-                i18n::t(Key::TaskApprovalProvenance),
-                logical_rect(
-                    20.0,
-                    f64::from(height) - 140.0,
-                    f64::from(width) - 40.0,
-                    44.0,
-                ),
-            );
-            confirmation.set_value(state.typed_confirmation.as_str());
-            confirmation.add_action(Action::Focus);
-            confirmation.add_action(Action::SetValue);
-            nodes.push((TASK_CONFIRMATION, confirmation));
-            children.push(TASK_CONFIRMATION);
-        }
-
-        let mut approve = interactive_node(
-            Role::DefaultButton,
-            i18n::t(Key::ActionApprove),
-            logical_rect(20.0, f64::from(height) - 76.0, 130.0, 44.0),
-        );
-        if !state.decision_is_ready(ApprovalDecision::Approve) {
-            approve.set_disabled();
-        }
-        nodes.push((TASK_APPROVE, approve));
-        children.push(TASK_APPROVE);
-
-        if !approval.requires_typed_confirmation {
-            let mut approve_session = interactive_node(
-                Role::Button,
-                i18n::t(Key::ActionApproveSession),
-                logical_rect(158.0, f64::from(height) - 76.0, 170.0, 44.0),
-            );
-            if !state.decision_is_ready(ApprovalDecision::ApproveForSession) {
-                approve_session.set_disabled();
-            }
-            nodes.push((TASK_APPROVE_SESSION, approve_session));
-            children.push(TASK_APPROVE_SESSION);
-        }
-        nodes.push((
-            TASK_DENY,
-            interactive_node(
-                Role::Button,
-                i18n::t(Key::ActionDeny),
-                logical_rect(
-                    f64::from(width) - 126.0,
-                    f64::from(height) - 76.0,
-                    106.0,
-                    44.0,
-                ),
-            ),
-        ));
-        children.push(TASK_DENY);
-    } else if state.is_running() {
-        nodes.push((
-            TASK_CANCEL,
-            interactive_node(
-                Role::Button,
-                i18n::t(Key::ActionCancel),
-                logical_rect(20.0, f64::from(height) - 76.0, 120.0, 44.0),
-            ),
-        ));
-        children.push(TASK_CANCEL);
-    } else {
-        nodes.push((
-            TASK_COPY,
-            interactive_node(
-                Role::Button,
-                i18n::t(Key::ActionCopy),
-                logical_rect(20.0, f64::from(height) - 76.0, 120.0, 44.0),
-            ),
-        ));
-        nodes.push((
-            TASK_CLOSE,
-            interactive_node(
-                Role::Button,
-                i18n::t(Key::ActionDismiss),
-                logical_rect(
-                    f64::from(width) - 126.0,
-                    f64::from(height) - 76.0,
-                    106.0,
-                    44.0,
-                ),
-            ),
-        ));
-        children.extend([TASK_COPY, TASK_CLOSE]);
-    }
-
-    root.set_children(children);
-    nodes.push((TASK_ROOT, root));
-    full_tree(nodes, TASK_ROOT, focus)
-}
-
 /// Translate a native Settings action to the ordinary Settings message path.
 pub fn settings_message(
     state: &SettingsState,
@@ -756,26 +620,6 @@ pub fn panel_message(state: &PanelState, request: &ActionRequest) -> Option<pane
         (PANEL_COPY, Action::Click) => Some(panel::Message::Copy),
         (PANEL_DISMISS, Action::Click) => Some(panel::Message::Dismiss),
         (PANEL_SHOW_TASK, Action::Click) => Some(panel::Message::ShowTask),
-        _ => None,
-    }
-}
-
-/// Translate a native task action to the ordinary task-window message path.
-pub fn task_message(request: &ActionRequest) -> Option<task_window::Message> {
-    match (request.target_node, request.action) {
-        (TASK_CONFIRMATION, Action::SetValue) => {
-            action_value(request).map(task_window::Message::ConfirmationChanged)
-        }
-        (TASK_APPROVE, Action::Click) => {
-            Some(task_window::Message::Decide(ApprovalDecision::Approve))
-        }
-        (TASK_APPROVE_SESSION, Action::Click) => Some(task_window::Message::Decide(
-            ApprovalDecision::ApproveForSession,
-        )),
-        (TASK_DENY, Action::Click) => Some(task_window::Message::Decide(ApprovalDecision::Deny)),
-        (TASK_CANCEL, Action::Click) => Some(task_window::Message::Cancel),
-        (TASK_CLOSE, Action::Click) => Some(task_window::Message::Close),
-        (TASK_COPY, Action::Click) => Some(task_window::Message::CopyTranscript),
         _ => None,
     }
 }

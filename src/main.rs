@@ -2847,7 +2847,7 @@ mod runtime {
     /// than paraphrased — the owner asked for the same harness — with one
     /// §11 divergence: a guideline explaining approvals, which pi does not
     /// have.
-    fn agent_system_prompt(workspace: Option<&std::path::Path>) -> String {
+    fn agent_system_prompt(roots: &[std::path::PathBuf]) -> String {
         let mut prompt = String::from(
             "You are an expert coding assistant operating inside aibo, a coding agent \
              harness. You help users by reading files, executing commands, editing code, \
@@ -2867,9 +2867,11 @@ mod runtime {
              - Commands run non-interactively; prefer flags like --yes, or pass a \
              prompt's answer via bash's stdin parameter\n\
              - If the message is conversation or a question that needs no files or \
-             commands, just answer it; do not invent a task",
+             commands, just answer it; do not invent a task\n\
+             - Mathematics: LaTeX is welcome; $$...$$ display equations are \
+             typeset, inline math shows as written",
         );
-        if let Some(workspace) = workspace {
+        if let Some(workspace) = roots.first() {
             // pi's <project_context>: the workspace's own instructions, when
             // it keeps any. Bounded read — a giant AGENTS.md is a context
             // bomb, not a briefing.
@@ -2893,6 +2895,19 @@ mod runtime {
                 &mut prompt,
                 format_args!("\nCurrent working directory: {}", workspace.display()),
             );
+            // pi states only the cwd because pi has only a cwd. This
+            // workspace is multi-root, and an agent that does not know
+            // Downloads exists searches Documents and reports "not found"
+            // for a file that is right there (owner report, 2026-08-02).
+            if roots.len() > 1 {
+                prompt.push_str("\nOther accessible folders:");
+                for root in &roots[1..] {
+                    let _ = std::fmt::Write::write_fmt(
+                        &mut prompt,
+                        format_args!("\n- {}", root.display()),
+                    );
+                }
+            }
         }
         prompt
     }
@@ -3343,6 +3358,11 @@ mod runtime {
         /// The `@` finder's roots as currently configured — the live copy
         /// settings edits, so a change applies to the very next walk.
         file_roots: Option<Vec<String>>,
+        /// Steering queues for running agent tasks: the composer's mid-run
+        /// text is delivered at the loop's next turn boundary.
+        steering: std::sync::Arc<
+            std::sync::Mutex<HashMap<uuid::Uuid, tokio::sync::mpsc::Sender<String>>>,
+        >,
         /// Approval prompts parked mid-agent-run, keyed by `(task, call id)`.
         ///
         /// [`TaskApprovalBroker::request`] parks here and the task window's
@@ -3463,6 +3483,7 @@ mod runtime {
                 catalogue: aibo_provider::ModelCatalogue::shipped(),
                 dictation: None,
                 file_roots: config.files.roots.clone(),
+                steering: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
                 pending_approvals: Arc::new(std::sync::Mutex::new(HashMap::new())),
             }
         }
@@ -3823,6 +3844,33 @@ mod runtime {
                         }
                         None => {
                             tracing::warn!(%task, "approval arrived for no pending request");
+                        }
+                    }
+                }
+
+                UiRequest::SteerTask { task, text } => {
+                    let sender = self
+                        .steering
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .get(&task)
+                        .cloned();
+                    match sender {
+                        Some(sender) if sender.try_send(text.clone()).is_ok() => {
+                            // Echo immediately: the loop consumes the queue
+                            // silently at its next turn boundary, and the
+                            // card should show the steering the moment it
+                            // was given, not when it lands.
+                            let _ = self
+                                .events
+                                .send(UiEvent::TaskStep {
+                                    task,
+                                    step: Box::new(AgentStep::Steered(text)),
+                                })
+                                .await;
+                        }
+                        _ => {
+                            tracing::warn!(%task, "steering arrived for no running task");
                         }
                     }
                 }
@@ -4551,8 +4599,41 @@ mod runtime {
             };
 
             if surface == Surface::Do {
-                let context = captured_agent_context(state);
-                self.submit_agent(instruction, role_override, context).await;
+                let mut context = captured_agent_context(state);
+                // The conversation so far, fenced (§5): an agent follow-up —
+                // "no, a *file* called テスト" — is meaningless without the
+                // turns it corrects. Untrusted like every non-instruction
+                // block; under YOLO its only power is persuasion.
+                if !history.is_empty() {
+                    let mut convo = String::new();
+                    for turn in &history {
+                        for message in &turn.messages {
+                            let speaker = match message.role {
+                                aibo_core::types::MessageRole::User => "User",
+                                aibo_core::types::MessageRole::Assistant => "Assistant",
+                                _ => continue,
+                            };
+                            let text: String = message
+                                .parts
+                                .iter()
+                                .filter_map(|part| match part {
+                                    aibo_core::types::ContentPart::Text(t) => Some(t.as_str()),
+                                    _ => None,
+                                })
+                                .collect();
+                            use std::fmt::Write as _;
+                            let _ = writeln!(convo, "{speaker}: {text}");
+                        }
+                    }
+                    context.push(aibo_core::types::UntrustedBlock {
+                        origin: aibo_core::types::ContentOrigin::ToolResult,
+                        label: "conversation so far".to_owned(),
+                        content: convo,
+                        truncated: false,
+                    });
+                }
+                self.submit_agent(session, instruction, role_override, context)
+                    .await;
                 return;
             }
 
@@ -4645,6 +4726,7 @@ mod runtime {
         /// until their canonical-path executors and approval broker are wired.
         async fn submit_agent(
             &self,
+            session: SessionId,
             instruction: String,
             role_override: Option<Role>,
             context: Vec<UntrustedBlock>,
@@ -4657,6 +4739,7 @@ mod runtime {
                 let _ = events
                     .send(UiEvent::TaskStarted {
                         task: task_id,
+                        session,
                         instruction,
                     })
                     .await;
@@ -4674,6 +4757,7 @@ mod runtime {
                 let _ = events
                     .send(UiEvent::TaskStarted {
                         task: task_id,
+                        session,
                         instruction,
                     })
                     .await;
@@ -4699,6 +4783,7 @@ mod runtime {
                     let _ = events
                         .send(UiEvent::TaskStarted {
                             task: task_id,
+                            session,
                             instruction,
                         })
                         .await;
@@ -4721,7 +4806,13 @@ mod runtime {
                 pending: Arc::clone(&self.pending_approvals),
             });
             let gate = Arc::new(aibo_agent::PermissionGate::new(approval_ui, roots.clone()));
+            let (steer_tx, steer_rx) = tokio::sync::mpsc::channel(8);
+            self.steering
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(task_id, steer_tx);
             let mut native_config = aibo_agent::NativeLoopConfig::new(binding.clone());
+            native_config.steer = Some(Arc::new(tokio::sync::Mutex::new(steer_rx)));
             native_config.budget.deadline = self.engine.config().request_deadline;
             // pi-sized system prompt: the tools speak for themselves through
             // their schemas; the prompt only sets the frame.
@@ -4730,9 +4821,7 @@ mod runtime {
             // project context from AGENTS.md/CLAUDE.md, and — the line whose
             // absence wrote `Documents/Documents` — the working directory.
             // The approval guideline is aibo's one §11 divergence from pi.
-            native_config.system_prompt = Some(agent_system_prompt(
-                roots.first().map(std::path::PathBuf::as_path),
-            ));
+            native_config.system_prompt = Some(agent_system_prompt(&roots));
             let backend: Arc<dyn aibo_core::traits::AgentBackend> = Arc::new(
                 aibo_agent::NativeLoop::new(provider, tools, gate, native_config),
             );
@@ -4746,6 +4835,7 @@ mod runtime {
             };
             let engine = Arc::clone(&self.engine);
             let pending = Arc::clone(&self.pending_approvals);
+            let steering = Arc::clone(&self.steering);
             let (sink, mut agent_events) = AgentSink::channel();
             tokio::spawn(crate::diagnostics::supervise("native-agent", async move {
                 let pump_events = events.clone();
@@ -4753,9 +4843,11 @@ mod runtime {
                     let mut terminal_step_seen = false;
                     while let Some(event) = agent_events.recv().await {
                         let ui = match event {
-                            AgentEvent::Started { task, instruction } => {
-                                UiEvent::TaskStarted { task, instruction }
-                            }
+                            AgentEvent::Started { task, instruction } => UiEvent::TaskStarted {
+                                task,
+                                session,
+                                instruction,
+                            },
                             AgentEvent::Step(step) => {
                                 terminal_step_seen |= matches!(*step, AgentStep::Done(_));
                                 UiEvent::TaskStep {
@@ -4816,6 +4908,10 @@ mod runtime {
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .retain(|(task, _), _| *task != task_id);
+                steering
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .remove(&task_id);
                 drop(sink);
                 let _ = pump.await;
             }));

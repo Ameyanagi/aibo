@@ -661,8 +661,9 @@ pub struct ConversationTurn {
     pub user: String,
     /// The assistant response.
     pub assistant: String,
-    /// Parsed assistant Markdown retained for zero-copy rendering.
-    assistant_markdown: Vec<markdown::Item>,
+    /// The response, pre-split into markdown and rendered display math
+    /// (`crate::math`), retained for zero-copy rendering.
+    assistant_segments: Vec<crate::math::Segment>,
 }
 
 /// Everything the panel renders from.
@@ -759,11 +760,22 @@ pub struct PanelState {
     input_editor: text_editor::Content,
     /// The microphone is live and deltas are streaming into the input (§P9+).
     pub dictating: bool,
-    /// Agent mode (§1 Do): submissions run the coding agent in a task window
-    /// instead of chat. Session-scoped on purpose — `reset` clears it, so a
-    /// forgotten toggle cannot silently make tomorrow's first question
-    /// agentic. `/agent` remains the one-shot spelling.
+    /// Agent mode (§1 Do): submissions run the coding agent inline.
+    /// Session-scoped on purpose — `reset` clears it, so a forgotten toggle
+    /// cannot silently make tomorrow's first question agentic. `/agent`
+    /// remains the one-shot spelling.
     pub agent_mode: bool,
+    /// Every agent run, whatever its session (owner redesign, 2026-08-02:
+    /// no separate task window). Runs whose session matches render inline as
+    /// activity cards; all are reachable through the ⌘T overlay.
+    pub tasks: Vec<crate::tasks::TaskState>,
+    /// Whether the ⌘T tasks overlay is up.
+    pub tasks_open: bool,
+    /// The task whose detail the overlay shows; `None` lists all.
+    pub selected_task: Option<Uuid>,
+    /// The finished active response, split into markdown and typeset math.
+    /// Built once at `Done`; `None` while streaming.
+    pub active_segments: Option<Vec<crate::math::Segment>>,
     /// Insert one space before the first dictation delta, because the input
     /// already ends mid-word. Set on `DictationStarted`, spent on the first
     /// delta.
@@ -817,6 +829,10 @@ impl PanelState {
             input_editor: text_editor::Content::new(),
             dictating: false,
             agent_mode: false,
+            tasks: Vec::new(),
+            tasks_open: false,
+            selected_task: None,
+            active_segments: None,
             dictation_pad: false,
             recent_models: Vec::new(),
             // Constructed once at boot, not per session, so recall survives
@@ -851,7 +867,11 @@ impl PanelState {
         // The finder's candidate index describes the disk, not the session;
         // rebuilding it on every ⌘N would make the next `@` needlessly slow.
         let file_finder = std::mem::take(&mut self.file_finder);
+        // Agent runs are not session state: a run started in a previous chat
+        // keeps going and stays reachable through the overlay (§6).
+        let tasks = std::mem::take(&mut self.tasks);
         *self = Self::new(session);
+        self.tasks = tasks;
         self.favourite_models = favourite_models;
         self.pins_customised = pins_customised;
         self.recent_models = recent_models;
@@ -893,6 +913,15 @@ impl PanelState {
         self.response.clear();
         self.response_editor = text_editor::Content::new();
         self.response_markdown = markdown::Content::new();
+        self.active_segments = None;
+    }
+
+    /// Split the finished response into markdown and typeset display math.
+    /// Called once, at `Done` — never per view, never mid-stream.
+    pub fn segment_finished_response(&mut self) {
+        if !self.response.is_empty() {
+            self.active_segments = Some(crate::math::segments(&self.response));
+        }
     }
 
     /// Completed turns to include before the next user message.
@@ -902,6 +931,14 @@ impl PanelState {
             .iter()
             .map(|turn| Turn::pair(turn.user.clone(), turn.assistant.clone()))
             .collect();
+        // Finished agent runs are turns of this conversation too: without
+        // them, "no, a *file* called テスト" arrives with no memory of the
+        // folder question it corrects (owner report, 2026-08-02).
+        for task in self.session_tasks() {
+            if let Some(message) = task.final_message() {
+                history.push(Turn::pair(task.instruction.clone(), message.to_owned()));
+            }
+        }
         if matches!(
             self.phase,
             Phase::Finished {
@@ -928,7 +965,7 @@ impl PanelState {
             self.turns.push(ConversationTurn {
                 user: previous_user,
                 assistant: self.response.clone(),
-                assistant_markdown: self.response_markdown.items().to_vec(),
+                assistant_segments: crate::math::segments(&self.response),
             });
         }
         self.active_user = Some(user);
@@ -988,7 +1025,28 @@ impl PanelState {
 
     /// Whether the compact composer has expanded into a chat transcript.
     pub fn has_conversation(&self) -> bool {
-        self.active_user.is_some() || !self.turns.is_empty()
+        self.active_user.is_some() || !self.turns.is_empty() || !self.session_tasks_empty()
+    }
+
+    /// Agent runs belonging to the current session, in start order.
+    pub fn session_tasks(&self) -> impl Iterator<Item = &crate::tasks::TaskState> {
+        self.tasks
+            .iter()
+            .filter(|task| task.session == self.session)
+    }
+
+    fn session_tasks_empty(&self) -> bool {
+        self.session_tasks().next().is_none()
+    }
+
+    /// Whether any run, in any session, still wants the user's attention.
+    pub fn any_task_blocked(&self) -> bool {
+        self.tasks.iter().any(crate::tasks::TaskState::is_blocked)
+    }
+
+    /// Runs still going, across sessions — the chip's number.
+    pub fn running_task_count(&self) -> usize {
+        self.tasks.iter().filter(|task| task.is_running()).count()
     }
 
     /// Remove the selected text from the visible card and future requests.
@@ -1224,7 +1282,8 @@ impl PanelState {
     /// wraps them; the window has to grow with it or the wrapped lines paint
     /// over the panel's bottom edge.
     pub(crate) fn input_extra_height(&self) -> f32 {
-        (estimated_text_height(&self.input, CHAT_USER_CHARS_PER_LINE) - 24.0).max(0.0)
+        (estimated_text_height(&self.input, CHAT_USER_CHARS_PER_LINE) - 24.0)
+            .clamp(0.0, INPUT_EXTRA_MAX_HEIGHT)
     }
 
     /// Put a picked file's content into the fenced selection slot.
@@ -1330,7 +1389,7 @@ impl PanelState {
     /// The height the panel wants, for [`crate::placement::PlacementRequest`].
     pub fn desired_height(&self) -> f32 {
         let base = self.height_without_overlay();
-        if self.picker.open || self.file_finder.open {
+        if self.picker.open || self.file_finder.open || self.tasks_open {
             // The quick-pick floats over the panel. The window grows only when
             // the panel is too short to contain the menu, and never shrinks
             // for it — mid-conversation, opening the picker moves nothing.
@@ -1464,6 +1523,22 @@ pub enum Message {
     ToggleDictation,
     /// `⌘J`, or the composer action: flip agent mode for this session.
     ToggleAgentMode,
+    /// `⌘T`: toggle the tasks overlay.
+    TasksToggle,
+    /// Close the tasks overlay.
+    TasksClose,
+    /// Show one task's detail in the overlay, or back out to the list.
+    TasksSelect(Option<Uuid>),
+    /// Expand or collapse one entry of a task's timeline.
+    TaskToggleEntry(Uuid, usize),
+    /// The typed-confirmation field of a pending approval changed.
+    TaskConfirmation(Uuid, String),
+    /// Answer a task's pending approval.
+    TaskDecide(Uuid, aibo_core::types::ApprovalDecision),
+    /// Cancel a running task.
+    TaskCancel(Uuid),
+    /// Copy a task's transcript.
+    TaskCopy(Uuid),
     /// Open the model quick-pick.
     OpenPicker,
     /// Close it without choosing.
@@ -1541,10 +1616,19 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
     }
 
     if shows_content {
-        body = body.push(widgets::railed(
-            content_rail_state(state),
-            content(state, appearance),
-        ));
+        let row = widgets::railed(content_rail_state(state), content(state, appearance));
+        if state.has_conversation() {
+            // The structural guarantee behind "the input box disappears"
+            // (owner screenshots, 2026-08-02, twice): the transcript region
+            // is the ONE flexible row, so the hairline, footer and composer
+            // — all content-sized — claim their height first and the
+            // transcript gets exactly what remains. Estimate drift can now
+            // only make the window roomy or the transcript tight; it can
+            // never evict the composer, whatever the arithmetic says.
+            body = body.push(container(row).height(Length::Fill));
+        } else {
+            body = body.push(row);
+        }
     }
     if has_result {
         // The one hairline `design.md` §9 leaves standing, and it sits in the
@@ -1585,6 +1669,8 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
         Some((picker_overlay(state), Message::ClosePicker))
     } else if state.file_finder.open {
         Some((finder_overlay(state), Message::FinderClose))
+    } else if state.tasks_open {
+        Some((tasks_overlay(state), Message::TasksClose))
     } else {
         None
     };
@@ -1639,6 +1725,360 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
 
 /// The `@` file finder's contents (§P9+): yuru-matched files, name first and
 /// home-relative path beneath, in the same menu chrome as the quick-pick.
+/// One agent run as an inline activity card.
+///
+/// Running: fixed height, the newest steps visible, the interior scrolling —
+/// a streaming run must never resize the window (§16). Settled: a one-line
+/// summary; the run's final message renders as an ordinary assistant bubble
+/// below, and the full timeline lives in the ⌘T overlay.
+fn task_card(task: &crate::tasks::TaskState) -> Element<'_, Message> {
+    use aibo_core::types::AgentStatus;
+
+    let (severity, status) = match &task.outcome {
+        None if task.is_blocked() => (
+            Severity::Warning,
+            i18n::t(Key::TaskAwaitingApproval).to_owned(),
+        ),
+        None => (Severity::Info, i18n::t(Key::StateLoading).to_owned()),
+        Some(outcome) => match &outcome.status {
+            AgentStatus::Completed => (Severity::Success, i18n::t(Key::TaskCompleted).to_owned()),
+            AgentStatus::Cancelled => (Severity::Info, i18n::t(Key::TaskCancelled).to_owned()),
+            AgentStatus::Failed(message) => (Severity::Danger, message.clone()),
+            AgentStatus::BudgetExceeded(_) => (
+                Severity::Warning,
+                i18n::t(Key::ErrBudgetExceeded).to_owned(),
+            ),
+        },
+    };
+
+    let header = row![
+        text("●")
+            .size(type_scale::META)
+            .style(theme::text_severity(severity)),
+        text(widgets::elide(&task.instruction, 72))
+            .size(type_scale::META)
+            .style(theme::text_primary),
+        Space::new().width(Length::Fill),
+        text(format!("{} · {}", status, task.steps))
+            .size(type_scale::META)
+            .style(theme::text_dim),
+    ]
+    .spacing(space(1.0))
+    .align_y(Alignment::Center);
+
+    if !task.is_running() {
+        // Settled: the summary line is the card. Clicking opens the timeline.
+        return button(header)
+            .width(Length::Fill)
+            .padding([space(1.0), space(1.5)])
+            .style(theme::list_row_button(false))
+            .on_press(Message::TasksToggle)
+            .into();
+    }
+
+    let mut steps = column![].spacing(space(0.5));
+    for (index, entry) in task.entries.iter().enumerate() {
+        steps = steps.push(task_step_row(task.id, index, entry, false));
+    }
+    let body = scrollable(steps)
+        .style(theme::scroller)
+        .height(Length::Fill)
+        .anchor_bottom();
+
+    container(column![header, body].spacing(space(1.0)))
+        .width(Length::Fill)
+        .height(Length::Fixed(TASK_CARD_RUNNING_HEIGHT))
+        .padding([space(1.0), space(1.5)])
+        .style(theme::raised)
+        .into()
+}
+
+/// A task's final message as an assistant bubble, through the same
+/// markdown-and-math pipeline as chat answers — plain text showed literal
+/// `**bold**` asterisks (owner report, 2026-08-02). Segments were built once
+/// when the run finished; the view only borrows.
+fn assistant_markdown_bubble<'a>(
+    task: &'a crate::tasks::TaskState,
+    appearance: theme::Appearance,
+) -> Element<'a, Message> {
+    let rendered = segments_view(&task.final_segments, appearance);
+    row![
+        container(
+            column![
+                text(i18n::t(Key::ChatAssistant))
+                    .size(type_scale::META)
+                    .style(theme::text_dim),
+                rendered,
+            ]
+            .spacing(space(1.0)),
+        )
+        .width(Length::FillPortion(4))
+        .padding([space(2.0), space(2.5)]),
+        Space::new().width(Length::FillPortion(1)),
+    ]
+    .into()
+}
+
+/// One timeline row, shared by the running card and the overlay detail.
+fn task_step_row(
+    task: Uuid,
+    index: usize,
+    entry: &crate::tasks::Entry,
+    expandable: bool,
+) -> Element<'_, Message> {
+    use aibo_core::types::AgentStep;
+    match &entry.step {
+        AgentStep::Thought(body) => {
+            let label = text(i18n::t(Key::TaskThinking))
+                .size(type_scale::META)
+                .style(theme::text_dim);
+            if !expandable {
+                return label.into();
+            }
+            let mut stack = column![
+                button(label)
+                    .style(theme::action_button)
+                    .padding([space(0.5), space(1.0)])
+                    .on_press(Message::TaskToggleEntry(task, index)),
+            ]
+            .spacing(space(0.5));
+            if !entry.collapsed {
+                stack = stack.push(
+                    text(body.clone())
+                        .size(type_scale::META)
+                        .style(theme::text_dim),
+                );
+            }
+            stack.into()
+        }
+        AgentStep::ToolUse {
+            name, args, tier, ..
+        } => {
+            let detail = args
+                .get("command")
+                .or_else(|| args.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default();
+            row![
+                text(format!("› {name}"))
+                    .size(type_scale::META)
+                    .font(theme::MONO_FONT)
+                    .style(theme::text_primary),
+                text(widgets::elide(detail, 72))
+                    .size(type_scale::META)
+                    .font(theme::MONO_FONT)
+                    .style(theme::text_dim),
+                text(task_tier_label(*tier))
+                    .size(type_scale::META)
+                    .style(theme::text_faint),
+            ]
+            .spacing(space(1.5))
+            .align_y(Alignment::Center)
+            .into()
+        }
+        AgentStep::FileDiff { path, unified_diff } => {
+            if expandable {
+                widgets::diff_view(&path.to_string_lossy(), unified_diff)
+            } else {
+                row![
+                    text(i18n::t(Key::TaskFileChanged))
+                        .size(type_scale::META)
+                        .style(theme::text_dim),
+                    text(widgets::elide(&path.to_string_lossy(), 72))
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_primary),
+                ]
+                .spacing(space(1.0))
+                .into()
+            }
+        }
+        AgentStep::Message(body) => text(widgets::elide(body, 120))
+            .size(type_scale::META)
+            .style(theme::text_primary)
+            .into(),
+        AgentStep::Steered(body) => text(format!("→ {}", widgets::elide(body, 110)))
+            .size(type_scale::META)
+            .style(theme::text_primary)
+            .into(),
+        AgentStep::AwaitingApproval(_) | AgentStep::Done(_) => Space::new().into(),
+    }
+}
+
+const fn task_tier_label(tier: aibo_core::types::ToolTier) -> &'static str {
+    use aibo_core::types::ToolTier;
+    match tier {
+        ToolTier::Builtin => "builtin",
+        ToolTier::Sandboxed => "sandboxed",
+        ToolTier::Mcp => "mcp",
+        ToolTier::ShellFs => "shell/fs",
+        ToolTier::Delegate => "delegate",
+    }
+}
+
+/// The ⌘T tasks overlay: every run across sessions, list and detail.
+fn tasks_overlay(state: &PanelState) -> Element<'_, Message> {
+    use aibo_core::types::ApprovalDecision;
+
+    let selected = state
+        .selected_task
+        .and_then(|id| state.tasks.iter().find(|task| task.id == id));
+
+    let Some(task) = selected else {
+        // The list. Newest first: the run just started is the run wanted.
+        let mut list = column![
+            text(i18n::t(Key::PanelTasksTitle))
+                .size(type_scale::META)
+                .style(theme::text_dim),
+        ]
+        .spacing(space(0.5));
+        if state.tasks.is_empty() {
+            list = list.push(
+                text(i18n::t(Key::TaskEmpty))
+                    .size(type_scale::BODY)
+                    .style(theme::text_dim),
+            );
+        }
+        for task in state.tasks.iter().rev() {
+            let severity = if task.is_blocked() {
+                Severity::Warning
+            } else if task.is_running() {
+                Severity::Info
+            } else {
+                Severity::Success
+            };
+            list = list.push(
+                button(
+                    row![
+                        text("●")
+                            .size(type_scale::META)
+                            .style(theme::text_severity(severity)),
+                        text(widgets::elide(&task.instruction, 64))
+                            .size(type_scale::BODY)
+                            .style(theme::text_primary),
+                        Space::new().width(Length::Fill),
+                        text(task.steps.to_string())
+                            .size(type_scale::META)
+                            .style(theme::text_faint),
+                    ]
+                    .spacing(space(1.5))
+                    .align_y(Alignment::Center),
+                )
+                .width(Length::Fill)
+                .padding([space(1.0), space(1.5)])
+                .style(theme::list_row_button(false))
+                .on_press(Message::TasksSelect(Some(task.id))),
+            );
+        }
+        return scrollable(list).style(theme::scroller).into();
+    };
+
+    // Detail: the full railed timeline, approval included.
+    let mut detail = column![
+        row![
+            button(text("‹").size(type_scale::BODY).style(theme::text_dim))
+                .padding([space(0.5), space(1.0)])
+                .style(theme::action_button)
+                .on_press(Message::TasksSelect(None)),
+            text(widgets::elide(&task.instruction, 56))
+                .size(type_scale::BODY)
+                .style(theme::text_primary),
+            Space::new().width(Length::Fill),
+        ]
+        .spacing(space(1.0))
+        .align_y(Alignment::Center),
+    ]
+    .spacing(space(1.0));
+
+    let mut timeline = column![].spacing(space(0.5));
+    for (index, entry) in task.entries.iter().enumerate() {
+        timeline = timeline.push(widgets::railed(
+            widgets::RailState::Inactive,
+            task_step_row(task.id, index, entry, true),
+        ));
+    }
+    if let Some(request) = &task.pending_approval {
+        let mut approval = column![
+            text(i18n::t(Key::TaskAwaitingApproval))
+                .size(type_scale::META)
+                .style(theme::text_severity(Severity::Warning)),
+            text(request.summary.clone())
+                .size(type_scale::BODY)
+                .style(theme::text_primary),
+        ]
+        .spacing(space(1.0));
+        if let Some(command) = &request.command {
+            approval = approval.push(
+                container(
+                    text(command.clone())
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_primary),
+                )
+                .width(Length::Fill)
+                .padding(space(1.5))
+                .style(theme::raised),
+            );
+        }
+        if request.requires_typed_confirmation {
+            approval = approval.push(
+                text_input("", &task.typed_confirmation)
+                    .on_input({
+                        let id = task.id;
+                        move |value| Message::TaskConfirmation(id, value)
+                    })
+                    .size(type_scale::META)
+                    .font(theme::MONO_FONT)
+                    .padding(space(1.5))
+                    .style(theme::field),
+            );
+        }
+        let mut approve = Action::new(
+            Key::ActionApprove,
+            "⏎",
+            Message::TaskDecide(task.id, ApprovalDecision::Approve),
+        )
+        .primary();
+        if !task.approval_is_ready() {
+            approve = approve.disabled();
+        }
+        approval = approval.push(widgets::action_list(vec![
+            approve,
+            Action::new(
+                Key::ActionDeny,
+                "esc",
+                Message::TaskDecide(task.id, ApprovalDecision::Deny),
+            )
+            .destructive(),
+        ]));
+        timeline = timeline.push(widgets::railed(widgets::RailState::Active, approval));
+    }
+    detail = detail.push(
+        scrollable(timeline)
+            .style(theme::scroller)
+            .height(Length::Fill),
+    );
+
+    let mut actions = vec![Action::new(
+        Key::ActionCopy,
+        widgets::primary_shortcut("⌘C", "Ctrl+C"),
+        Message::TaskCopy(task.id),
+    )];
+    if task.is_running() {
+        actions.push(
+            Action::new(
+                Key::ActionCancel,
+                widgets::primary_shortcut("⌘.", "Ctrl+."),
+                Message::TaskCancel(task.id),
+            )
+            .destructive(),
+        );
+    }
+    detail = detail.push(widgets::action_list(actions));
+
+    detail.into()
+}
+
 fn finder_overlay(state: &PanelState) -> Element<'_, Message> {
     let results = state.file_finder.results();
     let mut list = column![].spacing(space(0.5));
@@ -1872,17 +2312,116 @@ fn chip_row(state: &PanelState) -> Element<'_, Message> {
                 .style(theme::text_faint),
         );
 
-    row![
-        context,
-        Space::new().width(Length::Fill),
-        button(cluster)
+    // The tasks chip (owner redesign, 2026-08-02): present only while runs
+    // exist, amber the moment one needs the user. This chip is the one thread
+    // back to a run whose session was ⌘N-ed away.
+    let mut cluster_row = row![context, Space::new().width(Length::Fill)]
+        .spacing(space(1.0))
+        .align_y(Alignment::Center);
+    // Mode toggles as persistent header chips (owner, 2026-08-02: "the
+    // status of the agent and dictation should be shown on the top as some
+    // icons (with toggles)"). Active state renders in the row's active
+    // treatment, so the mode is legible at a glance.
+    cluster_row = cluster_row.push(
+        button(
+            row![
+                text(if state.dictating { "●" } else { "○" })
+                    .size(type_scale::META)
+                    .style(move |t: &iced::Theme| {
+                        if state.dictating {
+                            theme::text_severity(Severity::Danger)(t)
+                        } else {
+                            theme::text_faint(t)
+                        }
+                    }),
+                text(i18n::t(if state.dictating {
+                    Key::ActionStopDictation
+                } else {
+                    Key::ActionDictate
+                }))
+                .size(type_scale::META)
+                .style(if state.dictating {
+                    theme::text_primary
+                } else {
+                    theme::text_dim
+                }),
+            ]
+            .spacing(space(0.5))
+            .align_y(Alignment::Center),
+        )
+        .padding([space(0.5), space(1.0)])
+        .style(theme::list_row_button(state.dictating))
+        .on_press(Message::ToggleDictation),
+    );
+    cluster_row = cluster_row.push(
+        button(
+            row![
+                text(if state.agent_mode { "◆" } else { "◇" })
+                    .size(type_scale::META)
+                    .style(move |t: &iced::Theme| {
+                        if state.agent_mode {
+                            theme::text_severity(Severity::Warning)(t)
+                        } else {
+                            theme::text_faint(t)
+                        }
+                    }),
+                text(i18n::t(Key::ActionAgentMode))
+                    .size(type_scale::META)
+                    .style(if state.agent_mode {
+                        theme::text_primary
+                    } else {
+                        theme::text_dim
+                    }),
+            ]
+            .spacing(space(0.5))
+            .align_y(Alignment::Center),
+        )
+        .padding([space(0.5), space(1.0)])
+        .style(theme::list_row_button(state.agent_mode))
+        .on_press(Message::ToggleAgentMode),
+    );
+    if !state.tasks.is_empty() {
+        let severity = if state.any_task_blocked() {
+            Severity::Warning
+        } else if state.running_task_count() > 0 {
+            Severity::Info
+        } else {
+            Severity::Success
+        };
+        let label = if state.running_task_count() > 0 {
+            format!("● {}", state.running_task_count())
+        } else {
+            "●".to_owned()
+        };
+        cluster_row = cluster_row.push(
+            button(
+                row![
+                    text(label)
+                        .size(type_scale::META)
+                        .style(theme::text_severity(severity)),
+                    text(widgets::primary_shortcut("⌘T", "Ctrl+T"))
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_faint),
+                ]
+                .spacing(space(1.0))
+                .align_y(Alignment::Center),
+            )
             .padding([space(0.5), space(1.0)])
             .style(theme::list_row_button(false))
-            .on_press(Message::OpenPicker),
-    ]
-    .spacing(space(1.5))
-    .align_y(Alignment::Center)
-    .into()
+            .on_press(Message::TasksToggle),
+        );
+    }
+    cluster_row
+        .push(
+            button(cluster)
+                .padding([space(0.5), space(1.0)])
+                .style(theme::list_row_button(false))
+                .on_press(Message::OpenPicker),
+        )
+        .spacing(space(1.5))
+        .align_y(Alignment::Center)
+        .into()
 }
 
 /// The model quick-pick's contents (§4).
@@ -2190,6 +2729,14 @@ const PICKER_PANEL_HEIGHT: f32 = 500.0;
 
 /// Widest the floating quick-pick menu grows.
 const PICKER_MENU_WIDTH: f32 = 560.0;
+/// The running activity card: header row plus a three-row scrolling interior.
+/// Fixed so a streaming run never resizes the window (§16's reserve rule).
+const TASK_CARD_RUNNING_HEIGHT: f32 = 148.0;
+/// The settled card: one summary line in a quiet container.
+const TASK_CARD_DONE_HEIGHT: f32 = 34.0;
+/// The composer grows with wrapped lines up to this, then scrolls inside
+/// itself — a dictated essay must not displace the rest of the panel.
+const INPUT_EXTRA_MAX_HEIGHT: f32 = 120.0;
 
 /// Where the floating menu's top edge sits: just below the source/model row,
 /// so it reads as dropping down from the model cluster it opened from.
@@ -2369,6 +2916,12 @@ fn input_row(state: &PanelState) -> Element<'_, Message> {
             text_editor::Binding::from_key_press(key_press)
         })
         .style(theme::answer_editor);
+    // Bounded so a dictated essay scrolls inside the editor instead of
+    // displacing the footer and its own send button; mirrors
+    // `input_extra_height`'s clamp exactly.
+    let input = container(input)
+        .max_height(24.0 + INPUT_EXTRA_MAX_HEIGHT + 2.0 * space(1.0))
+        .width(Length::Fill);
 
     // No well. `design.md` §3's mock puts the caret directly on the panel
     // ground with the rail beside it — the input is the line you were already
@@ -2393,31 +2946,8 @@ fn shows_empty_invitation(state: &PanelState) -> bool {
 }
 
 fn composer_actions_for(state: &PanelState) -> Vec<Action<Message>> {
-    // Push-to-talk (§P9+): one toggle whose label always states what pressing
-    // it does next, same rule as the Codex sign-in button.
-    let dictate = Action::new(
-        if state.dictating {
-            Key::ActionStopDictation
-        } else {
-            Key::ActionDictate
-        },
-        widgets::primary_shortcut("⌘L", "Ctrl+L"),
-        Message::ToggleDictation,
-    );
-
-    // The agent toggle: a mode, so the *state* is shown (checkmark), unlike
-    // dictate's label-says-what-happens-next pattern — "stop agent" would
-    // misdescribe a toggle that only affects future submissions.
-    let agent = Action::new(
-        if state.agent_mode {
-            Key::ActionAgentModeOn
-        } else {
-            Key::ActionAgentMode
-        },
-        widgets::primary_shortcut("⌘J", "Ctrl+J"),
-        Message::ToggleAgentMode,
-    );
-
+    // Dictation and agent mode moved to the header chips (owner,
+    // 2026-08-02); the composer keeps only per-submission actions.
     let attach = Action::new(Key::ActionAttachImage, ATTACH_KEY, Message::Attach);
     let attach = if state.clipboard.is_attachable() {
         attach
@@ -2439,7 +2969,7 @@ fn composer_actions_for(state: &PanelState) -> Vec<Action<Message>> {
     } else {
         primary
     };
-    vec![dictate, agent, attach, primary]
+    vec![attach, primary]
 }
 
 fn user_bubble(message: &str) -> Element<'_, Message> {
@@ -2494,6 +3024,33 @@ fn markdown_settings(appearance: theme::Appearance) -> markdown::Settings {
     settings
 }
 
+/// A finished response's segments: markdown interleaved with typeset
+/// display equations (`crate::math`).
+fn segments_view<'a>(
+    segments: &'a [crate::math::Segment],
+    appearance: theme::Appearance,
+) -> Element<'a, Message> {
+    let mut stack = column![].spacing(space(1.0));
+    for segment in segments {
+        stack = stack.push(match segment {
+            crate::math::Segment::Markdown(items) => markdown_view(items, appearance),
+            crate::math::Segment::Math {
+                handle,
+                width,
+                height,
+            } => container(
+                iced::widget::svg(handle.clone())
+                    .width(Length::Fixed(*width))
+                    .height(Length::Fixed(*height)),
+            )
+            .width(Length::Fill)
+            .padding([space(0.5), 0.0])
+            .into(),
+        });
+    }
+    stack.into()
+}
+
 fn markdown_view<'a>(
     items: impl IntoIterator<Item = &'a markdown::Item>,
     appearance: theme::Appearance,
@@ -2515,7 +3072,7 @@ fn assistant_text_bubble(
                 text(i18n::t(Key::ChatAssistant))
                     .size(type_scale::META)
                     .style(theme::text_dim),
-                markdown_view(&turn.assistant_markdown, appearance),
+                segments_view(&turn.assistant_segments, appearance),
             ]
             .spacing(space(1.0)),
         )
@@ -2534,7 +3091,12 @@ fn active_assistant_bubble(
     let body: Element<'_, Message> = match state.phase {
         Phase::Loading => widgets::thinking(Some(state.chat_answer_height())),
         Phase::Streaming | Phase::Finished { .. } => {
-            let rendered = markdown_view(state.response_markdown.items(), appearance);
+            let rendered = match (&state.phase, state.active_segments.as_deref()) {
+                // Finished and segmented: display math snaps to its typeset
+                // form. While streaming, the incremental markdown stands.
+                (Phase::Finished { .. }, Some(segments)) => segments_view(segments, appearance),
+                _ => markdown_view(state.response_markdown.items(), appearance),
+            };
             if state.is_truncated() {
                 column![
                     rendered,
@@ -2596,24 +3158,32 @@ fn conversation(state: &PanelState, appearance: theme::Appearance) -> Element<'_
             transcript = transcript.push(active_assistant_bubble(state, appearance));
         }
     }
-
-    if state.transcript_content_height() > state.max_transcript_height() {
-        scrollable(transcript)
-            .height(Length::Fixed(state.transcript_height()))
-            .style(theme::scroller)
-            .into()
-    } else {
-        // Avoid retaining a scroll offset while retrying or replacing a short
-        // answer. On macOS that stale offset can yield an invalid glyph
-        // position after the window shrinks.
-        //
-        // Content-sized, deliberately: this box was pinned to the *estimated*
-        // height, which painted every estimation error as dead space between
-        // the last bubble and the hairline (owner report, 2026-08-01). When
-        // nothing scrolls, the real content is the right height — the
-        // estimate's only job is sizing the window.
-        container(transcript).into()
+    // Agent runs of this session, as activity cards in the conversation
+    // (owner redesign, 2026-08-02): you asked, it worked, it answered — one
+    // surface. Heights mirror `transcript_content_height` exactly.
+    for task in state.session_tasks() {
+        transcript = transcript.push(task_card(task));
+        if task.final_message().is_some() {
+            transcript = transcript.push(assistant_markdown_bubble(task, appearance));
+        }
     }
+
+    // Always the anchored scrollable — never a content-sized branch chosen
+    // by estimates. The owner's diagnosis (2026-08-02) was exact: the scroll
+    // used to engage only when the *estimate* said content beat the window,
+    // so anything between region height (window minus composer and footer)
+    // and the estimate's threshold overflowed with no scrollbar at all.
+    // Unconditionally scrollable, the threshold is the region's real edge:
+    // while the window still grows with content nothing scrolls, and the
+    // moment content exceeds what the region actually has, it scrolls.
+    //
+    // Anchored to the end so a streaming answer stays in view; iced detaches
+    // the anchor while the user scrolls up to reread, the chat convention.
+    scrollable(transcript)
+        .height(Length::Fill)
+        .anchor_bottom()
+        .style(theme::scroller)
+        .into()
 }
 
 fn content(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Message> {
@@ -2803,13 +3373,46 @@ impl PanelState {
             height += (messages - 1) as f32 * CHAT_MESSAGE_SPACING;
         }
 
+        // Activity cards for this session's agent runs (owner redesign,
+        // 2026-08-02). Running: a fixed-height card whose interior scrolls,
+        // so steps never resize the window. Finished: a one-line summary,
+        // plus the final message as an ordinary assistant bubble.
+        for task in self.session_tasks() {
+            if height > 0.0 || messages > 0 {
+                height += CHAT_MESSAGE_SPACING;
+            }
+            if task.is_running() {
+                height += TASK_CARD_RUNNING_HEIGHT;
+            } else {
+                height += TASK_CARD_DONE_HEIGHT;
+                if let Some(message) = task.final_message() {
+                    height += CHAT_MESSAGE_SPACING + chat_bubble_height(message, true);
+                }
+            }
+        }
+
         height
     }
 
     /// Visible transcript height, content-sized until a useful scrolling cap.
     fn transcript_height(&self) -> f32 {
+        // Clamped against what is actually left once the window has paid for
+        // the chrome — not only against the display fraction. When the two
+        // clamps disagreed, a full transcript kept its fixed height inside a
+        // window that had already stopped growing, and the composer was
+        // pushed off the bottom edge ("I cannot input", owner screenshot,
+        // 2026-08-02).
+        let fixed = theme::PANEL_HEIGHT_COLLAPSED
+            + self.attachment_block_height()
+            + self.selection_preview_height()
+            + self.input_extra_height()
+            + self.chat_error_height()
+            + self.footer_height()
+            - CHAT_ESTIMATE_SURPLUS;
+        let available = (self.max_panel_height() - fixed).max(80.0);
         self.transcript_content_height()
             .min(self.max_transcript_height())
+            .min(available)
     }
 
     /// The tallest the panel may grow on this display (`design.md` §4).
@@ -3055,12 +3658,44 @@ fn chat_bubble_height(message: &str, assistant: bool) -> f32 {
 }
 
 fn estimated_text_height(message: &str, chars_per_line: usize) -> f32 {
+    // Counted in display *columns*, not characters: CJK glyphs are
+    // double-width, so a Japanese paragraph wraps at roughly half the
+    // character count — counting chars under-estimated its height by ~2×,
+    // the window came up short, and the composer was clipped off the bottom
+    // (owner screenshot, 2026-08-02).
     let lines = message
         .split('\n')
-        .map(|line| line.chars().count().max(1).div_ceil(chars_per_line))
+        .map(|line| {
+            let columns: usize = line.chars().map(char_columns).sum();
+            columns.max(1).div_ceil(chars_per_line)
+        })
         .sum::<usize>()
         .max(1);
     lines as f32 * 20.0 + 4.0
+}
+
+/// Display width of one character, per UAX #11's East Asian Wide/Fullwidth
+/// classes — the blocks this panel actually meets (kana, CJK ideographs,
+/// Hangul, fullwidth forms). Everything else counts 1; that under-counts
+/// rare wide blocks, which errs toward a slightly roomier window rather
+/// than a clipped one... and 1 for combining marks over-counts, same safe
+/// direction.
+const fn char_columns(c: char) -> usize {
+    match c as u32 {
+        0x1100..=0x115F
+        | 0x2E80..=0x303E
+        | 0x3041..=0x33FF
+        | 0x3400..=0x4DBF
+        | 0x4E00..=0x9FFF
+        | 0xA000..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x20000..=0x2FA1F => 2,
+        _ => 1,
+    }
 }
 
 fn footer(state: &PanelState) -> Element<'_, Message> {
@@ -4446,7 +5081,7 @@ mod tests {
         assert_eq!(state.turns.len(), 1);
         assert_eq!(state.turns[0].user, "first question");
         assert_eq!(state.turns[0].assistant, "first answer");
-        assert!(!state.turns[0].assistant_markdown.is_empty());
+        assert!(!state.turns[0].assistant_segments.is_empty());
         assert_eq!(state.active_user.as_deref(), Some("follow up"));
         assert!(state.response.is_empty());
         assert!(state.input.is_empty());
@@ -4488,6 +5123,58 @@ mod height_probe {
     /// 132 — and the panel's height for a short finished chat is the plain
     /// sum of its parts, floored by nothing. The 320 pt floor this replaces
     /// painted its whole surplus as dead space under the composer.
+    /// The CJK overflow (owner screenshot, 2026-08-02): Japanese glyphs are
+    /// double-width, and an estimate that counts characters instead of
+    /// columns halves a Japanese bubble's height — which clipped the
+    /// composer off the window. A CJK line must estimate twice the Latin
+    /// height for the same character count.
+    #[test]
+    fn cjk_text_is_estimated_at_its_real_width() {
+        let latin: String = "a".repeat(40);
+        let kana: String = "あ".repeat(40);
+        let latin_height = estimated_text_height(&latin, 40);
+        let kana_height = estimated_text_height(&kana, 40);
+        assert_eq!(latin_height, 24.0, "one line");
+        assert_eq!(kana_height, 44.0, "two lines: 80 columns at width 40");
+
+        // And the mixed case from the screenshot: mostly kana with Latin
+        // fragments must round up, never down.
+        let mixed = "ダウンロードフォルダ内を検索しましたが、テストという名前のフォルダは見つかりませんでした";
+        assert!(
+            estimated_text_height(mixed, 40) >= 44.0,
+            "44 kana chars are 88 columns — at least two lines"
+        );
+    }
+
+    /// The "I cannot input" bug (owner screenshot, 2026-08-02): however tall
+    /// the transcript wants to be, the window must always leave room for the
+    /// footer and the composer.
+    #[test]
+    fn a_huge_transcript_never_evicts_the_composer() {
+        let mut state = PanelState::new(SessionId::from_u128(1));
+        state.phase = Phase::Idle;
+        state.display_height = Some(900.0);
+        for turn in 0..40 {
+            state.begin_turn(format!("question {turn} with plenty of words in it"));
+            state.response = "a long answer\n".repeat(12);
+            state.phase = Phase::Finished {
+                reason: StopReason::EndTurn,
+            };
+        }
+        let fixed = theme::PANEL_HEIGHT_COLLAPSED + state.footer_height() - CHAT_ESTIMATE_SURPLUS;
+        assert!(
+            state.transcript_height() + fixed <= state.max_panel_height() + 0.01,
+            "transcript {} + chrome {} must fit inside {}",
+            state.transcript_height(),
+            fixed,
+            state.max_panel_height()
+        );
+        assert!(
+            state.desired_height() <= state.max_panel_height() + 0.01,
+            "and the whole window respects its ceiling"
+        );
+    }
+
     #[test]
     fn a_short_finished_chat_is_the_sum_of_its_parts() {
         let mut state = PanelState::new(SessionId::from_u128(1));

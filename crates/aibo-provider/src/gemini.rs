@@ -286,14 +286,22 @@ fn build_generate_body(req: &ChatRequest) -> Value {
     if !generation_config.is_empty() {
         body["generationConfig"] = Value::Object(generation_config);
     }
+    let mut tools: Vec<Value> = Vec::new();
     if !req.tools.is_empty() {
-        body["tools"] = json!([{
+        tools.push(json!({
             "functionDeclarations": req.tools.iter().map(|tool| json!({
                 "name": tool.name,
                 "description": tool.description,
                 "parameters": tool.parameters,
             })).collect::<Vec<_>>(),
-        }]);
+        }));
+    }
+    // Gemini's hosted grounding search (owner, 2026-08-02).
+    if req.web_search {
+        tools.push(json!({ "google_search": {} }));
+    }
+    if !tools.is_empty() {
+        body["tools"] = json!(tools);
     }
     body
 }
@@ -579,6 +587,7 @@ mod tests {
                 deadline: std::time::Duration::from_secs(60),
             },
             tools: Vec::new(),
+            web_search: false,
             user_instruction: None,
             untrusted: Vec::new(),
             attachments: Vec::new(),

@@ -377,6 +377,7 @@ mod tests {
                 deadline: Duration::from_secs(30),
             },
             tools: Vec::new(),
+            web_search: false,
             user_instruction: Some("what is in this image?".into()),
             untrusted: Vec::new(),
             attachments,

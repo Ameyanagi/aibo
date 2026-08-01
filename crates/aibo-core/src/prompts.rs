@@ -540,6 +540,10 @@ pub fn assemble(inputs: &PromptInputs) -> Result<Assembled> {
             // tool call, which rule 2 forbids.
             Vec::new()
         },
+        // Every surface: a hosted search is provider-side inference, not a
+        // local tool, so the §5 no-tools rule for insertion surfaces does
+        // not apply to it.
+        web_search: true,
         user_instruction: inputs.instruction.clone(),
         untrusted,
         // Straight through from `fitted`, which is straight through from the

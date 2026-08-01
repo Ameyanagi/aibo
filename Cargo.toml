@@ -149,6 +149,10 @@ uiautomation = "0.25"                # §8 [!Send + !Sync — dedicated MTA thre
 # --- dev --------------------------------------------------------------------
 insta = "1"
 proptest = "1"
+ratex-layout = "0.1"
+ratex-parser = "0.1"
+ratex-svg = { version = "0.1", features = ["embed-fonts"] }
+ratex-types = "0.1"
 similar = "2"
 tempfile = "3"
 

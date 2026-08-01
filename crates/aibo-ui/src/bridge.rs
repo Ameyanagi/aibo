@@ -323,6 +323,15 @@ pub enum UiRequest {
         typed_confirmation: Option<String>,
     },
 
+    /// Queue a mid-run instruction into a running agent task (steering,
+    /// pi's queuing model): consumed at the loop's next turn boundary.
+    SteerTask {
+        /// The run to steer.
+        task: Uuid,
+        /// The user's typed text, verbatim.
+        text: String,
+    },
+
     /// Cancel an agent run.
     CancelTask {
         /// Task id.
@@ -498,7 +507,10 @@ pub enum UiEvent {
     TaskStarted {
         /// Task id.
         task: Uuid,
-        /// The instruction, shown as the window's subject and as approval
+        /// The panel session the run was started from — the conversation its
+        /// activity card renders in (owner redesign, 2026-08-02).
+        session: SessionId,
+        /// The instruction, shown as the card's subject and as approval
         /// provenance (§5 rule 3).
         instruction: String,
     },

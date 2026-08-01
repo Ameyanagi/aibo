@@ -204,7 +204,11 @@ impl ToolExecutor for NoTools {
 // ---------------------------------------------------------------------------
 
 /// Everything `NativeLoop` needs that is not per-task.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `Clone` shares the steering queue (an `Arc`), which is what a clone of a
+/// run's config should mean; the old `PartialEq` derive compared nothing any
+/// caller relied on and a receiver cannot be compared, so it is gone.
+#[derive(Debug, Clone)]
 pub struct NativeLoopConfig {
     /// Model to use when [`AgentTask::binding`] is `None`.
     pub binding: ModelBinding,
@@ -221,6 +225,10 @@ pub struct NativeLoopConfig {
     /// System prompt. `None` means the provider's default, which is what the
     /// eval harness (§5) uses as its baseline.
     pub system_prompt: Option<String>,
+    /// Mid-run user instructions (steering), drained at each turn boundary —
+    /// pi's message-queuing model: the next assistant turn sees them as
+    /// fresh user messages.
+    pub steer: Option<Arc<tokio::sync::Mutex<mpsc::Receiver<String>>>>,
 }
 
 impl NativeLoopConfig {
@@ -238,6 +246,7 @@ impl NativeLoopConfig {
             },
             prompt_version: "native-loop/0".to_owned(),
             system_prompt: None,
+            steer: None,
         }
     }
 }
@@ -355,6 +364,18 @@ impl Driver {
                 let _ = self.tx.send(Err(crate::limits::budget_error(kind))).await;
                 let _ = self.tx.send(Ok(AgentStep::Done(outcome))).await;
                 return;
+            }
+
+            // Steering (owner, 2026-08-02): text the user queued mid-run
+            // joins the conversation here, at the turn boundary, as their
+            // own fresh instruction — which also restores instruction
+            // provenance for the §5 origin bookkeeping.
+            if let Some(steer) = &self.config.steer {
+                let mut steer = steer.lock().await;
+                while let Ok(text) = steer.try_recv() {
+                    messages.push(Message::text(MessageRole::User, text));
+                    call_origin = ContentOrigin::UserInstruction;
+                }
             }
 
             let request = self.build_request(&task, messages.clone());
@@ -627,6 +648,7 @@ impl Driver {
             params: self.config.params.clone(),
             budget: self.config.budget,
             tools: self.tools.schemas(),
+            web_search: true,
             user_instruction: Some(task.instruction.clone()),
             untrusted: task.context.clone(),
             // Placeholder wired by the contract change only. `AgentTask` has no
