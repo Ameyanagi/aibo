@@ -219,6 +219,10 @@ pub enum UiRequest {
         /// Removing the context card changes this to `false` without mutating
         /// the backend's captured insertion target.
         include_selection: bool,
+        /// The working directory an agent run should start in (owner
+        /// redesign, 2026-08-02). `None` keeps the default — the first
+        /// configured root. Ignored for chat surfaces.
+        workdir: Option<std::path::PathBuf>,
     },
 
     /// Cancel in-flight work for a session (`esc`, or a new submission).
@@ -360,6 +364,11 @@ pub enum UiRequest {
         /// Absolute path, exactly as [`UiEvent::FileCandidates`] reported it.
         path: String,
     },
+
+    /// List candidate agent working directories (owner redesign, 2026-08-02):
+    /// recently used first, then the configured roots and their immediate
+    /// subdirectories. Answered by [`UiEvent::WorkdirCandidates`].
+    ListWorkdirs,
 
     /// Persist the quick-pick pin set. Sent on every deliberate toggle: a pin
     /// must survive a restart, or pinning is pointless.
@@ -639,6 +648,15 @@ pub enum UiEvent {
     FileCandidates {
         /// Bounded by the runtime's walk limits.
         files: Vec<FileCandidate>,
+    },
+
+    /// Candidate agent working directories, answering
+    /// [`UiRequest::ListWorkdirs`].
+    WorkdirCandidates {
+        /// Recently used, most recent first — the "pick up where I was" rows.
+        recents: Vec<std::path::PathBuf>,
+        /// The configured roots and their immediate subdirectories.
+        dirs: Vec<std::path::PathBuf>,
     },
 
     /// The persisted settings the runtime owns, published once at startup so

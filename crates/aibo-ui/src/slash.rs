@@ -18,6 +18,9 @@ use crate::i18n::Key;
 pub enum CommandAction {
     /// Open the help overlay.
     Help,
+    /// Choose the agent's working directory: bare `/cd` opens the picker,
+    /// `/cd path` sets it directly.
+    Workdir,
     /// Run the coding agent on the trailing text (handled by the runtime's
     /// existing `/agent` strip; the popup only completes the prefix).
     Agent,
@@ -60,6 +63,13 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         description: Key::CmdAgentDesc,
         action: CommandAction::Agent,
+        takes_args: true,
+    },
+    Command {
+        name: "/cd",
+        aliases: &[],
+        description: Key::CmdCdDesc,
+        action: CommandAction::Workdir,
         takes_args: true,
     },
     Command {

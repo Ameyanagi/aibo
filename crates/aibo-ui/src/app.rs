@@ -1478,6 +1478,15 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
     match state.role_of(window) {
         Some(Role::Panel) if state.panel_visible => {
             let message = match chord {
+                // The workdir picker owns the keyboard while it is open,
+                // exactly like the finder and quick-pick below.
+                _ if state.panel.workdir_picker.open => match chord {
+                    WindowChord::Escape => panel::Message::WorkdirClose,
+                    WindowChord::Enter { .. } => panel::Message::WorkdirCommit,
+                    WindowChord::HistoryOlder => panel::Message::WorkdirMove(-1),
+                    WindowChord::HistoryNewer => panel::Message::WorkdirMove(1),
+                    _ => return Task::none(),
+                },
                 // The `@` finder owns the keyboard while it is open, exactly
                 // like the quick-pick below.
                 _ if state.panel.file_finder.open => match chord {
@@ -1975,7 +1984,7 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             // Slash commands and their bare aliases act locally; they never
             // reach a model (owner redesign, 2026-08-02: help is "?", "help"
             // or "/help" typed into the composer).
-            if let Some((command, _args)) = crate::slash::parse(&state.panel.input) {
+            if let Some((command, command_args)) = crate::slash::parse(&state.panel.input) {
                 use crate::slash::CommandAction;
                 match command.action {
                     CommandAction::Help => {
@@ -1994,6 +2003,41 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                     CommandAction::Settings => {
                         state.panel.consume_input();
                         return open_settings(state);
+                    }
+                    CommandAction::Workdir => {
+                        let args = command_args.trim().to_owned();
+                        state.panel.consume_input();
+                        if args.is_empty() {
+                            return panel_update(state, M::WorkdirOpen);
+                        }
+                        // `~` expansion, then the filesystem's own verdict —
+                        // the UI shares the process, so it can just ask.
+                        let expanded = if let Some(rest) = args.strip_prefix("~/") {
+                            std::env::var("HOME")
+                                .map(|home| std::path::PathBuf::from(home).join(rest))
+                                .unwrap_or_else(|_| std::path::PathBuf::from(&args))
+                        } else {
+                            std::path::PathBuf::from(&args)
+                        };
+                        match expanded.canonicalize() {
+                            Ok(dir) if dir.is_dir() => {
+                                state.panel.agent_workdir = Some(dir);
+                                // A chosen workdir is agent intent; make the
+                                // mode match so the chip shows the choice.
+                                if !state.panel.agent_mode {
+                                    state.panel.agent_mode = true;
+                                    state.send(UiRequest::ListWorkdirs);
+                                }
+                            }
+                            _ => {
+                                state.panel.toast = Some(panel::ToastView {
+                                    severity: ui_theme::Severity::Warning,
+                                    body: i18n::t1(crate::i18n::Key::ToastWorkdirInvalid, &args),
+                                    offer_diagnostics: false,
+                                });
+                            }
+                        }
+                        return resize_panel_if_visible(state);
                     }
                     // `/agent …` is the runtime's spelling and goes through
                     // the ordinary submit path below.
@@ -2052,6 +2096,7 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 attachments,
                 history,
                 include_selection,
+                workdir: state.panel.agent_workdir.clone(),
             });
             resize_panel_if_visible(state)
         }
@@ -2213,7 +2258,57 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
 
         M::ToggleAgentMode => {
             state.panel.agent_mode = !state.panel.agent_mode;
+            if state.panel.agent_mode {
+                // The chip needs candidates to name the default workdir, and
+                // the picker should open warm.
+                state.send(UiRequest::ListWorkdirs);
+            }
+            resize_panel_if_visible(state)
+        }
+
+        M::WorkdirOpen => {
+            state.panel.workdir_picker.open();
+            // Re-listed on every open, so a directory created since the last
+            // one is choosable.
+            state.send(UiRequest::ListWorkdirs);
+            resize_panel_if_visible(state).chain(operation::focus(panel::WORKDIR_ID))
+        }
+        M::WorkdirClose => {
+            state.panel.workdir_picker.close();
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
+        }
+        M::WorkdirQuery(query) => {
+            // The same ⌘-fallout guard as every other text field.
+            if state.command_held
+                && is_single_char_insertion(&state.panel.workdir_picker.query, &query)
+            {
+                return Task::none();
+            }
+            state.panel.workdir_picker.query = query;
+            state.panel.workdir_picker.highlight = 0;
             Task::none()
+        }
+        M::WorkdirMove(delta) => {
+            state.panel.workdir_picker.move_highlight(delta);
+            Task::none()
+        }
+        M::WorkdirChoose(index) => {
+            state.panel.workdir_picker.highlight = index;
+            panel_update(state, M::WorkdirCommit)
+        }
+        M::WorkdirCommit => {
+            let chosen = state
+                .panel
+                .workdir_picker
+                .rows()
+                .get(state.panel.workdir_picker.highlight)
+                .map(|dir| dir.to_path_buf());
+            let Some(dir) = chosen else {
+                return Task::none();
+            };
+            state.panel.agent_workdir = Some(dir);
+            state.panel.workdir_picker.close();
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
         }
         M::TasksToggle => {
             state.panel.tasks_open = !state.panel.tasks_open;
@@ -3217,6 +3312,13 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             Task::none()
         }
 
+        UiEvent::WorkdirCandidates { recents, dirs } => {
+            state.panel.workdir_picker.recents = recents;
+            state.panel.workdir_picker.dirs = dirs;
+            state.panel.workdir_picker.highlight = 0;
+            Task::none()
+        }
+
         UiEvent::FileAttached { name, content } => {
             state.panel.attach_file_selection(content);
             let body = i18n::t1(crate::i18n::Key::ToastFileAttached, &name);
@@ -3842,6 +3944,10 @@ mod tests {
 
         let _ = panel_update(&mut state, panel::Message::ToggleAgentMode);
         assert!(state.panel.agent_mode);
+        assert!(
+            matches!(received.try_recv(), Ok(UiRequest::ListWorkdirs)),
+            "agent mode warms the workdir candidates for the chip"
+        );
 
         state.panel.set_input("tidy the downloads folder");
         let _ = panel_update(&mut state, panel::Message::Submit);
@@ -3876,6 +3982,10 @@ mod tests {
         state.panel.phase = Phase::Idle;
 
         let _ = panel_update(&mut state, panel::Message::ToggleAgentMode);
+        assert!(
+            matches!(received.try_recv(), Ok(UiRequest::ListWorkdirs)),
+            "agent mode warms the workdir candidates for the chip"
+        );
         state.panel.set_input("hello");
         let _ = panel_update(&mut state, panel::Message::Submit);
         assert!(matches!(received.try_recv(), Ok(UiRequest::Submit { .. })));

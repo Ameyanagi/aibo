@@ -48,6 +48,9 @@ pub const FINDER_ID: &str = "aibo.panel.finder";
 /// The id of the model quick-pick's search field.
 pub const PICKER_ID: &str = "aibo.panel.picker";
 
+/// Focus target for the workdir picker's filter field.
+pub const WORKDIR_ID: &str = "aibo.panel.workdir";
+
 /// Where the panel is in its lifecycle.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Phase {
@@ -780,6 +783,13 @@ pub struct PanelState {
     /// Whether the composer's ＋ attach menu is up (owner redesign,
     /// 2026-08-02: one button, three sources — clipboard, screenshot, file).
     pub attach_menu_open: bool,
+    /// The directory this session's agent runs start in. `None` is the
+    /// default — the first configured root. Session-scoped on purpose: a
+    /// workdir is a task decision, not a preference; the *recents* in the
+    /// picker are what persists.
+    pub agent_workdir: Option<std::path::PathBuf>,
+    /// The agent working-directory picker (owner redesign, 2026-08-02).
+    pub workdir_picker: WorkdirPicker,
     /// The task whose detail the overlay shows; `None` lists all.
     pub selected_task: Option<Uuid>,
     /// The finished active response, split into markdown and typeset math.
@@ -843,6 +853,8 @@ impl PanelState {
             slash: crate::slash::SlashState::default(),
             help_open: false,
             attach_menu_open: false,
+            agent_workdir: None,
+            workdir_picker: WorkdirPicker::default(),
             selected_task: None,
             active_segments: None,
             dictation_pad: false,
@@ -879,6 +891,9 @@ impl PanelState {
         // The finder's candidate index describes the disk, not the session;
         // rebuilding it on every ⌘N would make the next `@` needlessly slow.
         let file_finder = std::mem::take(&mut self.file_finder);
+        // Same argument for the workdir picker's candidates; the *chosen*
+        // workdir stays session state and resets with everything else.
+        let workdir_picker = std::mem::take(&mut self.workdir_picker);
         // Agent runs are not session state: a run started in a previous chat
         // keeps going and stays reachable through the overlay (§6).
         let tasks = std::mem::take(&mut self.tasks);
@@ -889,6 +904,8 @@ impl PanelState {
         self.recent_models = recent_models;
         self.file_finder = file_finder;
         self.file_finder.close();
+        self.workdir_picker = workdir_picker;
+        self.workdir_picker.close();
         self.model_options = model_options;
         self.selected_model = selected_model;
         self.display_height = display_height;
@@ -1410,6 +1427,7 @@ impl PanelState {
             || self.slash.open
             || self.help_open
             || self.attach_menu_open
+            || self.workdir_picker.open
     }
 
     /// The height the panel wants, for [`crate::placement::PlacementRequest`].
@@ -1615,6 +1633,18 @@ pub enum Message {
     AttachScreenshot,
     /// Attach menu: open the `@` file finder.
     AttachPickFile,
+    /// Open the agent working-directory picker.
+    WorkdirOpen,
+    /// Close it without choosing.
+    WorkdirClose,
+    /// The picker's filter changed.
+    WorkdirQuery(String),
+    /// Move the picker's highlight.
+    WorkdirMove(i32),
+    /// A row was clicked: highlight and commit in one gesture.
+    WorkdirChoose(usize),
+    /// Commit the highlighted directory as this session's workdir.
+    WorkdirCommit,
 }
 
 /// Render the panel.
@@ -1721,6 +1751,8 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
         Some((help_overlay(), Message::HelpClose))
     } else if state.attach_menu_open {
         Some((attach_menu_overlay(state), Message::AttachMenuClose))
+    } else if state.workdir_picker.open {
+        Some((workdir_overlay(state), Message::WorkdirClose))
     } else if state.slash.open {
         Some((slash_overlay(state), Message::SlashClose))
     } else {
@@ -2239,6 +2271,79 @@ fn slash_overlay(state: &PanelState) -> Element<'_, Message> {
     .into()
 }
 
+/// The agent workdir picker: recents first, then roots and their immediate
+/// subdirectories, filtered as the query grows. Same chrome as the finder.
+fn workdir_overlay(state: &PanelState) -> Element<'_, Message> {
+    let recents = state.workdir_picker.recents.len();
+    let mut list = column![].spacing(space(0.5));
+    for (index, dir) in state.workdir_picker.rows().into_iter().enumerate() {
+        let highlighted = index == state.workdir_picker.highlight;
+        let name = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.display().to_string());
+        let mut labels = row![text(name).size(type_scale::ANSWER).style(if highlighted {
+            theme::text_primary
+        } else {
+            theme::text_dim
+        }),]
+        .spacing(space(1.0))
+        .align_y(Alignment::Center);
+        if index < recents && state.workdir_picker.query.is_empty() {
+            labels = labels.push(
+                text(i18n::t(Key::WorkdirRecent))
+                    .size(type_scale::META)
+                    .style(theme::text_faint),
+            );
+        }
+        list = list.push(widgets::railed_with(
+            if highlighted {
+                RailState::Active
+            } else {
+                RailState::Inactive
+            },
+            theme::ground,
+            button(
+                column![
+                    labels,
+                    text(workdir_display(dir))
+                        .size(type_scale::META)
+                        .style(theme::text_faint),
+                ]
+                .spacing(space(0.25)),
+            )
+            .width(Length::Fill)
+            .padding([space(0.5), space(1.0)])
+            .style(theme::list_row_button(highlighted))
+            .on_press(Message::WorkdirChoose(index)),
+        ));
+    }
+
+    column![
+        text_input(
+            i18n::t(Key::WorkdirPlaceholder),
+            &state.workdir_picker.query
+        )
+        .id(WORKDIR_ID)
+        .on_input(Message::WorkdirQuery)
+        .on_submit(Message::WorkdirCommit)
+        .size(type_scale::BODY)
+        .font(theme::UI_FONT)
+        .padding(space(1.0))
+        .style(theme::input),
+        scrollable(list)
+            .height(Length::Fixed(PICKER_LIST_HEIGHT))
+            .width(Length::Fill)
+            .style(theme::scroller),
+        widgets::action_list(vec![
+            Action::new(Key::ActionSelect, "⏎", Message::WorkdirCommit).primary(),
+            Action::new(Key::ActionDismiss, "esc", Message::WorkdirClose),
+        ]),
+    ]
+    .spacing(space(1.5))
+    .into()
+}
+
 /// The composer's ＋ menu: three ways to attach, each row teaching its own
 /// faster chord (owner redesign, 2026-08-02 — one affordance, three sources).
 fn attach_menu_overlay(state: &PanelState) -> Element<'_, Message> {
@@ -2637,6 +2742,35 @@ fn chip_row(state: &PanelState) -> Element<'_, Message> {
         .style(theme::list_row_button(state.agent_mode))
         .on_press(Message::ToggleAgentMode),
     );
+    if state.agent_mode {
+        // Where the agent will work, and the handle to change it (owner,
+        // 2026-08-02). Its own chip rather than a second meaning on the
+        // toggle: clicking the toggle must keep toggling.
+        let label = state
+            .agent_workdir
+            .as_deref()
+            // The default is the first configured root; the candidate list
+            // reports it first, so the chip can say so before any choice.
+            .or_else(|| state.workdir_picker.dirs.first().map(|dir| dir.as_path()))
+            .map(workdir_display)
+            .unwrap_or_else(|| "…".to_owned());
+        cluster_row = cluster_row.push(
+            button(
+                row![
+                    text(widgets::elide(&label, 28))
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_dim),
+                    text("▾").size(type_scale::META).style(theme::text_faint),
+                ]
+                .spacing(space(0.5))
+                .align_y(Alignment::Center),
+            )
+            .padding([space(0.5), space(1.0)])
+            .style(theme::list_row_button(false))
+            .on_press(Message::WorkdirOpen),
+        );
+    }
     if !state.tasks.is_empty() {
         let severity = if state.any_task_blocked() {
             Severity::Warning
@@ -3190,6 +3324,75 @@ fn input_row(state: &PanelState) -> Element<'_, Message> {
     )
     .width(Length::Fill)
     .into()
+}
+
+/// The agent working-directory picker (owner redesign, 2026-08-02): recents
+/// first, then the configured roots and their immediate subdirectories,
+/// filtered by a plain substring on the home-relative display path.
+#[derive(Debug, Default)]
+pub struct WorkdirPicker {
+    /// Whether the picker is up.
+    pub open: bool,
+    /// Filter text.
+    pub query: String,
+    /// Highlighted row, an index into [`WorkdirPicker::rows`].
+    pub highlight: usize,
+    /// Recently used directories, most recent first (persisted runtime-side).
+    pub recents: Vec<std::path::PathBuf>,
+    /// The configured roots and their immediate subdirectories.
+    pub dirs: Vec<std::path::PathBuf>,
+}
+
+impl WorkdirPicker {
+    /// Open with a fresh query; candidates arrive via
+    /// [`crate::bridge::UiEvent::WorkdirCandidates`].
+    pub fn open(&mut self) {
+        self.open = true;
+        self.query.clear();
+        self.highlight = 0;
+    }
+
+    /// Close, keeping the candidate lists for next time.
+    pub fn close(&mut self) {
+        self.open = false;
+    }
+
+    /// The rows the query leaves standing: recents first, then the rest,
+    /// deduplicated in that order.
+    pub fn rows(&self) -> Vec<&std::path::Path> {
+        let needle = self.query.to_lowercase();
+        let mut seen = std::collections::HashSet::new();
+        self.recents
+            .iter()
+            .chain(self.dirs.iter())
+            .filter(|dir| seen.insert(dir.as_path()))
+            .filter(|dir| {
+                needle.is_empty() || workdir_display(dir).to_lowercase().contains(&needle)
+            })
+            .map(std::path::PathBuf::as_path)
+            .collect()
+    }
+
+    /// Move the highlight, wrapping.
+    pub fn move_highlight(&mut self, delta: i32) {
+        let count = self.rows().len();
+        if count == 0 {
+            return;
+        }
+        let count = i32::try_from(count).unwrap_or(i32::MAX);
+        let current = i32::try_from(self.highlight).unwrap_or(0);
+        self.highlight = usize::try_from((current + delta).rem_euclid(count)).unwrap_or(0);
+    }
+}
+
+/// A path as the picker and the agent chip show it: `~`-relative when under
+/// the home directory, absolute otherwise.
+pub fn workdir_display(path: &std::path::Path) -> String {
+    let display = path.display().to_string();
+    std::env::var("HOME")
+        .ok()
+        .and_then(|home| display.strip_prefix(&home).map(|rest| format!("~{rest}")))
+        .unwrap_or(display)
 }
 
 /// Whether the panel is in `design.md` §4's empty state.
@@ -4143,6 +4346,33 @@ mod tests {
         let mut state = PanelState::new(SessionId::from_u128(1));
         state.phase = Phase::Idle;
         state
+    }
+
+    /// Recents lead, duplicates collapse into their recent row, and the
+    /// filter is a plain substring on the display path.
+    #[test]
+    fn workdir_rows_dedupe_and_filter() {
+        let mut picker = WorkdirPicker::default();
+        picker.recents = vec!["/tmp/dev/aibo".into()];
+        picker.dirs = vec![
+            "/tmp/dev".into(),
+            "/tmp/dev/aibo".into(),
+            "/tmp/docs".into(),
+        ];
+
+        let rows = picker.rows();
+        assert_eq!(
+            rows,
+            vec![
+                std::path::Path::new("/tmp/dev/aibo"),
+                std::path::Path::new("/tmp/dev"),
+                std::path::Path::new("/tmp/docs"),
+            ],
+            "the recent copy wins its duplicate"
+        );
+
+        picker.query = "docs".to_owned();
+        assert_eq!(picker.rows(), vec![std::path::Path::new("/tmp/docs")]);
     }
 
     /// The owner's ruling behind the clipped backdrop: opening a menu may

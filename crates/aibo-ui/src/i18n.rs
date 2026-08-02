@@ -506,6 +506,14 @@ pub enum Key {
     ActionAttach,
     /// Attach menu row: crop a screen region into the conversation.
     ActionScreenshot,
+    /// Marker on the workdir picker's recently-used rows.
+    WorkdirRecent,
+    /// Placeholder in the workdir picker's filter field.
+    WorkdirPlaceholder,
+    /// `/cd` — choose the agent's working directory.
+    CmdCdDesc,
+    /// `/cd` rejected a path that is not a directory: `{}` = what was typed.
+    ToastWorkdirInvalid,
     /// Section: roles.
     SettingsRoles,
     /// Section: budgets.
@@ -853,6 +861,10 @@ fn en(key: Key) -> &'static str {
         K::CmdSettingsDesc => "Open settings",
         K::ActionAttach => "Attach",
         K::ActionScreenshot => "Capture a screen region",
+        K::WorkdirRecent => "recent",
+        K::WorkdirPlaceholder => "choose where the agent works",
+        K::CmdCdDesc => "Choose the agent's working directory",
+        K::ToastWorkdirInvalid => "{} is not a directory",
         K::SettingsRoles => "Roles",
         K::SettingsBudgets => "Budgets",
         K::SettingsPermissions => "Permissions",
@@ -1114,6 +1126,10 @@ fn ja(key: Key) -> &'static str {
         K::CmdSettingsDesc => "設定を開く",
         K::ActionAttach => "添付",
         K::ActionScreenshot => "画面の範囲を撮影",
+        K::WorkdirRecent => "最近",
+        K::WorkdirPlaceholder => "エージェントの作業ディレクトリを選択",
+        K::CmdCdDesc => "エージェントの作業ディレクトリを選択",
+        K::ToastWorkdirInvalid => "{} はディレクトリではありません",
         K::PanelAgentPlaceholder => "タスクを入力 — エージェントは実行前に確認します",
         K::PanelTasksTitle => "エージェントの実行",
         K::SettingsRoles => "ロール",

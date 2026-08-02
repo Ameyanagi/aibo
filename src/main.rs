@@ -67,6 +67,7 @@ use anyhow::Context as _;
 
 mod files;
 mod stt;
+mod workdirs;
 
 /// How long the tokio runtime is given to finish in-flight work at shutdown.
 ///
@@ -311,6 +312,20 @@ mod paths {
         /// releases, so the table ships as TOML and the user may correct it).
         pub fn prices(&self) -> PathBuf {
             self.root.join("prices.toml")
+        }
+
+        /// Recently used agent working directories, one absolute path per
+        /// line, most recent first. State, not configuration — it changes on
+        /// every run and belongs out of `config.toml`.
+        pub fn recent_workdirs(&self) -> PathBuf {
+            self.root.join("recent_workdirs")
+        }
+
+        /// The user's skills — pi/Claude-Code-compatible `SKILL.md` folders.
+        /// Inside the one aibo directory so "back up my skills" is copying
+        /// the folder every other piece of state already lives in.
+        pub fn skills_dir(&self) -> PathBuf {
+            self.root.join("skills")
         }
     }
 
@@ -3023,6 +3038,7 @@ mod runtime {
         attachments: Vec<Attachment>,
         history: Vec<Turn>,
         include_selection: bool,
+        workdir: Option<std::path::PathBuf>,
     }
 
     /// Messages the backend's own tasks send back to its loop.
@@ -3682,6 +3698,7 @@ mod runtime {
                     attachments,
                     history,
                     include_selection,
+                    workdir,
                 } => {
                     let submission = LastSubmission {
                         instruction,
@@ -3690,6 +3707,7 @@ mod runtime {
                         attachments,
                         history,
                         include_selection,
+                        workdir,
                     };
                     self.submit(session, submission, internal.clone()).await;
                 }
@@ -3740,6 +3758,26 @@ mod runtime {
                         }
                     }));
                 }
+                UiRequest::ListWorkdirs => {
+                    let roots = crate::files::roots(self.file_roots.as_deref());
+                    let state_file = self.bootstrap.paths().recent_workdirs();
+                    let events = self.events.clone();
+                    tokio::spawn(crate::diagnostics::supervise("workdir-list", async move {
+                        let listed = tokio::task::spawn_blocking(move || {
+                            (
+                                crate::workdirs::recents(&state_file),
+                                crate::workdirs::candidates(&roots),
+                            )
+                        })
+                        .await;
+                        if let Ok((recents, dirs)) = listed {
+                            let _ = events
+                                .send(UiEvent::WorkdirCandidates { recents, dirs })
+                                .await;
+                        }
+                    }));
+                }
+
                 UiRequest::AttachFile { path } => {
                     let events = self.events.clone();
                     tokio::spawn(crate::diagnostics::supervise("file-attach", async move {
@@ -4586,6 +4624,7 @@ mod runtime {
                 attachments,
                 history,
                 include_selection,
+                workdir,
             } = request;
 
             // §1: "⌥Space then a verb", spelled `/agent`. The panel freezes
@@ -4632,7 +4671,7 @@ mod runtime {
                         truncated: false,
                     });
                 }
-                self.submit_agent(session, instruction, role_override, context)
+                self.submit_agent(session, instruction, role_override, context, workdir)
                     .await;
                 return;
             }
@@ -4730,6 +4769,7 @@ mod runtime {
             instruction: String,
             role_override: Option<Role>,
             context: Vec<UntrustedBlock>,
+            workdir: Option<std::path::PathBuf>,
         ) {
             let task_id = uuid::Uuid::now_v7();
             let events = self.events.clone();
@@ -4775,7 +4815,19 @@ mod runtime {
             // §11: writes are scoped to directories the user added. The same
             // roots the settings window's Files section edits are the agent's
             // workspace — one list, one mental model, already user-curated.
-            let roots = crate::files::roots(self.file_roots.as_deref());
+            let mut roots = crate::files::roots(self.file_roots.as_deref());
+            // A chosen workdir (owner redesign, 2026-08-02) becomes the
+            // anchor — the first root is what `WorkspaceExecutor` treats as
+            // the working directory — while the other roots stay in scope.
+            // Recorded as a recent only when the run actually starts with it.
+            if let Some(dir) = workdir.and_then(|dir| dir.canonicalize().ok()) {
+                if dir.is_dir() {
+                    crate::workdirs::remember(&self.bootstrap.paths().recent_workdirs(), &dir);
+                    roots.retain(|root| root != &dir);
+                    roots.insert(0, dir);
+                }
+            }
+            let roots = roots;
             let tools = match aibo_agent_tools_adapter::WorkspaceExecutor::new(roots.clone()) {
                 Ok(tools) => Arc::new(tools) as Arc<dyn aibo_agent::ToolExecutor>,
                 Err(error) => {
