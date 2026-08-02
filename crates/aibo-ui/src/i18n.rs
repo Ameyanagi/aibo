@@ -552,6 +552,14 @@ pub enum Key {
     SettingsAbout,
     /// Section: language.
     SettingsLanguage,
+    /// Section: appearance.
+    SettingsAppearance,
+    /// Appearance choice: follow the OS.
+    AppearanceSystem,
+    /// Appearance choice: always dark.
+    AppearanceDark,
+    /// Appearance choice: always light.
+    AppearanceLight,
     /// First-run setup heading.
     SettingsWelcomeTitle,
     /// First-run setup explanation.
@@ -914,6 +922,10 @@ fn en(key: Key) -> &'static str {
         K::SettingsHistory => "History",
         K::SettingsAbout => "About",
         K::SettingsLanguage => "Language",
+        K::SettingsAppearance => "Appearance",
+        K::AppearanceSystem => "Match the system",
+        K::AppearanceDark => "Dark",
+        K::AppearanceLight => "Light",
         K::SettingsWelcomeTitle => "Welcome to aibo",
         K::SettingsWelcomeBody => "Three quick steps, then aibo is ready wherever you write.",
         K::SettingsSetupConnect => "Connect ChatGPT",
@@ -1201,6 +1213,10 @@ fn ja(key: Key) -> &'static str {
         K::SettingsHistory => "履歴",
         K::SettingsAbout => "情報",
         K::SettingsLanguage => "言語",
+        K::SettingsAppearance => "外観",
+        K::AppearanceSystem => "システムに合わせる",
+        K::AppearanceDark => "ダーク",
+        K::AppearanceLight => "ライト",
         K::SettingsWelcomeTitle => "aibo へようこそ",
         K::SettingsWelcomeBody => {
             "3 つの簡単な手順で、どこで文章を書いていても aibo を使えるようになります。"

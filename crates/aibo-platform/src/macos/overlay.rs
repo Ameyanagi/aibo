@@ -8,9 +8,10 @@ use objc2::{MainThreadMarker, Message};
 use objc2_app_kit::{
     NSAccessibilityAnnouncementKey, NSAccessibilityAnnouncementRequestedNotification,
     NSAccessibilityPostNotificationWithUserInfo, NSApplication, NSAutoresizingMaskOptions, NSColor,
-    NSFloatingWindowLevel, NSUserInterfaceItemIdentification, NSView, NSVisualEffectBlendingMode,
-    NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView, NSWindowCollectionBehavior,
-    NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility, NSWorkspace,
+    NSFloatingWindowLevel, NSScreen, NSUserInterfaceItemIdentification, NSView,
+    NSVisualEffectBlendingMode, NSVisualEffectMaterial, NSVisualEffectState, NSVisualEffectView,
+    NSWindowCollectionBehavior, NSWindowOrderingMode, NSWindowStyleMask, NSWindowTitleVisibility,
+    NSWorkspace,
 };
 use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize, NSString};
 use raw_window_handle::AppKitWindowHandle;
@@ -118,6 +119,17 @@ pub(crate) fn activate_self() -> bool {
     true
 }
 
+/// Whether the OS is currently in a dark appearance.
+///
+/// `None` off the main thread or before AppKit is up — the caller keeps its
+/// previous answer rather than guessing. Matching on the name string covers
+/// both `DarkAqua` and the vibrant variants.
+pub(crate) fn system_prefers_dark() -> Option<bool> {
+    let mtm = MainThreadMarker::new()?;
+    let appearance = NSApplication::sharedApplication(mtm).effectiveAppearance();
+    Some(appearance.name().to_string().contains("Dark"))
+}
+
 pub(crate) fn reduced_motion_preferred() -> bool {
     // This AppKit preference is main-thread-only. An off-main query cannot
     // safely hop synchronously to the UI thread, so prefer reduced motion.
@@ -175,6 +187,43 @@ fn install_backdrop(mtm: MainThreadMarker, host: &NSView) -> BackdropStatus {
     effect.setAutoresizingMask(top_anchored_mask(frame_view.isFlipped()));
     frame_view.addSubview_positioned_relativeTo(&effect, NSWindowOrderingMode::Below, Some(host));
     BackdropStatus::Applied
+}
+
+/// Set the panel's frame in one native call, animated by the window server.
+///
+/// `x`/`y` are top-left-origin global logical points — the shell's own
+/// convention — flipped here against the primary screen into AppKit's
+/// bottom-left frame. One animated `setFrame` replaces the shell's separate
+/// resize-then-move effects: the window server interpolates the frame while
+/// the chrome re-lays-out each animation frame, which is what turns a
+/// streaming height change from a per-event snap into motion. Honors the
+/// system reduced-motion preference by applying the frame instantly.
+pub(crate) fn animate_panel_frame(
+    handle: AppKitWindowHandle,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), OverlayWindowError> {
+    let mtm = MainThreadMarker::new().ok_or(OverlayWindowError::MainThreadRequired)?;
+    with_native_view(handle.ns_view, |host| {
+        let Some(window) = host.window() else {
+            return Ok(());
+        };
+        // AppKit's global space is anchored to the primary screen's
+        // bottom-left; winit's to its top-left. The primary screen is the
+        // first in `screens` and holds the origin in both conventions.
+        let Some(primary) = NSScreen::screens(mtm).firstObject() else {
+            return Ok(());
+        };
+        let frame = NSRect::new(
+            NSPoint::new(x, primary.frame().size.height - y - height),
+            NSSize::new(width, height),
+        );
+        let animate = !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
+        window.setFrame_display_animate(frame, true, animate);
+        Ok(())
+    })
 }
 
 /// Resize the installed backdrop to hug the top `height` points of the panel.

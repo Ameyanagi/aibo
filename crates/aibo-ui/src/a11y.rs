@@ -170,6 +170,18 @@ pub fn settings_tree(
             ));
             content_children.push(SETTINGS_STATUS);
         }
+        Section::Appearance => {
+            // Same shape as Dictation: one label naming the current choice.
+            nodes.push((
+                SETTINGS_STATUS,
+                semantic_node(
+                    Role::Label,
+                    i18n::t(state.appearance.label()),
+                    logical_rect(content_x, 68.0, content_width, 28.0),
+                ),
+            ));
+            content_children.push(SETTINGS_STATUS);
+        }
         Section::About => {
             nodes.push((
                 SETTINGS_STATUS,
@@ -696,6 +708,7 @@ fn section_node_id(section: Section) -> NodeId {
                 Section::Models => 8,
                 Section::Files => 9,
                 Section::Dictation => 10,
+                Section::Appearance => 11,
             },
     )
 }

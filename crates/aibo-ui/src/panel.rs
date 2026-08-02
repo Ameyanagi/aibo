@@ -3574,6 +3574,7 @@ fn input_row(state: &PanelState) -> Element<'_, Message> {
     // report, 2026-08-01). ⏎ still submits — the key binding suppresses the
     // editor's own newline and the window chord carries the submit — while
     // ⇧⏎ makes a line break.
+    let slash_open = state.slash.open;
     let input = text_editor(state.input_editor())
         .id(INPUT_ID)
         .placeholder(placeholder)
@@ -3587,11 +3588,28 @@ fn input_row(state: &PanelState) -> Element<'_, Message> {
         // with a CJK companion ship (§2 names IBM Plex Mono + Plex Sans JP).
         .font(theme::UI_FONT)
         .padding(space(1.0))
-        .key_binding(|key_press| {
+        .key_binding(move |key_press| {
             if matches!(
                 key_press.key.as_ref(),
                 iced::keyboard::Key::Named(iced::keyboard::key::Named::Enter)
             ) && !key_press.modifiers.shift()
+            {
+                return None;
+            }
+            // While the slash popup is open, bare ↑/↓ choose a command. The
+            // editor must decline them — same trick as ⏎ above — because a
+            // multi-line editor otherwise consumes arrows as caret motion,
+            // the window listener sees `Captured`, and the highlight never
+            // moves (owner report, 2026-08-03). Modified arrows (⇧↑
+            // selection, ⌥↑ word motion) stay the editor's.
+            if slash_open
+                && key_press.modifiers.is_empty()
+                && matches!(
+                    key_press.key.as_ref(),
+                    iced::keyboard::Key::Named(
+                        iced::keyboard::key::Named::ArrowUp | iced::keyboard::key::Named::ArrowDown
+                    )
+                )
             {
                 return None;
             }
@@ -4085,18 +4103,26 @@ impl PanelState {
             height += chat_bubble_height(user, false);
             messages += 1;
             match self.phase {
-                // §16: while the answer can still grow, the reserved height
-                // stands so streaming never reflows the transcript. The
-                // reservation is floored well ahead of the text: tracking it
-                // line by line made every few tokens a window resize, and each
-                // resize is a visible flicker (owner report, 2026-08-01). One
-                // grow at dispatch and one settle at the finish is two resizes
-                // per turn instead of six.
+                // §16: while the answer can still grow, the reservation only
+                // ever steps *up*, so streaming never reflows the transcript.
+                // It used to be floored at a flat 96 pt from dispatch — sized
+                // so a typical answer needed no mid-stream resize back when
+                // every resize was an instant window-server snap. Now that
+                // resizes animate, that trade inverted: the flat reserve made
+                // every thinking phase balloon and every short answer bounce
+                // back down (owner report, 2026-08-03). The thinking row
+                // reserves only itself; text then grows the bubble in
+                // [`ANSWER_HEIGHT_STEP`] chunks — a handful of animated
+                // resizes for a long answer, none of them a give-back.
                 Phase::Loading | Phase::Streaming => {
-                    height += CHAT_BUBBLE_CHROME_HEIGHT
-                        + self
-                            .chat_answer_height()
-                            .max(CHAT_STREAM_RESERVE.min(self.max_chat_answer_height()));
+                    let reservation = if self.response.is_empty() {
+                        theme::CHAT_ANSWER_MIN_HEIGHT
+                    } else {
+                        ((self.chat_answer_height() / ANSWER_HEIGHT_STEP).ceil()
+                            * ANSWER_HEIGHT_STEP)
+                            .min(self.max_chat_answer_height())
+                    };
+                    height += CHAT_BUBBLE_CHROME_HEIGHT + reservation;
                     messages += 1;
                 }
                 // Settled: the bubble is as tall as what is actually in it.
@@ -4375,11 +4401,6 @@ const PANEL_HEIGHT_DISPLAY_FRACTION: f32 = 0.60;
 const ANSWER_HEIGHT_STEP: f32 = 48.0;
 
 const CHAT_ANSWER_MAX_HEIGHT: f32 = 172.0;
-/// Height reserved for the active answer while it streams, so a typical reply
-/// fits without a single mid-stream resize. Short answers give the space back
-/// when they settle; long ones grow past it in [`estimated_text_height`]'s
-/// whole-line steps.
-const CHAT_STREAM_RESERVE: f32 = 96.0;
 /// Everything a bubble adds around its body text: 16 pt vertical padding twice
 /// ([`space`]`(2.0)` in [`user_bubble`]/[`assistant_text_bubble`]), the ~15 pt
 /// `META` role label, and the 8 pt column gap between label and body.
@@ -4547,18 +4568,10 @@ fn actions_for(state: &PanelState) -> Vec<Action<Message>> {
         copy.disabled()
     });
 
-    // Removal is listed only while there is something to remove. It is not the
-    // "disabled rather than absent" case: unlike Replace and Copy, this action
-    // has a second, always-visible home — the `×` on every chip — so a disabled
-    // entry here would be a permanent row of noise for a capability the chip
-    // already advertises the moment it becomes real.
-    if state.has_attachments() {
-        actions.push(Action::new(
-            Key::ActionRemoveImage,
-            DETACH_KEY,
-            Message::DetachLast,
-        ));
-    }
+    // Removal is NOT listed here (owner, 2026-08-03: "remove image should
+    // only be an × in a circle"). Its one home is the ring on every chip,
+    // which carries the ⌫ hint on the newest — a footer entry was the same
+    // capability recited twice.
 
     // Cancel keeps its seat while a stream is in flight: it is state
     // feedback, not a shortcut listing.
@@ -5350,18 +5363,20 @@ mod tests {
         let with = listed(&state).expect("still listed");
         assert!(with.on_press.is_some());
 
-        // Removal appears with the thing it removes, and shows its own key.
+        // Removal never appears in the footer (owner, 2026-08-03): its one
+        // home is the ringed × on the chip itself, with or without chips.
         assert!(
             actions_for(&state)
                 .iter()
                 .all(|a| a.label != Key::ActionRemoveImage)
         );
         state.attach(screenshot("shot")).expect("valid");
-        let remove = actions_for(&state)
-            .into_iter()
-            .find(|a| a.label == Key::ActionRemoveImage)
-            .expect("removal is offered once there is something to remove");
-        assert_eq!(remove.key, DETACH_KEY);
+        assert!(
+            actions_for(&state)
+                .iter()
+                .all(|a| a.label != Key::ActionRemoveImage),
+            "the chip's ring is the only removal affordance"
+        );
     }
 
     #[test]

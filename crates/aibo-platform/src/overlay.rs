@@ -119,6 +119,47 @@ pub fn set_panel_backdrop_height(
     }
 }
 
+/// Whether the OS is currently in a dark appearance, `None` when it cannot
+/// say (off-main-thread, headless, or a platform with no such notion).
+pub fn system_prefers_dark() -> Option<bool> {
+    #[cfg(target_os = "macos")]
+    {
+        crate::macos::overlay::system_prefers_dark()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
+    }
+}
+
+/// Move and resize the panel in one native, window-server-animated call.
+///
+/// Coordinates are top-left-origin global logical points, the shell's own
+/// convention. macOS-only: platforms without an animated frame API return
+/// `wrong_handle`, and the caller falls back to its instant resize — the
+/// animation is polish, never the only way geometry lands.
+pub fn animate_panel_frame(
+    handle: WindowHandle<'_>,
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> Result<(), OverlayWindowError> {
+    let raw = handle.as_raw();
+    #[cfg(target_os = "macos")]
+    {
+        let RawWindowHandle::AppKit(handle) = raw else {
+            return Err(wrong_handle("AppKit", raw));
+        };
+        crate::macos::overlay::animate_panel_frame(handle, x, y, width, height)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (x, y, width, height);
+        Err(wrong_handle("AppKit", raw))
+    }
+}
+
 /// Show the panel without activating aibo or replacing the foreground app.
 ///
 /// The panel remains capable of becoming key/foreground later when the user

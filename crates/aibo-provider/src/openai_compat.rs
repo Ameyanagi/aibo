@@ -1206,6 +1206,16 @@ struct ResponsesItem {
     name: Option<String>,
     #[serde(default)]
     arguments: Option<String>,
+    /// Hosted-tool payload — a `web_search_call` item carries
+    /// `{"type": "search", "query": "…"}` here.
+    #[serde(default)]
+    action: Option<ResponsesItemAction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ResponsesItemAction {
+    #[serde(default)]
+    query: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1292,6 +1302,22 @@ impl SseDecoder for ResponsesDecoder {
                 }
             }
             "response.output_item.done" => {
+                // Hosted web search runs server-side, so it is *evidence*, not
+                // a call for the client to execute. It surfaces on the
+                // reasoning channel — collapsed in the panel, a step in the
+                // task timeline — because until it did, searches were
+                // invisible and "web search never activates" was
+                // indistinguishable from "web search is not wired" (owner
+                // report, 2026-08-03).
+                if let Some(item) = &parsed.item
+                    && item.kind == "web_search_call"
+                {
+                    let line = match item.action.as_ref().and_then(|a| a.query.as_deref()) {
+                        Some(query) => format!("web search: {query}"),
+                        None => "web search".to_owned(),
+                    };
+                    out.push(Ok(StreamEvent::Reasoning(line)));
+                }
                 if let Some(item) = parsed.item
                     && item.kind == "function_call"
                 {
@@ -1625,5 +1651,40 @@ mod tests {
         };
         assert_eq!(decoder.on_event(&overflow, &mut out), Flow::Stop);
         assert!(matches!(out.last(), Some(Err(AiboError::Internal(_)))));
+    }
+
+    /// A hosted `web_search_call` is server-side evidence, not a client call:
+    /// it must surface on the reasoning channel — invisible searches read as
+    /// "web search never works" — and must never count against the tool-call
+    /// budget or reach the agent loop as something to execute.
+    #[test]
+    fn a_hosted_web_search_surfaces_as_reasoning_not_a_tool_call() {
+        let mut decoder = ResponsesDecoder::default();
+        let mut out = Vec::new();
+        let event = Event {
+            data: json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "web_search_call",
+                    "id": "ws-1",
+                    "action": { "type": "search", "query": "iced 0.14 text_editor focus" }
+                }
+            })
+            .to_string(),
+            ..Event::default()
+        };
+        assert_eq!(decoder.on_event(&event, &mut out), Flow::Continue);
+        assert!(
+            matches!(
+                out.as_slice(),
+                [Ok(StreamEvent::Reasoning(line))]
+                    if line == "web search: iced 0.14 text_editor focus"
+            ),
+            "got {out:?}"
+        );
+        assert_eq!(
+            decoder.tool_calls_seen, 0,
+            "hosted search is not a client tool call"
+        );
     }
 }
