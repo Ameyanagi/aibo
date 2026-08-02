@@ -43,6 +43,8 @@ pub enum Section {
     History,
     /// The `@` finder's search roots (§P9+).
     Files,
+    /// Dictation source (§P9+, owner request 2026-08-02).
+    Dictation,
     /// UI language (§9).
     Language,
     /// Version, licence, diagnostics (§19).
@@ -51,7 +53,7 @@ pub enum Section {
 
 impl Section {
     /// Every section, in navigation order.
-    pub const ALL: [Section; 10] = [
+    pub const ALL: [Section; 11] = [
         Section::Providers,
         Section::Models,
         Section::Roles,
@@ -60,6 +62,7 @@ impl Section {
         Section::Actions,
         Section::History,
         Section::Files,
+        Section::Dictation,
         Section::Language,
         Section::About,
     ];
@@ -70,13 +73,14 @@ impl Section {
     /// showing them before their editors exist creates navigation that ends in
     /// unrelated generic empty-state copy. Add them here when their controls
     /// ship.
-    pub const VISIBLE: [Section; 8] = [
+    pub const VISIBLE: [Section; 9] = [
         Section::Providers,
         Section::Models,
         Section::Budgets,
         Section::Permissions,
         Section::History,
         Section::Files,
+        Section::Dictation,
         Section::Language,
         Section::About,
     ];
@@ -92,6 +96,7 @@ impl Section {
             Section::Actions => Key::SettingsActions,
             Section::History => Key::SettingsHistory,
             Section::Files => Key::SettingsFiles,
+            Section::Dictation => Key::SettingsDictation,
             Section::Language => Key::SettingsLanguage,
             Section::About => Key::SettingsAbout,
         }
@@ -331,6 +336,8 @@ pub struct SettingsState {
     pub hotkey: Option<HotkeyStatus>,
     /// The active UI language.
     pub language: Lang,
+    /// The dictation backend choice (`[stt] backend`).
+    pub stt_backend: SttChoice,
     /// Whether this window is the first-run setup rather than a later visit.
     pub onboarding: bool,
     /// Whether the optional Codex security/storage explanation is expanded.
@@ -666,6 +673,8 @@ pub enum Message {
     OpenSystemSettings(Permission),
     /// Change the UI language.
     SetLanguage(Lang),
+    /// Change the dictation backend.
+    SetSttBackend(SttChoice),
     /// Copy the device-code to the clipboard.
     ///
     /// §3a's code looks like `RJF3-XIERE`, and the verification page expects it
@@ -799,6 +808,7 @@ fn section_body(state: &SettingsState) -> Element<'_, Message> {
         Section::Models => models(state),
         Section::Permissions => permissions(state),
         Section::Budgets => budgets(state),
+        Section::Dictation => dictation(state),
         Section::Language => language(state),
         Section::About => about(state),
         Section::History => history(state),
@@ -1715,6 +1725,101 @@ fn files(state: &SettingsState) -> Element<'_, Message> {
     list.into()
 }
 
+/// The dictation source (`[stt] backend`), as a three-way choice.
+fn dictation(state: &SettingsState) -> Element<'_, Message> {
+    let mut list = column![].spacing(space(1.0));
+    for choice in SttChoice::ALL {
+        let selected = choice == state.stt_backend;
+        list = list.push(
+            button(
+                row![
+                    text(selection_marker(selected))
+                        .width(Length::Fixed(space(3.0)))
+                        .size(type_scale::BODY)
+                        .style(theme::text_primary),
+                    column![
+                        text(i18n::t(choice.label()))
+                            .size(type_scale::BODY)
+                            .style(if selected {
+                                theme::text_primary
+                            } else {
+                                theme::text_dim
+                            }),
+                        text(i18n::t(choice.detail()))
+                            .size(type_scale::META)
+                            .style(theme::text_faint),
+                    ]
+                    .spacing(space(0.25)),
+                ]
+                .align_y(iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding([space(1.5), space(2.0)])
+            .style(if selected {
+                theme::selected_button
+            } else {
+                theme::action_button
+            })
+            .on_press(Message::SetSttBackend(choice)),
+        );
+    }
+    list.into()
+}
+
+/// The dictation backend, as the settings window models it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SttChoice {
+    /// Prefer the OpenAI key, fall back to the ChatGPT plan.
+    #[default]
+    Auto,
+    /// The realtime API with the OpenAI key — streaming, word by word.
+    OpenAi,
+    /// The ChatGPT plan's transcription endpoint via the Codex sign-in —
+    /// the text arrives when the turn ends.
+    ChatGpt,
+}
+
+impl SttChoice {
+    /// Every choice, in display order.
+    pub const ALL: [SttChoice; 3] = [SttChoice::Auto, SttChoice::OpenAi, SttChoice::ChatGpt];
+
+    /// The `[stt] backend` spelling; `None` is auto.
+    pub fn tag(self) -> Option<&'static str> {
+        match self {
+            SttChoice::Auto => None,
+            SttChoice::OpenAi => Some("openai"),
+            SttChoice::ChatGpt => Some("chatgpt"),
+        }
+    }
+
+    /// Parse the config spelling; unknown values read as auto.
+    pub fn from_tag(tag: Option<&str>) -> SttChoice {
+        match tag {
+            Some("openai") => SttChoice::OpenAi,
+            Some("chatgpt") => SttChoice::ChatGpt,
+            _ => SttChoice::Auto,
+        }
+    }
+
+    /// The row's title.
+    pub const fn label(self) -> Key {
+        match self {
+            SttChoice::Auto => Key::SttAuto,
+            SttChoice::OpenAi => Key::SttOpenAi,
+            SttChoice::ChatGpt => Key::SttChatGpt,
+        }
+    }
+
+    /// The row's one-line explanation.
+    pub const fn detail(self) -> Key {
+        match self {
+            SttChoice::Auto => Key::SttAutoDetail,
+            SttChoice::OpenAi => Key::SttOpenAiDetail,
+            SttChoice::ChatGpt => Key::SttChatGptDetail,
+        }
+    }
+}
+
 fn language(state: &SettingsState) -> Element<'_, Message> {
     let mut list = column![].spacing(space(1.0));
     for lang in Lang::ALL {
@@ -1907,13 +2012,15 @@ mod tests {
     fn the_information_architecture_matches_section_16() {
         // §16 names: providers, roles, budgets, permissions, actions, history,
         // about/license. Language is the §9 addition; Models and Files are the
-        // owner's 2026-08-01 additions (quick-pick pins, @ finder roots).
+        // owner's 2026-08-01 additions (quick-pick pins, @ finder roots);
+        // Dictation is the owner's 2026-08-02 addition (STT method).
         // Unfinished editors stay in the durable enum without creating
         // dead-end navigation.
-        assert_eq!(Section::ALL.len(), 10);
-        assert_eq!(Section::VISIBLE.len(), 8);
+        assert_eq!(Section::ALL.len(), 11);
+        assert_eq!(Section::VISIBLE.len(), 9);
         assert!(Section::VISIBLE.contains(&Section::Models));
         assert!(Section::VISIBLE.contains(&Section::Files));
+        assert!(Section::VISIBLE.contains(&Section::Dictation));
         assert!(!Section::VISIBLE.contains(&Section::Roles));
         assert!(!Section::VISIBLE.contains(&Section::Actions));
         assert_eq!(Section::default(), Section::Providers);

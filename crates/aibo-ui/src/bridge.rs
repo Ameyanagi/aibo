@@ -374,6 +374,13 @@ pub enum UiRequest {
     /// [`UiEvent::SkillCatalog`].
     ListSkills,
 
+    /// Persist the dictation backend choice: `"openai"`, `"chatgpt"`, or
+    /// `None` for auto.
+    SetSttBackend {
+        /// The choice, as `[stt] backend` spells it.
+        backend: Option<String>,
+    },
+
     /// Persist the quick-pick pin set. Sent on every deliberate toggle: a pin
     /// must survive a restart, or pinning is pointless.
     SetPinnedModels {
@@ -684,6 +691,8 @@ pub enum UiEvent {
         default_file_roots: Vec<String>,
         /// `[budget]`, as (limit_micros, warn_at_percent, hard_stop).
         budget: Option<(u64, u8, bool)>,
+        /// `[stt] backend`: `"openai"`, `"chatgpt"`, or `None` for auto.
+        stt_backend: Option<String>,
     },
 
     /// A picked file's content, size-capped and text-decoded. The UI routes

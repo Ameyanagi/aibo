@@ -1798,6 +1798,18 @@ mod config_file {
         write_ui_key(path, "panel_hotkey", spec.map(quote).as_deref())
     }
 
+    /// Persist the dictation backend choice; `None` returns to auto.
+    pub fn write_stt_backend(path: &Path, backend: Option<&str>) -> io::Result<()> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+        let updated =
+            splice_key_in_table(&existing, "stt", "backend", backend.map(quote).as_deref());
+        crate::paths::atomic_write(path, updated.as_bytes())
+    }
+
     /// Set or remove **one key** of `[ui]`, leaving its other keys standing.
     ///
     /// `[ui]` is the one multi-tenant table settings writes: `language`,
@@ -3375,6 +3387,9 @@ mod runtime {
         /// The `@` finder's roots as currently configured — the live copy
         /// settings edits, so a change applies to the very next walk.
         file_roots: Option<Vec<String>>,
+        /// `[stt] backend` as currently configured — the live copy, so a
+        /// settings change applies to the very next `⌘L`.
+        stt_backend: Option<String>,
         /// Steering queues for running agent tasks: the composer's mid-run
         /// text is delivered at the loop's next turn boundary.
         steering: std::sync::Arc<
@@ -3500,6 +3515,7 @@ mod runtime {
                 catalogue: aibo_provider::ModelCatalogue::shipped(),
                 dictation: None,
                 file_roots: config.files.roots.clone(),
+                stt_backend: config.stt.backend.clone(),
                 steering: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
                 pending_approvals: Arc::new(std::sync::Mutex::new(HashMap::new())),
             }
@@ -3593,6 +3609,7 @@ mod runtime {
                             budget.hard_stop,
                         )
                     }),
+                    stt_backend: self.stt_backend.clone(),
                 }
             };
             if self.events.send(startup_settings).await.is_err() {
@@ -3669,15 +3686,38 @@ mod runtime {
 
                 // §P9+ dictation. One turn at a time: a second Start while one
                 // runs is the toggle racing itself and is ignored.
+                //
+                // Which backend answers is the `[stt]` setting (owner request,
+                // 2026-08-02): "openai" streams over the realtime API with the
+                // OpenAI key; "chatgpt" records the turn and uploads it to the
+                // ChatGPT plan's transcription endpoint with the Codex tokens;
+                // auto prefers the key and falls back to the plan.
                 UiRequest::StartDictation => {
                     if self.dictation.is_none() {
-                        match self.bootstrap.api_key(&ProviderId::OPENAI) {
-                            Some(key) => {
-                                self.dictation = Some(crate::stt::start(key, self.events.clone()));
-                            }
-                            None => self.emit(UiEvent::DictationFailed {
-                                failure: aibo_ui::DictationFailure::NoOpenAiKey,
+                        let choice = self.stt_backend.as_deref().unwrap_or("auto");
+                        let openai_key = self.bootstrap.api_key(&ProviderId::OPENAI);
+                        let chatgpt_tokens = || {
+                            let config = self.bootstrap.config();
+                            self.bootstrap.codex_tokens(&config)
+                        };
+                        self.dictation = match choice {
+                            "chatgpt" => chatgpt_tokens().map(|tokens| {
+                                crate::stt::start_chatgpt(tokens, self.events.clone())
                             }),
+                            "openai" => {
+                                openai_key.map(|key| crate::stt::start(key, self.events.clone()))
+                            }
+                            _ => match openai_key {
+                                Some(key) => Some(crate::stt::start(key, self.events.clone())),
+                                None => chatgpt_tokens().map(|tokens| {
+                                    crate::stt::start_chatgpt(tokens, self.events.clone())
+                                }),
+                            },
+                        };
+                        if self.dictation.is_none() {
+                            self.emit(UiEvent::DictationFailed {
+                                failure: aibo_ui::DictationFailure::NoOpenAiKey,
+                            });
                         }
                     }
                 }
@@ -3759,6 +3799,16 @@ mod runtime {
                         }
                     }));
                 }
+                UiRequest::SetSttBackend { backend } => {
+                    if let Err(error) = crate::config_file::write_stt_backend(
+                        &self.bootstrap.paths().config(),
+                        backend.as_deref(),
+                    ) {
+                        tracing::warn!(%error, "could not persist the STT backend");
+                    }
+                    self.stt_backend = backend;
+                }
+
                 UiRequest::ListSkills => {
                     let dir = self.bootstrap.paths().skills_dir();
                     let events = self.events.clone();

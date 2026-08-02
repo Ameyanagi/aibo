@@ -2677,6 +2677,13 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             state.send(UiRequest::SetAxTreeActivation { enabled });
             Task::none()
         }
+        M::SetSttBackend(choice) => {
+            state.settings.stt_backend = choice;
+            state.send(UiRequest::SetSttBackend {
+                backend: choice.tag().map(str::to_owned),
+            });
+            Task::none()
+        }
         M::RootDraft(draft) => {
             if state.command_held && is_single_char_insertion(&state.settings.root_draft, &draft) {
                 return Task::none();
@@ -3380,8 +3387,11 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             file_roots,
             default_file_roots,
             budget,
+            stt_backend,
         } => {
             state.settings.ax_tree_activation = ax_tree_activation;
+            state.settings.stt_backend =
+                crate::settings::SttChoice::from_tag(stt_backend.as_deref());
             state.settings.file_roots = file_roots;
             state.settings.default_file_roots = default_file_roots;
             state.settings.budget_configured = budget.is_some();
@@ -4054,6 +4064,7 @@ mod tests {
                 file_roots: None,
                 default_file_roots: vec!["/d/Documents".to_owned(), "/d/Desktop".to_owned()],
                 budget: None,
+                stt_backend: None,
             },
         );
 

@@ -522,6 +522,20 @@ pub enum Key {
     SkillsTitle,
     /// The `/skills` overlay with nothing installed: how to get one.
     SkillsEmpty,
+    /// Settings section: dictation source.
+    SettingsDictation,
+    /// STT choice: automatic.
+    SttAuto,
+    /// STT auto explanation.
+    SttAutoDetail,
+    /// STT choice: OpenAI key, realtime.
+    SttOpenAi,
+    /// STT OpenAI explanation.
+    SttOpenAiDetail,
+    /// STT choice: ChatGPT plan.
+    SttChatGpt,
+    /// STT ChatGPT explanation.
+    SttChatGptDetail,
     /// Section: roles.
     SettingsRoles,
     /// Section: budgets.
@@ -877,6 +891,13 @@ fn en(key: Key) -> &'static str {
         K::CmdSkillsDesc => "List installed skills",
         K::SkillsTitle => "Skills",
         K::SkillsEmpty => "No skills yet. In agent mode, try: make yourself a skill that …",
+        K::SettingsDictation => "Dictation",
+        K::SttAuto => "Automatic",
+        K::SttAutoDetail => "OpenAI key when present, otherwise the ChatGPT plan",
+        K::SttOpenAi => "OpenAI API key",
+        K::SttOpenAiDetail => "Streaming — words appear as you speak",
+        K::SttChatGpt => "ChatGPT plan",
+        K::SttChatGptDetail => "Uses the Codex sign-in; the text arrives when you stop",
         K::SettingsRoles => "Roles",
         K::SettingsBudgets => "Budgets",
         K::SettingsPermissions => "Permissions",
@@ -1148,6 +1169,13 @@ fn ja(key: Key) -> &'static str {
         K::SkillsEmpty => {
             "スキルはまだありません。エージェントモードで「〜するスキルを作って」と頼んでみてください"
         }
+        K::SettingsDictation => "音声入力",
+        K::SttAuto => "自動",
+        K::SttAutoDetail => "OpenAI キーがあれば使用し、なければ ChatGPT プランを使用",
+        K::SttOpenAi => "OpenAI API キー",
+        K::SttOpenAiDetail => "ストリーミング — 話すそばから文字になります",
+        K::SttChatGpt => "ChatGPT プラン",
+        K::SttChatGptDetail => "Codex サインインを使用。停止すると文字が届きます",
         K::PanelAgentPlaceholder => "タスクを入力 — エージェントは実行前に確認します",
         K::PanelTasksTitle => "エージェントの実行",
         K::SettingsRoles => "ロール",

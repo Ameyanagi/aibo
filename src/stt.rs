@@ -85,6 +85,178 @@ pub fn start(key: SecretString, events: mpsc::Sender<UiEvent>) -> DictationHandl
     DictationHandle { stop }
 }
 
+/// Start a dictation turn against the ChatGPT plan's transcription endpoint
+/// (owner request, 2026-08-02): record the whole turn, then one authenticated
+/// upload to `chatgpt.com/backend-api/transcribe`.
+///
+/// Whisper-shaped rather than streaming — the text arrives after the second
+/// `⌘L`, like the ChatGPT apps' own voice input. The endpoint is not part of
+/// any published API, so failure is expected to be possible on any day and is
+/// reported as an ordinary connection failure the user can act on by
+/// switching the STT method in Settings.
+pub fn start_chatgpt(
+    tokens: std::sync::Arc<aibo_provider::auth::RefreshingTokenProvider>,
+    events: mpsc::Sender<UiEvent>,
+) -> DictationHandle {
+    let stop = CancellationToken::new();
+    let task_stop = stop.clone();
+    tokio::spawn(crate::diagnostics::supervise(
+        "dictation-chatgpt",
+        async move {
+            run_chatgpt(tokens, events, task_stop).await;
+        },
+    ));
+    DictationHandle { stop }
+}
+
+/// The upload flavour: same microphone pipeline, buffered instead of
+/// streamed.
+async fn run_chatgpt(
+    tokens: std::sync::Arc<aibo_provider::auth::RefreshingTokenProvider>,
+    events: mpsc::Sender<UiEvent>,
+    stop: CancellationToken,
+) {
+    use aibo_core::types::TokenProvider as _;
+
+    let emit = |event: UiEvent| {
+        let events = events.clone();
+        async move {
+            let _ = events.send(event).await;
+        }
+    };
+
+    let (chunk_tx, mut chunks) = mpsc::channel::<Vec<u8>>(64);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let mic_stop = stop.clone();
+    let spawned = std::thread::Builder::new()
+        .name("aibo-dictation-mic".into())
+        .spawn(move || capture_thread(chunk_tx, ready_tx, mic_stop));
+    if spawned.is_err() || !matches!(ready_rx.await, Ok(Ok(()))) {
+        emit(UiEvent::DictationFailed {
+            failure: DictationFailure::Microphone,
+        })
+        .await;
+        return;
+    }
+
+    emit(UiEvent::DictationStarted).await;
+
+    // Phase 1 — buffer PCM until the user ends the turn. Bounded: at 48 KB/s
+    // the cap below is several minutes of speech, and a dictation longer than
+    // that deserves the streaming backend anyway.
+    const MAX_PCM_BYTES: usize = 24_000 * 2 * 300;
+    let mut pcm: Vec<u8> = Vec::new();
+    loop {
+        tokio::select! {
+            biased;
+            () = stop.cancelled() => break,
+            chunk = chunks.recv() => {
+                let Some(bytes) = chunk else {
+                    emit(UiEvent::DictationFailed {
+                        failure: DictationFailure::Microphone,
+                    })
+                    .await;
+                    return;
+                };
+                if pcm.len() + bytes.len() <= MAX_PCM_BYTES {
+                    pcm.extend_from_slice(&bytes);
+                }
+            }
+        }
+    }
+    if pcm.is_empty() {
+        emit(UiEvent::DictationEnded).await;
+        return;
+    }
+
+    // Phase 2 — one upload. The token comes fresh from the refresh flow; the
+    // account id rides in the header the backend keys plans off.
+    let outcome = async {
+        let token = tokens.token().await.ok()?;
+        let account = tokens.account_id().await;
+        transcribe_upload(&token, account.as_deref(), wav_bytes(&pcm)).await
+    }
+    .await;
+    match outcome {
+        Some(text) if !text.is_empty() => {
+            emit(UiEvent::DictationDelta { text }).await;
+            emit(UiEvent::DictationEnded).await;
+        }
+        Some(_) => emit(UiEvent::DictationEnded).await,
+        None => {
+            emit(UiEvent::DictationFailed {
+                failure: DictationFailure::Connection,
+            })
+            .await;
+        }
+    }
+}
+
+/// POST the recorded turn to the ChatGPT backend; `Some(text)` on success.
+async fn transcribe_upload(
+    token: &SecretString,
+    account: Option<&str>,
+    wav: Vec<u8>,
+) -> Option<String> {
+    const BOUNDARY: &str = "aibo-dictation-boundary";
+    let mut body = Vec::with_capacity(wav.len() + 256);
+    body.extend_from_slice(
+        format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"dictation.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&wav);
+    body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://chatgpt.com/backend-api/transcribe")
+        .bearer_auth(token.expose_secret())
+        .header(
+            "Content-Type",
+            format!("multipart/form-data; boundary={BOUNDARY}"),
+        )
+        .header("chatgpt-account-id", account.unwrap_or_default())
+        .body(body)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        tracing::warn!(status = %response.status(), "chatgpt transcribe refused the upload");
+        return None;
+    }
+    let value: serde_json::Value = response.json().await.ok()?;
+    value
+        .get("text")
+        .or_else(|| value.get("transcription"))
+        .and_then(|text| text.as_str())
+        .map(|text| text.trim().to_owned())
+}
+
+/// A minimal 16-bit mono PCM WAV container around the captured samples.
+fn wav_bytes(pcm: &[u8]) -> Vec<u8> {
+    let data_len = u32::try_from(pcm.len()).unwrap_or(u32::MAX);
+    let byte_rate = TARGET_RATE * 2;
+    let mut wav = Vec::with_capacity(44 + pcm.len());
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&(36 + data_len).to_le_bytes());
+    wav.extend_from_slice(b"WAVEfmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&TARGET_RATE.to_le_bytes());
+    wav.extend_from_slice(&byte_rate.to_le_bytes());
+    wav.extend_from_slice(&2u16.to_le_bytes()); // block align
+    wav.extend_from_slice(&16u16.to_le_bytes()); // bits per sample
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&data_len.to_le_bytes());
+    wav.extend_from_slice(pcm);
+    wav
+}
+
 async fn run(key: SecretString, events: mpsc::Sender<UiEvent>, stop: CancellationToken) {
     let emit = |event: UiEvent| {
         let events = events.clone();

@@ -157,6 +157,19 @@ pub fn settings_tree(
             }
             content_children.extend(ids);
         }
+        Section::Dictation => {
+            // One summary label naming the current choice; the three radio
+            // rows are ordinary buttons the pointer path already covers.
+            nodes.push((
+                SETTINGS_STATUS,
+                semantic_node(
+                    Role::Label,
+                    i18n::t(state.stt_backend.label()),
+                    logical_rect(content_x, 68.0, content_width, 28.0),
+                ),
+            ));
+            content_children.push(SETTINGS_STATUS);
+        }
         Section::About => {
             nodes.push((
                 SETTINGS_STATUS,
@@ -682,6 +695,7 @@ fn section_node_id(section: Section) -> NodeId {
                 Section::About => 7,
                 Section::Models => 8,
                 Section::Files => 9,
+                Section::Dictation => 10,
             },
     )
 }
