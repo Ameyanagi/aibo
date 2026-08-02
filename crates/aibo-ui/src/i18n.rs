@@ -480,6 +480,64 @@ pub enum Key {
     PanelAgentPlaceholder,
     /// Heading of the ⌘T tasks overlay.
     PanelTasksTitle,
+
+    // --- panel: slash commands & help (owner redesign, 2026-08-02) --------
+    /// The footer's help affordance and the help overlay's title.
+    ActionHelp,
+    /// Help section: keyboard shortcuts.
+    HelpHeadingShortcuts,
+    /// Help section: slash commands.
+    HelpHeadingCommands,
+    /// Help row: the global summon hotkey.
+    HelpSummon,
+    /// Help row: crop a screen region into an attachment.
+    HelpCrop,
+    /// Help row: ↑/↓ prompt history.
+    HelpHistory,
+    /// `/help` — show shortcuts and commands.
+    CmdHelpDesc,
+    /// `/agent` — run the coding agent on the trailing text.
+    CmdAgentDesc,
+    /// `/new` — start a fresh session.
+    CmdNewDesc,
+    /// `/model` — open the quick-pick.
+    CmdModelDesc,
+    /// `/settings` — open the settings window.
+    CmdSettingsDesc,
+    /// The composer's ＋ button: open the attach menu.
+    ActionAttach,
+    /// Attach menu row: crop a screen region into the conversation.
+    ActionScreenshot,
+    /// Marker on the workdir picker's recently-used rows.
+    WorkdirRecent,
+    /// Placeholder in the workdir picker's filter field.
+    WorkdirPlaceholder,
+    /// `/cd` — choose the agent's working directory.
+    CmdCdDesc,
+    /// `/cd` rejected a path that is not a directory: `{}` = what was typed.
+    ToastWorkdirInvalid,
+    /// `/skill` — invoke a skill by name.
+    CmdSkillDesc,
+    /// `/skills` — list installed skills.
+    CmdSkillsDesc,
+    /// Heading of the `/skills` overlay.
+    SkillsTitle,
+    /// The `/skills` overlay with nothing installed: how to get one.
+    SkillsEmpty,
+    /// Settings section: dictation source.
+    SettingsDictation,
+    /// STT choice: automatic.
+    SttAuto,
+    /// STT auto explanation.
+    SttAutoDetail,
+    /// STT choice: OpenAI key, realtime.
+    SttOpenAi,
+    /// STT OpenAI explanation.
+    SttOpenAiDetail,
+    /// STT choice: ChatGPT plan.
+    SttChatGpt,
+    /// STT ChatGPT explanation.
+    SttChatGptDetail,
     /// Section: roles.
     SettingsRoles,
     /// Section: budgets.
@@ -815,6 +873,34 @@ fn en(key: Key) -> &'static str {
         K::ActionAgentModeOn => "✓ Agent",
         K::PanelAgentPlaceholder => "describe a task — the agent asks before it acts",
         K::PanelTasksTitle => "Agent runs",
+        K::ActionHelp => "Help",
+        K::HelpHeadingShortcuts => "Keyboard",
+        K::HelpHeadingCommands => "Commands",
+        K::HelpSummon => "Summon or dismiss the panel",
+        K::HelpCrop => "Crop a screen region and attach it",
+        K::HelpHistory => "Prompt history",
+        K::CmdHelpDesc => "Show shortcuts and commands",
+        K::CmdAgentDesc => "Run the coding agent on what follows",
+        K::CmdNewDesc => "Start a new chat",
+        K::CmdModelDesc => "Open the model picker",
+        K::CmdSettingsDesc => "Open settings",
+        K::ActionAttach => "Attach",
+        K::ActionScreenshot => "Capture a screen region",
+        K::WorkdirRecent => "recent",
+        K::WorkdirPlaceholder => "choose where the agent works",
+        K::CmdCdDesc => "Choose the agent's working directory",
+        K::ToastWorkdirInvalid => "{} is not a directory",
+        K::CmdSkillDesc => "Invoke a skill by name",
+        K::CmdSkillsDesc => "List installed skills",
+        K::SkillsTitle => "Skills",
+        K::SkillsEmpty => "No skills yet. In agent mode, try: make yourself a skill that …",
+        K::SettingsDictation => "Dictation",
+        K::SttAuto => "Automatic",
+        K::SttAutoDetail => "OpenAI key when present, otherwise the ChatGPT plan",
+        K::SttOpenAi => "OpenAI API key",
+        K::SttOpenAiDetail => "Streaming — words appear as you speak",
+        K::SttChatGpt => "ChatGPT plan",
+        K::SttChatGptDetail => "Uses the Codex sign-in; the text arrives when you stop",
         K::SettingsRoles => "Roles",
         K::SettingsBudgets => "Budgets",
         K::SettingsPermissions => "Permissions",
@@ -1064,6 +1150,36 @@ fn ja(key: Key) -> &'static str {
         K::ActionRemoveBudget => "上限を削除",
         K::ActionAgentMode => "エージェント",
         K::ActionAgentModeOn => "✓ エージェント",
+        K::ActionHelp => "ヘルプ",
+        K::HelpHeadingShortcuts => "キーボード",
+        K::HelpHeadingCommands => "コマンド",
+        K::HelpSummon => "パネルを呼び出す・閉じる",
+        K::HelpCrop => "画面の範囲を切り取って添付",
+        K::HelpHistory => "入力履歴",
+        K::CmdHelpDesc => "ショートカットとコマンドを表示",
+        K::CmdAgentDesc => "続くテキストをコーディングエージェントで実行",
+        K::CmdNewDesc => "新しいチャットを開始",
+        K::CmdModelDesc => "モデルピッカーを開く",
+        K::CmdSettingsDesc => "設定を開く",
+        K::ActionAttach => "添付",
+        K::ActionScreenshot => "画面の範囲を撮影",
+        K::WorkdirRecent => "最近",
+        K::WorkdirPlaceholder => "エージェントの作業ディレクトリを選択",
+        K::CmdCdDesc => "エージェントの作業ディレクトリを選択",
+        K::ToastWorkdirInvalid => "{} はディレクトリではありません",
+        K::CmdSkillDesc => "スキルを名前で実行",
+        K::CmdSkillsDesc => "インストール済みスキルを一覧",
+        K::SkillsTitle => "スキル",
+        K::SkillsEmpty => {
+            "スキルはまだありません。エージェントモードで「〜するスキルを作って」と頼んでみてください"
+        }
+        K::SettingsDictation => "音声入力",
+        K::SttAuto => "自動",
+        K::SttAutoDetail => "OpenAI キーがあれば使用し、なければ ChatGPT プランを使用",
+        K::SttOpenAi => "OpenAI API キー",
+        K::SttOpenAiDetail => "ストリーミング — 話すそばから文字になります",
+        K::SttChatGpt => "ChatGPT プラン",
+        K::SttChatGptDetail => "Codex サインインを使用。停止すると文字が届きます",
         K::PanelAgentPlaceholder => "タスクを入力 — エージェントは実行前に確認します",
         K::PanelTasksTitle => "エージェントの実行",
         K::SettingsRoles => "ロール",

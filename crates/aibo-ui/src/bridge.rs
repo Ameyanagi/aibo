@@ -219,6 +219,10 @@ pub enum UiRequest {
         /// Removing the context card changes this to `false` without mutating
         /// the backend's captured insertion target.
         include_selection: bool,
+        /// The working directory an agent run should start in (owner
+        /// redesign, 2026-08-02). `None` keeps the default — the first
+        /// configured root. Ignored for chat surfaces.
+        workdir: Option<std::path::PathBuf>,
     },
 
     /// Cancel in-flight work for a session (`esc`, or a new submission).
@@ -359,6 +363,22 @@ pub enum UiRequest {
     AttachFile {
         /// Absolute path, exactly as [`UiEvent::FileCandidates`] reported it.
         path: String,
+    },
+
+    /// List candidate agent working directories (owner redesign, 2026-08-02):
+    /// recently used first, then the configured roots and their immediate
+    /// subdirectories. Answered by [`UiEvent::WorkdirCandidates`].
+    ListWorkdirs,
+
+    /// List installed skills for the `/skills` overlay. Answered by
+    /// [`UiEvent::SkillCatalog`].
+    ListSkills,
+
+    /// Persist the dictation backend choice: `"openai"`, `"chatgpt"`, or
+    /// `None` for auto.
+    SetSttBackend {
+        /// The choice, as `[stt] backend` spells it.
+        backend: Option<String>,
     },
 
     /// Persist the quick-pick pin set. Sent on every deliberate toggle: a pin
@@ -641,6 +661,25 @@ pub enum UiEvent {
         files: Vec<FileCandidate>,
     },
 
+    /// Candidate agent working directories, answering
+    /// [`UiRequest::ListWorkdirs`].
+    WorkdirCandidates {
+        /// Recently used, most recent first — the "pick up where I was" rows.
+        recents: Vec<std::path::PathBuf>,
+        /// The configured roots and their immediate subdirectories.
+        dirs: Vec<std::path::PathBuf>,
+    },
+
+    /// The installed skills, answering [`UiRequest::ListSkills`]:
+    /// `(name, description)` pairs plus the folder they live in — the folder
+    /// is the backup story, so the overlay shows it.
+    SkillCatalog {
+        /// Installed skills, sorted by name.
+        skills: Vec<(String, String)>,
+        /// The skills folder.
+        dir: std::path::PathBuf,
+    },
+
     /// The persisted settings the runtime owns, published once at startup so
     /// the settings window edits real values instead of blanks.
     SettingsLoaded {
@@ -652,6 +691,8 @@ pub enum UiEvent {
         default_file_roots: Vec<String>,
         /// `[budget]`, as (limit_micros, warn_at_percent, hard_stop).
         budget: Option<(u64, u8, bool)>,
+        /// `[stt] backend`: `"openai"`, `"chatgpt"`, or `None` for auto.
+        stt_backend: Option<String>,
     },
 
     /// A picked file's content, size-capped and text-decoded. The UI routes

@@ -48,6 +48,9 @@ pub const FINDER_ID: &str = "aibo.panel.finder";
 /// The id of the model quick-pick's search field.
 pub const PICKER_ID: &str = "aibo.panel.picker";
 
+/// Focus target for the workdir picker's filter field.
+pub const WORKDIR_ID: &str = "aibo.panel.workdir";
+
 /// Where the panel is in its lifecycle.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub enum Phase {
@@ -771,6 +774,28 @@ pub struct PanelState {
     pub tasks: Vec<crate::tasks::TaskState>,
     /// Whether the ⌘T tasks overlay is up.
     pub tasks_open: bool,
+    /// The slash-command popup (owner redesign, 2026-08-02): open while the
+    /// composer holds a command-in-progress, highlight and dismissal state.
+    pub slash: crate::slash::SlashState,
+    /// Whether the help overlay is up (`?`, `help`, `/help`, or the footer's
+    /// Help action).
+    pub help_open: bool,
+    /// Whether the composer's ＋ attach menu is up (owner redesign,
+    /// 2026-08-02: one button, three sources — clipboard, screenshot, file).
+    pub attach_menu_open: bool,
+    /// The directory this session's agent runs start in. `None` is the
+    /// default — the first configured root. Session-scoped on purpose: a
+    /// workdir is a task decision, not a preference; the *recents* in the
+    /// picker are what persists.
+    pub agent_workdir: Option<std::path::PathBuf>,
+    /// The agent working-directory picker (owner redesign, 2026-08-02).
+    pub workdir_picker: WorkdirPicker,
+    /// Whether the `/skills` overlay is up.
+    pub skills_open: bool,
+    /// Installed skills as `(name, description)`, from the runtime.
+    pub skill_catalog: Vec<(String, String)>,
+    /// The skills folder, shown as the backup story.
+    pub skills_dir: Option<std::path::PathBuf>,
     /// The task whose detail the overlay shows; `None` lists all.
     pub selected_task: Option<Uuid>,
     /// The finished active response, split into markdown and typeset math.
@@ -831,6 +856,14 @@ impl PanelState {
             agent_mode: false,
             tasks: Vec::new(),
             tasks_open: false,
+            slash: crate::slash::SlashState::default(),
+            help_open: false,
+            attach_menu_open: false,
+            agent_workdir: None,
+            workdir_picker: WorkdirPicker::default(),
+            skills_open: false,
+            skill_catalog: Vec::new(),
+            skills_dir: None,
             selected_task: None,
             active_segments: None,
             dictation_pad: false,
@@ -867,6 +900,9 @@ impl PanelState {
         // The finder's candidate index describes the disk, not the session;
         // rebuilding it on every ⌘N would make the next `@` needlessly slow.
         let file_finder = std::mem::take(&mut self.file_finder);
+        // Same argument for the workdir picker's candidates; the *chosen*
+        // workdir stays session state and resets with everything else.
+        let workdir_picker = std::mem::take(&mut self.workdir_picker);
         // Agent runs are not session state: a run started in a previous chat
         // keeps going and stays reachable through the overlay (§6).
         let tasks = std::mem::take(&mut self.tasks);
@@ -877,6 +913,8 @@ impl PanelState {
         self.recent_models = recent_models;
         self.file_finder = file_finder;
         self.file_finder.close();
+        self.workdir_picker = workdir_picker;
+        self.workdir_picker.close();
         self.model_options = model_options;
         self.selected_model = selected_model;
         self.display_height = display_height;
@@ -985,6 +1023,7 @@ impl PanelState {
     pub fn consume_input(&mut self) {
         self.input.clear();
         self.input_editor = text_editor::Content::new();
+        self.slash.sync(&self.input);
     }
 
     /// Take back a chat turn that another surface claimed.
@@ -1267,6 +1306,7 @@ impl PanelState {
         self.input_editor = text_editor::Content::with_text(text);
         self.input_editor
             .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+        self.slash.sync(&self.input);
     }
 
     /// Apply a user edit from the composer widget.
@@ -1279,6 +1319,7 @@ impl PanelState {
             text.pop();
         }
         self.input = text;
+        self.slash.sync(&self.input);
     }
 
     /// Height the composer needs beyond its single-line baseline.
@@ -1391,10 +1432,23 @@ impl PanelState {
         }
     }
 
+    /// Whether any floating menu is over the panel. One place, because the
+    /// window-height rule and the view's menu slot must agree exactly.
+    pub fn menu_open(&self) -> bool {
+        self.picker.open
+            || self.file_finder.open
+            || self.tasks_open
+            || self.slash.open
+            || self.help_open
+            || self.attach_menu_open
+            || self.workdir_picker.open
+            || self.skills_open
+    }
+
     /// The height the panel wants, for [`crate::placement::PlacementRequest`].
     pub fn desired_height(&self) -> f32 {
         let base = self.height_without_overlay();
-        if self.picker.open || self.file_finder.open || self.tasks_open {
+        if self.menu_open() {
             // The quick-pick floats over the panel. The window grows only when
             // the panel is too short to contain the menu, and never shrinks
             // for it — mid-conversation, opening the picker moves nothing.
@@ -1574,6 +1628,42 @@ pub enum Message {
     PickerPin(usize),
     /// A lane was clicked.
     PickerLane(crate::model_picker::Lane),
+    /// Move the slash popup's highlight.
+    SlashMove(i32),
+    /// Accept the slash popup's highlighted command.
+    SlashAccept,
+    /// A slash row was clicked: highlight and accept in one gesture.
+    SlashChoose(usize),
+    /// Put the slash popup away for the current text.
+    SlashClose,
+    /// Open the help overlay.
+    HelpOpen,
+    /// Close the help overlay.
+    HelpClose,
+    /// Toggle the composer's ＋ attach menu.
+    AttachMenuToggle,
+    /// Close the attach menu without choosing.
+    AttachMenuClose,
+    /// Attach menu: crop a screen region into this conversation.
+    AttachScreenshot,
+    /// Attach menu: open the `@` file finder.
+    AttachPickFile,
+    /// Open the agent working-directory picker.
+    WorkdirOpen,
+    /// Close it without choosing.
+    WorkdirClose,
+    /// The picker's filter changed.
+    WorkdirQuery(String),
+    /// Move the picker's highlight.
+    WorkdirMove(i32),
+    /// A row was clicked: highlight and commit in one gesture.
+    WorkdirChoose(usize),
+    /// Commit the highlighted directory as this session's workdir.
+    WorkdirCommit,
+    /// Open the `/skills` overlay.
+    SkillsOpen,
+    /// Close it.
+    SkillsClose,
 }
 
 /// Render the panel.
@@ -1676,6 +1766,16 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
         Some((finder_overlay(state), Message::FinderClose))
     } else if state.tasks_open {
         Some((tasks_overlay(state), Message::TasksClose))
+    } else if state.help_open {
+        Some((help_overlay(), Message::HelpClose))
+    } else if state.attach_menu_open {
+        Some((attach_menu_overlay(state), Message::AttachMenuClose))
+    } else if state.workdir_picker.open {
+        Some((workdir_overlay(state), Message::WorkdirClose))
+    } else if state.skills_open {
+        Some((skills_overlay(state), Message::SkillsClose))
+    } else if state.slash.open {
+        Some((slash_overlay(state), Message::SlashClose))
     } else {
         None
     };
@@ -2220,6 +2320,336 @@ fn finder_overlay(state: &PanelState) -> Element<'_, Message> {
     .into()
 }
 
+/// The slash-command completion popup: matching commands, name and
+/// description, highlight driven by ↑/↓ while the composer keeps focus.
+fn slash_overlay(state: &PanelState) -> Element<'_, Message> {
+    let mut list = column![].spacing(space(0.5));
+    for (index, command) in crate::slash::matches(&state.input).iter().enumerate() {
+        let highlighted = index == state.slash.highlight;
+        list = list.push(widgets::railed_with(
+            if highlighted {
+                RailState::Active
+            } else {
+                RailState::Inactive
+            },
+            theme::ground,
+            button(
+                row![
+                    text(command.name)
+                        .size(type_scale::BODY)
+                        .font(theme::MONO_FONT)
+                        .style(if highlighted {
+                            theme::text_primary
+                        } else {
+                            theme::text_dim
+                        }),
+                    text(i18n::t(command.description))
+                        .size(type_scale::META)
+                        .style(theme::text_faint),
+                ]
+                .spacing(space(1.5))
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding([space(0.5), space(1.0)])
+            .style(theme::list_row_button(highlighted))
+            .on_press(Message::SlashChoose(index)),
+        ));
+    }
+    column![
+        list,
+        widgets::action_list(vec![
+            Action::new(Key::ActionSelect, "⏎", Message::SlashAccept).primary(),
+            Action::new(Key::ActionDismiss, "esc", Message::SlashClose),
+        ]),
+    ]
+    .spacing(space(1.5))
+    .into()
+}
+
+/// The agent workdir picker: recents first, then roots and their immediate
+/// subdirectories, filtered as the query grows. Same chrome as the finder.
+fn workdir_overlay(state: &PanelState) -> Element<'_, Message> {
+    let recents = state.workdir_picker.recents.len();
+    let mut list = column![].spacing(space(0.5));
+    for (index, dir) in state.workdir_picker.rows().into_iter().enumerate() {
+        let highlighted = index == state.workdir_picker.highlight;
+        let name = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| dir.display().to_string());
+        let mut labels = row![text(name).size(type_scale::ANSWER).style(if highlighted {
+            theme::text_primary
+        } else {
+            theme::text_dim
+        }),]
+        .spacing(space(1.0))
+        .align_y(Alignment::Center);
+        if index < recents && state.workdir_picker.query.is_empty() {
+            labels = labels.push(
+                text(i18n::t(Key::WorkdirRecent))
+                    .size(type_scale::META)
+                    .style(theme::text_faint),
+            );
+        }
+        list = list.push(widgets::railed_with(
+            if highlighted {
+                RailState::Active
+            } else {
+                RailState::Inactive
+            },
+            theme::ground,
+            button(
+                column![
+                    labels,
+                    text(workdir_display(dir))
+                        .size(type_scale::META)
+                        .style(theme::text_faint),
+                ]
+                .spacing(space(0.25)),
+            )
+            .width(Length::Fill)
+            .padding([space(0.5), space(1.0)])
+            .style(theme::list_row_button(highlighted))
+            .on_press(Message::WorkdirChoose(index)),
+        ));
+    }
+
+    column![
+        text_input(
+            i18n::t(Key::WorkdirPlaceholder),
+            &state.workdir_picker.query
+        )
+        .id(WORKDIR_ID)
+        .on_input(Message::WorkdirQuery)
+        .on_submit(Message::WorkdirCommit)
+        .size(type_scale::BODY)
+        .font(theme::UI_FONT)
+        .padding(space(1.0))
+        .style(theme::input),
+        scrollable(list)
+            .height(Length::Fixed(PICKER_LIST_HEIGHT))
+            .width(Length::Fill)
+            .style(theme::scroller),
+        widgets::action_list(vec![
+            Action::new(Key::ActionSelect, "⏎", Message::WorkdirCommit).primary(),
+            Action::new(Key::ActionDismiss, "esc", Message::WorkdirClose),
+        ]),
+    ]
+    .spacing(space(1.5))
+    .into()
+}
+
+/// The `/skills` overlay: what is installed, and where it lives — the folder
+/// path *is* the backup story (owner request, 2026-08-02).
+fn skills_overlay(state: &PanelState) -> Element<'_, Message> {
+    let mut body = column![].spacing(space(1.0));
+    if state.skill_catalog.is_empty() {
+        body = body.push(
+            text(i18n::t(Key::SkillsEmpty))
+                .size(type_scale::META)
+                .style(theme::text_dim),
+        );
+    }
+    for (name, description) in &state.skill_catalog {
+        body = body.push(
+            column![
+                text(name.clone())
+                    .size(type_scale::BODY)
+                    .font(theme::MONO_FONT)
+                    .style(theme::text_primary),
+                text(description.clone())
+                    .size(type_scale::META)
+                    .style(theme::text_dim),
+            ]
+            .spacing(space(0.25)),
+        );
+    }
+    if let Some(dir) = &state.skills_dir {
+        body = body.push(
+            text(workdir_display(dir))
+                .size(type_scale::META)
+                .font(theme::MONO_FONT)
+                .style(theme::text_faint),
+        );
+    }
+
+    column![
+        text(i18n::t(Key::SkillsTitle))
+            .size(type_scale::BODY)
+            .style(theme::text_primary),
+        scrollable(body)
+            .height(Length::Fixed(PICKER_LIST_HEIGHT))
+            .width(Length::Fill)
+            .style(theme::scroller),
+        widgets::action_list(vec![Action::new(
+            Key::ActionDismiss,
+            "esc",
+            Message::SkillsClose
+        )]),
+    ]
+    .spacing(space(1.5))
+    .into()
+}
+
+/// The composer's ＋ menu: three ways to attach, each row teaching its own
+/// faster chord (owner redesign, 2026-08-02 — one affordance, three sources).
+fn attach_menu_overlay(state: &PanelState) -> Element<'_, Message> {
+    let row_for = |label: Key, chord: &'static str, message: Option<Message>| {
+        let enabled = message.is_some();
+        let mut entry = button(
+            row![
+                text(i18n::t(label))
+                    .size(type_scale::BODY)
+                    .style(if enabled {
+                        theme::text_primary
+                    } else {
+                        theme::text_faint
+                    }),
+                Space::new().width(Length::Fill),
+                text(chord)
+                    .size(type_scale::META)
+                    .font(theme::MONO_FONT)
+                    .style(theme::text_faint),
+            ]
+            .spacing(space(1.5))
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([space(1.0), space(1.0)])
+        .style(theme::list_row_button(false));
+        if let Some(message) = message {
+            entry = entry.on_press(message);
+        }
+        entry
+    };
+
+    column![
+        row_for(
+            Key::ActionAttachImage,
+            widgets::primary_shortcut("⌘V", "Ctrl+V"),
+            state.clipboard.is_attachable().then_some(Message::Attach),
+        ),
+        row_for(
+            Key::ActionScreenshot,
+            "⌥⇧Space",
+            cfg!(target_os = "macos").then_some(Message::AttachScreenshot),
+        ),
+        row_for(Key::ActionAttachFile, "@", Some(Message::AttachPickFile)),
+        widgets::action_list(vec![Action::new(
+            Key::ActionDismiss,
+            "esc",
+            Message::AttachMenuClose
+        )]),
+    ]
+    .spacing(space(0.5))
+    .into()
+}
+
+/// The help overlay: every shortcut and every slash command, on demand
+/// (owner redesign, 2026-08-02 — the footer no longer carries the list).
+fn help_overlay<'a>() -> Element<'a, Message> {
+    // (chord, what it does) — the chords are cross-platform strings where the
+    // two differ, and the labels reuse the action catalogue so help can never
+    // drift from what the buttons themselves say.
+    let shortcuts: &[(&str, Key)] = &[
+        (
+            if cfg!(target_os = "macos") {
+                "⌥Space"
+            } else {
+                "Ctrl+Shift+Space"
+            },
+            Key::HelpSummon,
+        ),
+        ("⌥⇧Space", Key::HelpCrop),
+        ("⌘↩", Key::ActionReplace),
+        ("⌘⇧↩", Key::ActionSmartModel),
+        ("⌘C", Key::ActionCopy),
+        ("⌘V", Key::ActionAttachImage),
+        ("@", Key::ActionAttachFile),
+        ("⌘N", Key::ActionNewChat),
+        ("⌘K", Key::ActionSwitchModel),
+        ("⌘D", Key::ActionPinModel),
+        ("⌘L", Key::ActionDictate),
+        ("⌘J", Key::ActionAgentMode),
+        ("⌘T", Key::ActionShowTask),
+        ("⌘R", Key::ActionRegenerate),
+        ("↑ / ↓", Key::HelpHistory),
+        ("⌘,", Key::ActionOpenSettings),
+        ("esc", Key::ActionDismiss),
+    ];
+
+    let mut body = column![
+        text(i18n::t(Key::HelpHeadingShortcuts))
+            .size(type_scale::META)
+            .style(theme::text_dim),
+    ]
+    .spacing(space(0.75));
+    for (chord, label) in shortcuts {
+        body = body.push(
+            row![
+                container(
+                    text(*chord)
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_primary),
+                )
+                .width(Length::Fixed(HELP_CHORD_WIDTH)),
+                text(i18n::t(*label))
+                    .size(type_scale::META)
+                    .style(theme::text_dim),
+            ]
+            .spacing(space(1.5))
+            .align_y(Alignment::Center),
+        );
+    }
+
+    body = body.push(Space::new().height(space(1.0)));
+    body = body.push(
+        text(i18n::t(Key::HelpHeadingCommands))
+            .size(type_scale::META)
+            .style(theme::text_dim),
+    );
+    for command in crate::slash::COMMANDS {
+        body = body.push(
+            row![
+                container(
+                    text(command.name)
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_primary),
+                )
+                .width(Length::Fixed(HELP_CHORD_WIDTH)),
+                text(i18n::t(command.description))
+                    .size(type_scale::META)
+                    .style(theme::text_dim),
+            ]
+            .spacing(space(1.5))
+            .align_y(Alignment::Center),
+        );
+    }
+
+    column![
+        text(i18n::t(Key::ActionHelp))
+            .size(type_scale::BODY)
+            .style(theme::text_primary),
+        scrollable(body)
+            .height(Length::Fixed(PICKER_LIST_HEIGHT))
+            .width(Length::Fill)
+            .style(theme::scroller),
+        widgets::action_list(vec![Action::new(
+            Key::ActionDismiss,
+            "esc",
+            Message::HelpClose
+        )]),
+    ]
+    .spacing(space(1.5))
+    .into()
+}
+
+/// Width of the chord column in the help overlay, so the labels align.
+const HELP_CHORD_WIDTH: f32 = 132.0;
+
 impl PanelState {
     /// The models that can serve *this* request.
     ///
@@ -2460,6 +2890,35 @@ fn chip_row(state: &PanelState) -> Element<'_, Message> {
         .style(theme::list_row_button(state.agent_mode))
         .on_press(Message::ToggleAgentMode),
     );
+    if state.agent_mode {
+        // Where the agent will work, and the handle to change it (owner,
+        // 2026-08-02). Its own chip rather than a second meaning on the
+        // toggle: clicking the toggle must keep toggling.
+        let label = state
+            .agent_workdir
+            .as_deref()
+            // The default is the first configured root; the candidate list
+            // reports it first, so the chip can say so before any choice.
+            .or_else(|| state.workdir_picker.dirs.first().map(|dir| dir.as_path()))
+            .map(workdir_display)
+            .unwrap_or_else(|| "…".to_owned());
+        cluster_row = cluster_row.push(
+            button(
+                row![
+                    text(widgets::elide(&label, 28))
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_dim),
+                    text("▾").size(type_scale::META).style(theme::text_faint),
+                ]
+                .spacing(space(0.5))
+                .align_y(Alignment::Center),
+            )
+            .padding([space(0.5), space(1.0)])
+            .style(theme::list_row_button(false))
+            .on_press(Message::WorkdirOpen),
+        );
+    }
     if !state.tasks.is_empty() {
         let severity = if state.any_task_blocked() {
             Severity::Warning
@@ -3015,6 +3474,75 @@ fn input_row(state: &PanelState) -> Element<'_, Message> {
     .into()
 }
 
+/// The agent working-directory picker (owner redesign, 2026-08-02): recents
+/// first, then the configured roots and their immediate subdirectories,
+/// filtered by a plain substring on the home-relative display path.
+#[derive(Debug, Default)]
+pub struct WorkdirPicker {
+    /// Whether the picker is up.
+    pub open: bool,
+    /// Filter text.
+    pub query: String,
+    /// Highlighted row, an index into [`WorkdirPicker::rows`].
+    pub highlight: usize,
+    /// Recently used directories, most recent first (persisted runtime-side).
+    pub recents: Vec<std::path::PathBuf>,
+    /// The configured roots and their immediate subdirectories.
+    pub dirs: Vec<std::path::PathBuf>,
+}
+
+impl WorkdirPicker {
+    /// Open with a fresh query; candidates arrive via
+    /// [`crate::bridge::UiEvent::WorkdirCandidates`].
+    pub fn open(&mut self) {
+        self.open = true;
+        self.query.clear();
+        self.highlight = 0;
+    }
+
+    /// Close, keeping the candidate lists for next time.
+    pub fn close(&mut self) {
+        self.open = false;
+    }
+
+    /// The rows the query leaves standing: recents first, then the rest,
+    /// deduplicated in that order.
+    pub fn rows(&self) -> Vec<&std::path::Path> {
+        let needle = self.query.to_lowercase();
+        let mut seen = std::collections::HashSet::new();
+        self.recents
+            .iter()
+            .chain(self.dirs.iter())
+            .filter(|dir| seen.insert(dir.as_path()))
+            .filter(|dir| {
+                needle.is_empty() || workdir_display(dir).to_lowercase().contains(&needle)
+            })
+            .map(std::path::PathBuf::as_path)
+            .collect()
+    }
+
+    /// Move the highlight, wrapping.
+    pub fn move_highlight(&mut self, delta: i32) {
+        let count = self.rows().len();
+        if count == 0 {
+            return;
+        }
+        let count = i32::try_from(count).unwrap_or(i32::MAX);
+        let current = i32::try_from(self.highlight).unwrap_or(0);
+        self.highlight = usize::try_from((current + delta).rem_euclid(count)).unwrap_or(0);
+    }
+}
+
+/// A path as the picker and the agent chip show it: `~`-relative when under
+/// the home directory, absolute otherwise.
+pub fn workdir_display(path: &std::path::Path) -> String {
+    let display = path.display().to_string();
+    std::env::var("HOME")
+        .ok()
+        .and_then(|home| display.strip_prefix(&home).map(|rest| format!("~{rest}")))
+        .unwrap_or(display)
+}
+
 /// Whether the panel is in `design.md` §4's empty state.
 ///
 /// Nothing typed, nothing asked, nothing in flight — the moment right after the
@@ -3028,12 +3556,12 @@ fn shows_empty_invitation(state: &PanelState) -> bool {
 fn composer_actions_for(state: &PanelState) -> Vec<Action<Message>> {
     // Dictation and agent mode moved to the header chips (owner,
     // 2026-08-02); the composer keeps only per-submission actions.
-    let attach = Action::new(Key::ActionAttachImage, ATTACH_KEY, Message::Attach);
-    let attach = if state.clipboard.is_attachable() {
-        attach
-    } else {
-        attach.disabled()
-    };
+    //
+    // One ＋, three sources (owner redesign, 2026-08-02): the button opens a
+    // menu of clipboard image, screenshot and file, each row showing its own
+    // faster chord. Always enabled — the menu itself is where "what can I
+    // attach right now" is answered.
+    let attach = Action::new(Key::ActionAttach, "＋", Message::AttachMenuToggle);
 
     // Deliberately *not* `.primary()`. `design.md` §2 makes amber "the one live
     // accent" and §9's whole method is to spend the boldness in one place — a
@@ -3876,25 +4404,6 @@ fn actions_for(state: &PanelState) -> Vec<Action<Message>> {
         copy.disabled()
     });
 
-    // Skipped during the truncated swap: the primary slot already carries
-    // this exact message, and two entries for one action is noise.
-    if !truncated_retry {
-        let retry = Action::new(
-            Key::ActionRegenerate,
-            widgets::primary_shortcut("⌘R", "Ctrl+R"),
-            Message::Retry,
-        );
-        actions.push(
-            if matches!(state.phase, Phase::Finished { .. } | Phase::Failed)
-                && state.active_user.is_some()
-            {
-                retry
-            } else {
-                retry.disabled()
-            },
-        );
-    }
-
     // Removal is listed only while there is something to remove. It is not the
     // "disabled rather than absent" case: unlike Replace and Copy, this action
     // has a second, always-visible home — the `×` on every chip — so a disabled
@@ -3908,26 +4417,17 @@ fn actions_for(state: &PanelState) -> Vec<Action<Message>> {
         ));
     }
 
-    // The answer to "how do I start over": visible the moment there is
-    // something to start over from.
-    if state.has_conversation() {
-        actions.push(Action::new(
-            Key::ActionNewChat,
-            widgets::primary_shortcut("⌘N", "Ctrl+N"),
-            Message::NewChat,
-        ));
-    }
-
+    // Cancel keeps its seat while a stream is in flight: it is state
+    // feedback, not a shortcut listing.
     if matches!(state.phase, Phase::Loading | Phase::Streaming) {
         actions.push(Action::new(Key::ActionCancel, "esc", Message::Dismiss));
-    } else {
-        actions.push(Action::new(
-            Key::ActionSmartModel,
-            widgets::primary_shortcut("⌘⇧↩", "Ctrl+Shift+Enter"),
-            Message::Escalate,
-        ));
-        actions.push(Action::new(Key::ActionDismiss, "esc", Message::Dismiss));
     }
+
+    // Everything else — regenerate, new chat, smart model, dismiss — lives in
+    // the help overlay now (owner redesign, 2026-08-02: "we don't need to
+    // show the shortcut list in the composer"). The chords all still work;
+    // the footer just stops reciting them.
+    actions.push(Action::new(Key::ActionHelp, "?", Message::HelpOpen));
 
     actions
 }
@@ -3994,6 +4494,35 @@ mod tests {
         let mut state = PanelState::new(SessionId::from_u128(1));
         state.phase = Phase::Idle;
         state
+    }
+
+    /// Recents lead, duplicates collapse into their recent row, and the
+    /// filter is a plain substring on the display path.
+    #[test]
+    fn workdir_rows_dedupe_and_filter() {
+        let mut picker = WorkdirPicker {
+            recents: vec!["/tmp/dev/aibo".into()],
+            dirs: vec![
+                "/tmp/dev".into(),
+                "/tmp/dev/aibo".into(),
+                "/tmp/docs".into(),
+            ],
+            ..WorkdirPicker::default()
+        };
+
+        let rows = picker.rows();
+        assert_eq!(
+            rows,
+            vec![
+                std::path::Path::new("/tmp/dev/aibo"),
+                std::path::Path::new("/tmp/dev"),
+                std::path::Path::new("/tmp/docs"),
+            ],
+            "the recent copy wins its duplicate"
+        );
+
+        picker.query = "docs".to_owned();
+        assert_eq!(picker.rows(), vec![std::path::Path::new("/tmp/docs")]);
     }
 
     /// The owner's ruling behind the clipped backdrop: opening a menu may
@@ -4626,19 +5155,19 @@ mod tests {
         let listed = |state: &PanelState| {
             composer_actions_for(state)
                 .into_iter()
-                .find(|a| a.label == Key::ActionAttachImage)
+                .find(|a| a.label == Key::ActionAttach)
         };
 
+        // One ＋, always live (owner redesign, 2026-08-02): the button opens
+        // the source menu whatever the clipboard holds, so the row never
+        // changes length or enablement under the user's fingers.
         let without = listed(&state).expect("§16: listed even with nothing to attach");
-        assert_eq!(without.key, ATTACH_KEY);
-        assert!(
-            without.on_press.is_none(),
-            "disabled rather than absent, so the row does not change length"
-        );
+        assert_eq!(without.key, "＋");
+        assert!(without.on_press.is_some());
 
         state.clipboard = offered();
         let with = listed(&state).expect("still listed");
-        assert!(with.on_press.is_some(), "the offer enables it");
+        assert!(with.on_press.is_some());
 
         // Removal appears with the thing it removes, and shows its own key.
         assert!(
@@ -4655,19 +5184,24 @@ mod tests {
     }
 
     #[test]
-    fn an_image_reference_without_pixels_keeps_attach_disabled() {
+    fn an_image_reference_without_pixels_is_not_attachable() {
         let mut state = panel();
         state.clipboard = ClipboardOffer::Image {
             label: "Clipboard image".to_owned(),
             image: None,
         };
         assert!(state.clipboard.is_image());
-        assert!(!state.clipboard.is_attachable());
+        assert!(
+            !state.clipboard.is_attachable(),
+            "the attach menu's clipboard row gates on this"
+        );
+        // The ＋ button itself stays live: the menu is where "what can I
+        // attach right now" is answered (owner redesign, 2026-08-02).
         let attach = composer_actions_for(&state)
             .into_iter()
-            .find(|action| action.label == Key::ActionAttachImage)
-            .expect("the stable composer keeps the disabled entry");
-        assert!(attach.on_press.is_none());
+            .find(|action| action.label == Key::ActionAttach)
+            .expect("the composer keeps its one attach affordance");
+        assert!(attach.on_press.is_some());
     }
 
     #[test]

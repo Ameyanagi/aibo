@@ -59,6 +59,7 @@ pub mod palette;
 pub mod panel;
 pub mod placement;
 pub mod settings;
+pub mod slash;
 pub mod tasks;
 pub mod theme;
 pub mod tray;

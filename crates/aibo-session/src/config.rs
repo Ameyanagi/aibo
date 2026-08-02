@@ -483,6 +483,8 @@ pub struct Config {
     pub pins: PinsSettings,
     /// The `@` file finder's search roots (`[files]`).
     pub files: FilesSettings,
+    /// Dictation source selection (`[stt]`).
+    pub stt: SttSettings,
     /// Wall-clock ceiling for one request, in seconds.
     pub request_deadline_secs: Option<u64>,
     /// §13's large-selection refusal, in characters.
@@ -509,6 +511,20 @@ pub struct FilesSettings {
     /// Directories the finder indexes. Absent means the platform defaults
     /// (Documents, Desktop, Downloads under the home directory).
     pub roots: Option<Vec<String>>,
+}
+
+/// Dictation source selection (`[stt]`).
+///
+/// `backend` is a plain string so the config file stays hand-editable and an
+/// unknown value degrades to the default rather than failing the whole parse:
+/// `"auto"` (absent), `"openai"` — the realtime API with the OpenAI key — or
+/// `"chatgpt"` — the ChatGPT plan's transcription endpoint via the Codex
+/// sign-in (owner request, 2026-08-02).
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct SttSettings {
+    /// `"auto"`, `"openai"` or `"chatgpt"`. Absent means auto.
+    pub backend: Option<String>,
 }
 
 /// Persisted desktop-shell preferences.

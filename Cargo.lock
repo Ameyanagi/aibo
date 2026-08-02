@@ -128,6 +128,7 @@ dependencies = [
  "cpal",
  "futures",
  "keyring",
+ "reqwest 0.12.28",
  "secrecy",
  "serde_json",
  "tempfile",

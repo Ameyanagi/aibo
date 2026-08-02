@@ -338,6 +338,10 @@ pub struct Aibo {
     panel_visible: bool,
     /// The command modifier is currently down; see [`Message::CommandHeld`].
     command_held: bool,
+    /// The in-flight region capture came from the composer's attach menu, so
+    /// the session — transcript, composer text, attachments — must survive it.
+    /// The hotkey path keeps its crop-*then*-ask shape and starts fresh.
+    region_capture_keeps_session: bool,
     /// Placement of the last show, so a display change can re-clamp (§9).
     last_placement: Option<Placement>,
     /// The window server's last answer about the panel's monitor (§9).
@@ -878,6 +882,7 @@ fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) 
         panel: PanelState::new(Uuid::now_v7()),
         panel_visible: false,
         command_held: false,
+        region_capture_keeps_session: false,
         last_placement: None,
         observed: None,
         pending_show: false,
@@ -1185,10 +1190,20 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
         }
 
         Message::ScreenRegionCaptured(result) => match result {
-            Ok(None) => Task::none(),
+            Ok(None) => {
+                // A cancelled crop from the attach menu must bring the
+                // conversation back; the hotkey path had nothing to return to.
+                if std::mem::take(&mut state.region_capture_keeps_session) {
+                    aibo_platform::activate_self();
+                    return state.present_panel();
+                }
+                Task::none()
+            }
             Ok(Some(mut attachment)) => {
                 attachment.label = i18n::t(crate::i18n::Key::AttachmentScreenRegion).to_owned();
-                state.begin_panel_session();
+                if !std::mem::take(&mut state.region_capture_keeps_session) {
+                    state.begin_panel_session();
+                }
                 if let Err(error) = state.panel.attach(attachment) {
                     state.panel.fail(&std::sync::Arc::new(error));
                 }
@@ -1203,7 +1218,9 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
             }
             Err(error) => {
                 tracing::warn!(%error, "screen-region capture failed");
-                state.begin_panel_session();
+                if !std::mem::take(&mut state.region_capture_keeps_session) {
+                    state.begin_panel_session();
+                }
                 state.panel.toast = Some(panel::ToastView {
                     severity: ui_theme::Severity::Warning,
                     body: i18n::t(crate::i18n::Key::ToastScreenCaptureFailed).to_owned(),
@@ -1429,9 +1446,50 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
         return open_settings(state);
     }
 
+    // The slash popup and the help overlay intercept only their own keys —
+    // unlike the finder and quick-pick they hold no text field, the composer
+    // keeps focus, and every other chord must keep meaning what it means.
+    if matches!(state.role_of(window), Some(Role::Panel)) && state.panel_visible {
+        if state.panel.slash.open {
+            match chord {
+                WindowChord::Escape => return panel_update(state, panel::Message::SlashClose),
+                WindowChord::Enter {
+                    command: false,
+                    shift: false,
+                } => return panel_update(state, panel::Message::SlashAccept),
+                WindowChord::NextLane => return panel_update(state, panel::Message::SlashAccept),
+                WindowChord::HistoryOlder => {
+                    return panel_update(state, panel::Message::SlashMove(-1));
+                }
+                WindowChord::HistoryNewer => {
+                    return panel_update(state, panel::Message::SlashMove(1));
+                }
+                _ => {}
+            }
+        }
+        if state.panel.help_open && matches!(chord, WindowChord::Escape) {
+            return panel_update(state, panel::Message::HelpClose);
+        }
+        if state.panel.attach_menu_open && matches!(chord, WindowChord::Escape) {
+            return panel_update(state, panel::Message::AttachMenuClose);
+        }
+        if state.panel.skills_open && matches!(chord, WindowChord::Escape) {
+            return panel_update(state, panel::Message::SkillsClose);
+        }
+    }
+
     match state.role_of(window) {
         Some(Role::Panel) if state.panel_visible => {
             let message = match chord {
+                // The workdir picker owns the keyboard while it is open,
+                // exactly like the finder and quick-pick below.
+                _ if state.panel.workdir_picker.open => match chord {
+                    WindowChord::Escape => panel::Message::WorkdirClose,
+                    WindowChord::Enter { .. } => panel::Message::WorkdirCommit,
+                    WindowChord::HistoryOlder => panel::Message::WorkdirMove(-1),
+                    WindowChord::HistoryNewer => panel::Message::WorkdirMove(1),
+                    _ => return Task::none(),
+                },
                 // The `@` finder owns the keyboard while it is open, exactly
                 // like the quick-pick below.
                 _ if state.panel.file_finder.open => match chord {
@@ -1796,6 +1854,77 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             state.panel.file_finder.close();
             resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
         }
+        M::SlashMove(delta) => {
+            let count = crate::slash::matches(&state.panel.input).len();
+            state.panel.slash.move_highlight(delta, count);
+            Task::none()
+        }
+        M::SlashChoose(index) => {
+            state.panel.slash.highlight = index;
+            panel_update(state, M::SlashAccept)
+        }
+        M::SlashAccept => {
+            let commands = crate::slash::matches(&state.panel.input);
+            let Some(command) = commands.get(state.panel.slash.highlight).copied() else {
+                let input = state.panel.input.clone();
+                state.panel.slash.dismiss(&input);
+                return resize_panel_if_visible(state);
+            };
+            if command.takes_args {
+                // Complete the prefix and keep the user typing the arguments;
+                // the trailing space is what closes the popup.
+                state.panel.set_input(&format!("{} ", command.name));
+                resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
+            } else {
+                // Argument-less commands run on accept — a second ⏎ to
+                // confirm a completion the popup already showed is busywork.
+                state.panel.set_input(command.name);
+                panel_update(state, M::Submit)
+            }
+        }
+        M::SlashClose => {
+            let input = state.panel.input.clone();
+            state.panel.slash.dismiss(&input);
+            resize_panel_if_visible(state)
+        }
+        M::HelpOpen => {
+            state.panel.help_open = true;
+            resize_panel_if_visible(state)
+        }
+        M::HelpClose => {
+            state.panel.help_open = false;
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
+        }
+
+        M::AttachMenuToggle => {
+            state.panel.attach_menu_open = !state.panel.attach_menu_open;
+            resize_panel_if_visible(state)
+        }
+        M::AttachMenuClose => {
+            state.panel.attach_menu_open = false;
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
+        }
+        M::AttachScreenshot => {
+            state.panel.attach_menu_open = false;
+            // Unlike the ⌥⇧Space crop-then-ask, this joins the conversation
+            // in progress: the panel hides for clean pixels but nothing is
+            // discarded, and the capture re-presents it with the crop
+            // attached.
+            state.region_capture_keeps_session = true;
+            let hidden = if state.panel_visible {
+                state.hide_panel()
+            } else {
+                Task::none()
+            };
+            hidden.chain(capture_screen_region_task())
+        }
+        M::AttachPickFile => {
+            state.panel.attach_menu_open = false;
+            state.panel.file_finder.open();
+            state.send(UiRequest::ListFiles);
+            resize_panel_if_visible(state).chain(operation::focus(panel::FINDER_ID))
+        }
+
         M::FinderClose => {
             state.panel.file_finder.close();
             // The trigger `@` stays if the user dismissed — they may have
@@ -1855,6 +1984,74 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 return Task::none();
             }
 
+            // Slash commands and their bare aliases act locally; they never
+            // reach a model (owner redesign, 2026-08-02: help is "?", "help"
+            // or "/help" typed into the composer).
+            if let Some((command, command_args)) = crate::slash::parse(&state.panel.input) {
+                use crate::slash::CommandAction;
+                match command.action {
+                    CommandAction::Help => {
+                        state.panel.consume_input();
+                        state.panel.help_open = true;
+                        return resize_panel_if_visible(state);
+                    }
+                    CommandAction::NewChat => {
+                        state.panel.consume_input();
+                        return panel_update(state, M::NewChat);
+                    }
+                    CommandAction::Model => {
+                        state.panel.consume_input();
+                        return panel_update(state, M::OpenPicker);
+                    }
+                    CommandAction::Settings => {
+                        state.panel.consume_input();
+                        return open_settings(state);
+                    }
+                    CommandAction::Workdir => {
+                        let args = command_args.trim().to_owned();
+                        state.panel.consume_input();
+                        if args.is_empty() {
+                            return panel_update(state, M::WorkdirOpen);
+                        }
+                        // `~` expansion, then the filesystem's own verdict —
+                        // the UI shares the process, so it can just ask.
+                        let expanded = if let Some(rest) = args.strip_prefix("~/") {
+                            std::env::var("HOME")
+                                .map(|home| std::path::PathBuf::from(home).join(rest))
+                                .unwrap_or_else(|_| std::path::PathBuf::from(&args))
+                        } else {
+                            std::path::PathBuf::from(&args)
+                        };
+                        match expanded.canonicalize() {
+                            Ok(dir) if dir.is_dir() => {
+                                state.panel.agent_workdir = Some(dir);
+                                // A chosen workdir is agent intent; make the
+                                // mode match so the chip shows the choice.
+                                if !state.panel.agent_mode {
+                                    state.panel.agent_mode = true;
+                                    state.send(UiRequest::ListWorkdirs);
+                                }
+                            }
+                            _ => {
+                                state.panel.toast = Some(panel::ToastView {
+                                    severity: ui_theme::Severity::Warning,
+                                    body: i18n::t1(crate::i18n::Key::ToastWorkdirInvalid, &args),
+                                    offer_diagnostics: false,
+                                });
+                            }
+                        }
+                        return resize_panel_if_visible(state);
+                    }
+                    CommandAction::Skills => {
+                        state.panel.consume_input();
+                        return panel_update(state, M::SkillsOpen);
+                    }
+                    // `/agent …` and `/skill …` are the runtime's spellings
+                    // and go through the ordinary submit path below.
+                    CommandAction::Agent | CommandAction::Skill => {}
+                }
+            }
+
             let instruction = state.panel.input.clone();
             let history = state.panel.history_for_next_turn();
             let include_selection = state.panel.includes_selection();
@@ -1906,6 +2103,7 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 attachments,
                 history,
                 include_selection,
+                workdir: state.panel.agent_workdir.clone(),
             });
             resize_panel_if_visible(state)
         }
@@ -1937,6 +2135,9 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
         // UI writes to `PanelState::attachments`, so nothing ambient can reach
         // routing through it.
         M::Attach => {
+            // Reached from ⌘V or from the attach menu's clipboard row; either
+            // way the menu's job is done.
+            state.panel.attach_menu_open = false;
             let panel::ClipboardOffer::Image { image, .. } = &state.panel.clipboard else {
                 // Nothing attachable. The action list already renders the entry
                 // disabled in this state, so silence here is what the panel
@@ -2064,7 +2265,69 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
 
         M::ToggleAgentMode => {
             state.panel.agent_mode = !state.panel.agent_mode;
+            if state.panel.agent_mode {
+                // The chip needs candidates to name the default workdir, and
+                // the picker should open warm.
+                state.send(UiRequest::ListWorkdirs);
+            }
+            resize_panel_if_visible(state)
+        }
+
+        M::WorkdirOpen => {
+            state.panel.workdir_picker.open();
+            // Re-listed on every open, so a directory created since the last
+            // one is choosable.
+            state.send(UiRequest::ListWorkdirs);
+            resize_panel_if_visible(state).chain(operation::focus(panel::WORKDIR_ID))
+        }
+        M::WorkdirClose => {
+            state.panel.workdir_picker.close();
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
+        }
+        M::WorkdirQuery(query) => {
+            // The same ⌘-fallout guard as every other text field.
+            if state.command_held
+                && is_single_char_insertion(&state.panel.workdir_picker.query, &query)
+            {
+                return Task::none();
+            }
+            state.panel.workdir_picker.query = query;
+            state.panel.workdir_picker.highlight = 0;
             Task::none()
+        }
+        M::WorkdirMove(delta) => {
+            state.panel.workdir_picker.move_highlight(delta);
+            Task::none()
+        }
+        M::WorkdirChoose(index) => {
+            state.panel.workdir_picker.highlight = index;
+            panel_update(state, M::WorkdirCommit)
+        }
+        M::SkillsOpen => {
+            state.panel.skills_open = true;
+            // Re-listed on every open, so a skill the agent just wrote shows
+            // without a restart.
+            state.send(UiRequest::ListSkills);
+            resize_panel_if_visible(state)
+        }
+        M::SkillsClose => {
+            state.panel.skills_open = false;
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
+        }
+
+        M::WorkdirCommit => {
+            let chosen = state
+                .panel
+                .workdir_picker
+                .rows()
+                .get(state.panel.workdir_picker.highlight)
+                .map(|dir| dir.to_path_buf());
+            let Some(dir) = chosen else {
+                return Task::none();
+            };
+            state.panel.agent_workdir = Some(dir);
+            state.panel.workdir_picker.close();
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
         }
         M::TasksToggle => {
             state.panel.tasks_open = !state.panel.tasks_open;
@@ -2412,6 +2675,13 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
         M::AxTreeToggle(enabled) => {
             state.settings.ax_tree_activation = enabled;
             state.send(UiRequest::SetAxTreeActivation { enabled });
+            Task::none()
+        }
+        M::SetSttBackend(choice) => {
+            state.settings.stt_backend = choice;
+            state.send(UiRequest::SetSttBackend {
+                backend: choice.tag().map(str::to_owned),
+            });
             Task::none()
         }
         M::RootDraft(draft) => {
@@ -3068,6 +3338,19 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             Task::none()
         }
 
+        UiEvent::WorkdirCandidates { recents, dirs } => {
+            state.panel.workdir_picker.recents = recents;
+            state.panel.workdir_picker.dirs = dirs;
+            state.panel.workdir_picker.highlight = 0;
+            Task::none()
+        }
+
+        UiEvent::SkillCatalog { skills, dir } => {
+            state.panel.skill_catalog = skills;
+            state.panel.skills_dir = Some(dir);
+            Task::none()
+        }
+
         UiEvent::FileAttached { name, content } => {
             state.panel.attach_file_selection(content);
             let body = i18n::t1(crate::i18n::Key::ToastFileAttached, &name);
@@ -3104,8 +3387,11 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             file_roots,
             default_file_roots,
             budget,
+            stt_backend,
         } => {
             state.settings.ax_tree_activation = ax_tree_activation;
+            state.settings.stt_backend =
+                crate::settings::SttChoice::from_tag(stt_backend.as_deref());
             state.settings.file_roots = file_roots;
             state.settings.default_file_roots = default_file_roots;
             state.settings.budget_configured = budget.is_some();
@@ -3693,6 +3979,10 @@ mod tests {
 
         let _ = panel_update(&mut state, panel::Message::ToggleAgentMode);
         assert!(state.panel.agent_mode);
+        assert!(
+            matches!(received.try_recv(), Ok(UiRequest::ListWorkdirs)),
+            "agent mode warms the workdir candidates for the chip"
+        );
 
         state.panel.set_input("tidy the downloads folder");
         let _ = panel_update(&mut state, panel::Message::Submit);
@@ -3727,6 +4017,10 @@ mod tests {
         state.panel.phase = Phase::Idle;
 
         let _ = panel_update(&mut state, panel::Message::ToggleAgentMode);
+        assert!(
+            matches!(received.try_recv(), Ok(UiRequest::ListWorkdirs)),
+            "agent mode warms the workdir candidates for the chip"
+        );
         state.panel.set_input("hello");
         let _ = panel_update(&mut state, panel::Message::Submit);
         assert!(matches!(received.try_recv(), Ok(UiRequest::Submit { .. })));
@@ -3770,6 +4064,7 @@ mod tests {
                 file_roots: None,
                 default_file_roots: vec!["/d/Documents".to_owned(), "/d/Desktop".to_owned()],
                 budget: None,
+                stt_backend: None,
             },
         );
 

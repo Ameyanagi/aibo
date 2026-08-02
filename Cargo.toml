@@ -211,6 +211,9 @@ uuid = { workspace = true }
 # `SecretString`, to hand a storage-resolved API key to `aibo-session` without
 # it ever landing in a `String` that could be logged.
 secrecy = { workspace = true }
+# The ChatGPT-plan dictation upload (`/backend-api/transcribe`); the realtime
+# path speaks websockets via tokio-tungstenite instead.
+reqwest = { workspace = true }
 
 # `PlatformBackend` exposes a clipboard *read* only, so `UiRequest::Copy` has no
 # home in aibo-platform yet. arboard is the same crate aibo-platform already
