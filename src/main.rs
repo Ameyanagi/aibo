@@ -4910,12 +4910,12 @@ mod runtime {
             // anchor — the first root is what `WorkspaceExecutor` treats as
             // the working directory — while the other roots stay in scope.
             // Recorded as a recent only when the run actually starts with it.
-            if let Some(dir) = workdir.and_then(|dir| dir.canonicalize().ok()) {
-                if dir.is_dir() {
-                    crate::workdirs::remember(&self.bootstrap.paths().recent_workdirs(), &dir);
-                    roots.retain(|root| root != &dir);
-                    roots.insert(0, dir);
-                }
+            if let Some(dir) = workdir.and_then(|dir| dir.canonicalize().ok())
+                && dir.is_dir()
+            {
+                crate::workdirs::remember(&self.bootstrap.paths().recent_workdirs(), &dir);
+                roots.retain(|root| root != &dir);
+                roots.insert(0, dir);
             }
             // The skills folder rides along as an ordinary root: readable so
             // the agent can load a skill's body and run its scripts, writable

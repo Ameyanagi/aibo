@@ -109,7 +109,7 @@ mod tests {
         std::fs::create_dir(root.join(".hidden")).unwrap();
         std::fs::write(root.join("file.txt"), "x").unwrap();
 
-        let dirs = candidates(&[root.clone()]);
+        let dirs = candidates(std::slice::from_ref(&root));
         assert_eq!(
             dirs,
             vec![root.clone(), root.join("alpha"), root.join("beta")],

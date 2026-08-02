@@ -4420,13 +4420,15 @@ mod tests {
     /// filter is a plain substring on the display path.
     #[test]
     fn workdir_rows_dedupe_and_filter() {
-        let mut picker = WorkdirPicker::default();
-        picker.recents = vec!["/tmp/dev/aibo".into()];
-        picker.dirs = vec![
-            "/tmp/dev".into(),
-            "/tmp/dev/aibo".into(),
-            "/tmp/docs".into(),
-        ];
+        let mut picker = WorkdirPicker {
+            recents: vec!["/tmp/dev/aibo".into()],
+            dirs: vec![
+                "/tmp/dev".into(),
+                "/tmp/dev/aibo".into(),
+                "/tmp/docs".into(),
+            ],
+            ..WorkdirPicker::default()
+        };
 
         let rows = picker.rows();
         assert_eq!(
