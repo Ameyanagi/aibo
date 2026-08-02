@@ -502,7 +502,7 @@ impl ShellExecutor {
 
     /// Re-validate and run.
     ///
-    /// The command goes to the platform shell (`sh -c` / `cmd /C`) because §11
+    /// The command goes to the platform shell (`sh -c` / PowerShell `-Command`) because §11
     /// specifies "the exact command" is what the user sees and approves, and
     /// splitting it into an argv would run something different from what was
     /// displayed. The cost is stated plainly in the module docs: the shell can
@@ -616,21 +616,32 @@ impl ShellExecutor {
 #[cfg(windows)]
 fn platform_command(command: &str) -> tokio::process::Command {
     // Windows PowerShell otherwise inherits a legacy console code page when
-    // stdout is redirected, while aibo's tool protocol is UTF-8. Configure
-    // both PowerShell and common child runtimes before running the exact model
-    // command. The trailing exit preserves native-command failures instead of
-    // reporting every PowerShell process as successful.
+    // stdout is redirected and reads BOM-less files using the system code page,
+    // while aibo's tool protocol and workspace files are UTF-8. Configure both
+    // PowerShell and common child runtimes before running the exact model command.
+    // `-WindowStyle Hidden` complements CREATE_NO_WINDOW below so the host stays
+    // invisible even if a Windows launcher changes the process creation context.
+    // The trailing exit preserves native-command failures instead of reporting
+    // every PowerShell process as successful.
     let script = format!(
         "$utf8 = New-Object System.Text.UTF8Encoding($false); \
          [Console]::InputEncoding = $utf8; \
          [Console]::OutputEncoding = $utf8; \
          $OutputEncoding = $utf8; \
+         $PSDefaultParameterValues['*:Encoding'] = 'utf8'; \
          $global:LASTEXITCODE = 0;\n{command}\n\
          if (-not $?) {{ exit 1 }}; exit $LASTEXITCODE"
     );
     let mut process = tokio::process::Command::new("powershell.exe");
     process
-        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-WindowStyle",
+            "Hidden",
+            "-Command",
+        ])
         .arg(script)
         .env("PYTHONUTF8", "1")
         .env("PYTHONIOENCODING", "utf-8");
@@ -1397,6 +1408,40 @@ mod tests {
         assert!(outcome.succeeded(), "{}", outcome.stderr);
         assert_eq!(outcome.stdout.trim(), "日本語 ✓ →");
         assert!(!outcome.stdout.contains('\u{fffd}'));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_reads_bomless_utf8_files_by_default() {
+        let f = fixture();
+        std::fs::write(f.root.join("utf8.txt"), "日本語 ✓ →").expect("write fixture");
+        let exec = ShellExecutor::new(f.scope.clone());
+        let request = ShellRequest::new("Get-Content -Raw -LiteralPath 'utf8.txt'", &f.root);
+        let approval = CommandApproval::granted(&request);
+        let outcome = exec
+            .run(&request, &approval, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(outcome.succeeded(), "{}", outcome.stderr);
+        assert_eq!(outcome.stdout.trim(), "日本語 ✓ →");
+        assert!(!outcome.stdout.contains('\u{fffd}'));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_process_has_no_window() {
+        let f = fixture();
+        let exec = ShellExecutor::new(f.scope.clone());
+        let request = ShellRequest::new("(Get-Process -Id $PID).MainWindowHandle", &f.root);
+        let approval = CommandApproval::granted(&request);
+        let outcome = exec
+            .run(&request, &approval, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(outcome.succeeded(), "{}", outcome.stderr);
+        assert_eq!(outcome.stdout.trim(), "0");
     }
 
     #[cfg(windows)]
