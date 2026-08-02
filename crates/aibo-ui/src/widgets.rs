@@ -226,14 +226,31 @@ pub fn provider_logo<'a, Message: 'a>(
 /// column that the eye can run down — the only reason to have them.
 pub const MARK_SIZE: f32 = 22.0;
 
-/// Render a shortcut using the platform's primary-modifier convention.
-pub const fn primary_shortcut(macos: &'static str, other: &'static str) -> &'static str {
+/// Render a key hint the way the platform spells it.
+///
+/// macOS uses compact glyphs while Windows uses key names. Keeping the choice
+/// here also avoids sending arrow glyphs through Windows' emoji fallback font.
+pub const fn platform_key(macos: &'static str, windows: &'static str) -> &'static str {
     if cfg!(target_os = "macos") {
         macos
     } else {
-        other
+        windows
     }
 }
+
+/// Render a shortcut using the platform's primary-modifier convention.
+pub const fn primary_shortcut(macos: &'static str, other: &'static str) -> &'static str {
+    platform_key(macos, other)
+}
+
+/// Return, as this platform names it.
+pub const ENTER_KEY: &str = platform_key("⏎", "Enter");
+
+/// Shift+Return, as this platform names it.
+pub const SHIFT_ENTER_KEY: &str = platform_key("⇧⏎", "Shift+Enter");
+
+/// Backspace, as this platform names it.
+pub const BACKSPACE_KEY: &str = platform_key("⌫", "Backspace");
 
 /// One action offered on a surface, with the key that triggers it (§16).
 #[derive(Debug, Clone)]
@@ -860,7 +877,11 @@ pub fn permission_banner<'a, Message: Clone + 'a>(
 
     let actions = match on_open_settings {
         Some(message) if status != S::Granted => {
-            vec![Action::new(Key::ActionOpenSystemSettings, "⏎", message)]
+            vec![Action::new(
+                Key::ActionOpenSystemSettings,
+                ENTER_KEY,
+                message,
+            )]
         }
         _ => Vec::new(),
     };

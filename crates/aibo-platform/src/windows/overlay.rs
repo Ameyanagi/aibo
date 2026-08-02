@@ -4,24 +4,36 @@ use std::ffi::c_void;
 use std::mem::size_of;
 
 use raw_window_handle::Win32WindowHandle;
-use windows::Win32::Foundation::{ERROR_SUCCESS, GetLastError, HWND, SetLastError};
+use windows::Win32::Foundation::{
+    ERROR_SUCCESS, GetLastError, HWND, LPARAM, LRESULT, POINT, SetLastError, WPARAM,
+};
 use windows::Win32::Graphics::Dwm::{
     DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
     DwmSetWindowAttribute,
 };
+use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::Accessibility::{
     NotificationKind_Other, NotificationProcessing_MostRecent, UiaHostProviderFromHwnd,
     UiaRaiseNotificationEvent,
 };
+use windows::Win32::UI::HiDpi::GetDpiForWindow;
+use windows::Win32::UI::Shell::{DefSubclassProc, RemoveWindowSubclass, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::{
-    GWL_EXSTYLE, GetWindowLongPtrW, HWND_TOPMOST, IsWindow, SET_WINDOW_POS_FLAGS,
-    SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE, SWP_NOSIZE,
-    SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowLongPtrW, SetWindowPos,
-    SystemParametersInfoW, WINDOW_EX_STYLE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
+    GWL_EXSTYLE, GetWindowLongPtrW, HTCAPTION, HTCLIENT, HWND_TOPMOST, IsWindow,
+    SET_WINDOW_POS_FLAGS, SPI_GETCLIENTAREAANIMATION, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_SHOWWINDOW, SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS, SetWindowLongPtrW,
+    SetWindowPos, SystemParametersInfoW, WINDOW_EX_STYLE, WM_NCDESTROY, WM_NCHITTEST,
+    WS_EX_APPWINDOW, WS_EX_NOACTIVATE, WS_EX_TOOLWINDOW,
 };
 use windows_core::{BOOL, BSTR, Error, HRESULT};
 
 use crate::overlay::{BackdropStatus, OverlayWindowConfiguration, OverlayWindowError};
+
+/// The panel already reserves this much empty chrome above its first row.
+/// Treating it as a caption matches macOS's movable-by-background panel while
+/// leaving every actual control in the header interactive.
+const DRAG_BAND_LOGICAL_PX: u32 = 16;
+const PANEL_SUBCLASS_ID: usize = 0xA1B0_0001;
 
 fn overlay_extended_style(current: WINDOW_EX_STYLE) -> WINDOW_EX_STYLE {
     let mut bits = current.0;
@@ -42,6 +54,7 @@ pub(crate) fn configure_panel_window(
 ) -> Result<OverlayWindowConfiguration, OverlayWindowError> {
     let hwnd = hwnd(handle);
     validate_window(hwnd)?;
+    install_panel_subclass(hwnd)?;
     let current = get_extended_style(hwnd)?;
     set_extended_style(hwnd, overlay_extended_style(current))?;
 
@@ -127,6 +140,73 @@ pub(crate) fn announce_accessibility(message: &str) {
 
 fn hwnd(handle: Win32WindowHandle) -> HWND {
     HWND(handle.hwnd.get() as *mut c_void)
+}
+
+fn drag_band_height(dpi: u32) -> i32 {
+    let dpi = dpi.max(96);
+    (u64::from(DRAG_BAND_LOGICAL_PX) * u64::from(dpi)).div_ceil(96) as i32
+}
+
+fn is_drag_band_y(client_y: i32, dpi: u32) -> bool {
+    (0..drag_band_height(dpi)).contains(&client_y)
+}
+
+#[allow(unsafe_code)]
+fn install_panel_subclass(hwnd: HWND) -> Result<(), OverlayWindowError> {
+    // SAFETY: `hwnd` was validated by the caller. The callback is a static
+    // function, its subclass id is process-local and stable, and comctl32
+    // automatically confines callback execution to the window's UI thread.
+    unsafe { SetLastError(ERROR_SUCCESS) };
+    if unsafe { SetWindowSubclass(hwnd, Some(panel_subclass_proc), PANEL_SUBCLASS_ID, 0) }.as_bool()
+    {
+        Ok(())
+    } else {
+        let error = unsafe { GetLastError() };
+        Err(native_error(
+            "install panel drag region",
+            if error == ERROR_SUCCESS {
+                "SetWindowSubclass returned false".to_owned()
+            } else {
+                Error::from_hresult(HRESULT::from_win32(error.0)).to_string()
+            },
+        ))
+    }
+}
+
+#[allow(unsafe_code)]
+unsafe extern "system" fn panel_subclass_proc(
+    hwnd: HWND,
+    message: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+    _subclass_id: usize,
+    _reference_data: usize,
+) -> LRESULT {
+    if message == WM_NCHITTEST {
+        // Preserve any non-client answer supplied by winit first. For an
+        // ordinary client hit, promote only the panel's otherwise-unused top
+        // band to HTCAPTION so Windows owns dragging and snap gestures.
+        let result = unsafe { DefSubclassProc(hwnd, message, wparam, lparam) };
+        if result.0 == HTCLIENT as isize {
+            let packed = lparam.0 as u32;
+            let mut point = POINT {
+                x: (packed as u16 as i16) as i32,
+                y: ((packed >> 16) as u16 as i16) as i32,
+            };
+            if unsafe { ScreenToClient(hwnd, &mut point) }.as_bool()
+                && is_drag_band_y(point.y, unsafe { GetDpiForWindow(hwnd) })
+            {
+                return LRESULT(HTCAPTION as isize);
+            }
+        }
+        return result;
+    }
+
+    if message == WM_NCDESTROY {
+        // SAFETY: this exact callback/id pair was installed on `hwnd` above.
+        let _ = unsafe { RemoveWindowSubclass(hwnd, Some(panel_subclass_proc), PANEL_SUBCLASS_ID) };
+    }
+    unsafe { DefSubclassProc(hwnd, message, wparam, lparam) }
 }
 
 #[allow(unsafe_code)]
@@ -218,7 +298,7 @@ fn native_error(operation: &'static str, reason: String) -> OverlayWindowError {
 
 #[cfg(test)]
 mod tests {
-    use super::{overlay_extended_style, presentation_flags};
+    use super::{drag_band_height, is_drag_band_y, overlay_extended_style, presentation_flags};
     use windows::Win32::UI::WindowsAndMessaging::{
         SWP_NOACTIVATE, SWP_SHOWWINDOW, WINDOW_EX_STYLE, WS_EX_APPWINDOW, WS_EX_NOACTIVATE,
         WS_EX_TOOLWINDOW,
@@ -240,5 +320,15 @@ mod tests {
         let flags = presentation_flags();
         assert!(flags.contains(SWP_SHOWWINDOW));
         assert!(flags.contains(SWP_NOACTIVATE));
+    }
+
+    #[test]
+    fn drag_band_tracks_the_windows_scale_factor() {
+        assert_eq!(drag_band_height(96), 16);
+        assert_eq!(drag_band_height(144), 24);
+        assert_eq!(drag_band_height(192), 32);
+        assert!(is_drag_band_y(15, 96));
+        assert!(!is_drag_band_y(16, 96));
+        assert!(!is_drag_band_y(-1, 192));
     }
 }

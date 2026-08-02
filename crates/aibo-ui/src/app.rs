@@ -376,6 +376,11 @@ pub struct Aibo {
     /// is putting the panel somewhere and moving it, and "somewhere" was the
     /// top-left corner.
     pending_show: bool,
+    /// The user moved the borderless panel during this showing.
+    ///
+    /// Content growth must resize a hand-placed panel without snapping it back
+    /// to the computed caret/fallback position. Cleared on every new summon.
+    panel_dragged: bool,
 
     settings_window: Option<window::Id>,
     settings: SettingsState,
@@ -642,6 +647,7 @@ impl Aibo {
         // press read as "summon" instead of "dismiss".
         self.panel_focused = true;
         self.pending_show = false;
+        self.panel_dragged = false;
 
         let position = Point::new(placement.position.0, placement.position.1);
         let size = Size::new(placement.size.0, placement.size.1);
@@ -653,6 +659,10 @@ impl Aibo {
             ))
             .chain(window::move_to(self.panel_window, position))
             .chain(window::set_mode(self.panel_window, Mode::Windowed))
+            // winit rewrites the Win32 style words when changing mode. Reapply
+            // WS_EX_TOOLWINDOW after the show so the panel stays out of the
+            // taskbar and Alt-Tab, matching AppKit's utility-window policy.
+            .chain(configure_or_present_panel(self.panel_window, true))
             .chain(configure_or_present_panel(self.panel_window, false))
             .chain(window::gain_focus(self.panel_window))
             .chain(operation::focus(panel::INPUT_ID))
@@ -923,6 +933,7 @@ fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) 
         last_placement: None,
         observed: None,
         pending_show: false,
+        panel_dragged: false,
         settings_window: None,
         settings: SettingsState::default(),
         tasks: Vec::new(),
@@ -988,6 +999,9 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
 
         Message::PanelFrameFallback(placement) => {
             let size = Size::new(placement.size.0, placement.size.1);
+            if state.panel_dragged {
+                return window::resize(state.panel_window, size);
+            }
             let position = Point::new(placement.position.0, placement.position.1);
             window::resize(state.panel_window, size)
                 .chain(window::move_to(state.panel_window, position))
@@ -1866,6 +1880,10 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             let lanes = crate::model_picker::lanes(&capable, &state.panel.pins(&capable));
             state.panel.picker.cycle_lane(&lanes);
             Task::none()
+        }
+        M::BeginDrag => {
+            state.panel_dragged = true;
+            window::drag(state.panel_window)
         }
         M::PickerToggleFavourite => {
             let rows = state.panel.picker_rows();
@@ -3679,6 +3697,10 @@ fn resize_panel_if_visible(state: &mut Aibo) -> Task<Message> {
     if previous == Some(placement) {
         return backdrop;
     }
+    let size = Size::new(placement.size.0, placement.size.1);
+    if state.panel_dragged {
+        return window::resize(state.panel_window, size).chain(backdrop);
+    }
     // One native, animated frame change instead of separate resize/move
     // effects (owner report, 2026-08-03: instant streaming resizes "feel
     // flaky, or flashing"). The window server interpolates the frame while
@@ -5301,6 +5323,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn beginning_a_panel_drag_preserves_the_users_position() {
+        let mut state = app();
+        assert!(!state.panel_dragged);
+
+        let task = panel_update(&mut state, panel::Message::BeginDrag);
+
+        assert!(state.panel_dragged);
+        assert!(task.units() > 0, "the native window drag must be requested");
+    }
+
     /// The re-probe that follows every show must not re-show the panel when
     /// nothing changed, or `resize` → resize event → probe → `resize` never
     /// settles.
@@ -5333,7 +5366,7 @@ mod tests {
 
     /// §9: the position and size must reach the window server *before* it is
     /// made visible. `Task::batch` merges with `SelectAll` and makes no such
-    /// promise, so the show is a chain — six effects, in order.
+    /// promise, so the show is a chain — eight effects, in order.
     #[test]
     fn the_show_sequence_is_ordered() {
         let mut state = app();
@@ -5342,8 +5375,8 @@ mod tests {
         let task = state.show_panel(placement);
         assert_eq!(
             task.units(),
-            7,
-            "resize, backdrop pin, move, show, native present, focus window, focus input"
+            8,
+            "resize, backdrop pin, move, show, native configure, native present, focus window, focus input"
         );
     }
 

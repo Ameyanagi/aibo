@@ -25,13 +25,14 @@ use aibo_agent::{
 use aibo_core::error::Result;
 use aibo_core::types::{ApprovalKind, ToolSchema, ToolTier};
 use aibo_tools::shell::{
-    CommandApproval, Scope, ShellExecutor, ShellRequest, read_file, write_file,
+    CommandApproval, Scope, ShellExecutor, ShellRequest, is_platform_shell_tool,
+    platform_shell_tool_name, read_file, write_file,
 };
 use async_trait::async_trait;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-/// Longest a `bash` call may run, model-overridable up to [`MAX_TIMEOUT`].
+/// Longest a shell call may run, model-overridable up to [`MAX_TIMEOUT`].
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(60);
 /// Ceiling on the model-requested timeout.
 const MAX_TIMEOUT: Duration = Duration::from_secs(600);
@@ -69,7 +70,7 @@ pub struct WorkspaceExecutor {
 impl std::fmt::Debug for WorkspaceExecutor {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("WorkspaceExecutor")
-            .field("surface", &"read/ls/write/edit/bash")
+            .field("surface", &"read/shell/edit/write")
             .field("roots", &self.scope.roots().len())
             .finish()
     }
@@ -123,10 +124,15 @@ impl WorkspaceExecutor {
 impl ToolExecutor for WorkspaceExecutor {
     fn schemas(&self) -> Vec<ToolSchema> {
         // pi's tool surface, spelled pi's way (owner: "use the same harness
-        // as pi coding agent"): read, bash, edit, write — no ls; the prompt
-        // tells the model to use bash for ls/rg/find, as pi's does. `edit`
+        // as pi coding agent"): read, shell, edit, write — no ls; the prompt
+        // tells the model to use the platform shell for discovery. `edit`
         // takes an ARRAY of {oldText, newText} replacements.
         let object = |properties: serde_json::Value, required: &[&str]| json!({ "type": "object", "properties": properties, "required": required });
+        let shell_description = if cfg!(windows) {
+            "Execute a PowerShell command in the current working directory. Use Windows/PowerShell syntax such as Get-ChildItem, Get-Content, and $env:USERPROFILE; do not use bash, sh, chcp, or POSIX $VARIABLE syntax. UTF-8 input and output are configured automatically. Returns stdout and stderr. Output is truncated when very large. Optionally provide a timeout in seconds (default 60, max 600). Commands run non-interactively (stdin is closed); for a simple prompt, pass its answer via `stdin`. Commands classified destructive are refused once — if genuinely required, state why and retry with `confirm_destructive: true`."
+        } else {
+            "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated when very large. Optionally provide a timeout in seconds (default 60, max 600). Commands run non-interactively (stdin is closed): prefer non-interactive flags (--yes, --no-edit); for a simple prompt, pass its answer via `stdin`. Commands classified destructive (recursive deletes, force pushes, privilege escalation, disk tools) are refused once — if genuinely required, state why and retry with `confirm_destructive: true`."
+        };
         vec![
             ToolSchema {
                 name: "read".into(),
@@ -142,11 +148,11 @@ impl ToolExecutor for WorkspaceExecutor {
                 tier: 3,
             },
             ToolSchema {
-                name: "bash".into(),
-                description: "Execute a bash command in the current working directory. Returns stdout and stderr. Output is truncated when very large. Optionally provide a timeout in seconds (default 60, max 600). Commands run non-interactively (stdin is closed): prefer non-interactive flags (--yes, --no-edit); for a simple prompt, pass its answer via `stdin`. Commands classified destructive (recursive deletes, force pushes, privilege escalation, disk tools) are refused once — if genuinely required, state why and retry with `confirm_destructive: true`.".into(),
+                name: platform_shell_tool_name().into(),
+                description: shell_description.into(),
                 parameters: object(
                     json!({
-                        "command": { "type": "string", "description": "Bash command to execute" },
+                        "command": { "type": "string", "description": "Platform-native shell command to execute" },
                         "timeout": { "type": "integer", "description": "Timeout in seconds (optional)" },
                         "stdin": { "type": "string", "description": "Text written to the command's stdin before it is closed (for y/n prompts and heredocs)" },
                         "confirm_destructive": { "type": "boolean", "description": "Set true only after restating why a destructive command is required for the task" },
@@ -237,7 +243,7 @@ impl ToolExecutor for WorkspaceExecutor {
                 command: None,
                 paths: path_of("path"),
             }),
-            "bash" => {
+            name if is_platform_shell_tool(name) => {
                 let command = Self::str_arg(&call.args, "command").unwrap_or("<missing command>");
                 Some(ToolIntent {
                     tier: ToolTier::ShellFs,
@@ -265,8 +271,8 @@ impl ToolExecutor for WorkspaceExecutor {
             "read" => run_read(&self.scope, &invocation.args, &resolved_paths),
             "write" => run_write(&self.scope, &invocation.args, &resolved_paths),
             "edit" => run_edit(&self.scope, &invocation.args, &resolved_paths),
-            "bash" => {
-                return run_bash(&self.shell, &self.workspace, &invocation.args, cancel).await;
+            name if is_platform_shell_tool(name) => {
+                return run_shell(&self.shell, &self.workspace, &invocation.args, cancel).await;
             }
             other => Err(format!("no such tool: {other}")),
         };
@@ -412,7 +418,7 @@ fn edit_count(args: &serde_json::Value) -> usize {
         .map_or(0, Vec::len)
 }
 
-async fn run_bash(
+async fn run_shell(
     shell: &ShellExecutor,
     workspace: &Path,
     args: &serde_json::Value,
@@ -440,8 +446,9 @@ async fn run_bash(
             content: format!(
                 "`{command}` is classified as destructive (deletes, force-push, \
                  privilege escalation, or disk-level). If it is genuinely required \
-                 for the task, state why and call bash again with \
-                 \"confirm_destructive\": true. Otherwise choose a safer command."
+                 for the task, state why and call {} again with \
+                 \"confirm_destructive\": true. Otherwise choose a safer command.",
+                platform_shell_tool_name()
             ),
             is_error: true,
             diffs: Vec::new(),
@@ -643,11 +650,15 @@ mod tests {
     /// executor tests; this one asserts the adapter's plumbing.
     #[cfg(unix)]
     #[tokio::test]
-    async fn bash_runs_in_the_workspace_and_reports_exit() {
+    async fn shell_runs_in_the_workspace_and_reports_exit() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().canonicalize().expect("canonical");
         let exec = executor(&root);
-        let call = authorized(&exec, "bash", json!({ "command": "pwd && printf x >&2" }));
+        let call = authorized(
+            &exec,
+            platform_shell_tool_name(),
+            json!({ "command": "pwd && printf x >&2" }),
+        );
         let out = exec.execute(call, CancellationToken::new()).await.unwrap();
         assert!(!out.is_error, "{}", out.content);
         assert!(
@@ -657,6 +668,33 @@ mod tests {
         );
         assert!(out.content.contains("stderr"), "{}", out.content);
         assert!(out.content.contains("(exit 0"), "{}", out.content);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_runs_windows_native_commands_and_environment_syntax() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().canonicalize().expect("canonical");
+        std::fs::write(root.join("日本語.txt"), "hello").expect("write fixture");
+        let exec = executor(&root);
+        let call = authorized(
+            &exec,
+            platform_shell_tool_name(),
+            json!({
+                "command": "Get-ChildItem -Force | Select-Object -ExpandProperty Name; Write-Output $env:USERPROFILE"
+            }),
+        );
+
+        let out = exec.execute(call, CancellationToken::new()).await.unwrap();
+
+        assert!(!out.is_error, "{}", out.content);
+        assert!(out.content.contains("日本語.txt"), "{}", out.content);
+        assert!(
+            std::env::var("USERPROFILE").is_ok_and(|profile| out.content.contains(&profile)),
+            "{}",
+            out.content
+        );
+        assert!(!out.content.contains('\u{fffd}'), "{}", out.content);
     }
 
     /// pi's multi-edit contract: all oldText matched against the ORIGINAL,
@@ -702,13 +740,22 @@ mod tests {
     /// The self-confirmation dance: a destructive command is refused once
     /// with instructions, and the confirmed retry runs — no user in the loop.
     #[tokio::test]
-    async fn destructive_bash_requires_the_agents_own_confirmation() {
+    async fn destructive_shell_requires_the_agents_own_confirmation() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().canonicalize().expect("canonical");
         std::fs::create_dir(root.join("junk")).expect("mkdir");
         let exec = executor(&root);
+        let command = if cfg!(windows) {
+            "Remove-Item -Recurse -Force junk"
+        } else {
+            "rm -rf junk"
+        };
 
-        let first = authorized(&exec, "bash", json!({ "command": "rm -rf junk" }));
+        let first = authorized(
+            &exec,
+            platform_shell_tool_name(),
+            json!({ "command": command }),
+        );
         let out = exec.execute(first, CancellationToken::new()).await.unwrap();
         assert!(out.is_error);
         assert!(
@@ -720,8 +767,8 @@ mod tests {
 
         let confirmed = authorized(
             &exec,
-            "bash",
-            json!({ "command": "rm -rf junk", "confirm_destructive": true }),
+            platform_shell_tool_name(),
+            json!({ "command": command, "confirm_destructive": true }),
         );
         let out = exec
             .execute(confirmed, CancellationToken::new())
@@ -735,12 +782,12 @@ mod tests {
     /// prompt reads its answer instead of hanging.
     #[cfg(unix)]
     #[tokio::test]
-    async fn bash_stdin_feeds_a_prompt_and_then_eof() {
+    async fn shell_stdin_feeds_a_prompt_and_then_eof() {
         let dir = tempfile::tempdir().expect("tempdir");
         let exec = executor(&dir.path().canonicalize().expect("canonical"));
         let call = authorized(
             &exec,
-            "bash",
+            platform_shell_tool_name(),
             json!({ "command": "read answer && echo got:$answer", "stdin": "yes\n" }),
         );
         let out = exec.execute(call, CancellationToken::new()).await.unwrap();
@@ -755,7 +802,7 @@ mod tests {
         let names: Vec<String> = exec.schemas().into_iter().map(|s| s.name).collect();
         assert_eq!(
             names,
-            ["read", "bash", "edit", "write"],
+            ["read", platform_shell_tool_name(), "edit", "write"],
             "pi's order, pi's set"
         );
         assert!(exec.schemas().iter().all(|s| s.tier == 3));

@@ -332,6 +332,7 @@ dependencies = [
  "aibo-platform",
  "global-hotkey",
  "iced",
+ "image",
  "muda",
  "nucleo-matcher",
  "ratex-layout",

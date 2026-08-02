@@ -1346,6 +1346,11 @@ impl ConflictReport {
                 // *common* macOS case cannot tell `-9878` from `-9868`, and
                 // picking either message would be a guess presented as fact.
                 // Say both, and give the action that helps under either.
+                _ if cfg!(target_os = "windows") => format!(
+                    "{} was refused and Windows did not say why. Another app may be holding it; \
+                     try a different combination, or quit the app you think has it.",
+                    self.display
+                ),
                 _ => format!(
                     "{} was refused. Either another app already owns it or macOS will not accept \
                      these modifiers — it does not report which. Try a combination that includes \
@@ -2839,8 +2844,14 @@ mod tests {
             !ambiguous.contains("Another app already owns"),
             "an unclassifiable refusal must not assert the -9878 reading: {ambiguous}"
         );
-        // It must still name both readings and give an action.
-        assert!(ambiguous.contains("another app"));
-        assert!(ambiguous.contains("modifiers"));
+        // It must still name a possible cause and an action, without naming
+        // the wrong operating system on Windows.
+        assert!(ambiguous.contains("another app") || ambiguous.contains("Another app"));
+        if cfg!(target_os = "windows") {
+            assert!(ambiguous.contains("Windows"));
+            assert!(!ambiguous.contains("macOS"));
+        } else {
+            assert!(ambiguous.contains("modifiers"));
+        }
     }
 }

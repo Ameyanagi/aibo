@@ -887,7 +887,7 @@ fn history(state: &SettingsState) -> Element<'_, Message> {
     } else {
         vec![Action::new(
             Key::ActionEnableHistory,
-            "⏎",
+            widgets::ENTER_KEY,
             Message::InitializeHistory,
         )]
     };
@@ -1104,9 +1104,13 @@ fn codex_card(state: &SettingsState) -> Element<'_, Message> {
                 .style(theme::action_button)
                 .on_press(Message::CopyDeviceCode(code)),
                 button(
-                    text(format!("⏎ {}", i18n::t(Key::SettingsOpenDevicePage)))
-                        .size(type_scale::META)
-                        .style(theme::text_accent)
+                    text(format!(
+                        "{} {}",
+                        widgets::ENTER_KEY,
+                        i18n::t(Key::SettingsOpenDevicePage)
+                    ))
+                    .size(type_scale::META)
+                    .style(theme::text_accent)
                 )
                 .height(Length::Fixed(theme::MIN_HIT_TARGET))
                 .padding([space(1.0), space(2.0)])
@@ -1210,7 +1214,11 @@ fn providers(state: &SettingsState) -> Element<'_, Message> {
                 } else {
                     Key::ActionForgetProvider
                 },
-                if single_forgettable { "⌫" } else { "" },
+                if single_forgettable {
+                    widgets::BACKSPACE_KEY
+                } else {
+                    ""
+                },
                 Message::ForgetProvider(provider.id.clone()),
             )
             .destructive(),
@@ -1232,7 +1240,7 @@ fn provider_draft(state: &SettingsState) -> Element<'_, Message> {
         return widgets::action_list(vec![
             Action::new(
                 Key::ActionAddProvider,
-                "⌘N",
+                widgets::primary_shortcut("⌘N", "Ctrl+N"),
                 Message::DraftBackend(Backend::default()),
             )
             .primary(),
@@ -1289,7 +1297,12 @@ fn provider_draft(state: &SettingsState) -> Element<'_, Message> {
             .style(theme::field),
     );
 
-    let save = Action::new(Key::ActionSaveProvider, "⏎", Message::DraftSave).primary();
+    let save = Action::new(
+        Key::ActionSaveProvider,
+        widgets::ENTER_KEY,
+        Message::DraftSave,
+    )
+    .primary();
     let save = if draft.is_saveable() {
         save
     } else {

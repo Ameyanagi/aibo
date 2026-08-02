@@ -716,7 +716,7 @@ mod diagnostics {
 /// PID reclamation.
 mod instance {
     use std::fs::{File, OpenOptions, TryLockError};
-    use std::io::{Read as _, Seek as _, Write as _};
+    use std::io::{Read as _, Write as _};
     use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -730,6 +730,7 @@ mod instance {
     pub struct Guard {
         file: File,
         path: PathBuf,
+        metadata_path: PathBuf,
         listener: TcpListener,
         nonce: String,
         serving: AtomicBool,
@@ -779,6 +780,13 @@ mod instance {
     impl Drop for Guard {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Release);
+            // Remove the readable sidecar before releasing the kernel lock, so
+            // a successor can never erase metadata written by a newer owner.
+            if let Err(error) = std::fs::remove_file(&self.metadata_path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %self.metadata_path.display(), %error, "could not remove instance metadata");
+            }
             if let Err(error) = self.file.unlock() {
                 tracing::warn!(path = %self.path.display(), %error, "could not unlock instance file");
             }
@@ -802,6 +810,10 @@ mod instance {
     /// Take the single-instance lock.
     pub fn acquire(paths: &Paths) -> anyhow::Result<Outcome> {
         let path = paths.lock();
+        // Windows' exclusive `LockFileEx` range prevents another process from
+        // reading the locked file. Keep ownership in `aibo.lock`, and the
+        // authenticated focus endpoint in a readable sidecar.
+        let metadata_path = path.with_extension("instance");
         let mut options = OpenOptions::new();
         options.create(true).read(true).write(true);
         #[cfg(unix)]
@@ -809,11 +821,11 @@ mod instance {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
-        let mut file = options.open(&path)?;
+        let file = options.open(&path)?;
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                let metadata = std::fs::read_to_string(&path)
+                let metadata = std::fs::read_to_string(&metadata_path)
                     .ok()
                     .and_then(|contents| parse(&contents));
                 let pid = metadata.as_ref().map_or(0, |metadata| metadata.pid);
@@ -831,14 +843,15 @@ mod instance {
         let nonce = uuid::Uuid::now_v7().to_string();
         let me = std::process::id();
         let name = executable_name();
-        file.set_len(0)?;
-        file.rewind()?;
-        file.write_all(format!("{me}\n{name}\n{port}\n{nonce}\n").as_bytes())?;
-        file.sync_all()?;
+        crate::paths::atomic_write(
+            &metadata_path,
+            format!("{me}\n{name}\n{port}\n{nonce}\n").as_bytes(),
+        )?;
 
         Ok(Outcome::Acquired(Guard {
             file,
             path,
+            metadata_path,
             listener,
             nonce,
             serving: AtomicBool::new(false),
@@ -904,10 +917,12 @@ mod instance {
                 Outcome::Acquired(guard) => guard,
                 Outcome::AlreadyRunning { .. } => panic!("first owner was rejected"),
             };
-            assert!(matches!(
-                acquire(&paths).expect("second acquire"),
-                Outcome::AlreadyRunning { .. }
-            ));
+            match acquire(&paths).expect("second acquire") {
+                Outcome::AlreadyRunning { pid, .. } => {
+                    assert_eq!(pid, std::process::id(), "metadata stays readable")
+                }
+                Outcome::Acquired(_) => panic!("second owner acquired the live lock"),
+            }
             drop(first);
             assert!(matches!(
                 acquire(&paths).expect("reacquire after drop"),
@@ -2904,28 +2919,44 @@ mod runtime {
     /// §11 divergence: a guideline explaining approvals, which pi does not
     /// have.
     fn agent_system_prompt(roots: &[std::path::PathBuf]) -> String {
-        let mut prompt = String::from(
+        let shell = aibo_agent_tools_adapter::platform_shell_tool_name();
+        let (shell_description, shell_guidance, destructive_examples) = if cfg!(windows) {
+            (
+                "Execute a PowerShell command in the current working directory",
+                "Use Windows PowerShell syntax: Get-ChildItem, Get-Content, \
+                 $env:USERPROFILE, and semicolon-separated commands. Never invoke bash, \
+                 sh, or chcp, and never use POSIX $VARIABLE syntax. UTF-8 is already configured",
+                "Remove-Item -Recurse/-Force, force-push and the like",
+            )
+        } else {
+            (
+                "Execute a bash command in the current working directory",
+                "Use bash for file operations like ls, rg, find",
+                "rm -rf, force-push and the like",
+            )
+        };
+        let mut prompt = format!(
             "You are an expert coding assistant operating inside aibo, a coding agent \
              harness. You help users by reading files, executing commands, editing code, \
              and writing new files.\n\n\
              Available tools:\n\
              - read: Read the contents of a file\n\
-             - bash: Execute a bash command in the current working directory\n\
+             - {shell}: {shell_description}\n\
              - edit: Edit a single file using exact text replacement\n\
              - write: Write content to a file\n\n\
              Guidelines:\n\
-             - Use bash for file operations like ls, rg, find\n\
+             - {shell_guidance}\n\
              - Be concise in your responses\n\
              - Show file paths clearly when working with files\n\
-             - Destructive commands (rm -rf, force-push and the like) are refused \
+             - Destructive commands ({destructive_examples}) are refused \
              once; if one is genuinely required, state why and retry with \
              confirm_destructive: true\
              - Commands run non-interactively; prefer flags like --yes, or pass a \
-             prompt's answer via bash's stdin parameter\n\
+             prompt's answer via {shell}'s stdin parameter\n\
              - If the message is conversation or a question that needs no files or \
              commands, just answer it; do not invent a task\n\
              - Mathematics: LaTeX is welcome; $$...$$ display equations are \
-             typeset, inline math shows as written",
+             typeset, inline math shows as written"
         );
         if let Some(workspace) = roots.first() {
             // pi's <project_context>: the workspace's own instructions, when
@@ -5693,6 +5724,20 @@ mod runtime {
         /// runs. Every value below that mentions it is a value the product must
         /// never produce.
         const AIBO_PID: i32 = 99;
+
+        #[test]
+        fn agent_prompt_names_the_native_shell_and_its_syntax() {
+            let prompt = agent_system_prompt(&[]);
+            if cfg!(windows) {
+                assert!(prompt.contains("- powershell:"));
+                assert!(prompt.contains("$env:USERPROFILE"));
+                assert!(prompt.contains("Never invoke bash"));
+                assert!(!prompt.contains("- bash:"));
+            } else {
+                assert!(prompt.contains("- bash:"));
+                assert!(prompt.contains("Use bash for file operations"));
+            }
+        }
 
         /// The catalogue as it is before any network refresh, which is the state
         /// these tests describe.

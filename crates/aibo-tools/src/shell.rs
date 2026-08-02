@@ -55,6 +55,23 @@ pub const MAX_CAPTURE_BYTES: usize = 256 << 10;
 /// Default wall-clock limit for one command.
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The shell tool name exposed to the model on this platform.
+///
+/// Calling a `cmd.exe` executor "bash" taught the model to emit POSIX syntax
+/// on Windows. Give the model the actual interpreter name so commands match
+/// the machine they run on.
+pub const fn platform_shell_tool_name() -> &'static str {
+    if cfg!(windows) { "powershell" } else { "bash" }
+}
+
+/// Whether `name` is executable by this platform's workspace shell.
+///
+/// Windows accepts the old `bash` spelling for in-flight conversations from
+/// before the schema changed, but new schemas advertise only `powershell`.
+pub fn is_platform_shell_tool(name: &str) -> bool {
+    name == platform_shell_tool_name() || (cfg!(windows) && name == "bash")
+}
+
 // ---------------------------------------------------------------------------
 // Scope
 // ---------------------------------------------------------------------------
@@ -226,7 +243,19 @@ pub fn classify_command(command: &str) -> CommandRisk {
             return CommandRisk::TypedConfirmation("recursive or forced delete");
         }
     }
-    if lower.contains("rmdir /s") || lower.contains("del /f") || lower.contains("del /q") {
+    if lower.contains("rmdir /s")
+        || lower.contains("rmdir -recurse")
+        || lower.contains("rmdir -force")
+        || lower.contains("del /f")
+        || lower.contains("del /q")
+    {
+        return CommandRisk::TypedConfirmation("recursive or forced delete");
+    }
+    if (has("remove-item") || starts_with_word("ri"))
+        && tokens
+            .iter()
+            .any(|t| matches!(*t, "-recurse" | "-force" | "-r"))
+    {
         return CommandRisk::TypedConfirmation("recursive or forced delete");
     }
 
@@ -487,15 +516,7 @@ impl ShellExecutor {
         let cwd = self.revalidate(request, approval)?;
         let started = Instant::now();
 
-        let mut command = if cfg!(windows) {
-            let mut c = tokio::process::Command::new("cmd");
-            c.arg("/C").arg(&request.command);
-            c
-        } else {
-            let mut c = tokio::process::Command::new("/bin/sh");
-            c.arg("-c").arg(&request.command);
-            c
-        };
+        let mut command = platform_command(&request.command);
         command
             .current_dir(&cwd)
             .stdin(if request.stdin.is_some() {
@@ -590,6 +611,37 @@ impl ShellExecutor {
             duration: started.elapsed(),
         })
     }
+}
+
+#[cfg(windows)]
+fn platform_command(command: &str) -> tokio::process::Command {
+    // Windows PowerShell otherwise inherits a legacy console code page when
+    // stdout is redirected, while aibo's tool protocol is UTF-8. Configure
+    // both PowerShell and common child runtimes before running the exact model
+    // command. The trailing exit preserves native-command failures instead of
+    // reporting every PowerShell process as successful.
+    let script = format!(
+        "$utf8 = New-Object System.Text.UTF8Encoding($false); \
+         [Console]::InputEncoding = $utf8; \
+         [Console]::OutputEncoding = $utf8; \
+         $OutputEncoding = $utf8; \
+         $global:LASTEXITCODE = 0;\n{command}\n\
+         if (-not $?) {{ exit 1 }}; exit $LASTEXITCODE"
+    );
+    let mut process = tokio::process::Command::new("powershell.exe");
+    process
+        .args(["-NoLogo", "-NoProfile", "-NonInteractive", "-Command"])
+        .arg(script)
+        .env("PYTHONUTF8", "1")
+        .env("PYTHONIOENCODING", "utf-8");
+    process
+}
+
+#[cfg(not(windows))]
+fn platform_command(command: &str) -> tokio::process::Command {
+    let mut process = tokio::process::Command::new("/bin/sh");
+    process.arg("-c").arg(command);
+    process
 }
 
 /// Terminate the process group/job and reap its direct child. The
@@ -1260,6 +1312,7 @@ mod tests {
             "rm -rf /",
             "rm -fr build",
             "rm -r node_modules",
+            "Remove-Item -Recurse -Force build",
             "git push --force origin main",
             "git reset --hard HEAD~3",
             "git clean -fd",
@@ -1327,6 +1380,39 @@ mod tests {
             .unwrap();
         assert!(outcome.succeeded());
         assert!(outcome.stdout.contains("hi"));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_output_is_utf8_and_preserves_unicode() {
+        let f = fixture();
+        let exec = ShellExecutor::new(f.scope.clone());
+        let request = ShellRequest::new("Write-Output '日本語 ✓ →'", &f.root);
+        let approval = CommandApproval::granted(&request);
+        let outcome = exec
+            .run(&request, &approval, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(outcome.succeeded(), "{}", outcome.stderr);
+        assert_eq!(outcome.stdout.trim(), "日本語 ✓ →");
+        assert!(!outcome.stdout.contains('\u{fffd}'));
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn powershell_errors_produce_a_failed_outcome() {
+        let f = fixture();
+        let exec = ShellExecutor::new(f.scope.clone());
+        let request = ShellRequest::new("Write-Error 'expected failure'", &f.root);
+        let approval = CommandApproval::granted(&request);
+        let outcome = exec
+            .run(&request, &approval, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(!outcome.succeeded());
+        assert!(outcome.stderr.contains("expected failure"));
     }
 
     #[cfg(unix)]
