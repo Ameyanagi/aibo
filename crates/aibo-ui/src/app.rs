@@ -1429,6 +1429,32 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
         return open_settings(state);
     }
 
+    // The slash popup and the help overlay intercept only their own keys —
+    // unlike the finder and quick-pick they hold no text field, the composer
+    // keeps focus, and every other chord must keep meaning what it means.
+    if matches!(state.role_of(window), Some(Role::Panel)) && state.panel_visible {
+        if state.panel.slash.open {
+            match chord {
+                WindowChord::Escape => return panel_update(state, panel::Message::SlashClose),
+                WindowChord::Enter {
+                    command: false,
+                    shift: false,
+                } => return panel_update(state, panel::Message::SlashAccept),
+                WindowChord::NextLane => return panel_update(state, panel::Message::SlashAccept),
+                WindowChord::HistoryOlder => {
+                    return panel_update(state, panel::Message::SlashMove(-1));
+                }
+                WindowChord::HistoryNewer => {
+                    return panel_update(state, panel::Message::SlashMove(1));
+                }
+                _ => {}
+            }
+        }
+        if state.panel.help_open && matches!(chord, WindowChord::Escape) {
+            return panel_update(state, panel::Message::HelpClose);
+        }
+    }
+
     match state.role_of(window) {
         Some(Role::Panel) if state.panel_visible => {
             let message = match chord {
@@ -1796,6 +1822,48 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             state.panel.file_finder.close();
             resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
         }
+        M::SlashMove(delta) => {
+            let count = crate::slash::matches(&state.panel.input).len();
+            state.panel.slash.move_highlight(delta, count);
+            Task::none()
+        }
+        M::SlashChoose(index) => {
+            state.panel.slash.highlight = index;
+            panel_update(state, M::SlashAccept)
+        }
+        M::SlashAccept => {
+            let commands = crate::slash::matches(&state.panel.input);
+            let Some(command) = commands.get(state.panel.slash.highlight).copied() else {
+                let input = state.panel.input.clone();
+                state.panel.slash.dismiss(&input);
+                return resize_panel_if_visible(state);
+            };
+            if command.takes_args {
+                // Complete the prefix and keep the user typing the arguments;
+                // the trailing space is what closes the popup.
+                state.panel.set_input(&format!("{} ", command.name));
+                resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
+            } else {
+                // Argument-less commands run on accept — a second ⏎ to
+                // confirm a completion the popup already showed is busywork.
+                state.panel.set_input(command.name);
+                panel_update(state, M::Submit)
+            }
+        }
+        M::SlashClose => {
+            let input = state.panel.input.clone();
+            state.panel.slash.dismiss(&input);
+            resize_panel_if_visible(state)
+        }
+        M::HelpOpen => {
+            state.panel.help_open = true;
+            resize_panel_if_visible(state)
+        }
+        M::HelpClose => {
+            state.panel.help_open = false;
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
+        }
+
         M::FinderClose => {
             state.panel.file_finder.close();
             // The trigger `@` stays if the user dismissed — they may have
@@ -1853,6 +1921,35 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             }
             if state.panel.input.trim().is_empty() {
                 return Task::none();
+            }
+
+            // Slash commands and their bare aliases act locally; they never
+            // reach a model (owner redesign, 2026-08-02: help is "?", "help"
+            // or "/help" typed into the composer).
+            if let Some((command, _args)) = crate::slash::parse(&state.panel.input) {
+                use crate::slash::CommandAction;
+                match command.action {
+                    CommandAction::Help => {
+                        state.panel.consume_input();
+                        state.panel.help_open = true;
+                        return resize_panel_if_visible(state);
+                    }
+                    CommandAction::NewChat => {
+                        state.panel.consume_input();
+                        return panel_update(state, M::NewChat);
+                    }
+                    CommandAction::Model => {
+                        state.panel.consume_input();
+                        return panel_update(state, M::OpenPicker);
+                    }
+                    CommandAction::Settings => {
+                        state.panel.consume_input();
+                        return open_settings(state);
+                    }
+                    // `/agent …` is the runtime's spelling and goes through
+                    // the ordinary submit path below.
+                    CommandAction::Agent => {}
+                }
             }
 
             let instruction = state.panel.input.clone();

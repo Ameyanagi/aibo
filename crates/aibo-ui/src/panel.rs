@@ -771,6 +771,12 @@ pub struct PanelState {
     pub tasks: Vec<crate::tasks::TaskState>,
     /// Whether the ⌘T tasks overlay is up.
     pub tasks_open: bool,
+    /// The slash-command popup (owner redesign, 2026-08-02): open while the
+    /// composer holds a command-in-progress, highlight and dismissal state.
+    pub slash: crate::slash::SlashState,
+    /// Whether the help overlay is up (`?`, `help`, `/help`, or the footer's
+    /// Help action).
+    pub help_open: bool,
     /// The task whose detail the overlay shows; `None` lists all.
     pub selected_task: Option<Uuid>,
     /// The finished active response, split into markdown and typeset math.
@@ -831,6 +837,8 @@ impl PanelState {
             agent_mode: false,
             tasks: Vec::new(),
             tasks_open: false,
+            slash: crate::slash::SlashState::default(),
+            help_open: false,
             selected_task: None,
             active_segments: None,
             dictation_pad: false,
@@ -985,6 +993,7 @@ impl PanelState {
     pub fn consume_input(&mut self) {
         self.input.clear();
         self.input_editor = text_editor::Content::new();
+        self.slash.sync(&self.input);
     }
 
     /// Take back a chat turn that another surface claimed.
@@ -1262,6 +1271,7 @@ impl PanelState {
         self.input_editor = text_editor::Content::with_text(text);
         self.input_editor
             .perform(text_editor::Action::Move(text_editor::Motion::DocumentEnd));
+        self.slash.sync(&self.input);
     }
 
     /// Apply a user edit from the composer widget.
@@ -1274,6 +1284,7 @@ impl PanelState {
             text.pop();
         }
         self.input = text;
+        self.slash.sync(&self.input);
     }
 
     /// Height the composer needs beyond its single-line baseline.
@@ -1386,10 +1397,20 @@ impl PanelState {
         }
     }
 
+    /// Whether any floating menu is over the panel. One place, because the
+    /// window-height rule and the view's menu slot must agree exactly.
+    pub fn menu_open(&self) -> bool {
+        self.picker.open
+            || self.file_finder.open
+            || self.tasks_open
+            || self.slash.open
+            || self.help_open
+    }
+
     /// The height the panel wants, for [`crate::placement::PlacementRequest`].
     pub fn desired_height(&self) -> f32 {
         let base = self.height_without_overlay();
-        if self.picker.open || self.file_finder.open || self.tasks_open {
+        if self.menu_open() {
             // The quick-pick floats over the panel. The window grows only when
             // the panel is too short to contain the menu, and never shrinks
             // for it — mid-conversation, opening the picker moves nothing.
@@ -1569,6 +1590,18 @@ pub enum Message {
     PickerPin(usize),
     /// A lane was clicked.
     PickerLane(crate::model_picker::Lane),
+    /// Move the slash popup's highlight.
+    SlashMove(i32),
+    /// Accept the slash popup's highlighted command.
+    SlashAccept,
+    /// A slash row was clicked: highlight and accept in one gesture.
+    SlashChoose(usize),
+    /// Put the slash popup away for the current text.
+    SlashClose,
+    /// Open the help overlay.
+    HelpOpen,
+    /// Close the help overlay.
+    HelpClose,
 }
 
 /// Render the panel.
@@ -1671,6 +1704,10 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
         Some((finder_overlay(state), Message::FinderClose))
     } else if state.tasks_open {
         Some((tasks_overlay(state), Message::TasksClose))
+    } else if state.help_open {
+        Some((help_overlay(), Message::HelpClose))
+    } else if state.slash.open {
+        Some((slash_overlay(state), Message::SlashClose))
     } else {
         None
     };
@@ -2139,6 +2176,157 @@ fn finder_overlay(state: &PanelState) -> Element<'_, Message> {
     .spacing(space(1.5))
     .into()
 }
+
+/// The slash-command completion popup: matching commands, name and
+/// description, highlight driven by ↑/↓ while the composer keeps focus.
+fn slash_overlay(state: &PanelState) -> Element<'_, Message> {
+    let mut list = column![].spacing(space(0.5));
+    for (index, command) in crate::slash::matches(&state.input).iter().enumerate() {
+        let highlighted = index == state.slash.highlight;
+        list = list.push(widgets::railed_with(
+            if highlighted {
+                RailState::Active
+            } else {
+                RailState::Inactive
+            },
+            theme::ground,
+            button(
+                row![
+                    text(command.name)
+                        .size(type_scale::BODY)
+                        .font(theme::MONO_FONT)
+                        .style(if highlighted {
+                            theme::text_primary
+                        } else {
+                            theme::text_dim
+                        }),
+                    text(i18n::t(command.description))
+                        .size(type_scale::META)
+                        .style(theme::text_faint),
+                ]
+                .spacing(space(1.5))
+                .align_y(Alignment::Center),
+            )
+            .width(Length::Fill)
+            .padding([space(0.5), space(1.0)])
+            .style(theme::list_row_button(highlighted))
+            .on_press(Message::SlashChoose(index)),
+        ));
+    }
+    column![
+        list,
+        widgets::action_list(vec![
+            Action::new(Key::ActionSelect, "⏎", Message::SlashAccept).primary(),
+            Action::new(Key::ActionDismiss, "esc", Message::SlashClose),
+        ]),
+    ]
+    .spacing(space(1.5))
+    .into()
+}
+
+/// The help overlay: every shortcut and every slash command, on demand
+/// (owner redesign, 2026-08-02 — the footer no longer carries the list).
+fn help_overlay<'a>() -> Element<'a, Message> {
+    // (chord, what it does) — the chords are cross-platform strings where the
+    // two differ, and the labels reuse the action catalogue so help can never
+    // drift from what the buttons themselves say.
+    let shortcuts: &[(&str, Key)] = &[
+        (
+            if cfg!(target_os = "macos") {
+                "⌥Space"
+            } else {
+                "Ctrl+Shift+Space"
+            },
+            Key::HelpSummon,
+        ),
+        ("⌥⇧Space", Key::HelpCrop),
+        ("⌘↩", Key::ActionReplace),
+        ("⌘⇧↩", Key::ActionSmartModel),
+        ("⌘C", Key::ActionCopy),
+        ("⌘V", Key::ActionAttachImage),
+        ("@", Key::ActionAttachFile),
+        ("⌘N", Key::ActionNewChat),
+        ("⌘K", Key::ActionSwitchModel),
+        ("⌘D", Key::ActionPinModel),
+        ("⌘L", Key::ActionDictate),
+        ("⌘J", Key::ActionAgentMode),
+        ("⌘T", Key::ActionShowTask),
+        ("⌘R", Key::ActionRegenerate),
+        ("↑ / ↓", Key::HelpHistory),
+        ("⌘,", Key::ActionOpenSettings),
+        ("esc", Key::ActionDismiss),
+    ];
+
+    let mut body = column![
+        text(i18n::t(Key::HelpHeadingShortcuts))
+            .size(type_scale::META)
+            .style(theme::text_dim),
+    ]
+    .spacing(space(0.75));
+    for (chord, label) in shortcuts {
+        body = body.push(
+            row![
+                container(
+                    text(*chord)
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_primary),
+                )
+                .width(Length::Fixed(HELP_CHORD_WIDTH)),
+                text(i18n::t(*label))
+                    .size(type_scale::META)
+                    .style(theme::text_dim),
+            ]
+            .spacing(space(1.5))
+            .align_y(Alignment::Center),
+        );
+    }
+
+    body = body.push(Space::new().height(space(1.0)));
+    body = body.push(
+        text(i18n::t(Key::HelpHeadingCommands))
+            .size(type_scale::META)
+            .style(theme::text_dim),
+    );
+    for command in crate::slash::COMMANDS {
+        body = body.push(
+            row![
+                container(
+                    text(command.name)
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_primary),
+                )
+                .width(Length::Fixed(HELP_CHORD_WIDTH)),
+                text(i18n::t(command.description))
+                    .size(type_scale::META)
+                    .style(theme::text_dim),
+            ]
+            .spacing(space(1.5))
+            .align_y(Alignment::Center),
+        );
+    }
+
+    column![
+        text(i18n::t(Key::ActionHelp))
+            .size(type_scale::BODY)
+            .style(theme::text_primary),
+        scrollable(body)
+            .height(Length::Fixed(PICKER_LIST_HEIGHT))
+            .width(Length::Fill)
+            .style(theme::scroller),
+        widgets::action_list(vec![Action::new(
+            Key::ActionDismiss,
+            "esc",
+            Message::HelpClose
+        )]),
+    ]
+    .spacing(space(1.5))
+    .into()
+}
+
+/// Width of the chord column in the help overlay, so the labels align.
+const HELP_CHORD_WIDTH: f32 = 132.0;
 
 impl PanelState {
     /// The models that can serve *this* request.
@@ -3796,25 +3984,6 @@ fn actions_for(state: &PanelState) -> Vec<Action<Message>> {
         copy.disabled()
     });
 
-    // Skipped during the truncated swap: the primary slot already carries
-    // this exact message, and two entries for one action is noise.
-    if !truncated_retry {
-        let retry = Action::new(
-            Key::ActionRegenerate,
-            widgets::primary_shortcut("⌘R", "Ctrl+R"),
-            Message::Retry,
-        );
-        actions.push(
-            if matches!(state.phase, Phase::Finished { .. } | Phase::Failed)
-                && state.active_user.is_some()
-            {
-                retry
-            } else {
-                retry.disabled()
-            },
-        );
-    }
-
     // Removal is listed only while there is something to remove. It is not the
     // "disabled rather than absent" case: unlike Replace and Copy, this action
     // has a second, always-visible home — the `×` on every chip — so a disabled
@@ -3828,26 +3997,17 @@ fn actions_for(state: &PanelState) -> Vec<Action<Message>> {
         ));
     }
 
-    // The answer to "how do I start over": visible the moment there is
-    // something to start over from.
-    if state.has_conversation() {
-        actions.push(Action::new(
-            Key::ActionNewChat,
-            widgets::primary_shortcut("⌘N", "Ctrl+N"),
-            Message::NewChat,
-        ));
-    }
-
+    // Cancel keeps its seat while a stream is in flight: it is state
+    // feedback, not a shortcut listing.
     if matches!(state.phase, Phase::Loading | Phase::Streaming) {
         actions.push(Action::new(Key::ActionCancel, "esc", Message::Dismiss));
-    } else {
-        actions.push(Action::new(
-            Key::ActionSmartModel,
-            widgets::primary_shortcut("⌘⇧↩", "Ctrl+Shift+Enter"),
-            Message::Escalate,
-        ));
-        actions.push(Action::new(Key::ActionDismiss, "esc", Message::Dismiss));
     }
+
+    // Everything else — regenerate, new chat, smart model, dismiss — lives in
+    // the help overlay now (owner redesign, 2026-08-02: "we don't need to
+    // show the shortcut list in the composer"). The chords all still work;
+    // the footer just stops reciting them.
+    actions.push(Action::new(Key::ActionHelp, "?", Message::HelpOpen));
 
     actions
 }
