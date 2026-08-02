@@ -239,6 +239,10 @@ async-trait = { workspace = true }
 zeroize = { workspace = true }
 unicode-segmentation = { workspace = true }
 
+[build-dependencies]
+# The Windows exe icon (`build.rs`); inert on every other target and host.
+winresource = "0.1"
+
 [dev-dependencies]
 # The panic-boundary test in `diagnostics` needs `#[tokio::test]`.
 tokio = { workspace = true, features = ["macros", "rt"] }
