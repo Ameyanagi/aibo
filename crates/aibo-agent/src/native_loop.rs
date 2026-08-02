@@ -500,14 +500,16 @@ impl Driver {
         cancel: &CancellationToken,
     ) -> Result<Option<Message>> {
         let Some(intent) = self.tools.intent(&call) else {
-            return Ok(Some(tool_result_message(
-                &call,
-                &ToolOutput {
-                    content: format!("no such tool: {}", call.name),
-                    is_error: true,
-                    diffs: Vec::new(),
-                },
-            )));
+            return self
+                .finish_tool(
+                    &call,
+                    &ToolOutput {
+                        content: format!("no such tool: {}", call.name),
+                        is_error: true,
+                        diffs: Vec::new(),
+                    },
+                )
+                .await;
         };
 
         if let Err(kind) = self.tracker.record_tool_call() {
@@ -566,14 +568,16 @@ impl Driver {
             Authorisation::Allowed { resolved_paths, .. } => resolved_paths,
             Authorisation::Denied(reason) => {
                 tracing::info!(tool = %call.name, %reason, "tool call refused");
-                return Ok(Some(tool_result_message(
-                    &call,
-                    &ToolOutput {
-                        content: reason.to_string(),
-                        is_error: true,
-                        diffs: Vec::new(),
-                    },
-                )));
+                return self
+                    .finish_tool(
+                        &call,
+                        &ToolOutput {
+                            content: reason.to_string(),
+                            is_error: true,
+                            diffs: Vec::new(),
+                        },
+                    )
+                    .await;
             }
         };
 
@@ -587,14 +591,16 @@ impl Driver {
             Ok(paths) => paths,
             Err(reason) => {
                 tracing::warn!(tool = %call.name, %reason, "tool call revoked at execution time");
-                return Ok(Some(tool_result_message(
-                    &call,
-                    &ToolOutput {
-                        content: reason.to_string(),
-                        is_error: true,
-                        diffs: Vec::new(),
-                    },
-                )));
+                return self
+                    .finish_tool(
+                        &call,
+                        &ToolOutput {
+                            content: reason.to_string(),
+                            is_error: true,
+                            diffs: Vec::new(),
+                        },
+                    )
+                    .await;
             }
         };
 
@@ -613,7 +619,32 @@ impl Driver {
             }
         }
 
-        Ok(Some(tool_result_message(&call, &output)))
+        self.finish_tool(&call, &output).await
+    }
+
+    /// Report a finished tool call to the UI and build the message that feeds
+    /// its output back to the model.
+    ///
+    /// Every path out of [`Self::run_tool`] that produced an output — success,
+    /// refusal, revocation, unknown tool — comes through here, so the timeline
+    /// never shows a call without its outcome.
+    async fn finish_tool(
+        &mut self,
+        call: &ToolInvocation,
+        output: &ToolOutput,
+    ) -> Result<Option<Message>> {
+        if !self
+            .emit(AgentStep::ToolResult {
+                id: call.id.clone(),
+                name: call.name.clone(),
+                excerpt: display_excerpt(&output.content),
+                is_error: output.is_error,
+            })
+            .await
+        {
+            return Ok(None);
+        }
+        Ok(Some(tool_result_message(call, output)))
     }
 
     fn seed_messages(&self, task: &AgentTask) -> Vec<Message> {
@@ -700,6 +731,21 @@ fn tool_result_message(call: &ToolInvocation, output: &ToolOutput) -> Message {
         tool_call_id: Some(call.id.clone()),
         tool_name: Some(call.name.clone()),
     }
+}
+
+/// Cap tool output for the UI timeline.
+///
+/// Character-counted, not byte-sliced: a byte cut can land inside a CJK
+/// character and panic `String::truncate`. The model's copy is not capped
+/// here — this excerpt exists only for [`AgentStep::ToolResult`].
+fn display_excerpt(content: &str) -> String {
+    const MAX_CHARS: usize = 700;
+    let trimmed = content.trim_end();
+    let mut excerpt: String = trimmed.chars().take(MAX_CHARS).collect();
+    if excerpt.chars().count() < trimmed.chars().count() {
+        excerpt.push('…');
+    }
+    excerpt
 }
 
 fn context_call_origin(blocks: &[UntrustedBlock]) -> ContentOrigin {

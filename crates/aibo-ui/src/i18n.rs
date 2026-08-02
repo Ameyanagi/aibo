@@ -414,6 +414,8 @@ pub enum Key {
     TaskThinking,
     /// A tool is running — `{}` = tool name.
     TaskRunningTool,
+    /// Between tool calls: the model is reading results or writing.
+    TaskWaitingModel,
     /// A file diff step.
     TaskFileChanged,
     /// The run is blocked on an approval.
@@ -770,6 +772,7 @@ fn en(key: Key) -> &'static str {
         K::TaskSteps => "Steps",
         K::TaskThinking => "Thinking",
         K::TaskRunningTool => "Running {}",
+        K::TaskWaitingModel => "Waiting for the model",
         K::TaskFileChanged => "Changed",
         K::TaskAwaitingApproval => "Waiting for your approval",
         K::TaskCompleted => "Finished",
@@ -1022,6 +1025,7 @@ fn ja(key: Key) -> &'static str {
         K::TaskSteps => "ステップ",
         K::TaskThinking => "思考",
         K::TaskRunningTool => "{} を実行中",
+        K::TaskWaitingModel => "モデルの応答を待っています",
         K::TaskFileChanged => "変更",
         K::TaskAwaitingApproval => "承認を待っています",
         K::TaskCompleted => "完了",

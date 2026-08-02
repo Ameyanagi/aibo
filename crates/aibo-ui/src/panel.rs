@@ -1232,21 +1232,26 @@ impl PanelState {
     pub fn can_accept(&self) -> bool {
         !matches!(self.phase, Phase::Loading | Phase::Streaming)
             && self.latest_answer().is_some()
-            // Replace needs somewhere to replace *into*, and this used to only
-            // exclude `ImeActive`. Every other non-`Available` state — a
-            // terminal or Electron app that exposes no field, a capture still
-            // in flight, a capture that failed — left the affordance enabled
-            // with no target behind it. Pressing it dispatched `Insert`, the
-            // panel hid itself per §8's ordering, the runtime found nothing to
-            // insert into, and the user saw an action fire and do nothing.
+            // Replace needs somewhere to replace *into*. The gate is "a
+            // capture completed", not "a capture read something": the runtime
+            // records an insert target (the hotkey-down app snapshot) on
+            // *every* completed capture, so `Unavailable` — a terminal or
+            // Electron app exposing no readable field, nothing selected —
+            // still takes §8's pasteboard-write-plus-synthetic-paste.
+            // Requiring `Available` grayed Replace out on every reopen over
+            // such an app even with the resumed answer on screen (owner
+            // report, 2026-08-02).
             //
-            // `Available` on its own is the right gate rather than
-            // `caret_bounds.is_some()`: §8's insert path is a pasteboard write
-            // plus a synthetic paste into the focused field, which needs a
-            // field and not a caret rectangle. S1 has the bounds arriving as
-            // `None` throughout, so requiring them would disable replace
-            // everywhere.
-            && matches!(self.context, ContextState::Available { .. })
+            // What stays excluded: `Pending` (the target has not reached the
+            // backend yet, so Insert would find nothing), `ImeActive` (§9:
+            // while composing, aibo neither reads nor inserts) and
+            // `PermissionDenied` (no way to restore focus or paste). If the
+            // target app is gone by insert time, §8's validation turns the
+            // paste into a toast, never a guess.
+            && matches!(
+                self.context,
+                ContextState::Available { .. } | ContextState::Unavailable { .. }
+            )
     }
 
     /// The composer's editing state, for the view.
@@ -1780,6 +1785,9 @@ fn task_card(task: &crate::tasks::TaskState) -> Element<'_, Message> {
     for (index, entry) in task.entries.iter().enumerate() {
         steps = steps.push(task_step_row(task.id, index, entry, false));
     }
+    if let Some(activity) = task_activity_row(task) {
+        steps = steps.push(activity);
+    }
     let body = scrollable(steps)
         .style(theme::scroller)
         .height(Length::Fill)
@@ -1819,6 +1827,27 @@ fn assistant_markdown_bubble<'a>(
     .into()
 }
 
+/// The running task's live status line — the answer to "what is it doing
+/// *right now*" that a history of settled rows cannot give (owner report,
+/// 2026-08-02: a silent card mid-run "makes me anxious").
+fn task_activity_row(task: &crate::tasks::TaskState) -> Option<Element<'_, Message>> {
+    let label = match task.activity()? {
+        crate::tasks::Activity::RunningTool(name) => i18n::t1(Key::TaskRunningTool, name),
+        crate::tasks::Activity::WaitingModel => i18n::t(Key::TaskWaitingModel).to_owned(),
+    };
+    Some(
+        row![
+            text("●")
+                .size(type_scale::META)
+                .style(theme::text_severity(Severity::Warning)),
+            text(label).size(type_scale::META).style(theme::text_dim),
+        ]
+        .spacing(space(1.0))
+        .align_y(Alignment::Center)
+        .into(),
+    )
+}
+
 /// One timeline row, shared by the running card and the overlay detail.
 fn task_step_row(
     task: Uuid,
@@ -1829,9 +1858,20 @@ fn task_step_row(
     use aibo_core::types::AgentStep;
     match &entry.step {
         AgentStep::Thought(body) => {
-            let label = text(i18n::t(Key::TaskThinking))
-                .size(type_scale::META)
-                .style(theme::text_dim);
+            // A bare "Thinking…" label hides *what* is being thought about;
+            // the first line is enough to keep the user oriented (owner
+            // report, 2026-08-02).
+            let preview = body.lines().find(|line| !line.trim().is_empty());
+            let label = row![
+                text(i18n::t(Key::TaskThinking))
+                    .size(type_scale::META)
+                    .style(theme::text_dim),
+                text(widgets::elide(preview.unwrap_or_default(), 64))
+                    .size(type_scale::META)
+                    .style(theme::text_faint),
+            ]
+            .spacing(space(1.0))
+            .align_y(Alignment::Center);
             if !expandable {
                 return label.into();
             }
@@ -1859,7 +1899,14 @@ fn task_step_row(
                 .or_else(|| args.get("path"))
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default();
-            row![
+            // No outcome yet means the call is running *now* — that state
+            // must be visible, not implied (owner report, 2026-08-02).
+            let (glyph, glyph_style) = match &entry.outcome {
+                None => ("…", theme::text_severity(Severity::Warning)),
+                Some(outcome) if outcome.is_error => ("✗", theme::text_severity(Severity::Danger)),
+                Some(_) => ("✓", theme::text_severity(Severity::Success)),
+            };
+            let head = row![
                 text(format!("› {name}"))
                     .size(type_scale::META)
                     .font(theme::MONO_FONT)
@@ -1871,11 +1918,41 @@ fn task_step_row(
                 text(task_tier_label(*tier))
                     .size(type_scale::META)
                     .style(theme::text_faint),
+                text(glyph).size(type_scale::META).style(glyph_style),
             ]
             .spacing(space(1.5))
-            .align_y(Alignment::Center)
-            .into()
+            .align_y(Alignment::Center);
+            let excerpt = entry
+                .outcome
+                .as_ref()
+                .filter(|outcome| expandable && !outcome.excerpt.is_empty());
+            match excerpt {
+                // The detail view carries the output itself; the inline card
+                // stays one line per call.
+                Some(outcome) => column![
+                    head,
+                    text(outcome.excerpt.clone())
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_dim),
+                ]
+                .spacing(space(0.5))
+                .into(),
+                None => head.into(),
+            }
         }
+        AgentStep::ToolResult { name, excerpt, .. } => column![
+            text(format!("› {name}"))
+                .size(type_scale::META)
+                .font(theme::MONO_FONT)
+                .style(theme::text_primary),
+            text(widgets::elide(excerpt, 200))
+                .size(type_scale::META)
+                .font(theme::MONO_FONT)
+                .style(theme::text_dim),
+        ]
+        .spacing(space(0.5))
+        .into(),
         AgentStep::FileDiff { path, unified_diff } => {
             if expandable {
                 widgets::diff_view(&path.to_string_lossy(), unified_diff)
@@ -1996,6 +2073,9 @@ fn tasks_overlay(state: &PanelState) -> Element<'_, Message> {
             widgets::RailState::Inactive,
             task_step_row(task.id, index, entry, true),
         ));
+    }
+    if let Some(activity) = task_activity_row(task) {
+        timeline = timeline.push(widgets::railed(widgets::RailState::Active, activity));
     }
     if let Some(request) = &task.pending_approval {
         let mut approval = column![
@@ -3996,11 +4076,7 @@ mod tests {
             reason: StopReason::EndTurn,
         };
 
-        for context in [
-            ContextState::Pending,
-            ContextState::Unavailable { app: None },
-            ContextState::ImeActive,
-        ] {
+        for context in [ContextState::Pending, ContextState::ImeActive] {
             state.context = context.clone();
             assert!(
                 !state.can_accept(),
@@ -4011,6 +4087,12 @@ mod tests {
                 "copy stays available — it needs no target (§13)"
             );
         }
+
+        // A completed capture that read nothing still recorded an insert
+        // target — reopening over a terminal must not gray out Replace when
+        // the resumed answer is on screen (owner report, 2026-08-02).
+        state.context = ContextState::Unavailable { app: None };
+        assert!(state.can_accept());
 
         state.context = available_context();
         assert!(state.can_accept());

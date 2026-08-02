@@ -33,6 +33,28 @@ pub struct Entry {
     /// Reasoning and long tool output start collapsed (§7: reasoning renders
     /// collapsed and is never inserted).
     pub collapsed: bool,
+    /// The outcome of a [`AgentStep::ToolUse`] entry, attached when its
+    /// [`AgentStep::ToolResult`] arrives. `None` on a tool row means the call
+    /// is still running — which is exactly what the timeline renders.
+    pub outcome: Option<ToolOutcome>,
+}
+
+/// What a running task is doing at this moment, derived from the timeline.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Activity<'a> {
+    /// The last tool call has no result yet.
+    RunningTool(&'a str),
+    /// Between tool calls — the model is reading results or writing.
+    WaitingModel,
+}
+
+/// A finished tool call's display outcome.
+#[derive(Debug, Clone)]
+pub struct ToolOutcome {
+    /// Bounded output excerpt from the backend.
+    pub excerpt: String,
+    /// Whether the tool reported failure.
+    pub is_error: bool,
 }
 
 /// State for one agent run.
@@ -107,6 +129,34 @@ impl TaskState {
                     self.final_segments = crate::math::segments(&message);
                 }
             }
+            AgentStep::ToolResult {
+                id,
+                name,
+                excerpt,
+                is_error,
+            } => {
+                let outcome = ToolOutcome { excerpt, is_error };
+                // Attach to the call it finishes; the row flips from
+                // "running" to its outcome without growing the timeline.
+                let matching = self.entries.iter_mut().rev().find(|entry| {
+                    matches!(&entry.step, AgentStep::ToolUse { id: call, .. } if *call == id)
+                });
+                match matching {
+                    Some(entry) => entry.outcome = Some(outcome),
+                    // A result whose call was never shown (unknown tool):
+                    // render it standalone rather than dropping it.
+                    None => self.entries.push(Entry {
+                        step: AgentStep::ToolResult {
+                            id,
+                            name,
+                            excerpt: outcome.excerpt.clone(),
+                            is_error: outcome.is_error,
+                        },
+                        collapsed: false,
+                        outcome: Some(outcome),
+                    }),
+                }
+            }
             other => {
                 // Reasoning arrives on its own channel and stays collapsed
                 // until the user asks for it (§7).
@@ -115,8 +165,30 @@ impl TaskState {
                 self.entries.push(Entry {
                     step: other,
                     collapsed,
+                    outcome: None,
                 });
             }
+        }
+    }
+
+    /// What the run is doing right now, for the running timeline's live
+    /// status line. `None` once settled or while blocked on an approval —
+    /// those states have their own, louder rendering.
+    pub fn activity(&self) -> Option<Activity<'_>> {
+        if !self.is_running() || self.is_blocked() {
+            return None;
+        }
+        let last_tool =
+            self.entries
+                .iter()
+                .rev()
+                .find_map(|entry| match (&entry.step, &entry.outcome) {
+                    (AgentStep::ToolUse { name, .. }, outcome) => Some((name, outcome.is_none())),
+                    _ => None,
+                });
+        match last_tool {
+            Some((name, true)) => Some(Activity::RunningTool(name)),
+            _ => Some(Activity::WaitingModel),
         }
     }
 
@@ -186,6 +258,14 @@ impl TaskState {
                 }
                 AgentStep::ToolUse { name, .. } => {
                     out.push_str(&i18n::t1(Key::TaskRunningTool, name));
+                    if let Some(outcome) = &entry.outcome {
+                        out.push('\n');
+                        out.push_str(&outcome.excerpt);
+                    }
+                }
+                AgentStep::ToolResult { name, excerpt, .. } => {
+                    let _ = writeln!(out, "{name}:");
+                    out.push_str(excerpt);
                 }
                 AgentStep::FileDiff { path, unified_diff } => {
                     let _ = writeln!(
@@ -267,6 +347,59 @@ mod tests {
         }));
         assert!(!state.is_running());
         assert_eq!(state.final_message(), Some("done looking"));
+    }
+
+    #[test]
+    fn tool_results_attach_to_their_call_and_drive_activity() {
+        let mut state = task();
+        assert_eq!(
+            state.activity(),
+            Some(Activity::WaitingModel),
+            "a fresh run is waiting on the model, visibly"
+        );
+
+        state.push(AgentStep::ToolUse {
+            id: "c1".into(),
+            name: "bash".into(),
+            args: serde_json::json!({"command": "ls"}),
+            tier: ToolTier::ShellFs,
+        });
+        assert!(state.entries[0].outcome.is_none());
+        assert_eq!(state.activity(), Some(Activity::RunningTool("bash")));
+
+        state.push(AgentStep::ToolResult {
+            id: "c1".into(),
+            name: "bash".into(),
+            excerpt: "src".into(),
+            is_error: false,
+        });
+        assert_eq!(state.entries.len(), 1, "the result joins its call's row");
+        assert!(
+            state.entries[0]
+                .outcome
+                .as_ref()
+                .is_some_and(|outcome| !outcome.is_error && outcome.excerpt == "src")
+        );
+        assert_eq!(state.activity(), Some(Activity::WaitingModel));
+
+        state.push(AgentStep::Done(AgentOutcome {
+            status: AgentStatus::Completed,
+            usage: Usage::default(),
+            steps: 1,
+        }));
+        assert_eq!(state.activity(), None, "settled runs have no live status");
+    }
+
+    #[test]
+    fn an_orphan_tool_result_still_renders() {
+        let mut state = task();
+        state.push(AgentStep::ToolResult {
+            id: "never-shown".into(),
+            name: "mystery".into(),
+            excerpt: "no such tool".into(),
+            is_error: true,
+        });
+        assert_eq!(state.entries.len(), 1);
     }
 
     #[test]
