@@ -336,11 +336,21 @@ pub struct Aibo {
     panel: PanelState,
     /// Whether the panel is currently on screen.
     panel_visible: bool,
+    /// Whether the panel window holds native keyboard focus.
+    ///
+    /// Set optimistically on show (the show sequence asks for focus) and
+    /// corrected by the window server's `Focused`/`Unfocused` events. The
+    /// toggle hotkey reads it to tell "dismiss me" from "bring me back":
+    /// pressing the hotkey while another app has the keyboard summons the
+    /// visible panel instead of destroying the session it still displays.
+    panel_focused: bool,
     /// The command modifier is currently down; see [`Message::CommandHeld`].
     command_held: bool,
-    /// The in-flight region capture came from the composer's attach menu, so
-    /// the session — transcript, composer text, attachments — must survive it.
-    /// The hotkey path keeps its crop-*then*-ask shape and starts fresh.
+    /// The in-flight region capture joins the session in progress — the
+    /// transcript, composer text and attachments survive it and the crop is
+    /// appended. Set by the attach menu, and by the capture hotkey pressed
+    /// while the panel is open; only the hotkey over a closed panel keeps the
+    /// crop-*then*-ask shape and starts fresh.
     region_capture_keeps_session: bool,
     /// Placement of the last show, so a display change can re-clamp (§9).
     last_placement: Option<Placement>,
@@ -620,6 +630,10 @@ impl Aibo {
     fn show_panel(&mut self, placement: Placement) -> Task<Message> {
         self.last_placement = Some(placement);
         self.panel_visible = true;
+        // Optimistic: `gain_focus` below asks for it, and waiting for the
+        // window server's confirmation would make an immediate second hotkey
+        // press read as "summon" instead of "dismiss".
+        self.panel_focused = true;
         self.pending_show = false;
 
         let position = Point::new(placement.position.0, placement.position.1);
@@ -640,6 +654,7 @@ impl Aibo {
     /// Hide the panel. Never cancels an agent run (§6).
     fn hide_panel(&mut self) -> Task<Message> {
         self.panel_visible = false;
+        self.panel_focused = false;
         // A show that was still waiting on the window server must not land
         // after the user has already dismissed the panel.
         self.pending_show = false;
@@ -881,6 +896,7 @@ fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) 
         panel_window,
         panel: PanelState::new(Uuid::now_v7()),
         panel_visible: false,
+        panel_focused: false,
         command_held: false,
         region_capture_keeps_session: false,
         last_placement: None,
@@ -1099,6 +1115,9 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
             if let Some(role) = state.role_of(id) {
                 aibo_platform::set_accessibility_focus(Aibo::accessibility_surface(role), focused);
             }
+            if id == state.panel_window {
+                state.panel_focused = focused;
+            }
             // Focusing the panel window is intent to type (owner, 2026-08-01:
             // "when the focus is on aibo, it should immediately be able to
             // start typing" — clicking the panel or ⌘-tabbing back left the
@@ -1159,7 +1178,18 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                 .and_then(|hotkeys| hotkeys.action_for(id));
             match action {
                 Some(HotkeyAction::TogglePanel) => {
-                    if state.panel_visible {
+                    if state.panel_visible && !state.panel_focused {
+                        // The panel is on screen but another app holds the
+                        // keyboard. From there the hotkey means "get me back
+                        // to aibo" — hiding would destroy a session the user
+                        // can still see, which is an implicit destructive
+                        // gesture. Dismissal stays one press away: the next
+                        // toggle finds the panel focused and hides it.
+                        state.panel_focused = true;
+                        aibo_platform::activate_self();
+                        window::gain_focus(state.panel_window)
+                            .chain(operation::focus(panel::INPUT_ID))
+                    } else if state.panel_visible {
                         discard_panel_session(state, true);
                         state.hide_panel()
                     } else {
@@ -1175,7 +1205,14 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                     // Keep the panel out of the pixels. `chain` begins the picker
                     // only after the window server has hidden the overlay.
                     let hidden = if state.panel_visible {
-                        discard_panel_session(state, true);
+                        // An open panel means a conversation in progress, and
+                        // the hotkey joins it exactly like the attach menu's
+                        // screenshot row: composer text, transcript and
+                        // attachments survive, and the crop lands beside them.
+                        // Discarding here threw away what the user had typed —
+                        // an implicit destructive gesture. Crop-*then*-ask
+                        // starts fresh only from a closed panel.
+                        state.region_capture_keeps_session = true;
                         state.hide_panel()
                     } else {
                         Task::none()
@@ -1389,12 +1426,22 @@ fn focus_first_task(state: &mut Aibo) -> Task<Message> {
 }
 
 fn open_settings(state: &mut Aibo) -> Task<Message> {
+    // The panel floats at `Level::AlwaysOnTop`; a normal-level settings window
+    // can only ever open *behind* it. Opening settings is a statement about
+    // where the user is going next, so the panel steps aside. Nothing is lost:
+    // `hide_panel` never cancels a run (§6) and the hotkey resumes the
+    // conversation.
+    let step_aside = if state.panel_visible {
+        state.hide_panel()
+    } else {
+        Task::none()
+    };
     if let Some(id) = state.settings_window {
-        return window::gain_focus(id);
+        return step_aside.chain(window::gain_focus(id));
     }
     let (id, opened) = window::open(settings_window_settings());
     state.settings_window = Some(id);
-    opened.map(Message::WindowOpened)
+    step_aside.chain(opened.map(Message::WindowOpened))
 }
 
 /// Whether `new` is exactly `old` with one extra character inserted.
@@ -2938,7 +2985,9 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 };
             }
             state.panel.fail(&error);
-            resize_panel_if_visible(state)
+            // Same as `UiEvent::Failed`: the error ends the capture, so the
+            // caret returns to the composer for the retry.
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
         }
 
         UiEvent::Dispatched {
@@ -3052,7 +3101,11 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             if opens_settings {
                 Task::batch([resize, open_settings(state)])
             } else {
-                resize
+                // A failure ends the run just as `StreamEvent::Done` ends a
+                // success, and the caret comes back at the same moment: the
+                // user's next move is to edit and retry, not to click the
+                // input first.
+                resize.chain(operation::focus(panel::INPUT_ID))
             }
         }
 
@@ -3432,7 +3485,9 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 body: i18n::t(key).to_owned(),
                 offer_diagnostics: false,
             });
-            resize_panel_if_visible(state)
+            // `DictationEnded` gives the caret back; ending in failure is
+            // still ending, and the user types what they meant to dictate.
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
         }
     }
 }
@@ -4303,6 +4358,28 @@ mod tests {
         assert_eq!(state.settings.section, settings::Section::Providers);
         assert!(state.settings_window.is_some());
         assert!(task.units() > 0);
+    }
+
+    /// The panel is `AlwaysOnTop` and the settings window is not, so with both
+    /// on screen settings always sits behind the panel — unreachable without
+    /// dragging it out from underneath (owner report, 2026-08-02). Opening
+    /// settings therefore hides the panel; the session survives and the hotkey
+    /// brings it back.
+    #[test]
+    fn opening_settings_hides_the_panel_instead_of_covering_the_window() {
+        let mut state = app();
+        state.panel_visible = true;
+
+        let _ = open_settings(&mut state);
+
+        assert!(!state.panel_visible, "settings must not open behind aibo");
+        assert!(state.settings_window.is_some());
+
+        // Re-opening while the settings window already exists takes the same
+        // path: focus settings, panel out of the way.
+        state.panel_visible = true;
+        let _ = open_settings(&mut state);
+        assert!(!state.panel_visible);
     }
 
     #[test]
