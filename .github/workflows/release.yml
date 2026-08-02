@@ -205,12 +205,15 @@ jobs:
           set -euo pipefail
           # UDZO read-only compressed, which is what `hdiutil` gives a plain
           # folder. Applications symlink so the image is drag-to-install.
-          staging="$RUNNER_TEMP/dmg"
-          mkdir -p "$staging"
-          cp -R dist/aibo.app "$staging/"
-          ln -s /Applications "$staging/Applications"
-          hdiutil create -volname aibo -srcfolder "$staging" -ov \
-            -format UDZO "dist/${{ matrix.asset }}"
+          # dmgbuild rather than a bare `hdiutil create -srcfolder`: it writes
+          # the .DS_Store (window size, icon positions, background art)
+          # programmatically, with the alias records Finder needs — the one
+          # thing a committed .DS_Store cannot carry across volumes — and it
+          # needs no Finder scripting, which is the flakiest thing a headless
+          # runner can be asked to do. The look lives in
+          # packaging/macos/dmg/settings.py.
+          pipx run dmgbuild -s packaging/macos/dmg/settings.py \
+            -D app=dist/aibo.app aibo "dist/${{ matrix.asset }}"
           rm -rf dist/aibo.app
 
       - name: Sign the disk image
