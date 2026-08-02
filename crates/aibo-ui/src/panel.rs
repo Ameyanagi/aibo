@@ -1818,7 +1818,19 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
         .into();
     if let Some((overlay, dismiss)) = menu {
         return stack![
-            base,
+            // The stack takes its size from this first layer, so the chrome
+            // — deliberately *short*, so the backdrop does not grow when a
+            // menu opens — cannot be it: every menu was then clipped to the
+            // chrome's height, and on an empty panel that is barely one row.
+            // `/` showed a single command and `@` showed a sliver of its
+            // results (owner screenshots, 2026-08-02); with a conversation
+            // behind it the chrome was tall enough to hide the bug. So the
+            // layer fills the window and the chrome sits at the top of it,
+            // painted at its own height.
+            container(base)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .align_y(Alignment::Start),
             // A transparent scrim between the panel and the menu: clicking
             // anywhere that is not the menu dismisses it, which is what every
             // dropdown teaches the hand to expect.
@@ -2373,8 +2385,14 @@ fn slash_overlay(state: &PanelState) -> Element<'_, Message> {
             .on_press(Message::SlashChoose(index)),
         ));
     }
+    // Bounded and scrolling, like the finder and the quick-pick: the command
+    // set grows over time, and a list that pushes its own action row off the
+    // bottom teaches the wrong shortcut.
     column![
-        list,
+        scrollable(list)
+            .height(Length::Fixed(SLASH_LIST_HEIGHT))
+            .width(Length::Fill)
+            .style(theme::scroller),
         widgets::action_list(vec![
             Action::new(Key::ActionSelect, "⏎", Message::SlashAccept).primary(),
             Action::new(Key::ActionDismiss, "esc", Message::SlashClose),
@@ -2383,6 +2401,10 @@ fn slash_overlay(state: &PanelState) -> Element<'_, Message> {
     .spacing(space(1.5))
     .into()
 }
+
+/// The slash popup's list height: shorter than the finder's, because the
+/// command set is small and a half-empty menu reads as a mistake.
+const SLASH_LIST_HEIGHT: f32 = 200.0;
 
 /// The agent workdir picker: recents first, then roots and their immediate
 /// subdirectories, filtered as the query grows. Same chrome as the finder.
@@ -4515,6 +4537,44 @@ mod tests {
         let mut state = PanelState::new(SessionId::from_u128(1));
         state.phase = Phase::Idle;
         state
+    }
+
+    /// Every menu needs the same room, and an *empty* panel is the case that
+    /// broke: its chrome is one row tall, and a menu clipped to the chrome
+    /// showed one command or a sliver of results (owner screenshots,
+    /// 2026-08-02). The window must ask for menu height in every state.
+    #[test]
+    fn an_empty_panel_still_makes_room_for_every_menu() {
+        let mut state = panel();
+        state.display_height = Some(1000.0);
+        let collapsed = state.desired_height();
+
+        type Opener = fn(&mut PanelState, bool);
+        let openers: [(&str, Opener); 6] = [
+            ("slash", |s, on| s.slash.open = on),
+            ("help", |s, on| s.help_open = on),
+            ("attach", |s, on| s.attach_menu_open = on),
+            ("skills", |s, on| s.skills_open = on),
+            ("tasks", |s, on| s.tasks_open = on),
+            ("workdir", |s, on| s.workdir_picker.open = on),
+        ];
+        for (name, set) in openers {
+            set(&mut state, true);
+            let with_menu = state.desired_height();
+            assert!(
+                with_menu > collapsed,
+                "{name}: a menu over an empty panel must grow the window \
+                 ({with_menu} vs {collapsed})"
+            );
+            assert!(
+                with_menu >= PICKER_PANEL_HEIGHT.min(state.max_panel_height()),
+                "{name}: and grow to menu height, not merely a little"
+            );
+            set(&mut state, false);
+        }
+
+        state.file_finder.open();
+        assert!(state.desired_height() > collapsed, "the @ finder too");
     }
 
     /// Recents lead, duplicates collapse into their recent row, and the
