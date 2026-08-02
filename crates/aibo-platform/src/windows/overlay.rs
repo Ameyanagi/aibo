@@ -144,7 +144,7 @@ fn hwnd(handle: Win32WindowHandle) -> HWND {
 
 fn drag_band_height(dpi: u32) -> i32 {
     let dpi = dpi.max(96);
-    ((u64::from(DRAG_BAND_LOGICAL_PX) * u64::from(dpi) + 95) / 96) as i32
+    (u64::from(DRAG_BAND_LOGICAL_PX) * u64::from(dpi)).div_ceil(96) as i32
 }
 
 fn is_drag_band_y(client_y: i32, dpi: u32) -> bool {

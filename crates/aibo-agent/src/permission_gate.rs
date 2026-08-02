@@ -764,8 +764,13 @@ pub fn is_destructive_command(command: &str) -> bool {
             }
             // cmd.exe uses slash flags. `/s` recursively removes a directory;
             // `/f` and `/q` make file deletion forced/non-interactive.
-            "rmdir" | "rd" => args.iter().any(|a| *a == "/s"),
+            "rmdir" | "rd" => args
+                .iter()
+                .any(|a| matches!(*a, "/s" | "-recurse" | "-force" | "-r")),
             "del" | "erase" => args.iter().any(|a| matches!(*a, "/f" | "/q" | "/s")),
+            "remove-item" | "ri" => args
+                .iter()
+                .any(|a| matches!(*a, "-recurse" | "-force" | "-r")),
             "git" => is_destructive_git(args),
             "dd" => args.iter().any(|a| a.starts_with("of=")),
             "mkfs" | "fdisk" | "diskutil" | "format" | "shutdown" | "reboot" | "halt" => true,
@@ -1069,6 +1074,7 @@ mod tests {
         assert!(is_destructive_command("rmdir /s /q build"));
         assert!(is_destructive_command("rd /s build"));
         assert!(is_destructive_command("del /f /q build\\*"));
+        assert!(is_destructive_command("Remove-Item -Recurse -Force build"));
         assert!(is_destructive_command("git push --force origin main"));
         assert!(is_destructive_command("git push -f"));
         assert!(is_destructive_command("git reset --hard HEAD~3"));

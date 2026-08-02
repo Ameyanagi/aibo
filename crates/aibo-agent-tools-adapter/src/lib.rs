@@ -16,6 +16,7 @@
 #![forbid(unsafe_code)]
 
 mod workspace;
+pub use aibo_tools::shell::platform_shell_tool_name;
 pub use workspace::{WorkspaceError, WorkspaceExecutor};
 
 use aibo_agent::{

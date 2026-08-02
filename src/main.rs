@@ -2919,28 +2919,44 @@ mod runtime {
     /// §11 divergence: a guideline explaining approvals, which pi does not
     /// have.
     fn agent_system_prompt(roots: &[std::path::PathBuf]) -> String {
-        let mut prompt = String::from(
+        let shell = aibo_agent_tools_adapter::platform_shell_tool_name();
+        let (shell_description, shell_guidance, destructive_examples) = if cfg!(windows) {
+            (
+                "Execute a PowerShell command in the current working directory",
+                "Use Windows PowerShell syntax: Get-ChildItem, Get-Content, \
+                 $env:USERPROFILE, and semicolon-separated commands. Never invoke bash, \
+                 sh, or chcp, and never use POSIX $VARIABLE syntax. UTF-8 is already configured",
+                "Remove-Item -Recurse/-Force, force-push and the like",
+            )
+        } else {
+            (
+                "Execute a bash command in the current working directory",
+                "Use bash for file operations like ls, rg, find",
+                "rm -rf, force-push and the like",
+            )
+        };
+        let mut prompt = format!(
             "You are an expert coding assistant operating inside aibo, a coding agent \
              harness. You help users by reading files, executing commands, editing code, \
              and writing new files.\n\n\
              Available tools:\n\
              - read: Read the contents of a file\n\
-             - bash: Execute a bash command in the current working directory\n\
+             - {shell}: {shell_description}\n\
              - edit: Edit a single file using exact text replacement\n\
              - write: Write content to a file\n\n\
              Guidelines:\n\
-             - Use bash for file operations like ls, rg, find\n\
+             - {shell_guidance}\n\
              - Be concise in your responses\n\
              - Show file paths clearly when working with files\n\
-             - Destructive commands (rm -rf, force-push and the like) are refused \
+             - Destructive commands ({destructive_examples}) are refused \
              once; if one is genuinely required, state why and retry with \
              confirm_destructive: true\
              - Commands run non-interactively; prefer flags like --yes, or pass a \
-             prompt's answer via bash's stdin parameter\n\
+             prompt's answer via {shell}'s stdin parameter\n\
              - If the message is conversation or a question that needs no files or \
              commands, just answer it; do not invent a task\n\
              - Mathematics: LaTeX is welcome; $$...$$ display equations are \
-             typeset, inline math shows as written",
+             typeset, inline math shows as written"
         );
         if let Some(workspace) = roots.first() {
             // pi's <project_context>: the workspace's own instructions, when
@@ -5708,6 +5724,20 @@ mod runtime {
         /// runs. Every value below that mentions it is a value the product must
         /// never produce.
         const AIBO_PID: i32 = 99;
+
+        #[test]
+        fn agent_prompt_names_the_native_shell_and_its_syntax() {
+            let prompt = agent_system_prompt(&[]);
+            if cfg!(windows) {
+                assert!(prompt.contains("- powershell:"));
+                assert!(prompt.contains("$env:USERPROFILE"));
+                assert!(prompt.contains("Never invoke bash"));
+                assert!(!prompt.contains("- bash:"));
+            } else {
+                assert!(prompt.contains("- bash:"));
+                assert!(prompt.contains("Use bash for file operations"));
+            }
+        }
 
         /// The catalogue as it is before any network refresh, which is the state
         /// these tests describe.
