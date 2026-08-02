@@ -5080,11 +5080,36 @@ mod runtime {
         /// §8: restore focus *with confirmation*, validate, then one atomic
         /// paste.
         fn insert(&mut self, session: SessionId, text: String) {
-            let target = self.sessions.get(&session).and_then(|s| s.target.clone());
+            let captured = self.sessions.get(&session).and_then(|s| s.target.clone());
             let platform = self.platform.clone();
             let events = self.events.clone();
 
             tokio::spawn(crate::diagnostics::supervise("insert", async move {
+                // The paste is aimed at the app the user was *last* in, not
+                // necessarily the one the capture read (owner, 2026-08-02:
+                // switching apps while the panel is open is how you choose
+                // where the text lands). The panel is non-activating, so the
+                // frontmost app at this moment *is* that choice. When the
+                // user never switched, the captured target — carrying §8's
+                // full content hashes — still does the validating; a switched
+                // target gets §8's structural checks (pid, window, focused
+                // element, IME) plus the secure-input gate, which is every
+                // check that can exist for a field aibo never read.
+                let own_pid = i32::try_from(std::process::id()).ok();
+                let target = match platform.focused_app_ref() {
+                    Ok(front)
+                        if Some(front.pid) != own_pid
+                            && captured.as_ref().is_none_or(|t| t.app_ref.pid != front.pid) =>
+                    {
+                        Some(InsertTarget {
+                            app_ref: front,
+                            focused_element: None,
+                            selection_hash: None,
+                            prefix_hash: None,
+                        })
+                    }
+                    _ => captured,
+                };
                 let Some(target) = target else {
                     // No captured target means aibo does not know where "here"
                     // is. §8: offer copy instead, never guess.

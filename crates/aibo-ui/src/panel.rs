@@ -2352,8 +2352,9 @@ fn finder_overlay(state: &PanelState) -> Element<'_, Message> {
 /// The slash-command completion popup: matching commands, name and
 /// description, highlight driven by ↑/↓ while the composer keeps focus.
 fn slash_overlay(state: &PanelState) -> Element<'_, Message> {
+    let commands = crate::slash::matches(&state.input);
     let mut list = column![].spacing(space(0.5));
-    for (index, command) in crate::slash::matches(&state.input).iter().enumerate() {
+    for (index, command) in commands.iter().enumerate() {
         let highlighted = index == state.slash.highlight;
         list = list.push(widgets::railed_with(
             if highlighted {
@@ -2387,10 +2388,17 @@ fn slash_overlay(state: &PanelState) -> Element<'_, Message> {
     }
     // Bounded and scrolling, like the finder and the quick-pick: the command
     // set grows over time, and a list that pushes its own action row off the
-    // bottom teaches the wrong shortcut.
+    // bottom teaches the wrong shortcut. Bounded by *content* below the cap —
+    // a fixed 200 pt around one filtered row was a popup that is mostly hole
+    // (codex verification, 2026-08-02).
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "command counts are single digits"
+    )]
+    let list_height = SLASH_LIST_HEIGHT.min(commands.len().max(1) as f32 * SLASH_ROW_HEIGHT);
     column![
         scrollable(list)
-            .height(Length::Fixed(SLASH_LIST_HEIGHT))
+            .height(Length::Fixed(list_height))
             .width(Length::Fill)
             .style(theme::scroller),
         widgets::action_list(vec![
@@ -2405,6 +2413,11 @@ fn slash_overlay(state: &PanelState) -> Element<'_, Message> {
 /// The slash popup's list height: shorter than the finder's, because the
 /// command set is small and a half-empty menu reads as a mistake.
 const SLASH_LIST_HEIGHT: f32 = 200.0;
+
+/// One slash row: a BODY line plus the row button's vertical padding and the
+/// list's spacing share. Slightly generous beats clipped — the scrollable
+/// absorbs a couple of spare points invisibly.
+const SLASH_ROW_HEIGHT: f32 = 34.0;
 
 /// The agent workdir picker: recents first, then roots and their immediate
 /// subdirectories, filtered as the query grows. Same chrome as the finder.
@@ -2864,9 +2877,17 @@ fn chip_row(state: &PanelState) -> Element<'_, Message> {
     // The tasks chip (owner redesign, 2026-08-02): present only while runs
     // exist, amber the moment one needs the user. This chip is the one thread
     // back to a run whose session was ⌘N-ed away.
-    let mut cluster_row = row![context, Space::new().width(Length::Fill)]
-        .spacing(space(1.0))
-        .align_y(Alignment::Center);
+    // The context line is the row's one flexible member: it takes what the
+    // chips and cluster leave and is clipped there, so however long the
+    // excerpt, the trailing controls keep their natural size on one line.
+    let mut cluster_row = row![
+        container(context)
+            .width(Length::Fill)
+            .align_y(Alignment::Center)
+            .clip(true)
+    ]
+    .spacing(space(1.0))
+    .align_y(Alignment::Center);
     // Mode toggles as persistent header chips (owner, 2026-08-02: "the
     // status of the agent and dictation should be shown on the top as some
     // icons (with toggles)"). Active state renders in the row's active

@@ -311,11 +311,18 @@ pub fn context_chip<'a, Message: 'a>(
         None => i18n::t(Key::ContextChipNone).to_owned(),
     };
 
+    // `Wrapping::None` on both texts: this line lives in the header row beside
+    // the mode chips and the model cluster, and it is the member that yields.
+    // Left to wrap, a long excerpt squeezed the cluster into a one-word-wide
+    // column, the wrapped cluster made the whole row ~150 pt tall, and the
+    // composer — last in the column — was pushed straight off the window
+    // (owner screenshot, 2026-08-02: "how can I type or use this").
     let mut line = row![
         text(label)
             .size(type_scale::META)
             .font(theme::MONO_FONT)
-            .style(theme::text_dim),
+            .style(theme::text_dim)
+            .wrapping(text::Wrapping::None),
     ]
     .spacing(space(1.5))
     .align_y(Alignment::Center);
@@ -328,7 +335,8 @@ pub fn context_chip<'a, Message: 'a>(
             text(format!("· \u{201c}{}\u{201d}", elide(excerpt, 96)))
                 .size(type_scale::META)
                 .font(theme::MONO_FONT)
-                .style(theme::text_dim),
+                .style(theme::text_dim)
+                .wrapping(text::Wrapping::None),
         );
     }
 
