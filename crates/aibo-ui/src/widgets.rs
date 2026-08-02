@@ -744,15 +744,15 @@ pub fn footnote<'a, Message: 'a>(body: String) -> Element<'a, Message> {
         .into()
 }
 
-/// A non-blocking toast (§13: `InsertFailed`, `CaptureFailed`).
-///
-/// The result stays in the panel behind it so the user can copy manually — the
-/// toast never replaces the content it is complaining about.
 /// The severity bar's height: one line of [`type_scale::META`] with its
-/// leading. A constant rather than `Length::Fill` — see the note in
-/// [`toast`].
+/// leading. A constant rather than `Length::Fill` — see the note in [`toast`].
 const TOAST_BAR_HEIGHT: f32 = 18.0;
 
+/// A non-blocking notice (§13: `InsertFailed`, `CaptureFailed`).
+///
+/// Rendered as a row of the panel, above the composer — the result stays
+/// visible beside it so the user can still copy manually, and a notice never
+/// replaces the content it is complaining about.
 pub fn toast<'a, Message: Clone + 'a>(
     severity: Severity,
     body: &str,

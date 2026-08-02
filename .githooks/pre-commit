@@ -1,0 +1,24 @@
+#!/bin/sh
+# The gates CI enforces, run before the commit exists — with the *same* flags.
+#
+# The flags are the point. A bare `cargo clippy` reports `missing_docs` and
+# friends as warnings and exits 0, while CI runs `-D warnings` and fails; that
+# gap has cost this repository several red builds whose fix was a doc comment.
+# So this mirrors `.github/workflows/ci.yml` exactly rather than approximating
+# it. Tests are left to pre-push: they take minutes, and a commit should not.
+#
+# Install: git config core.hooksPath .githooks
+# Skip once (WIP commit): git commit --no-verify
+
+set -e
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-commit: cargo not on PATH, skipping the Rust gates" >&2
+    exit 0
+fi
+
+echo "pre-commit: cargo fmt --check"
+cargo fmt --all -- --check
+
+echo "pre-commit: cargo clippy -D warnings"
+cargo clippy --workspace --all-features --all-targets --locked -- -D warnings -A unsafe-code
