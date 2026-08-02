@@ -413,6 +413,15 @@ jobs:
           if [ "$PRERELEASE" = "true" ]; then
             flags+=(--prerelease)
           fi
+          if [ "$TAG" = "dev" ]; then
+            # Only the rolling `dev` release needs `--target`: its tag is
+            # deleted above and must be recut at this run's commit. For a
+            # pushed tag the commit is already pinned — and passing `--target`
+            # there trips a GITHUB_TOKEN limitation (cli/cli#9514: HTTP 403
+            # "Resource not accessible by integration" despite
+            # `contents: write`; the same call works with user credentials).
+            flags+=(--target "${{ github.sha }}")
+          fi
 
           if [ "$TAG" = "dev" ] && gh release view "$TAG" >/dev/null 2>&1; then
             # Deleted and recreated rather than edited, because `gh release edit`
@@ -428,7 +437,7 @@ jobs:
             # Deleting a published release breaks anyone who has the link.
             gh release upload "$TAG" dist/* --clobber
           else
-            gh release create "$TAG" dist/* "${flags[@]}" --target "${{ github.sha }}"
+            gh release create "$TAG" dist/* "${flags[@]}"
           fi
 
           echo "### Released [$TAG]($(gh release view "$TAG" --json url --jq .url))" \
