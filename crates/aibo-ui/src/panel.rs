@@ -31,7 +31,7 @@ use iced::widget::{
     Space, button, column, container, image, markdown, mouse_area, pick_list, row, rule,
     scrollable, stack, text, text_editor, text_input,
 };
-use iced::{Alignment, Element, Length};
+use iced::{Alignment, Element, Length, mouse};
 use uuid::Uuid;
 
 use crate::bridge::{ModelOption, SessionId};
@@ -2889,7 +2889,21 @@ fn chip_row(state: &PanelState) -> Element<'_, Message> {
     // The panel is borderless on both platforms. AppKit makes its background
     // movable natively; this explicit source-line handle gives Windows the
     // same affordance and delegates tracking/snapping to the window manager.
-    let context: Element<'_, Message> = mouse_area(context).on_press(Message::BeginDrag).into();
+    //
+    // Keep the fill container *inside* the mouse area. When it was outside,
+    // the row looked full-width but only the few pixels occupied by the source
+    // text received the press, which made the panel effectively immovable
+    // whenever the context line was short (or empty).
+    let context: Element<'_, Message> = mouse_area(
+        container(context)
+            .width(Length::Fill)
+            .padding([space(0.5), 0.0])
+            .align_y(Alignment::Center)
+            .clip(true),
+    )
+    .on_press(Message::BeginDrag)
+    .interaction(mouse::Interaction::Grab)
+    .into();
 
     if state.model_options.is_empty() {
         return context;
@@ -2936,14 +2950,7 @@ fn chip_row(state: &PanelState) -> Element<'_, Message> {
     // The context line is the row's one flexible member: it takes what the
     // chips and cluster leave and is clipped there, so however long the
     // excerpt, the trailing controls keep their natural size on one line.
-    let mut cluster_row = row![
-        container(context)
-            .width(Length::Fill)
-            .align_y(Alignment::Center)
-            .clip(true)
-    ]
-    .spacing(space(1.0))
-    .align_y(Alignment::Center);
+    let mut cluster_row = row![context].spacing(space(1.0)).align_y(Alignment::Center);
     // Mode toggles as persistent header chips (owner, 2026-08-02: "the
     // status of the agent and dictation should be shown on the top as some
     // icons (with toggles)"). Active state renders in the row's active

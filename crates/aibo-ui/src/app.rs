@@ -5252,6 +5252,17 @@ mod tests {
         );
     }
 
+    #[test]
+    fn beginning_a_panel_drag_preserves_the_users_position() {
+        let mut state = app();
+        assert!(!state.panel_dragged);
+
+        let task = panel_update(&mut state, panel::Message::BeginDrag);
+
+        assert!(state.panel_dragged);
+        assert!(task.units() > 0, "the native window drag must be requested");
+    }
+
     /// The re-probe that follows every show must not re-show the panel when
     /// nothing changed, or `resize` → resize event → probe → `resize` never
     /// settles.
