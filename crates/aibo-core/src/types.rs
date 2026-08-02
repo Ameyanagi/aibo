@@ -1502,6 +1502,23 @@ pub enum AgentStep {
         /// Permission tier (§11).
         tier: ToolTier,
     },
+    /// A tool call finished — success, failure or refusal alike.
+    ///
+    /// `excerpt` is a bounded slice for display; the payload the model sees
+    /// travels through the conversation, not through this event. Without this
+    /// step the timeline showed a tool *starting* and then nothing, which
+    /// reads as a hang (owner report, 2026-08-02: "it makes me anxious").
+    ToolResult {
+        /// The originating call id, matching [`AgentStep::ToolUse`].
+        id: String,
+        /// Tool name, so a result can render standalone if its call was
+        /// never shown (for instance an unknown tool).
+        name: String,
+        /// Bounded output excerpt.
+        excerpt: String,
+        /// Whether the tool reported failure.
+        is_error: bool,
+    },
     /// A file change, as a unified diff.
     ///
     /// §11: this is "revert these file changes", not an undo for the whole
