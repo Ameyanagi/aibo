@@ -1719,6 +1719,7 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 ))
             );
             let height_before = state.panel.desired_height();
+            let slash_open_before = state.panel.slash.open;
             state.panel.perform_input_action(action);
             if opens_finder && !state.panel.picker.open && !state.panel.file_finder.open {
                 state.panel.file_finder.open();
@@ -1727,11 +1728,24 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 state.send(UiRequest::ListFiles);
                 return resize_panel_if_visible(state).chain(operation::focus(panel::FINDER_ID));
             }
+            // Opening or closing the slash popup re-roots the panel — the
+            // view becomes a `stack!` with the menu over it, and back again —
+            // and iced drops keyboard focus when a widget's position in the
+            // tree changes. That left the user staring at a completion list
+            // they could not type into (owner report, 2026-08-02). The popup
+            // is deliberately focus-free: its query *is* the composer text,
+            // so focus is put straight back on **both** transitions.
+            let slash_toggled = state.panel.slash.open != slash_open_before;
             // Wrapping is why the composer is an editor at all: the window
             // has to follow the line count or the new lines paint past the
             // bottom edge.
-            if (state.panel.desired_height() - height_before).abs() >= 1.0 {
-                return resize_panel_if_visible(state);
+            let resized = (state.panel.desired_height() - height_before).abs() >= 1.0;
+            match (slash_toggled, resized) {
+                (true, _) => {
+                    return resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID));
+                }
+                (false, true) => return resize_panel_if_visible(state),
+                (false, false) => {}
             }
             Task::none()
         }
@@ -1857,7 +1871,9 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
         M::SlashMove(delta) => {
             let count = crate::slash::matches(&state.panel.input).len();
             state.panel.slash.move_highlight(delta, count);
-            Task::none()
+            // Moving the highlight must not cost the composer its keyboard;
+            // ↑/↓ are for choosing while the hands stay on the text.
+            operation::focus(panel::INPUT_ID)
         }
         M::SlashChoose(index) => {
             state.panel.slash.highlight = index;
@@ -1885,7 +1901,8 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
         M::SlashClose => {
             let input = state.panel.input.clone();
             state.panel.slash.dismiss(&input);
-            resize_panel_if_visible(state)
+            // The popup goes away; the caret stays where the user left it.
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
         }
         M::HelpOpen => {
             state.panel.help_open = true;
@@ -3966,6 +3983,47 @@ mod tests {
             abilities: Default::default(),
             cost: None,
         }
+    }
+
+    /// The slash popup is a *completion*, not a mode: typing `/` must open
+    /// it and leave the composer holding the keyboard, and every further
+    /// keystroke must keep filtering it (owner report, 2026-08-02: "the
+    /// focus changes to the completion menu, which makes it impossible to
+    /// input anything").
+    #[test]
+    fn typing_a_slash_command_never_leaves_the_composer() {
+        use iced::widget::text_editor::{Action, Edit};
+
+        let (requests, _received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+        state.panel.phase = Phase::Idle;
+
+        let _ = panel_update(
+            &mut state,
+            panel::Message::InputEdited(Action::Edit(Edit::Insert('/'))),
+        );
+        assert!(state.panel.slash.open, "`/` opens the completion");
+        assert_eq!(state.panel.input, "/", "and the character is still typed");
+
+        // Every following keystroke narrows the list rather than being eaten
+        // by it.
+        for c in ['h', 'e'] {
+            let _ = panel_update(
+                &mut state,
+                panel::Message::InputEdited(Action::Edit(Edit::Insert(c))),
+            );
+        }
+        assert_eq!(state.panel.input, "/he");
+        assert!(state.panel.slash.open);
+        assert_eq!(crate::slash::matches(&state.panel.input).len(), 1);
+
+        // A space begins arguments: the popup closes and typing continues.
+        let _ = panel_update(
+            &mut state,
+            panel::Message::InputEdited(Action::Edit(Edit::Insert(' '))),
+        );
+        assert!(!state.panel.slash.open, "arguments close the completion");
+        assert_eq!(state.panel.input, "/he ");
     }
 
     /// The agent-mode toggle (owner, 2026-08-01): ⌘J makes submissions Do,
