@@ -107,7 +107,7 @@ pub fn create() -> Result<Tray> {
         .with_icon(state_icon(TrayState::Idle))
         // macOS renders template images in the menu bar tint, so the icon
         // follows light/dark and the "reduce transparency" setting for free.
-        .with_icon_as_template(true)
+        .with_icon_as_template(cfg!(target_os = "macos"))
         // Left click shows the menu rather than opening the panel: the hotkey
         // is the way in, and a stray click should never capture context.
         .with_menu_on_left_click(true)
@@ -192,14 +192,65 @@ pub fn forward_events(sink: impl Fn(TrayCommand) + Send + Sync + 'static) {
     }));
 }
 
-/// Draw the tray glyph procedurally.
+/// Build the platform tray glyph.
 ///
-/// A generated icon rather than a bundled PNG: it keeps the ≤ 25 MB binary
-/// budget (§15) honest, it needs no asset pipeline before the first spike, and
-/// the template-image path on macOS only cares about the alpha channel anyway.
-///
-/// The final glyph is a design deliverable; this is a placeholder that is
-/// legible at 16 pt and distinguishes the three states by fill.
+/// Windows uses the existing app artwork so the notification-area entry is a
+/// recognisable aibo icon on both light and dark taskbars. macOS keeps a
+/// template glyph because AppKit supplies the correct menu-bar tint itself.
+#[cfg(target_os = "windows")]
+fn state_icon(state: TrayState) -> Icon {
+    let rgba = windows_icon_rgba(state);
+    Icon::from_rgba(rgba, 32, 32).expect("bundled Windows tray icon is well-formed")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_icon_rgba(state: TrayState) -> Vec<u8> {
+    const SIZE: u32 = 32;
+    let source = image::load_from_memory_with_format(
+        include_bytes!("../../../assets-src/aibo-icon-1024.png"),
+        image::ImageFormat::Png,
+    )
+    .expect("bundled aibo icon is a valid PNG");
+    let mut rgba = source
+        .resize_exact(SIZE, SIZE, image::imageops::FilterType::Lanczos3)
+        .to_rgba8()
+        .into_raw();
+
+    let badge = match state {
+        TrayState::Idle => None,
+        // The UI palette's success and danger colours. The dark outline keeps
+        // the badge separate from both the artwork and either taskbar theme.
+        TrayState::Busy => Some([0x5A, 0xD1, 0x9A, 0xFF]),
+        TrayState::Attention => Some([0xE5, 0x53, 0x4B, 0xFF]),
+    };
+    if let Some(fill) = badge {
+        paint_badge(&mut rgba, SIZE, fill);
+    }
+    rgba
+}
+
+#[cfg(target_os = "windows")]
+fn paint_badge(rgba: &mut [u8], size: u32, fill: [u8; 4]) {
+    let centre = (size as i32 - 6, size as i32 - 6);
+    for y in (centre.1 - 5)..=(centre.1 + 5) {
+        for x in (centre.0 - 5)..=(centre.0 + 5) {
+            let distance_squared = (x - centre.0).pow(2) + (y - centre.1).pow(2);
+            let colour = if distance_squared <= 16 {
+                Some(fill)
+            } else if distance_squared <= 25 {
+                Some([0x0C, 0x0D, 0x12, 0xFF])
+            } else {
+                None
+            };
+            if let Some(colour) = colour {
+                let index = ((y as u32 * size + x as u32) * 4) as usize;
+                rgba[index..index + 4].copy_from_slice(&colour);
+            }
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
 fn state_icon(state: TrayState) -> Icon {
     const SIZE: u32 = 32;
     let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];

@@ -693,7 +693,7 @@ mod diagnostics {
 /// PID reclamation.
 mod instance {
     use std::fs::{File, OpenOptions, TryLockError};
-    use std::io::{Read as _, Seek as _, Write as _};
+    use std::io::{Read as _, Write as _};
     use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
     use std::path::PathBuf;
     use std::sync::Arc;
@@ -707,6 +707,7 @@ mod instance {
     pub struct Guard {
         file: File,
         path: PathBuf,
+        metadata_path: PathBuf,
         listener: TcpListener,
         nonce: String,
         serving: AtomicBool,
@@ -756,6 +757,13 @@ mod instance {
     impl Drop for Guard {
         fn drop(&mut self) {
             self.stop.store(true, Ordering::Release);
+            // Remove the readable sidecar before releasing the kernel lock, so
+            // a successor can never erase metadata written by a newer owner.
+            if let Err(error) = std::fs::remove_file(&self.metadata_path)
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::warn!(path = %self.metadata_path.display(), %error, "could not remove instance metadata");
+            }
             if let Err(error) = self.file.unlock() {
                 tracing::warn!(path = %self.path.display(), %error, "could not unlock instance file");
             }
@@ -779,6 +787,10 @@ mod instance {
     /// Take the single-instance lock.
     pub fn acquire(paths: &Paths) -> anyhow::Result<Outcome> {
         let path = paths.lock();
+        // Windows' exclusive `LockFileEx` range prevents another process from
+        // reading the locked file. Keep ownership in `aibo.lock`, and the
+        // authenticated focus endpoint in a readable sidecar.
+        let metadata_path = path.with_extension("instance");
         let mut options = OpenOptions::new();
         options.create(true).read(true).write(true);
         #[cfg(unix)]
@@ -786,11 +798,11 @@ mod instance {
             use std::os::unix::fs::OpenOptionsExt as _;
             options.mode(0o600);
         }
-        let mut file = options.open(&path)?;
+        let file = options.open(&path)?;
         match file.try_lock() {
             Ok(()) => {}
             Err(TryLockError::WouldBlock) => {
-                let metadata = std::fs::read_to_string(&path)
+                let metadata = std::fs::read_to_string(&metadata_path)
                     .ok()
                     .and_then(|contents| parse(&contents));
                 let pid = metadata.as_ref().map_or(0, |metadata| metadata.pid);
@@ -808,14 +820,15 @@ mod instance {
         let nonce = uuid::Uuid::now_v7().to_string();
         let me = std::process::id();
         let name = executable_name();
-        file.set_len(0)?;
-        file.rewind()?;
-        file.write_all(format!("{me}\n{name}\n{port}\n{nonce}\n").as_bytes())?;
-        file.sync_all()?;
+        crate::paths::atomic_write(
+            &metadata_path,
+            format!("{me}\n{name}\n{port}\n{nonce}\n").as_bytes(),
+        )?;
 
         Ok(Outcome::Acquired(Guard {
             file,
             path,
+            metadata_path,
             listener,
             nonce,
             serving: AtomicBool::new(false),
@@ -881,10 +894,12 @@ mod instance {
                 Outcome::Acquired(guard) => guard,
                 Outcome::AlreadyRunning { .. } => panic!("first owner was rejected"),
             };
-            assert!(matches!(
-                acquire(&paths).expect("second acquire"),
-                Outcome::AlreadyRunning { .. }
-            ));
+            match acquire(&paths).expect("second acquire") {
+                Outcome::AlreadyRunning { pid, .. } => {
+                    assert_eq!(pid, std::process::id(), "metadata stays readable")
+                }
+                Outcome::Acquired(_) => panic!("second owner acquired the live lock"),
+            }
             drop(first);
             assert!(matches!(
                 acquire(&paths).expect("reacquire after drop"),

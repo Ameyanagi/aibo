@@ -13,6 +13,7 @@ aibo-core = { workspace = true }
 aibo-platform = { workspace = true }
 global-hotkey = { workspace = true }
 iced = { workspace = true }
+image = { workspace = true }
 muda = { workspace = true }
 nucleo-matcher = { workspace = true }
 ratex-layout = { workspace = true }
