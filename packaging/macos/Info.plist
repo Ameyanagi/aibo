@@ -24,6 +24,8 @@
 	<string>en</string>
 	<key>CFBundleExecutable</key>
 	<string>aibo</string>
+	<key>CFBundleIconFile</key>
+	<string>aibo</string>
 	<key>CFBundleIdentifier</key>
 	<string>com.ameyanagi.aibo</string>
 	<key>CFBundleInfoDictionaryVersion</key>

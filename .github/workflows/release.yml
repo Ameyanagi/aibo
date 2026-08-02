@@ -135,6 +135,7 @@ jobs:
           mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
           cp target/release/aibo "$app/Contents/MacOS/aibo"
           chmod +x "$app/Contents/MacOS/aibo"
+          cp packaging/macos/aibo.icns "$app/Contents/Resources/aibo.icns"
           sed "s/VERSION/${{ steps.version.outputs.version }}/g" \
             packaging/macos/Info.plist > "$app/Contents/Info.plist"
           # Verify the substitution landed rather than shipping a bundle whose
