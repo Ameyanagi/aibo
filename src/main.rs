@@ -107,6 +107,25 @@ fn panel_hotkey_override(paths: &paths::Paths) -> Option<aibo_ui::hotkey::HotKey
     }
 }
 
+/// The appearance preference from `config.toml`, if the user set one.
+///
+/// Same shape as [`panel_hotkey_override`]: read here because iced needs it
+/// before the backend thread has loaded anything, and every failure falls
+/// back to the default (dark, §16) rather than stopping startup.
+fn appearance_preference(paths: &paths::Paths) -> aibo_ui::theme::AppearancePreference {
+    use aibo_ui::theme::AppearancePreference;
+    let Ok(config) = aibo_session::config::Config::load(&paths.config()) else {
+        return AppearancePreference::default();
+    };
+    let Some(tag) = config.ui.appearance.as_deref() else {
+        return AppearancePreference::default();
+    };
+    AppearancePreference::parse(tag).unwrap_or_else(|| {
+        tracing::error!(tag, "ui.appearance is not dark/light/system; using dark");
+        AppearancePreference::default()
+    })
+}
+
 fn main() -> anyhow::Result<()> {
     diagnostics::init_tracing();
 
@@ -212,6 +231,10 @@ fn main() -> anyhow::Result<()> {
             // to start because a shortcut is mistyped is the same lockout by
             // another route.
             panel_hotkey: panel_hotkey_override(&paths),
+            appearance_preference: appearance_preference(&paths),
+            // `main` runs on the main thread, so the OS can answer "system"
+            // here; later re-resolutions happen on panel/settings open.
+            appearance: appearance_preference(&paths).resolve(aibo_platform::system_prefers_dark()),
             ..aibo_ui::UiConfig::default()
         };
         aibo_ui::run(
@@ -1796,6 +1819,11 @@ mod config_file {
     /// Persist the panel hotkey override; `None` returns to the default.
     pub fn write_ui_panel_hotkey(path: &Path, spec: Option<&str>) -> io::Result<()> {
         write_ui_key(path, "panel_hotkey", spec.map(quote).as_deref())
+    }
+
+    /// Persist the appearance preference (`dark`/`light`/`system`).
+    pub fn write_ui_appearance(path: &Path, tag: &str) -> io::Result<()> {
+        write_ui_key(path, "appearance", Some(&quote(tag)))
     }
 
     /// Persist the dictation backend choice; `None` returns to auto.
@@ -3779,6 +3807,15 @@ mod runtime {
                         language.tag(),
                     ) {
                         tracing::warn!(%error, "could not persist UI language");
+                    }
+                }
+
+                UiRequest::SetAppearance(preference) => {
+                    if let Err(error) = crate::config_file::write_ui_appearance(
+                        &self.bootstrap.paths().config(),
+                        preference.tag(),
+                    ) {
+                        tracing::warn!(%error, "could not persist the appearance preference");
                     }
                 }
 

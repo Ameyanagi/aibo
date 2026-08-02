@@ -348,6 +348,10 @@ pub enum UiRequest {
     /// Persist and apply a new UI language.
     SetLanguage(Lang),
 
+    /// Persist the appearance preference (`ui.appearance`). The UI applies
+    /// the palette itself; the runtime only writes the file.
+    SetAppearance(crate::theme::AppearancePreference),
+
     /// Persist and immediately activate a model offered by [`UiEvent::ModelOptions`].
     SetModel {
         /// Provider/model pair selected in the panel.

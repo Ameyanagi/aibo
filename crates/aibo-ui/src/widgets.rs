@@ -471,6 +471,10 @@ pub fn attachment_chip<'a, Message: Clone + 'a>(
         );
     }
 
+    // Removal is one `×` in a ring at the chip's edge (owner, 2026-08-03) —
+    // the labelled "× Remove image" text is gone, and so is the footer's
+    // duplicate listing. The ⌫ hint stays beside the ring on the newest chip:
+    // §16 wants the key visible somewhere, and this is now its only home.
     let mut remove = row![].spacing(space(1.0)).align_y(Alignment::Center);
     if let Some(key) = key {
         remove = remove.push(
@@ -481,9 +485,9 @@ pub fn attachment_chip<'a, Message: Clone + 'a>(
         );
     }
     remove = remove.push(
-        text(format!("× {}", i18n::t(Key::ActionRemoveImage)))
-            .size(type_scale::CHIP)
-            .style(theme::text_dim),
+        container(text("×").size(type_scale::CHIP))
+            .center(Length::Fixed(theme::REMOVE_BADGE_EDGE))
+            .style(theme::remove_badge),
     );
 
     line = line.push(
