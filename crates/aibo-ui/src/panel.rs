@@ -777,6 +777,9 @@ pub struct PanelState {
     /// Whether the help overlay is up (`?`, `help`, `/help`, or the footer's
     /// Help action).
     pub help_open: bool,
+    /// Whether the composer's ＋ attach menu is up (owner redesign,
+    /// 2026-08-02: one button, three sources — clipboard, screenshot, file).
+    pub attach_menu_open: bool,
     /// The task whose detail the overlay shows; `None` lists all.
     pub selected_task: Option<Uuid>,
     /// The finished active response, split into markdown and typeset math.
@@ -839,6 +842,7 @@ impl PanelState {
             tasks_open: false,
             slash: crate::slash::SlashState::default(),
             help_open: false,
+            attach_menu_open: false,
             selected_task: None,
             active_segments: None,
             dictation_pad: false,
@@ -1405,6 +1409,7 @@ impl PanelState {
             || self.tasks_open
             || self.slash.open
             || self.help_open
+            || self.attach_menu_open
     }
 
     /// The height the panel wants, for [`crate::placement::PlacementRequest`].
@@ -1602,6 +1607,14 @@ pub enum Message {
     HelpOpen,
     /// Close the help overlay.
     HelpClose,
+    /// Toggle the composer's ＋ attach menu.
+    AttachMenuToggle,
+    /// Close the attach menu without choosing.
+    AttachMenuClose,
+    /// Attach menu: crop a screen region into this conversation.
+    AttachScreenshot,
+    /// Attach menu: open the `@` file finder.
+    AttachPickFile,
 }
 
 /// Render the panel.
@@ -1706,6 +1719,8 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
         Some((tasks_overlay(state), Message::TasksClose))
     } else if state.help_open {
         Some((help_overlay(), Message::HelpClose))
+    } else if state.attach_menu_open {
+        Some((attach_menu_overlay(state), Message::AttachMenuClose))
     } else if state.slash.open {
         Some((slash_overlay(state), Message::SlashClose))
     } else {
@@ -2221,6 +2236,60 @@ fn slash_overlay(state: &PanelState) -> Element<'_, Message> {
         ]),
     ]
     .spacing(space(1.5))
+    .into()
+}
+
+/// The composer's ＋ menu: three ways to attach, each row teaching its own
+/// faster chord (owner redesign, 2026-08-02 — one affordance, three sources).
+fn attach_menu_overlay(state: &PanelState) -> Element<'_, Message> {
+    let row_for = |label: Key, chord: &'static str, message: Option<Message>| {
+        let enabled = message.is_some();
+        let mut entry = button(
+            row![
+                text(i18n::t(label))
+                    .size(type_scale::BODY)
+                    .style(if enabled {
+                        theme::text_primary
+                    } else {
+                        theme::text_faint
+                    }),
+                Space::new().width(Length::Fill),
+                text(chord)
+                    .size(type_scale::META)
+                    .font(theme::MONO_FONT)
+                    .style(theme::text_faint),
+            ]
+            .spacing(space(1.5))
+            .align_y(Alignment::Center),
+        )
+        .width(Length::Fill)
+        .padding([space(1.0), space(1.0)])
+        .style(theme::list_row_button(false));
+        if let Some(message) = message {
+            entry = entry.on_press(message);
+        }
+        entry
+    };
+
+    column![
+        row_for(
+            Key::ActionAttachImage,
+            widgets::primary_shortcut("⌘V", "Ctrl+V"),
+            state.clipboard.is_attachable().then_some(Message::Attach),
+        ),
+        row_for(
+            Key::ActionScreenshot,
+            "⌥⇧Space",
+            cfg!(target_os = "macos").then_some(Message::AttachScreenshot),
+        ),
+        row_for(Key::ActionAttachFile, "@", Some(Message::AttachPickFile)),
+        widgets::action_list(vec![Action::new(
+            Key::ActionDismiss,
+            "esc",
+            Message::AttachMenuClose
+        )]),
+    ]
+    .spacing(space(0.5))
     .into()
 }
 
@@ -3136,12 +3205,12 @@ fn shows_empty_invitation(state: &PanelState) -> bool {
 fn composer_actions_for(state: &PanelState) -> Vec<Action<Message>> {
     // Dictation and agent mode moved to the header chips (owner,
     // 2026-08-02); the composer keeps only per-submission actions.
-    let attach = Action::new(Key::ActionAttachImage, ATTACH_KEY, Message::Attach);
-    let attach = if state.clipboard.is_attachable() {
-        attach
-    } else {
-        attach.disabled()
-    };
+    //
+    // One ＋, three sources (owner redesign, 2026-08-02): the button opens a
+    // menu of clipboard image, screenshot and file, each row showing its own
+    // faster chord. Always enabled — the menu itself is where "what can I
+    // attach right now" is answered.
+    let attach = Action::new(Key::ActionAttach, "＋", Message::AttachMenuToggle);
 
     // Deliberately *not* `.primary()`. `design.md` §2 makes amber "the one live
     // accent" and §9's whole method is to spend the boldness in one place — a
@@ -4704,19 +4773,19 @@ mod tests {
         let listed = |state: &PanelState| {
             composer_actions_for(state)
                 .into_iter()
-                .find(|a| a.label == Key::ActionAttachImage)
+                .find(|a| a.label == Key::ActionAttach)
         };
 
+        // One ＋, always live (owner redesign, 2026-08-02): the button opens
+        // the source menu whatever the clipboard holds, so the row never
+        // changes length or enablement under the user's fingers.
         let without = listed(&state).expect("§16: listed even with nothing to attach");
-        assert_eq!(without.key, ATTACH_KEY);
-        assert!(
-            without.on_press.is_none(),
-            "disabled rather than absent, so the row does not change length"
-        );
+        assert_eq!(without.key, "＋");
+        assert!(without.on_press.is_some());
 
         state.clipboard = offered();
         let with = listed(&state).expect("still listed");
-        assert!(with.on_press.is_some(), "the offer enables it");
+        assert!(with.on_press.is_some());
 
         // Removal appears with the thing it removes, and shows its own key.
         assert!(
@@ -4733,19 +4802,24 @@ mod tests {
     }
 
     #[test]
-    fn an_image_reference_without_pixels_keeps_attach_disabled() {
+    fn an_image_reference_without_pixels_is_not_attachable() {
         let mut state = panel();
         state.clipboard = ClipboardOffer::Image {
             label: "Clipboard image".to_owned(),
             image: None,
         };
         assert!(state.clipboard.is_image());
-        assert!(!state.clipboard.is_attachable());
+        assert!(
+            !state.clipboard.is_attachable(),
+            "the attach menu's clipboard row gates on this"
+        );
+        // The ＋ button itself stays live: the menu is where "what can I
+        // attach right now" is answered (owner redesign, 2026-08-02).
         let attach = composer_actions_for(&state)
             .into_iter()
-            .find(|action| action.label == Key::ActionAttachImage)
-            .expect("the stable composer keeps the disabled entry");
-        assert!(attach.on_press.is_none());
+            .find(|action| action.label == Key::ActionAttach)
+            .expect("the composer keeps its one attach affordance");
+        assert!(attach.on_press.is_some());
     }
 
     #[test]

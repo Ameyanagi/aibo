@@ -338,6 +338,10 @@ pub struct Aibo {
     panel_visible: bool,
     /// The command modifier is currently down; see [`Message::CommandHeld`].
     command_held: bool,
+    /// The in-flight region capture came from the composer's attach menu, so
+    /// the session — transcript, composer text, attachments — must survive it.
+    /// The hotkey path keeps its crop-*then*-ask shape and starts fresh.
+    region_capture_keeps_session: bool,
     /// Placement of the last show, so a display change can re-clamp (§9).
     last_placement: Option<Placement>,
     /// The window server's last answer about the panel's monitor (§9).
@@ -878,6 +882,7 @@ fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) 
         panel: PanelState::new(Uuid::now_v7()),
         panel_visible: false,
         command_held: false,
+        region_capture_keeps_session: false,
         last_placement: None,
         observed: None,
         pending_show: false,
@@ -1185,10 +1190,20 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
         }
 
         Message::ScreenRegionCaptured(result) => match result {
-            Ok(None) => Task::none(),
+            Ok(None) => {
+                // A cancelled crop from the attach menu must bring the
+                // conversation back; the hotkey path had nothing to return to.
+                if std::mem::take(&mut state.region_capture_keeps_session) {
+                    aibo_platform::activate_self();
+                    return state.present_panel();
+                }
+                Task::none()
+            }
             Ok(Some(mut attachment)) => {
                 attachment.label = i18n::t(crate::i18n::Key::AttachmentScreenRegion).to_owned();
-                state.begin_panel_session();
+                if !std::mem::take(&mut state.region_capture_keeps_session) {
+                    state.begin_panel_session();
+                }
                 if let Err(error) = state.panel.attach(attachment) {
                     state.panel.fail(&std::sync::Arc::new(error));
                 }
@@ -1203,7 +1218,9 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
             }
             Err(error) => {
                 tracing::warn!(%error, "screen-region capture failed");
-                state.begin_panel_session();
+                if !std::mem::take(&mut state.region_capture_keeps_session) {
+                    state.begin_panel_session();
+                }
                 state.panel.toast = Some(panel::ToastView {
                     severity: ui_theme::Severity::Warning,
                     body: i18n::t(crate::i18n::Key::ToastScreenCaptureFailed).to_owned(),
@@ -1452,6 +1469,9 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
         }
         if state.panel.help_open && matches!(chord, WindowChord::Escape) {
             return panel_update(state, panel::Message::HelpClose);
+        }
+        if state.panel.attach_menu_open && matches!(chord, WindowChord::Escape) {
+            return panel_update(state, panel::Message::AttachMenuClose);
         }
     }
 
@@ -1864,6 +1884,35 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
         }
 
+        M::AttachMenuToggle => {
+            state.panel.attach_menu_open = !state.panel.attach_menu_open;
+            resize_panel_if_visible(state)
+        }
+        M::AttachMenuClose => {
+            state.panel.attach_menu_open = false;
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
+        }
+        M::AttachScreenshot => {
+            state.panel.attach_menu_open = false;
+            // Unlike the ⌥⇧Space crop-then-ask, this joins the conversation
+            // in progress: the panel hides for clean pixels but nothing is
+            // discarded, and the capture re-presents it with the crop
+            // attached.
+            state.region_capture_keeps_session = true;
+            let hidden = if state.panel_visible {
+                state.hide_panel()
+            } else {
+                Task::none()
+            };
+            hidden.chain(capture_screen_region_task())
+        }
+        M::AttachPickFile => {
+            state.panel.attach_menu_open = false;
+            state.panel.file_finder.open();
+            state.send(UiRequest::ListFiles);
+            resize_panel_if_visible(state).chain(operation::focus(panel::FINDER_ID))
+        }
+
         M::FinderClose => {
             state.panel.file_finder.close();
             // The trigger `@` stays if the user dismissed — they may have
@@ -2034,6 +2083,9 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
         // UI writes to `PanelState::attachments`, so nothing ambient can reach
         // routing through it.
         M::Attach => {
+            // Reached from ⌘V or from the attach menu's clipboard row; either
+            // way the menu's job is done.
+            state.panel.attach_menu_open = false;
             let panel::ClipboardOffer::Image { image, .. } = &state.panel.clipboard else {
                 // Nothing attachable. The action list already renders the entry
                 // disabled in this state, so silence here is what the panel

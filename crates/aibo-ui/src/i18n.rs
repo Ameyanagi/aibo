@@ -502,6 +502,10 @@ pub enum Key {
     CmdModelDesc,
     /// `/settings` — open the settings window.
     CmdSettingsDesc,
+    /// The composer's ＋ button: open the attach menu.
+    ActionAttach,
+    /// Attach menu row: crop a screen region into the conversation.
+    ActionScreenshot,
     /// Section: roles.
     SettingsRoles,
     /// Section: budgets.
@@ -847,6 +851,8 @@ fn en(key: Key) -> &'static str {
         K::CmdNewDesc => "Start a new chat",
         K::CmdModelDesc => "Open the model picker",
         K::CmdSettingsDesc => "Open settings",
+        K::ActionAttach => "Attach",
+        K::ActionScreenshot => "Capture a screen region",
         K::SettingsRoles => "Roles",
         K::SettingsBudgets => "Budgets",
         K::SettingsPermissions => "Permissions",
@@ -1106,6 +1112,8 @@ fn ja(key: Key) -> &'static str {
         K::CmdNewDesc => "新しいチャットを開始",
         K::CmdModelDesc => "モデルピッカーを開く",
         K::CmdSettingsDesc => "設定を開く",
+        K::ActionAttach => "添付",
+        K::ActionScreenshot => "画面の範囲を撮影",
         K::PanelAgentPlaceholder => "タスクを入力 — エージェントは実行前に確認します",
         K::PanelTasksTitle => "エージェントの実行",
         K::SettingsRoles => "ロール",
