@@ -717,7 +717,13 @@ fn en(key: Key) -> &'static str {
 
         K::StateLoading => "Thinking…",
         K::StateEmptyTitle => "Nothing to show yet",
-        K::StateEmptyBody => "Type an instruction, or press ↩ to continue where you left off.",
+        K::StateEmptyBody => {
+            if cfg!(target_os = "macos") {
+                "Type an instruction, or press ↩ to continue where you left off."
+            } else {
+                "Type an instruction, or press Enter to continue where you left off."
+            }
+        }
         K::StateContextUnavailableTitle => "No context from this app",
         K::StateContextUnavailableBody => {
             "aibo could not read the focused field, so it will work from what you type."
@@ -990,7 +996,13 @@ fn ja(key: Key) -> &'static str {
 
         K::StateLoading => "考えています…",
         K::StateEmptyTitle => "まだ表示するものがありません",
-        K::StateEmptyBody => "指示を入力するか、↩ で続きから始めます。",
+        K::StateEmptyBody => {
+            if cfg!(target_os = "macos") {
+                "指示を入力するか、↩ で続きから始めます。"
+            } else {
+                "指示を入力するか、Enter で続きから始めます。"
+            }
+        }
         K::StateContextUnavailableTitle => "このアプリからは読み取れません",
         K::StateContextUnavailableBody => {
             "入力欄を読み取れないため、入力された内容だけで動作します。"

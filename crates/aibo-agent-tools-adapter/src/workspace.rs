@@ -707,8 +707,13 @@ mod tests {
         let root = dir.path().canonicalize().expect("canonical");
         std::fs::create_dir(root.join("junk")).expect("mkdir");
         let exec = executor(&root);
+        let command = if cfg!(windows) {
+            "rmdir /s /q junk"
+        } else {
+            "rm -rf junk"
+        };
 
-        let first = authorized(&exec, "bash", json!({ "command": "rm -rf junk" }));
+        let first = authorized(&exec, "bash", json!({ "command": command }));
         let out = exec.execute(first, CancellationToken::new()).await.unwrap();
         assert!(out.is_error);
         assert!(
@@ -721,7 +726,7 @@ mod tests {
         let confirmed = authorized(
             &exec,
             "bash",
-            json!({ "command": "rm -rf junk", "confirm_destructive": true }),
+            json!({ "command": command, "confirm_destructive": true }),
         );
         let out = exec
             .execute(confirmed, CancellationToken::new())

@@ -1649,6 +1649,8 @@ pub enum Message {
     HelpOpen,
     /// Close the help overlay.
     HelpClose,
+    /// Begin an OS-managed drag of the borderless panel.
+    BeginDrag,
     /// Toggle the composer's ＋ attach menu.
     AttachMenuToggle,
     /// Close the attach menu without choosing.
@@ -2244,7 +2246,7 @@ fn tasks_overlay(state: &PanelState) -> Element<'_, Message> {
         }
         let mut approve = Action::new(
             Key::ActionApprove,
-            "⏎",
+            widgets::ENTER_KEY,
             Message::TaskDecide(task.id, ApprovalDecision::Approve),
         )
         .primary();
@@ -2341,7 +2343,12 @@ fn finder_overlay(state: &PanelState) -> Element<'_, Message> {
             .width(Length::Fill)
             .style(theme::scroller),
         widgets::action_list(vec![
-            Action::new(Key::ActionAttachFile, "⏎", Message::FinderCommit).primary(),
+            Action::new(
+                Key::ActionAttachFile,
+                widgets::ENTER_KEY,
+                Message::FinderCommit,
+            )
+            .primary(),
             Action::new(Key::ActionDismiss, "esc", Message::FinderClose),
         ]),
     ]
@@ -2402,7 +2409,7 @@ fn slash_overlay(state: &PanelState) -> Element<'_, Message> {
             .width(Length::Fill)
             .style(theme::scroller),
         widgets::action_list(vec![
-            Action::new(Key::ActionSelect, "⏎", Message::SlashAccept).primary(),
+            Action::new(Key::ActionSelect, widgets::ENTER_KEY, Message::SlashAccept).primary(),
             Action::new(Key::ActionDismiss, "esc", Message::SlashClose),
         ]),
     ]
@@ -2484,7 +2491,12 @@ fn workdir_overlay(state: &PanelState) -> Element<'_, Message> {
             .width(Length::Fill)
             .style(theme::scroller),
         widgets::action_list(vec![
-            Action::new(Key::ActionSelect, "⏎", Message::WorkdirCommit).primary(),
+            Action::new(
+                Key::ActionSelect,
+                widgets::ENTER_KEY,
+                Message::WorkdirCommit,
+            )
+            .primary(),
             Action::new(Key::ActionDismiss, "esc", Message::WorkdirClose),
         ]),
     ]
@@ -2576,25 +2588,31 @@ fn attach_menu_overlay(state: &PanelState) -> Element<'_, Message> {
         entry
     };
 
-    column![
-        row_for(
-            Key::ActionAttachImage,
-            widgets::primary_shortcut("⌘V", "Ctrl+V"),
-            state.clipboard.is_attachable().then_some(Message::Attach),
-        ),
-        row_for(
+    let mut menu = column![row_for(
+        Key::ActionAttachImage,
+        widgets::primary_shortcut("⌘V", "Ctrl+V"),
+        state.clipboard.is_attachable().then_some(Message::Attach),
+    )]
+    .spacing(space(0.5));
+    // Region capture is currently backed by macOS' native picker only. Do not
+    // advertise a macOS chord as a disabled Windows action.
+    if cfg!(target_os = "macos") {
+        menu = menu.push(row_for(
             Key::ActionScreenshot,
             "⌥⇧Space",
-            cfg!(target_os = "macos").then_some(Message::AttachScreenshot),
-        ),
-        row_for(Key::ActionAttachFile, "@", Some(Message::AttachPickFile)),
-        widgets::action_list(vec![Action::new(
-            Key::ActionDismiss,
-            "esc",
-            Message::AttachMenuClose
-        )]),
-    ]
-    .spacing(space(0.5))
+            Some(Message::AttachScreenshot),
+        ));
+    }
+    menu.push(row_for(
+        Key::ActionAttachFile,
+        "@",
+        Some(Message::AttachPickFile),
+    ))
+    .push(widgets::action_list(vec![Action::new(
+        Key::ActionDismiss,
+        "esc",
+        Message::AttachMenuClose,
+    )]))
     .into()
 }
 
@@ -2604,32 +2622,66 @@ fn help_overlay<'a>() -> Element<'a, Message> {
     // (chord, what it does) — the chords are cross-platform strings where the
     // two differ, and the labels reuse the action catalogue so help can never
     // drift from what the buttons themselves say.
-    let shortcuts: &[(&str, Key)] = &[
+    let mut shortcuts: Vec<(&str, Key)> = vec![(
+        widgets::platform_key("⌥Space", "Ctrl+Shift+Space"),
+        Key::HelpSummon,
+    )];
+    if cfg!(target_os = "macos") {
+        shortcuts.push(("⌥⇧Space", Key::HelpCrop));
+    }
+    shortcuts.extend([
         (
-            if cfg!(target_os = "macos") {
-                "⌥Space"
-            } else {
-                "Ctrl+Shift+Space"
-            },
-            Key::HelpSummon,
+            widgets::primary_shortcut("⌘↩", "Ctrl+Enter"),
+            Key::ActionReplace,
         ),
-        ("⌥⇧Space", Key::HelpCrop),
-        ("⌘↩", Key::ActionReplace),
-        ("⌘⇧↩", Key::ActionSmartModel),
-        ("⌘C", Key::ActionCopy),
-        ("⌘V", Key::ActionAttachImage),
+        (
+            widgets::primary_shortcut("⌘⇧↩", "Ctrl+Shift+Enter"),
+            Key::ActionSmartModel,
+        ),
+        (widgets::primary_shortcut("⌘C", "Ctrl+C"), Key::ActionCopy),
+        (
+            widgets::primary_shortcut("⌘V", "Ctrl+V"),
+            Key::ActionAttachImage,
+        ),
         ("@", Key::ActionAttachFile),
-        ("⌘N", Key::ActionNewChat),
-        ("⌘K", Key::ActionSwitchModel),
-        ("⌘D", Key::ActionPinModel),
-        ("⌘L", Key::ActionDictate),
-        ("⌘J", Key::ActionAgentMode),
-        ("⌘T", Key::ActionShowTask),
-        ("⌘R", Key::ActionRegenerate),
-        ("↑ / ↓", Key::HelpHistory),
-        ("⌘,", Key::ActionOpenSettings),
+        (
+            widgets::primary_shortcut("⌘N", "Ctrl+N"),
+            Key::ActionNewChat,
+        ),
+        (
+            widgets::primary_shortcut("⌘K", "Ctrl+K"),
+            Key::ActionSwitchModel,
+        ),
+        (
+            widgets::primary_shortcut("⌘D", "Ctrl+D"),
+            Key::ActionPinModel,
+        ),
+        (
+            widgets::primary_shortcut("⌘L", "Ctrl+L"),
+            Key::ActionDictate,
+        ),
+        (
+            widgets::primary_shortcut("⌘J", "Ctrl+J"),
+            Key::ActionAgentMode,
+        ),
+        (
+            widgets::primary_shortcut("⌘T", "Ctrl+T"),
+            Key::ActionShowTask,
+        ),
+        (
+            widgets::primary_shortcut("⌘R", "Ctrl+R"),
+            Key::ActionRegenerate,
+        ),
+        (
+            widgets::platform_key("↑ / ↓", "Up / Down"),
+            Key::HelpHistory,
+        ),
+        (
+            widgets::primary_shortcut("⌘,", "Ctrl+,"),
+            Key::ActionOpenSettings,
+        ),
         ("esc", Key::ActionDismiss),
-    ];
+    ]);
 
     let mut body = column![
         text(i18n::t(Key::HelpHeadingShortcuts))
@@ -2637,7 +2689,7 @@ fn help_overlay<'a>() -> Element<'a, Message> {
             .style(theme::text_dim),
     ]
     .spacing(space(0.75));
-    for (chord, label) in shortcuts {
+    for (chord, label) in &shortcuts {
         body = body.push(
             row![
                 container(
@@ -2834,6 +2886,10 @@ fn chip_row(state: &PanelState) -> Element<'_, Message> {
             widgets::context_chip(None, None)
         }
     };
+    // The panel is borderless on both platforms. AppKit makes its background
+    // movable natively; this explicit source-line handle gives Windows the
+    // same affordance and delegates tracking/snapping to the window manager.
+    let context: Element<'_, Message> = mouse_area(context).on_press(Message::BeginDrag).into();
 
     if state.model_options.is_empty() {
         return context;
@@ -3120,8 +3176,12 @@ fn picker_overlay(state: &PanelState) -> Element<'_, Message> {
         ]
         .spacing(space(2.0)),
         widgets::action_list(vec![
-            Action::new(Key::ActionSelect, "⏎", Message::PickerCommit).primary(),
-            Action::new(Key::ActionPinModel, "⌘D", Message::PickerToggleFavourite),
+            Action::new(Key::ActionSelect, widgets::ENTER_KEY, Message::PickerCommit).primary(),
+            Action::new(
+                Key::ActionPinModel,
+                widgets::primary_shortcut("⌘D", "Ctrl+D"),
+                Message::PickerToggleFavourite,
+            ),
             Action::new(Key::ActionDismiss, "esc", Message::ClosePicker),
         ]),
     ]
@@ -3401,11 +3461,23 @@ fn selection_card(state: &PanelState) -> Option<Element<'_, Message>> {
     };
 
     let toggle = if state.context_expanded {
-        Action::new(Key::ActionCollapse, "⌘E", Message::ToggleContext)
+        Action::new(
+            Key::ActionCollapse,
+            widgets::primary_shortcut("⌘E", "Ctrl+E"),
+            Message::ToggleContext,
+        )
     } else {
-        Action::new(Key::ActionExpand, "⌘E", Message::ToggleContext)
+        Action::new(
+            Key::ActionExpand,
+            widgets::primary_shortcut("⌘E", "Ctrl+E"),
+            Message::ToggleContext,
+        )
     };
-    let remove = Action::new(Key::ActionRemoveSelection, "⌘⇧E", Message::RemoveSelection);
+    let remove = Action::new(
+        Key::ActionRemoveSelection,
+        widgets::primary_shortcut("⌘⇧E", "Ctrl+Shift+E"),
+        Message::RemoveSelection,
+    );
 
     Some(
         container(
@@ -3633,7 +3705,7 @@ fn composer_actions_for(state: &PanelState) -> Vec<Action<Message>> {
     // signal the rail exists to carry. It also read as lit even with nothing to
     // send, because the disabled primary style is still amber at 0.32. Send is
     // the ⏎ key; the label says so, which §8 considers sufficient.
-    let primary = Action::new(Key::ActionSend, "↩", Message::Submit);
+    let primary = Action::new(Key::ActionSend, widgets::ENTER_KEY, Message::Submit);
     let primary = if state.input.trim().is_empty()
         || matches!(state.phase, Phase::Loading | Phase::Streaming)
     {
@@ -3949,8 +4021,8 @@ fn error_action(action: ErrorAction) -> Option<Action<Message>> {
             Key::ActionSmartModel,
             widgets::primary_shortcut("⌘↩", "Ctrl+Enter"),
         ),
-        ErrorAction::SignIn(_) => (Key::ActionSignIn, "⏎"),
-        ErrorAction::OpenSettings => (Key::ActionOpenSettings, "⏎"),
+        ErrorAction::SignIn(_) => (Key::ActionSignIn, widgets::ENTER_KEY),
+        ErrorAction::OpenSettings => (Key::ActionOpenSettings, widgets::ENTER_KEY),
         ErrorAction::CopyDiagnostics => (
             Key::ActionCopyDiagnostics,
             widgets::primary_shortcut("⌘C", "Ctrl+C"),
@@ -4532,7 +4604,7 @@ fn warm_up_view<'a>() -> Element<'a, Message> {
             widgets::answer::<Message>("warm", theme::ANSWER_BOX_MIN_HEIGHT, true),
             widgets::meta_line::<Message>("aibo", "warm", Some(0), Some("0")),
             widgets::action_list(vec![
-                Action::new(Key::ActionReplace, "⏎", Message::Dismiss).primary(),
+                Action::new(Key::ActionReplace, widgets::ENTER_KEY, Message::Dismiss).primary(),
                 Action::new(
                     Key::ActionCopy,
                     widgets::primary_shortcut("⌘C", "Ctrl+C"),
