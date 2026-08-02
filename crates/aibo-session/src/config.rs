@@ -564,6 +564,11 @@ pub struct UiSettings {
     /// another route.
     #[serde(default)]
     pub panel_hotkey: Option<String>,
+    /// `"dark"`, `"light"` or `"system"`. Absent means dark — the product
+    /// default (§16) — so existing installs keep their look. The UI layer
+    /// parses and applies it; an unknown value is reported and falls dark.
+    #[serde(default)]
+    pub appearance: Option<String>,
 }
 
 impl Config {

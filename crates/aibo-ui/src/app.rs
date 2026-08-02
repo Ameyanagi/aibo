@@ -67,6 +67,9 @@ pub struct UiConfig {
     pub language: Lang,
     /// Light or dark. Dark-first is the product default (§16).
     pub appearance: Appearance,
+    /// What the user asked for; `appearance` above is its current resolution.
+    /// Kept so "system" can be re-resolved on every panel or settings open.
+    pub appearance_preference: ui_theme::AppearancePreference,
     /// Whether animation runs at all (§16 reduced-motion).
     pub motion: Motion,
     /// The panel hotkey. `None` uses the platform default from §9 — `⌥Space`
@@ -79,6 +82,7 @@ impl Default for UiConfig {
         Self {
             language: Lang::default(),
             appearance: Appearance::Dark,
+            appearance_preference: ui_theme::AppearancePreference::Dark,
             motion: Motion::Full,
             panel_hotkey: None,
         }
@@ -247,6 +251,9 @@ pub enum Message {
     AccessibilityFocus(window::Id, bool),
     /// An event from the runtime.
     Backend(Box<UiEvent>),
+    /// The native animated resize was unavailable; apply this placement with
+    /// iced's instant resize/move instead.
+    PanelFrameFallback(Placement),
     /// Nothing. Returned where a branch has no work, so `update` stays total.
     Ignored,
 }
@@ -764,8 +771,22 @@ impl Aibo {
     }
 
     fn open_panel(&mut self) -> Task<Message> {
+        self.refresh_appearance();
         self.resume_panel_session();
         self.present_panel()
+    }
+
+    /// Re-resolve "system" against the OS's current answer.
+    ///
+    /// Called on every panel and settings open rather than subscribed to a
+    /// notification: appearance changes are rare, the read is one main-thread
+    /// AppKit call, and the next open is exactly when a stale palette would
+    /// first be seen.
+    fn refresh_appearance(&mut self) {
+        self.config.appearance = self
+            .config
+            .appearance_preference
+            .resolve(aibo_platform::system_prefers_dark());
     }
 
     fn refresh_tray(&mut self) {
@@ -924,6 +945,10 @@ fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) 
         )]),
         accessibility_scales: HashMap::from([(PANEL_ACCESSIBILITY, 1.0)]),
     };
+    let mut state = state;
+    // The selector shows the *preference* (System/Dark/Light), not its
+    // current resolution — the config carries both.
+    state.settings.appearance = state.config.appearance_preference;
 
     (
         state,
@@ -960,6 +985,13 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
 
     let task = match message {
         Message::Ready | Message::Ignored => Task::none(),
+
+        Message::PanelFrameFallback(placement) => {
+            let size = Size::new(placement.size.0, placement.size.1);
+            let position = Point::new(placement.position.0, placement.position.1);
+            window::resize(state.panel_window, size)
+                .chain(window::move_to(state.panel_window, position))
+        }
 
         Message::WindowOpened(id) => {
             let Some(role) = state.role_of(id) else {
@@ -1429,6 +1461,7 @@ fn focus_first_task(state: &mut Aibo) -> Task<Message> {
 }
 
 fn open_settings(state: &mut Aibo) -> Task<Message> {
+    state.refresh_appearance();
     // The panel floats at `Level::AlwaysOnTop`; a normal-level settings window
     // can only ever open *behind* it. Opening settings is a statement about
     // where the user is going next, so the panel steps aside. Nothing is lost:
@@ -2736,6 +2769,13 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             });
             Task::none()
         }
+        M::SetAppearance(preference) => {
+            state.settings.appearance = preference;
+            state.config.appearance_preference = preference;
+            state.config.appearance = preference.resolve(aibo_platform::system_prefers_dark());
+            state.send(UiRequest::SetAppearance(preference));
+            Task::none()
+        }
         M::SetLanguage(lang) => {
             i18n::set_language(lang);
             state.settings.language = lang;
@@ -3639,13 +3679,40 @@ fn resize_panel_if_visible(state: &mut Aibo) -> Task<Message> {
     if previous == Some(placement) {
         return backdrop;
     }
-    let size = Size::new(placement.size.0, placement.size.1);
-    let resize = window::resize(state.panel_window, size).chain(backdrop);
-    if previous.map(|p| p.position) == Some(placement.position) {
-        return resize;
-    }
-    let position = Point::new(placement.position.0, placement.position.1);
-    resize.chain(window::move_to(state.panel_window, position))
+    // One native, animated frame change instead of separate resize/move
+    // effects (owner report, 2026-08-03: instant streaming resizes "feel
+    // flaky, or flashing"). The window server interpolates the frame while
+    // the chrome re-lays-out under it; reduced motion applies it instantly
+    // inside the platform call, and any failure falls back to the iced path
+    // via `PanelFrameFallback`.
+    animate_panel_geometry(state.panel_window, placement).chain(backdrop)
+}
+
+/// Apply `placement` through the platform's animated frame call, falling back
+/// to iced's instant resize/move when the native path is unavailable.
+fn animate_panel_geometry(id: window::Id, placement: Placement) -> Task<Message> {
+    window::run(id, move |window| {
+        let animated = window
+            .window_handle()
+            .map_err(|error| error.to_string())
+            .and_then(|handle| {
+                aibo_platform::animate_panel_frame(
+                    handle,
+                    f64::from(placement.position.0),
+                    f64::from(placement.position.1),
+                    f64::from(placement.size.0),
+                    f64::from(placement.size.1),
+                )
+                .map_err(|error| error.to_string())
+            });
+        match animated {
+            Ok(()) => Message::Ignored,
+            Err(error) => {
+                tracing::debug!(%error, "animated frame unavailable; instant resize");
+                Message::PanelFrameFallback(placement)
+            }
+        }
+    })
 }
 
 fn capture_screen_region_task() -> Task<Message> {

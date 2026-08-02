@@ -45,6 +45,8 @@ pub enum Section {
     Files,
     /// Dictation source (§P9+, owner request 2026-08-02).
     Dictation,
+    /// Dark, light, or follow the system (owner request, 2026-08-03).
+    Appearance,
     /// UI language (§9).
     Language,
     /// Version, licence, diagnostics (§19).
@@ -53,7 +55,7 @@ pub enum Section {
 
 impl Section {
     /// Every section, in navigation order.
-    pub const ALL: [Section; 11] = [
+    pub const ALL: [Section; 12] = [
         Section::Providers,
         Section::Models,
         Section::Roles,
@@ -63,6 +65,7 @@ impl Section {
         Section::History,
         Section::Files,
         Section::Dictation,
+        Section::Appearance,
         Section::Language,
         Section::About,
     ];
@@ -73,7 +76,7 @@ impl Section {
     /// showing them before their editors exist creates navigation that ends in
     /// unrelated generic empty-state copy. Add them here when their controls
     /// ship.
-    pub const VISIBLE: [Section; 9] = [
+    pub const VISIBLE: [Section; 10] = [
         Section::Providers,
         Section::Models,
         Section::Budgets,
@@ -81,6 +84,7 @@ impl Section {
         Section::History,
         Section::Files,
         Section::Dictation,
+        Section::Appearance,
         Section::Language,
         Section::About,
     ];
@@ -97,6 +101,7 @@ impl Section {
             Section::History => Key::SettingsHistory,
             Section::Files => Key::SettingsFiles,
             Section::Dictation => Key::SettingsDictation,
+            Section::Appearance => Key::SettingsAppearance,
             Section::Language => Key::SettingsLanguage,
             Section::About => Key::SettingsAbout,
         }
@@ -336,6 +341,9 @@ pub struct SettingsState {
     pub hotkey: Option<HotkeyStatus>,
     /// The active UI language.
     pub language: Lang,
+    /// The appearance preference (`[ui] appearance`), as chosen — System
+    /// stays System here even while it resolves to a concrete palette.
+    pub appearance: theme::AppearancePreference,
     /// The dictation backend choice (`[stt] backend`).
     pub stt_backend: SttChoice,
     /// Whether this window is the first-run setup rather than a later visit.
@@ -673,6 +681,8 @@ pub enum Message {
     OpenSystemSettings(Permission),
     /// Change the UI language.
     SetLanguage(Lang),
+    /// Change the appearance preference (owner request, 2026-08-03).
+    SetAppearance(theme::AppearancePreference),
     /// Change the dictation backend.
     SetSttBackend(SttChoice),
     /// Copy the device-code to the clipboard.
@@ -809,6 +819,7 @@ fn section_body(state: &SettingsState) -> Element<'_, Message> {
         Section::Permissions => permissions(state),
         Section::Budgets => budgets(state),
         Section::Dictation => dictation(state),
+        Section::Appearance => appearance(state),
         Section::Language => language(state),
         Section::About => about(state),
         Section::History => history(state),
@@ -1820,6 +1831,44 @@ impl SttChoice {
     }
 }
 
+/// The appearance selector: System, Dark, Light — same shape as the
+/// language list below (owner request, 2026-08-03: "a theme selector, and
+/// also darkmode toggle").
+fn appearance(state: &SettingsState) -> Element<'_, Message> {
+    let mut list = column![].spacing(space(1.0));
+    for preference in theme::AppearancePreference::ALL {
+        let selected = preference == state.appearance;
+        list = list.push(
+            button(
+                row![
+                    text(selection_marker(selected))
+                        .width(Length::Fixed(space(3.0)))
+                        .size(type_scale::BODY)
+                        .style(theme::text_primary),
+                    text(i18n::t(preference.label()))
+                        .size(type_scale::BODY)
+                        .style(if selected {
+                            theme::text_primary
+                        } else {
+                            theme::text_dim
+                        }),
+                ]
+                .align_y(iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .height(Length::Fixed(theme::MIN_HIT_TARGET))
+            .padding([space(1.5), space(2.0)])
+            .style(if selected {
+                theme::selected_button
+            } else {
+                theme::action_button
+            })
+            .on_press(Message::SetAppearance(preference)),
+        );
+    }
+    list.into()
+}
+
 fn language(state: &SettingsState) -> Element<'_, Message> {
     let mut list = column![].spacing(space(1.0));
     for lang in Lang::ALL {
@@ -2013,14 +2062,16 @@ mod tests {
         // §16 names: providers, roles, budgets, permissions, actions, history,
         // about/license. Language is the §9 addition; Models and Files are the
         // owner's 2026-08-01 additions (quick-pick pins, @ finder roots);
-        // Dictation is the owner's 2026-08-02 addition (STT method).
+        // Dictation is the owner's 2026-08-02 addition (STT method);
+        // Appearance is the owner's 2026-08-03 addition (dark/light/system).
         // Unfinished editors stay in the durable enum without creating
         // dead-end navigation.
-        assert_eq!(Section::ALL.len(), 11);
-        assert_eq!(Section::VISIBLE.len(), 9);
+        assert_eq!(Section::ALL.len(), 12);
+        assert_eq!(Section::VISIBLE.len(), 10);
         assert!(Section::VISIBLE.contains(&Section::Models));
         assert!(Section::VISIBLE.contains(&Section::Files));
         assert!(Section::VISIBLE.contains(&Section::Dictation));
+        assert!(Section::VISIBLE.contains(&Section::Appearance));
         assert!(!Section::VISIBLE.contains(&Section::Roles));
         assert!(!Section::VISIBLE.contains(&Section::Actions));
         assert_eq!(Section::default(), Section::Providers);

@@ -396,6 +396,73 @@ pub enum Appearance {
     Light,
 }
 
+/// What the user asked for in settings, before the OS answers what "system"
+/// currently means. Persisted as `ui.appearance` in `config.toml`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AppearancePreference {
+    /// Follow the OS appearance, re-read on every panel or settings open.
+    System,
+    /// Always dark — the product default (§16), and what a missing or
+    /// unparseable config key resolves to, so existing installs keep
+    /// their look.
+    #[default]
+    Dark,
+    /// Always light.
+    Light,
+}
+
+impl AppearancePreference {
+    /// Every choice, in the order the settings selector lists them.
+    pub const ALL: [Self; 3] = [Self::System, Self::Dark, Self::Light];
+
+    /// The `config.toml` spelling.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::System => "system",
+            Self::Dark => "dark",
+            Self::Light => "light",
+        }
+    }
+
+    /// Parse the `config.toml` spelling.
+    pub fn parse(tag: &str) -> Option<Self> {
+        match tag.trim().to_ascii_lowercase().as_str() {
+            "system" => Some(Self::System),
+            "dark" => Some(Self::Dark),
+            "light" => Some(Self::Light),
+            _ => None,
+        }
+    }
+
+    /// Catalogue key for the selector row's label.
+    pub const fn label(self) -> crate::i18n::Key {
+        match self {
+            Self::System => crate::i18n::Key::AppearanceSystem,
+            Self::Dark => crate::i18n::Key::AppearanceDark,
+            Self::Light => crate::i18n::Key::AppearanceLight,
+        }
+    }
+
+    /// The appearance this preference means right now.
+    ///
+    /// `system_prefers_dark` is the OS's answer, `None` when the platform
+    /// cannot say — which falls dark, the product default (§16), rather
+    /// than surprising a dark-mode user with a white flash.
+    pub fn resolve(self, system_prefers_dark: Option<bool>) -> Appearance {
+        match self {
+            Self::Dark => Appearance::Dark,
+            Self::Light => Appearance::Light,
+            Self::System => {
+                if system_prefers_dark.unwrap_or(true) {
+                    Appearance::Dark
+                } else {
+                    Appearance::Light
+                }
+            }
+        }
+    }
+}
+
 impl Appearance {
     /// The palette for this appearance.
     pub const fn palette(self) -> Palette {
@@ -544,6 +611,30 @@ pub fn inset(theme: &Theme) -> container::Style {
         snap: true,
     }
 }
+
+/// The ring around an attachment chip's `×` (owner, 2026-08-03: removal is
+/// one glyph in a circle at the chip's edge, not a labelled action).
+///
+/// A hairline ring in the faint text colour — present enough to read as a
+/// button, quiet enough not to compete with the amber rail.
+pub fn remove_badge(theme: &Theme) -> container::Style {
+    let p = palette_of(theme);
+    container::Style {
+        text_color: Some(p.text_dim),
+        background: None,
+        border: Border {
+            color: p.text_faint,
+            width: 1.0,
+            radius: Radius::new(REMOVE_BADGE_EDGE / 2.0),
+        },
+        shadow: Shadow::default(),
+        snap: true,
+    }
+}
+
+/// The circled `×`'s diameter; sized to the chip's thumbnail, not the hit
+/// target — the enclosing button still spans [`MIN_HIT_TARGET`].
+pub const REMOVE_BADGE_EDGE: f32 = 20.0;
 
 /// The source line — `ghostty · "…and screencapture works"`.
 ///
