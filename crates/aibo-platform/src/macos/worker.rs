@@ -566,10 +566,19 @@ impl Worker {
     ///
     /// SPIKE: S7 — see [`MARKED_RANGE_ATTRIBUTES`]. A `false` here means "no
     /// evidence of composition", not "no composition".
+    ///
+    /// Presence of the attribute is **not** evidence: Cocoa text views expose
+    /// the marked-range attributes at all times, empty whenever nothing is
+    /// being composed. Reading presence as composition made every capture
+    /// from TextEdit-class apps refuse with "finish typing to continue"
+    /// (verified live, 2026-08-02). Only a marked range with text in it —
+    /// `length > 0` — says a composition is actually in flight.
     fn ime_composition_active(element: &AxElement) -> bool {
-        MARKED_RANGE_ATTRIBUTES
-            .iter()
-            .any(|attr| element.has_attribute(attr))
+        MARKED_RANGE_ATTRIBUTES.iter().any(|attr| {
+            element
+                .range_attribute(attr)
+                .is_ok_and(|range| range.length > 0)
+        })
     }
 
     /// Read the whole focused document (§8), bounded by `budget`.

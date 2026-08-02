@@ -30,7 +30,6 @@ pub struct FileFinder {
     candidates: Vec<FileCandidate>,
     /// yuru's index over `candidates`, ids matching their positions.
     index: Vec<Candidate>,
-    backend: JapaneseBackend,
     config: SearchConfig,
 }
 
@@ -57,7 +56,6 @@ impl Default for FileFinder {
             highlight: 0,
             candidates: Vec::new(),
             index: Vec::new(),
-            backend: JapaneseBackend::default(),
             config,
         }
     }
@@ -91,7 +89,7 @@ impl FileFinder {
     pub fn set_candidates(&mut self, files: Vec<FileCandidate>) {
         self.index = build_index(
             files.iter().map(|file| file_name(&file.display).to_owned()),
-            &self.backend,
+            japanese_backend(),
             &self.config,
         );
         self.candidates = files;
@@ -123,7 +121,7 @@ impl FileFinder {
         if self.query.trim().is_empty() {
             return self.candidates.iter().take(RESULT_LIMIT).collect();
         }
-        search(&self.query, &self.index, &self.backend, &self.config)
+        search(&self.query, &self.index, japanese_backend(), &self.config)
             .into_iter()
             .filter_map(|scored| self.candidates.get(scored.id))
             .collect()
@@ -140,6 +138,17 @@ impl FileFinder {
 /// The last path component of a display path.
 pub fn file_name(display: &str) -> &str {
     display.rsplit('/').next().unwrap_or(display)
+}
+
+/// One reading backend for the whole UI.
+///
+/// The embedded Lindera dictionary is the expensive part of yuru; the finder
+/// and the slash popup both match through this single instance rather than
+/// each loading their own copy.
+pub(crate) fn japanese_backend() -> &'static JapaneseBackend {
+    static BACKEND: std::sync::LazyLock<JapaneseBackend> =
+        std::sync::LazyLock::new(JapaneseBackend::default);
+    &BACKEND
 }
 
 #[cfg(test)]

@@ -202,15 +202,19 @@ impl AxElement {
     ///
     /// The returned offsets are in UTF-16 code units, which is what every
     /// caller must convert from before indexing a Rust `String`.
-    #[allow(unsafe_code)]
     pub(crate) fn selected_range(&self) -> MacosResult<CFRange> {
-        let value = self.attribute(accessibility_sys::kAXSelectedTextRangeAttribute)?;
+        self.range_attribute(accessibility_sys::kAXSelectedTextRangeAttribute)
+    }
+
+    /// Any attribute wrapping a `CFRange` `AXValue` — see [`Self::selected_range`]
+    /// for why the unwrap must go through `AXValueGetValue`.
+    #[allow(unsafe_code)]
+    pub(crate) fn range_attribute(&self, name: &str) -> MacosResult<CFRange> {
+        let value = self.attribute(name)?;
         let ax_value = value.as_ptr() as AXValueRef;
         // SAFETY: `ax_value` is the live object owned by `value`.
         if unsafe { AXValueGetType(ax_value) } != kAXValueTypeCFRange {
-            return Err(MacosError::Ax(
-                "AXSelectedTextRange was not a CFRange AXValue",
-            ));
+            return Err(MacosError::Ax("attribute was not a CFRange AXValue"));
         }
         let mut range = CFRange {
             location: 0,
@@ -330,14 +334,6 @@ impl AxElement {
             AXUIElementSetAttributeValue(self.raw, cf_string_ref(&key), boxed.as_CFTypeRef())
         };
         ax_result(code)
-    }
-
-    /// Does this element advertise the attribute at all?
-    ///
-    /// Cheaper and less noisy than reading it and discarding
-    /// `kAXErrorAttributeUnsupported`.
-    pub(crate) fn has_attribute(&self, name: &str) -> bool {
-        self.attribute(name).is_ok()
     }
 
     /// The element's `AXRole`, when it has one.

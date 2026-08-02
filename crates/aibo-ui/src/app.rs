@@ -1185,10 +1185,13 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                         // can still see, which is an implicit destructive
                         // gesture. Dismissal stays one press away: the next
                         // toggle finds the panel focused and hides it.
-                        state.panel_focused = true;
-                        aibo_platform::activate_self();
-                        window::gain_focus(state.panel_window)
-                            .chain(operation::focus(panel::INPUT_ID))
+                        //
+                        // The full `open_panel`, not a bare focus: the press
+                        // carries the other app's selection with it (§7), and
+                        // only `resume_panel_session`'s CaptureContext reads
+                        // it. A bare `gain_focus` summoned a panel that had
+                        // not looked at what the user was pointing at.
+                        state.open_panel()
                     } else if state.panel_visible {
                         discard_panel_session(state, true);
                         state.hide_panel()
@@ -2141,7 +2144,9 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                     task,
                     text: instruction,
                 });
-                return resize_panel_if_visible(state);
+                // The next steer starts here too; the caret has no reason to
+                // leave the composer.
+                return resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID));
             }
             if state.panel.agent_mode {
                 // The task window owns this run's transcript. Beginning a
@@ -2169,7 +2174,14 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 include_selection,
                 workdir: state.panel.agent_workdir.clone(),
             });
-            resize_panel_if_visible(state)
+            // Keep the caret in the composer while the answer streams (owner,
+            // 2026-08-02). `begin_turn` grew a transcript row above the input,
+            // which re-roots the tree, and iced drops focus on a re-root — so
+            // the next question could not be typed until completion's refocus.
+            // Asserting it here, at the one re-rooting moment, is what lets
+            // the caret survive the whole response without the resize path
+            // ever touching focus (and yanking a mid-answer text selection).
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
         }
 
         // ↑ / ↓ recall. Only meaningful while the user is composing: once a
@@ -2944,7 +2956,16 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             // discards it, because the alternative is asking about this
             // selection with an unrelated exchange still above it and in the
             // model's history.
-            if selection.is_some() && state.panel.has_conversation() {
+            // …unless a turn is already in flight: the capture was requested
+            // at open, and a fast submit can beat a slow AX read (a terminal
+            // scrollback takes a second or more). The late capture then
+            // belongs to the *previous* gesture, and starting fresh here
+            // destroys the turn the user just asked (observed live,
+            // 2026-08-02: the submission vanished mid-request).
+            if selection.is_some()
+                && state.panel.has_conversation()
+                && !matches!(state.panel.phase, Phase::Loading | Phase::Streaming)
+            {
                 state.begin_panel_session();
                 // `begin_panel_session` re-requests context against the new
                 // id, so this event now belongs to a session that is gone.

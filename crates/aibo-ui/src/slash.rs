@@ -11,6 +11,10 @@
 //! `/token` submits as ordinary text rather than erroring — `/Users/…` is a
 //! path, not a typo'd command.
 
+use std::sync::LazyLock;
+
+use yuru_core::{Candidate, SearchConfig, build_index, search};
+
 use crate::i18n::Key;
 
 /// What accepting a command does.
@@ -114,29 +118,78 @@ pub const COMMANDS: &[Command] = &[
     },
 ];
 
+/// yuru's index over the command names, sans slash, ids matching positions in
+/// [`COMMANDS`]. Built once: the registry is static, and the backend — shared
+/// with the `@` finder — carries the embedded dictionary.
+static SLASH_INDEX: LazyLock<(Vec<Candidate>, SearchConfig)> = LazyLock::new(|| {
+    let config = SearchConfig {
+        limit: COMMANDS.len(),
+        ..SearchConfig::default()
+    };
+    let index = build_index(
+        COMMANDS.iter().map(|command| command.name[1..].to_owned()),
+        crate::file_finder::japanese_backend(),
+        &config,
+    );
+    (index, config)
+});
+
 /// The commands matching the composer's current text, for the popup.
 ///
 /// Empty when the text is not a command-in-progress at all — the popup should
 /// then be closed, not showing "no match".
+///
+/// Matching is yuru (owner, 2026-08-02) — the same matcher as the `@` finder
+/// — rather than a bare prefix test, so `/mdl` still finds `/model` and a
+/// romaji-minded typo is forgiven. An empty token shows the registry in
+/// display order; a query shows yuru's ranking.
 pub fn matches(input: &str) -> Vec<&'static Command> {
     let Some(token) = command_token(input) else {
         return Vec::new();
     };
-    COMMANDS
-        .iter()
-        .filter(|command| command.name[1..].starts_with(&token))
-        .collect()
+    if token.is_empty() {
+        return COMMANDS.iter().collect();
+    }
+    let (index, config) = &*SLASH_INDEX;
+    search(
+        &token,
+        index,
+        crate::file_finder::japanese_backend(),
+        config,
+    )
+    .into_iter()
+    .filter_map(|scored| COMMANDS.get(scored.id))
+    .collect()
 }
 
 /// The lowercase command token being typed, if the input is exactly a leading
 /// `/` plus a partial name. Any whitespace means arguments have begun; any
 /// second `/` means it is a path.
 fn command_token(input: &str) -> Option<String> {
+    let input = half_width(input);
     let rest = input.strip_prefix('/')?;
     if rest.contains(char::is_whitespace) || rest.contains('/') {
         return None;
     }
     Some(rest.to_lowercase())
+}
+
+/// Fold the full-width forms (U+FF01–U+FF5E) back onto their ASCII originals.
+///
+/// A Japanese IME's default commit for `/help` is `／ｈｅｌｐ` — same intent,
+/// different code points (observed live, 2026-08-02: the popup opened for a
+/// pasted `/` and stayed shut for the committed `／`, which reads as "commands
+/// don't work in Japanese mode"). Command names are ASCII, so folding the
+/// token loses nothing; arguments are never folded — a full-width string in
+/// `/cd`'s path is a real filename, not a typo.
+fn half_width(input: &str) -> String {
+    input
+        .chars()
+        .map(|c| match c {
+            '\u{FF01}'..='\u{FF5E}' => char::from_u32(c as u32 - 0xFEE0).unwrap_or(c),
+            _ => c,
+        })
+        .collect()
 }
 
 /// Parse a submission into the command it names, with its arguments.
@@ -153,14 +206,15 @@ pub fn parse(input: &str) -> Option<(&'static Command, &str)> {
     {
         return Some((command, ""));
     }
-    if !trimmed.starts_with('/') {
+    if !trimmed.starts_with('/') && !trimmed.starts_with('\u{FF0F}') {
         return None;
     }
     let (token, args) = match trimmed.split_once(char::is_whitespace) {
         Some((token, args)) => (token, args.trim_start()),
         None => (trimmed, ""),
     };
-    let token = token.to_lowercase();
+    // Only the token is folded (see `half_width`); `args` stays verbatim.
+    let token = half_width(token).to_lowercase();
     COMMANDS
         .iter()
         .find(|command| command.name == token)
@@ -217,6 +271,41 @@ impl SlashState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The point of yuru here: completion forgives more than a prefix.
+    #[test]
+    fn fuzzy_queries_reach_their_command() {
+        let m = matches("/mdl");
+        assert!(
+            m.iter().any(|c| c.name == "/model"),
+            "/mdl finds /model, got {:?}",
+            m.iter().map(|c| c.name).collect::<Vec<_>>()
+        );
+        let m = matches("/setings");
+        assert!(
+            m.iter().any(|c| c.name == "/settings"),
+            "a dropped letter still finds /settings"
+        );
+    }
+
+    /// The Japanese IME commits `／ｈｅｌｐ` for `/help`; both spellings are
+    /// the same intent and both must reach the same command.
+    #[test]
+    fn full_width_spellings_match_commands() {
+        let m = matches("\u{FF0F}\u{FF48}\u{FF45}");
+        assert_eq!(m.len(), 1, "／ｈｅ filters like /he");
+        assert_eq!(m[0].name, "/help");
+
+        let (command, args) =
+            parse("\u{FF0F}\u{FF48}\u{FF45}\u{FF4C}\u{FF50}").expect("／ｈｅｌｐ parses");
+        assert_eq!(command.name, "/help");
+        assert_eq!(args, "");
+
+        // Arguments are never folded: a full-width path stays as typed.
+        let (command, args) = parse("/cd ／ｄａｔａ").expect("args keep their spelling");
+        assert_eq!(command.name, "/cd");
+        assert_eq!(args, "／ｄａｔａ");
+    }
 
     #[test]
     fn a_leading_slash_filters_the_registry() {
