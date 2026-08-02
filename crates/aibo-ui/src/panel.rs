@@ -790,6 +790,12 @@ pub struct PanelState {
     pub agent_workdir: Option<std::path::PathBuf>,
     /// The agent working-directory picker (owner redesign, 2026-08-02).
     pub workdir_picker: WorkdirPicker,
+    /// Whether the `/skills` overlay is up.
+    pub skills_open: bool,
+    /// Installed skills as `(name, description)`, from the runtime.
+    pub skill_catalog: Vec<(String, String)>,
+    /// The skills folder, shown as the backup story.
+    pub skills_dir: Option<std::path::PathBuf>,
     /// The task whose detail the overlay shows; `None` lists all.
     pub selected_task: Option<Uuid>,
     /// The finished active response, split into markdown and typeset math.
@@ -855,6 +861,9 @@ impl PanelState {
             attach_menu_open: false,
             agent_workdir: None,
             workdir_picker: WorkdirPicker::default(),
+            skills_open: false,
+            skill_catalog: Vec::new(),
+            skills_dir: None,
             selected_task: None,
             active_segments: None,
             dictation_pad: false,
@@ -1428,6 +1437,7 @@ impl PanelState {
             || self.help_open
             || self.attach_menu_open
             || self.workdir_picker.open
+            || self.skills_open
     }
 
     /// The height the panel wants, for [`crate::placement::PlacementRequest`].
@@ -1645,6 +1655,10 @@ pub enum Message {
     WorkdirChoose(usize),
     /// Commit the highlighted directory as this session's workdir.
     WorkdirCommit,
+    /// Open the `/skills` overlay.
+    SkillsOpen,
+    /// Close it.
+    SkillsClose,
 }
 
 /// Render the panel.
@@ -1753,6 +1767,8 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
         Some((attach_menu_overlay(state), Message::AttachMenuClose))
     } else if state.workdir_picker.open {
         Some((workdir_overlay(state), Message::WorkdirClose))
+    } else if state.skills_open {
+        Some((skills_overlay(state), Message::SkillsClose))
     } else if state.slash.open {
         Some((slash_overlay(state), Message::SlashClose))
     } else {
@@ -2339,6 +2355,58 @@ fn workdir_overlay(state: &PanelState) -> Element<'_, Message> {
             Action::new(Key::ActionSelect, "⏎", Message::WorkdirCommit).primary(),
             Action::new(Key::ActionDismiss, "esc", Message::WorkdirClose),
         ]),
+    ]
+    .spacing(space(1.5))
+    .into()
+}
+
+/// The `/skills` overlay: what is installed, and where it lives — the folder
+/// path *is* the backup story (owner request, 2026-08-02).
+fn skills_overlay(state: &PanelState) -> Element<'_, Message> {
+    let mut body = column![].spacing(space(1.0));
+    if state.skill_catalog.is_empty() {
+        body = body.push(
+            text(i18n::t(Key::SkillsEmpty))
+                .size(type_scale::META)
+                .style(theme::text_dim),
+        );
+    }
+    for (name, description) in &state.skill_catalog {
+        body = body.push(
+            column![
+                text(name.clone())
+                    .size(type_scale::BODY)
+                    .font(theme::MONO_FONT)
+                    .style(theme::text_primary),
+                text(description.clone())
+                    .size(type_scale::META)
+                    .style(theme::text_dim),
+            ]
+            .spacing(space(0.25)),
+        );
+    }
+    if let Some(dir) = &state.skills_dir {
+        body = body.push(
+            text(workdir_display(dir))
+                .size(type_scale::META)
+                .font(theme::MONO_FONT)
+                .style(theme::text_faint),
+        );
+    }
+
+    column![
+        text(i18n::t(Key::SkillsTitle))
+            .size(type_scale::BODY)
+            .style(theme::text_primary),
+        scrollable(body)
+            .height(Length::Fixed(PICKER_LIST_HEIGHT))
+            .width(Length::Fill)
+            .style(theme::scroller),
+        widgets::action_list(vec![Action::new(
+            Key::ActionDismiss,
+            "esc",
+            Message::SkillsClose
+        )]),
     ]
     .spacing(space(1.5))
     .into()

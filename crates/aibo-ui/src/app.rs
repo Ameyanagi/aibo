@@ -1473,6 +1473,9 @@ fn window_shortcut(state: &mut Aibo, window: window::Id, chord: WindowChord) -> 
         if state.panel.attach_menu_open && matches!(chord, WindowChord::Escape) {
             return panel_update(state, panel::Message::AttachMenuClose);
         }
+        if state.panel.skills_open && matches!(chord, WindowChord::Escape) {
+            return panel_update(state, panel::Message::SkillsClose);
+        }
     }
 
     match state.role_of(window) {
@@ -2039,9 +2042,13 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                         }
                         return resize_panel_if_visible(state);
                     }
-                    // `/agent …` is the runtime's spelling and goes through
-                    // the ordinary submit path below.
-                    CommandAction::Agent => {}
+                    CommandAction::Skills => {
+                        state.panel.consume_input();
+                        return panel_update(state, M::SkillsOpen);
+                    }
+                    // `/agent …` and `/skill …` are the runtime's spellings
+                    // and go through the ordinary submit path below.
+                    CommandAction::Agent | CommandAction::Skill => {}
                 }
             }
 
@@ -2296,6 +2303,18 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             state.panel.workdir_picker.highlight = index;
             panel_update(state, M::WorkdirCommit)
         }
+        M::SkillsOpen => {
+            state.panel.skills_open = true;
+            // Re-listed on every open, so a skill the agent just wrote shows
+            // without a restart.
+            state.send(UiRequest::ListSkills);
+            resize_panel_if_visible(state)
+        }
+        M::SkillsClose => {
+            state.panel.skills_open = false;
+            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
+        }
+
         M::WorkdirCommit => {
             let chosen = state
                 .panel
@@ -3316,6 +3335,12 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             state.panel.workdir_picker.recents = recents;
             state.panel.workdir_picker.dirs = dirs;
             state.panel.workdir_picker.highlight = 0;
+            Task::none()
+        }
+
+        UiEvent::SkillCatalog { skills, dir } => {
+            state.panel.skill_catalog = skills;
+            state.panel.skills_dir = Some(dir);
             Task::none()
         }
 

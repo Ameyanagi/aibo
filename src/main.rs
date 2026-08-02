@@ -66,6 +66,7 @@
 use anyhow::Context as _;
 
 mod files;
+mod skills;
 mod stt;
 mod workdirs;
 
@@ -3758,6 +3759,24 @@ mod runtime {
                         }
                     }));
                 }
+                UiRequest::ListSkills => {
+                    let dir = self.bootstrap.paths().skills_dir();
+                    let events = self.events.clone();
+                    tokio::spawn(crate::diagnostics::supervise("skill-list", async move {
+                        let listed = tokio::task::spawn_blocking(move || {
+                            let skills = crate::skills::load(&dir)
+                                .into_iter()
+                                .map(|skill| (skill.name, skill.description))
+                                .collect();
+                            (skills, dir)
+                        })
+                        .await;
+                        if let Ok((skills, dir)) = listed {
+                            let _ = events.send(UiEvent::SkillCatalog { skills, dir }).await;
+                        }
+                    }));
+                }
+
                 UiRequest::ListWorkdirs => {
                     let roots = crate::files::roots(self.file_roots.as_deref());
                     let state_file = self.bootstrap.paths().recent_workdirs();
@@ -4637,6 +4656,27 @@ mod runtime {
                 None => (surface, instruction),
             };
 
+            // `/skill <name> [args]` — the explicit spelling front-loads the
+            // skill's full body, pi's `/skill:` behaviour. An unknown name
+            // submits as ordinary text: `/skill` is also just a word.
+            let (surface, instruction) = match crate::skills::strip_skill_command(&instruction)
+                .map(|(name, args)| (name.to_owned(), args.to_owned()))
+            {
+                Some((name, args)) => {
+                    let catalogue = crate::skills::load(&self.bootstrap.paths().skills_dir());
+                    match catalogue
+                        .iter()
+                        .find(|skill| skill.name == name)
+                        .and_then(|skill| crate::skills::expand(skill).ok())
+                    {
+                        Some(block) if args.is_empty() => (Surface::Do, block),
+                        Some(block) => (Surface::Do, format!("{block}\n\n{args}")),
+                        None => (surface, instruction),
+                    }
+                }
+                None => (surface, instruction),
+            };
+
             if surface == Surface::Do {
                 let mut context = captured_agent_context(state);
                 // The conversation so far, fenced (§5): an agent follow-up —
@@ -4827,6 +4867,18 @@ mod runtime {
                     roots.insert(0, dir);
                 }
             }
+            // The skills folder rides along as an ordinary root: readable so
+            // the agent can load a skill's body and run its scripts, writable
+            // so "make yourself a skill that does X" is just a write (owner
+            // request, 2026-08-02).
+            let skills_dir = self.bootstrap.paths().skills_dir();
+            let _ = std::fs::create_dir_all(&skills_dir);
+            if let Ok(dir) = skills_dir.canonicalize()
+                && !roots.contains(&dir)
+            {
+                roots.push(dir);
+            }
+            let skills = crate::skills::load(&skills_dir);
             let roots = roots;
             let tools = match aibo_agent_tools_adapter::WorkspaceExecutor::new(roots.clone()) {
                 Ok(tools) => Arc::new(tools) as Arc<dyn aibo_agent::ToolExecutor>,
@@ -4873,7 +4925,11 @@ mod runtime {
             // project context from AGENTS.md/CLAUDE.md, and — the line whose
             // absence wrote `Documents/Documents` — the working directory.
             // The approval guideline is aibo's one §11 divergence from pi.
-            native_config.system_prompt = Some(agent_system_prompt(&roots));
+            native_config.system_prompt = Some(format!(
+                "{}{}",
+                agent_system_prompt(&roots),
+                crate::skills::prompt_section(&skills),
+            ));
             let backend: Arc<dyn aibo_core::traits::AgentBackend> = Arc::new(
                 aibo_agent::NativeLoop::new(provider, tools, gate, native_config),
             );

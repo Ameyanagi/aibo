@@ -30,6 +30,11 @@ pub enum CommandAction {
     Model,
     /// Open the settings window.
     Settings,
+    /// Invoke a named skill; the runtime expands it (falls through to
+    /// submit, like [`CommandAction::Agent`]).
+    Skill,
+    /// Open the installed-skills overlay.
+    Skills,
 }
 
 /// One registered command.
@@ -91,6 +96,20 @@ pub const COMMANDS: &[Command] = &[
         aliases: &[],
         description: Key::CmdSettingsDesc,
         action: CommandAction::Settings,
+        takes_args: false,
+    },
+    Command {
+        name: "/skill",
+        aliases: &[],
+        description: Key::CmdSkillDesc,
+        action: CommandAction::Skill,
+        takes_args: true,
+    },
+    Command {
+        name: "/skills",
+        aliases: &[],
+        description: Key::CmdSkillsDesc,
+        action: CommandAction::Skills,
         takes_args: false,
     },
 ];

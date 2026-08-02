@@ -370,6 +370,10 @@ pub enum UiRequest {
     /// subdirectories. Answered by [`UiEvent::WorkdirCandidates`].
     ListWorkdirs,
 
+    /// List installed skills for the `/skills` overlay. Answered by
+    /// [`UiEvent::SkillCatalog`].
+    ListSkills,
+
     /// Persist the quick-pick pin set. Sent on every deliberate toggle: a pin
     /// must survive a restart, or pinning is pointless.
     SetPinnedModels {
@@ -657,6 +661,16 @@ pub enum UiEvent {
         recents: Vec<std::path::PathBuf>,
         /// The configured roots and their immediate subdirectories.
         dirs: Vec<std::path::PathBuf>,
+    },
+
+    /// The installed skills, answering [`UiRequest::ListSkills`]:
+    /// `(name, description)` pairs plus the folder they live in — the folder
+    /// is the backup story, so the overlay shows it.
+    SkillCatalog {
+        /// Installed skills, sorted by name.
+        skills: Vec<(String, String)>,
+        /// The skills folder.
+        dir: std::path::PathBuf,
     },
 
     /// The persisted settings the runtime owns, published once at startup so

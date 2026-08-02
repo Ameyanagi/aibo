@@ -514,6 +514,14 @@ pub enum Key {
     CmdCdDesc,
     /// `/cd` rejected a path that is not a directory: `{}` = what was typed.
     ToastWorkdirInvalid,
+    /// `/skill` — invoke a skill by name.
+    CmdSkillDesc,
+    /// `/skills` — list installed skills.
+    CmdSkillsDesc,
+    /// Heading of the `/skills` overlay.
+    SkillsTitle,
+    /// The `/skills` overlay with nothing installed: how to get one.
+    SkillsEmpty,
     /// Section: roles.
     SettingsRoles,
     /// Section: budgets.
@@ -865,6 +873,10 @@ fn en(key: Key) -> &'static str {
         K::WorkdirPlaceholder => "choose where the agent works",
         K::CmdCdDesc => "Choose the agent's working directory",
         K::ToastWorkdirInvalid => "{} is not a directory",
+        K::CmdSkillDesc => "Invoke a skill by name",
+        K::CmdSkillsDesc => "List installed skills",
+        K::SkillsTitle => "Skills",
+        K::SkillsEmpty => "No skills yet. In agent mode, try: make yourself a skill that …",
         K::SettingsRoles => "Roles",
         K::SettingsBudgets => "Budgets",
         K::SettingsPermissions => "Permissions",
@@ -1130,6 +1142,12 @@ fn ja(key: Key) -> &'static str {
         K::WorkdirPlaceholder => "エージェントの作業ディレクトリを選択",
         K::CmdCdDesc => "エージェントの作業ディレクトリを選択",
         K::ToastWorkdirInvalid => "{} はディレクトリではありません",
+        K::CmdSkillDesc => "スキルを名前で実行",
+        K::CmdSkillsDesc => "インストール済みスキルを一覧",
+        K::SkillsTitle => "スキル",
+        K::SkillsEmpty => {
+            "スキルはまだありません。エージェントモードで「〜するスキルを作って」と頼んでみてください"
+        }
         K::PanelAgentPlaceholder => "タスクを入力 — エージェントは実行前に確認します",
         K::PanelTasksTitle => "エージェントの実行",
         K::SettingsRoles => "ロール",
