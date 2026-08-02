@@ -416,23 +416,27 @@ jobs:
           if [ "$PRERELEASE" = "true" ]; then
             flags+=(--prerelease)
           fi
-          if [ "$TAG" = "dev" ]; then
-            # Only the rolling `dev` release needs `--target`: its tag is
-            # deleted above and must be recut at this run's commit. For a
-            # pushed tag the commit is already pinned — and passing `--target`
-            # there trips a GITHUB_TOKEN limitation (cli/cli#9514: HTTP 403
-            # "Resource not accessible by integration" despite
-            # `contents: write`; the same call works with user credentials).
-            flags+=(--target "${{ github.sha }}")
-          fi
+          # No `--target` anywhere. It trips a GITHUB_TOKEN limitation
+          # (cli/cli#9514: HTTP 403 "Resource not accessible by integration"
+          # despite `contents: write`; the same call works with user
+          # credentials), and it is not needed: a pushed tag already pins its
+          # commit, and `dev` is recut below by pushing its tag with the
+          # checkout's own credentials before the release is created.
 
-          if [ "$TAG" = "dev" ] && gh release view "$TAG" >/dev/null 2>&1; then
-            # Deleted and recreated rather than edited, because `gh release edit`
-            # cannot move a tag: editing in place would leave `dev` pointing at
-            # whatever commit it was first cut from while serving assets built
-            # from a newer one. The URL is unchanged either way — it is keyed on
-            # the tag name, not the release id.
-            gh release delete "$TAG" --yes --cleanup-tag
+          if [ "$TAG" = "dev" ]; then
+            # Deleted and recreated rather than edited, because `gh release
+            # edit` cannot move a tag: editing in place would leave `dev`
+            # pointing at whatever commit it was first cut from while serving
+            # assets built from a newer one. The URL is unchanged either way —
+            # it is keyed on the tag name, not the release id.
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release delete "$TAG" --yes --cleanup-tag
+            fi
+            # Move the tag with git rather than with `--target`: the checkout
+            # action's credentials can push a tag, and the release then simply
+            # attaches to a tag that already points at this run's commit.
+            git tag -f "$TAG" "${{ github.sha }}"
+            git push -f origin "refs/tags/$TAG"
           fi
 
           if gh release view "$TAG" >/dev/null 2>&1; then

@@ -1,0 +1,23 @@
+#!/bin/sh
+# The test suite, before it can reach a pull request.
+#
+# Separate from pre-commit because it is slow: commits stay cheap, and the
+# expensive gate runs once per push instead of once per commit.
+#
+# Install: git config core.hooksPath .githooks
+# Skip once: git push --no-verify
+
+set -e
+
+# Preserve the git-lfs hook this replaces, when lfs is in use.
+if command -v git-lfs >/dev/null 2>&1; then
+    git lfs pre-push "$@"
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+    echo "pre-push: cargo not on PATH, skipping the tests" >&2
+    exit 0
+fi
+
+echo "pre-push: cargo test --workspace"
+cargo test --workspace --all-targets --locked

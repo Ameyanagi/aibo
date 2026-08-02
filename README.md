@@ -118,6 +118,17 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 ```
 
+Run them before pushing by installing the repository's hooks once:
+
+```sh
+git config core.hooksPath .githooks
+```
+
+`pre-commit` runs fmt and clippy with **CI's exact flags** — a bare
+`cargo clippy` leaves `missing_docs` a warning and exits 0, which is how a
+green local check becomes a red build — and `pre-push` runs the tests.
+`--no-verify` skips either when a work-in-progress commit needs to exist.
+
 `vendor/` carries temporary patches to `cosmic-text` and `cryoglyph`
 (overflow fixes for CJK fallback shaping) applied via `[patch.crates-io]`;
 they retire with the next iced upgrade.

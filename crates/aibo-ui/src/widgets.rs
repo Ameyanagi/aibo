@@ -744,10 +744,15 @@ pub fn footnote<'a, Message: 'a>(body: String) -> Element<'a, Message> {
         .into()
 }
 
-/// A non-blocking toast (§13: `InsertFailed`, `CaptureFailed`).
+/// The severity bar's height: one line of [`type_scale::META`] with its
+/// leading. A constant rather than `Length::Fill` — see the note in [`toast`].
+const TOAST_BAR_HEIGHT: f32 = 18.0;
+
+/// A non-blocking notice (§13: `InsertFailed`, `CaptureFailed`).
 ///
-/// The result stays in the panel behind it so the user can copy manually — the
-/// toast never replaces the content it is complaining about.
+/// Rendered as a row of the panel, above the composer — the result stays
+/// visible beside it so the user can still copy manually, and a notice never
+/// replaces the content it is complaining about.
 pub fn toast<'a, Message: Clone + 'a>(
     severity: Severity,
     body: &str,
@@ -758,12 +763,17 @@ pub fn toast<'a, Message: Clone + 'a>(
         // toast is deliberately quiet chrome (§13, non-blocking) and tinting a
         // whole sentence red would make `InsertFailed` louder than the answer
         // it is sitting beside.
-        container(Space::new().width(2.0).height(Length::Fill)).style(move |t: &iced::Theme| {
-            container::Style {
+        // Fixed height, NOT `Length::Fill`. A cross-axis `Fill` makes the row
+        // claim every point the parent can spare, and the toast lives in a
+        // column under a `Length::Fill` panel — so one line of text rendered
+        // as a box the height of the whole window with the sentence stranded
+        // at the bottom (owner screenshot, 2026-08-02).
+        container(Space::new().width(2.0).height(TOAST_BAR_HEIGHT)).style(
+            move |t: &iced::Theme| container::Style {
                 background: Some(Background::Color(severity.color(&theme::palette_of(t)))),
                 ..Default::default()
-            }
-        }),
+            },
+        ),
         text(body.to_owned())
             .size(type_scale::META)
             .style(theme::text_primary),

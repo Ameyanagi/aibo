@@ -1476,6 +1476,13 @@ impl PanelState {
         // Wrapped composer lines add height in every phase; see
         // `input_extra_height`.
         let input_extra = self.input_extra_height();
+        // A notice is now a row in the panel rather than a floating box, so
+        // it costs height like every other row.
+        let notice = if self.toast.is_some() {
+            NOTICE_ROW_HEIGHT
+        } else {
+            0.0
+        };
         if self.has_conversation() {
             // `CHAT_ESTIMATE_SURPLUS`: the collapsed baseline and the footer
             // estimate both over-count the chat composition slightly —
@@ -1486,6 +1493,7 @@ impl PanelState {
                 + attachments
                 + selection
                 + input_extra
+                + notice
                 + self.transcript_height()
                 + self.chat_error_height()
                 + self.footer_height()
@@ -1495,7 +1503,7 @@ impl PanelState {
 
         match self.phase {
             Phase::Hidden | Phase::WarmingUp { .. } | Phase::Idle => {
-                (theme::PANEL_HEIGHT_COLLAPSED + attachments + selection + input_extra)
+                (theme::PANEL_HEIGHT_COLLAPSED + attachments + selection + input_extra + notice)
                     .min(self.max_panel_height())
             }
             // `COLLAPSED` is input-plus-chrome only. Everything `footer()`
@@ -1507,6 +1515,7 @@ impl PanelState {
                 + attachments
                 + selection
                 + input_extra
+                + notice
                 + self.answer_height()
                 + self.footer_height())
             .min(self.max_panel_height()),
@@ -1737,9 +1746,10 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
         body = body.push(widgets::railed(RailState::Inactive, footer(state)));
     }
 
-    body = body.push(widgets::railed(input_rail_state(state), input_row(state)));
-
-    let mut stack = column![body].spacing(space(2.0));
+    // Notices live *in* the panel, on the rail, directly above the composer —
+    // not floating over it (owner ruling, 2026-08-02: "can we just show it in
+    // the chat window?"). A floating box overlapped the conversation and,
+    // being outside the layout, could not be sized against it.
     if let Some(toast) = &state.toast {
         let action = if toast.offer_diagnostics {
             Action::new(
@@ -1750,8 +1760,15 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
         } else {
             Action::new(Key::ActionDismiss, "esc", Message::DismissToast)
         };
-        stack = stack.push(widgets::toast(toast.severity, &toast.body, Some(action)));
+        body = body.push(widgets::railed(
+            RailState::Alert,
+            widgets::toast(toast.severity, &toast.body, Some(action)),
+        ));
     }
+
+    body = body.push(widgets::railed(input_rail_state(state), input_row(state)));
+
+    let stack = column![body].spacing(space(2.0));
 
     // The quick-pick and the `@` finder float over the panel as menus
     // (t3-style) instead of replacing the body: the panel stays where it was,
@@ -3270,6 +3287,10 @@ const PICKER_PANEL_HEIGHT: f32 = 500.0;
 const PICKER_MENU_WIDTH: f32 = 560.0;
 /// The running activity card: header row plus a three-row scrolling interior.
 /// Fixed so a streaming run never resizes the window (§16's reserve rule).
+/// One notice row above the composer: bar-and-text plus the toast's own
+/// padding and the column's spacing.
+const NOTICE_ROW_HEIGHT: f32 = 52.0;
+
 const TASK_CARD_RUNNING_HEIGHT: f32 = 148.0;
 /// The settled card: one summary line in a quiet container.
 const TASK_CARD_DONE_HEIGHT: f32 = 34.0;
