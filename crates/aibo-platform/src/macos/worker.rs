@@ -101,6 +101,45 @@ fn floor_char_boundary(text: &str, index: usize) -> usize {
     end
 }
 
+/// Append one AX node value without exceeding the byte cap.
+///
+/// Returns whether the value had to be truncated. An exact direct-parent copy
+/// is structural duplication; equal sibling values are legitimate repeated
+/// document content and are retained.
+fn append_document_value(
+    text: &mut String,
+    value: &str,
+    parent_value: Option<&str>,
+    max_bytes: usize,
+) -> bool {
+    if value.is_empty() || parent_value == Some(value) {
+        return false;
+    }
+    let separator = usize::from(!text.is_empty());
+    if text
+        .len()
+        .saturating_add(separator)
+        .saturating_add(value.len())
+        <= max_bytes
+    {
+        if separator != 0 {
+            text.push('\n');
+        }
+        text.push_str(value);
+        return false;
+    }
+
+    let room = max_bytes.saturating_sub(text.len());
+    if room > separator {
+        if separator != 0 {
+            text.push('\n');
+        }
+        let value_room = room - separator;
+        text.push_str(&value[..floor_char_boundary(value, value_room)]);
+    }
+    true
+}
+
 /// Stable-within-a-process hash of captured content, for [`InsertTarget`].
 ///
 /// `DefaultHasher` is not stable across Rust releases, which is fine and
@@ -617,9 +656,12 @@ impl Worker {
         let mut text = String::new();
         let mut nodes_visited = 0usize;
         let mut truncated = false;
-        let mut queue = std::collections::VecDeque::from([root]);
+        // Carry only the direct parent's value. This removes the common AX
+        // container/child duplicate without treating an ordinary repeated
+        // paragraph elsewhere in the document as a duplicate.
+        let mut queue = std::collections::VecDeque::from([(root, None::<String>)]);
 
-        while let Some(element) = queue.pop_front() {
+        while let Some((element, parent_value)) = queue.pop_front() {
             if nodes_visited >= budget.max_nodes {
                 truncated = true;
                 break;
@@ -631,23 +673,27 @@ impl Worker {
                 continue;
             }
 
-            if let Some(value) = Self::node_text(&element) {
-                // A container repeating its children's text is the common AX
-                // shape; appending both duplicates the document.
-                if !value.is_empty() && !text.contains(value.as_str()) {
-                    if text.len() + value.len() > budget.max_bytes {
-                        let room = budget.max_bytes.saturating_sub(text.len());
-                        text.push_str(&value[..floor_char_boundary(&value, room)]);
-                        truncated = true;
-                        break;
-                    }
-                    if !text.is_empty() {
-                        text.push('\n');
-                    }
-                    text.push_str(&value);
+            let node_value = Self::node_text(&element);
+            if let Some(value) = node_value.as_deref() {
+                // Only an exact value inherited from the direct parent is a
+                // structural duplicate. Global substring matching drops valid
+                // repeated prose and short labels.
+                if append_document_value(
+                    &mut text,
+                    value,
+                    parent_value.as_deref(),
+                    budget.max_bytes,
+                ) {
+                    truncated = true;
+                    break;
                 }
             }
-            queue.extend(element.children());
+            queue.extend(
+                element
+                    .children()
+                    .into_iter()
+                    .map(|child| (child, node_value.clone())),
+            );
         }
 
         if text.trim().is_empty() {
@@ -747,10 +793,12 @@ impl Worker {
             InsertMode::PasteAndRestore | InsertMode::PasteKeepNew => {
                 let saved = clipboard::snapshot();
                 let ours = clipboard::write_transient_text(text);
-                keys::press_paste()?;
-                // No delivery confirmation exists; give the target a moment
-                // before touching the clipboard again.
-                std::thread::sleep(PASTE_SETTLE);
+                let paste = keys::press_paste();
+                if paste.is_ok() {
+                    // No delivery confirmation exists; give the target a
+                    // moment before touching the clipboard again.
+                    std::thread::sleep(PASTE_SETTLE);
+                }
                 if matches!(mode, InsertMode::PasteAndRestore) {
                     let outcome = clipboard::restore(&saved, ours);
                     tracing::trace!(
@@ -759,7 +807,7 @@ impl Worker {
                         "clipboard restore after paste"
                     );
                 }
-                Ok(())
+                paste
             }
         }
     }
@@ -840,9 +888,10 @@ impl Worker {
             return Ok(false);
         }
         if let Some(expected) = target.selection_hash {
-            let live = element
-                .string_attribute(accessibility_sys::kAXSelectedTextAttribute)
-                .unwrap_or_default();
+            let Ok(live) = element.string_attribute(accessibility_sys::kAXSelectedTextAttribute)
+            else {
+                return Ok(false);
+            };
             if content_hash(&live) != expected {
                 return Ok(false);
             }
@@ -918,6 +967,34 @@ mod tests {
 
     fn worker(probe: fn() -> bool) -> Worker {
         Worker::with_secure_input_probe(MacosConfig::default(), probe)
+    }
+
+    #[test]
+    fn document_dedupes_only_direct_parent_copies() {
+        let mut text = String::new();
+        assert!(!append_document_value(&mut text, "repeat", None, 100));
+        assert!(!append_document_value(&mut text, "repeat", None, 100));
+        assert_eq!(text, "repeat\nrepeat", "equal siblings are both content");
+
+        let before = text.clone();
+        assert!(!append_document_value(
+            &mut text,
+            "container",
+            Some("container"),
+            100
+        ));
+        assert_eq!(
+            text, before,
+            "an exact parent copy is structural duplication"
+        );
+    }
+
+    #[test]
+    fn document_byte_budget_includes_the_separator() {
+        let mut text = "abc".to_owned();
+        assert!(append_document_value(&mut text, "def", None, 6));
+        assert_eq!(text.len(), 6);
+        assert_eq!(text, "abc\nde");
     }
 
     /// The app that had focus when the hotkey fired. Not this process — that is

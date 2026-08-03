@@ -29,7 +29,15 @@
   ],
   "model": "llama-3.3-70b",
   "stream": true,
-  "system": "You are aibo. Answer briefly.",
+  "system": [
+    {
+      "cache_control": {
+        "type": "ephemeral"
+      },
+      "text": "You are aibo. Answer briefly.",
+      "type": "text"
+    }
+  ],
   "temperature": 0.699999988079071,
   "tools": [
     {

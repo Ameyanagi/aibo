@@ -191,8 +191,12 @@ fn the_image_never_lands_in_the_system_prompt() {
     let req = request();
 
     let anthropic = build_messages_body(&req);
-    assert!(anthropic["system"].as_str().is_some());
-    assert!(!anthropic["system"].as_str().unwrap().contains("image/png"));
+    // Structured since the §15 cache breakpoints: one text block carrying
+    // the prompt, and the `cache_control` marker on its trailing edge.
+    let system = anthropic["system"].as_array().expect("system blocks");
+    let text = system[0]["text"].as_str().expect("system text");
+    assert!(!text.contains("image/png"));
+    assert_eq!(system[0]["cache_control"]["type"], "ephemeral");
 
     let responses = build_responses_body(&req, &openai::quirks());
     assert!(

@@ -23,7 +23,7 @@ use std::time::Instant;
 use aibo_core::AiboError;
 use aibo_core::cost::AgentLimitTracker;
 use aibo_core::traits::AgentBackend;
-use aibo_core::types::{AgentLimits, AgentOutcome, AgentStatus, AgentStep, AgentTask};
+use aibo_core::types::{AgentLimits, AgentOutcome, AgentStatus, AgentStep, AgentTask, BudgetKind};
 use futures::StreamExt as _;
 use uuid::Uuid;
 
@@ -149,11 +149,11 @@ impl Engine {
         events: &AgentSink,
     ) -> Result<AgentOutcome, Arc<AiboError>> {
         let task_id = task.id;
-        let cancel = self.register_task(task_id);
+        let registration = self.register_task(task_id);
         let result = self
-            .run_agent_inner(task, limits, backend, events, &cancel)
+            .run_agent_inner(task, limits, backend, events, &registration.cancel)
             .await;
-        self.retire_task(task_id);
+        drop(registration);
 
         match &result {
             Ok(outcome) => events.emit(AgentEvent::Finished {
@@ -182,18 +182,38 @@ impl Engine {
             instruction: task.instruction.clone(),
         });
 
-        let mut stream = backend
-            .run(task, limits, cancel.clone())
-            .await
-            .map_err(Arc::new)?;
+        // The limit covers backend startup as well as streamed work. Starting
+        // the tracker only after `run()` returned let a silent delegate spend
+        // an unlimited amount of time before the first poll.
+        let started = Instant::now();
+        let deadline = tokio::time::Instant::now() + limits.max_wall_clock;
+        let start = backend.run(task, limits, cancel.clone());
+        let mut stream = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                return Ok(outcome(
+                    &AgentLimitTracker::started_at(limits, started),
+                    AgentStatus::Cancelled,
+                ));
+            }
+            () = tokio::time::sleep_until(deadline) => {
+                cancel.cancel();
+                return Err(agent_deadline_exceeded());
+            }
+            result = start => result.map_err(Arc::new)?,
+        };
 
-        let mut tracker = AgentLimitTracker::started_at(limits, Instant::now());
+        let mut tracker = AgentLimitTracker::started_at(limits, started);
 
         loop {
             let next = tokio::select! {
                 biased;
                 () = cancel.cancelled() => {
                     return Ok(outcome(&tracker, AgentStatus::Cancelled));
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    cancel.cancel();
+                    return Err(agent_deadline_exceeded());
                 }
                 next = stream.next() => next,
             };
@@ -242,6 +262,12 @@ impl Engine {
             tokio::task::yield_now().await;
         }
     }
+}
+
+fn agent_deadline_exceeded() -> Arc<AiboError> {
+    Arc::new(AiboError::BudgetExceeded {
+        kind: BudgetKind::Steps,
+    })
 }
 
 #[cfg(test)]

@@ -13,13 +13,48 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use aibo_core::AiboError;
+use aibo_core::traits::AgentBackend;
 use aibo_core::types::{
-    AgentLimits, AgentOutcome, AgentStatus, AgentStep, AgentTask, BudgetKind, ToolTier, Usage,
+    AgentFeatures, AgentLimits, AgentOutcome, AgentStatus, AgentStep, AgentTask, BoxStream,
+    BudgetKind, SandboxKind, ToolTier, Usage,
 };
 use aibo_provider::ProviderRegistry;
 use aibo_session::{AgentEvent, AgentSink, Engine, EngineConfig, EventSink, Submission};
 use common::MockAgent;
 use uuid::Uuid;
+
+struct SilentAgent {
+    silent_during_startup: bool,
+}
+
+#[async_trait::async_trait]
+impl AgentBackend for SilentAgent {
+    async fn run(
+        &self,
+        _task: AgentTask,
+        _limits: AgentLimits,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> aibo_core::error::Result<BoxStream<'static, aibo_core::error::Result<AgentStep>>> {
+        if self.silent_during_startup {
+            std::future::pending().await
+        } else {
+            Ok(Box::pin(futures::stream::pending()))
+        }
+    }
+
+    fn supports(&self) -> AgentFeatures {
+        AgentFeatures {
+            file_edits: false,
+            shell: false,
+            mcp: false,
+            pre_write_approval: false,
+            streaming_diffs: false,
+            model_selection: false,
+            resume: false,
+            sandbox: SandboxKind::None,
+        }
+    }
+}
 
 fn engine() -> Arc<Engine> {
     Arc::new(Engine::new(
@@ -278,4 +313,148 @@ async fn cancel_task_stops_a_running_agent() {
         .unwrap()
         .expect("a cancelled run is an outcome, not an error");
     assert_eq!(outcome.status, AgentStatus::Cancelled);
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_wall_clock_limit_covers_backend_startup() {
+    let engine = engine();
+    let limits = AgentLimits {
+        max_wall_clock: Duration::from_secs(5),
+        ..limits()
+    };
+    let result = engine
+        .run_agent(
+            task(),
+            limits,
+            Arc::new(SilentAgent {
+                silent_during_startup: true,
+            }),
+            &AgentSink::channel().0,
+        )
+        .await;
+
+    assert!(matches!(
+        result.as_ref().unwrap_err().as_ref(),
+        AiboError::BudgetExceeded { .. }
+    ));
+}
+
+#[tokio::test(start_paused = true)]
+async fn the_wall_clock_limit_interrupts_a_silent_agent_stream() {
+    let engine = engine();
+    let limits = AgentLimits {
+        max_wall_clock: Duration::from_secs(5),
+        ..limits()
+    };
+    let result = engine
+        .run_agent(
+            task(),
+            limits,
+            Arc::new(SilentAgent {
+                silent_during_startup: false,
+            }),
+            &AgentSink::channel().0,
+        )
+        .await;
+
+    assert!(matches!(
+        result.as_ref().unwrap_err().as_ref(),
+        AiboError::BudgetExceeded { .. }
+    ));
+}
+
+#[tokio::test]
+async fn cancellation_interrupts_backend_startup_even_if_backend_ignores_the_token() {
+    let engine = engine();
+    let agent_task = task();
+    let task_id = agent_task.id;
+    let run = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .run_agent(
+                    agent_task,
+                    AgentLimits {
+                        max_wall_clock: Duration::from_secs(60),
+                        ..limits()
+                    },
+                    Arc::new(SilentAgent {
+                        silent_during_startup: true,
+                    }),
+                    &AgentSink::channel().0,
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    engine.cancel_task(task_id);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(1), run)
+        .await
+        .expect("engine cancellation owns the startup future")
+        .unwrap()
+        .unwrap();
+    assert_eq!(outcome.status, AgentStatus::Cancelled);
+}
+
+#[tokio::test]
+async fn an_old_agent_generation_cannot_retire_a_replacement_with_the_same_task_id() {
+    let engine = engine();
+    let agent_task = task();
+    let task_id = agent_task.id;
+    let generous = AgentLimits {
+        max_steps: u32::MAX,
+        max_tool_calls: u32::MAX,
+        max_wall_clock: Duration::from_secs(60),
+        max_total_tokens: u64::MAX,
+    };
+
+    let first = {
+        let engine = engine.clone();
+        let task = agent_task.clone();
+        tokio::spawn(async move {
+            engine
+                .run_agent(
+                    task,
+                    generous,
+                    Arc::new(SilentAgent {
+                        silent_during_startup: false,
+                    }),
+                    &AgentSink::channel().0,
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let second = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .run_agent(
+                    agent_task,
+                    generous,
+                    Arc::new(SilentAgent {
+                        silent_during_startup: false,
+                    }),
+                    &AgentSink::channel().0,
+                )
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+
+    let first_outcome = tokio::time::timeout(Duration::from_secs(1), first)
+        .await
+        .expect("replacement cancels the old generation")
+        .unwrap()
+        .unwrap();
+    assert_eq!(first_outcome.status, AgentStatus::Cancelled);
+
+    engine.cancel_task(task_id);
+    let second_outcome = tokio::time::timeout(Duration::from_secs(1), second)
+        .await
+        .expect("old cleanup did not remove the replacement")
+        .unwrap()
+        .unwrap();
+    assert_eq!(second_outcome.status, AgentStatus::Cancelled);
 }

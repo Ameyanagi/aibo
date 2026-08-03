@@ -45,7 +45,7 @@ use uuid::Uuid;
 use crate::a11y;
 #[cfg(test)]
 use crate::bridge::UI_REQUEST_CHANNEL_CAPACITY;
-use crate::bridge::{SessionId, UiEvent, UiRequest};
+use crate::bridge::{PersistenceScope, SessionId, UiEvent, UiRequest};
 use crate::error::{Result, UiError};
 use crate::hotkey::{self, HotkeyAction, HotkeyStatus, Hotkeys};
 use crate::i18n::{self, Lang};
@@ -55,6 +55,41 @@ use crate::settings::{self, SettingsState};
 use crate::tasks::TaskState;
 use crate::theme::{self as ui_theme, Appearance, motion::Motion};
 use crate::tray::{self, Tray, TrayCommand, TrayState};
+
+enum PersistenceSnapshot {
+    Language(Lang),
+    Appearance(ui_theme::AppearancePreference),
+    Model {
+        selected: Option<crate::bridge::ModelOption>,
+        recents: Vec<aibo_core::types::ModelBinding>,
+    },
+    ProviderSave(settings::ProviderDraft),
+    ProviderRemove(Option<aibo_core::types::ProviderId>),
+    SttEndOnSend(bool),
+    SttBackend(settings::SttChoice),
+    PinnedModels {
+        pins: Vec<aibo_core::types::ModelBinding>,
+        customised: bool,
+    },
+    Hotkey {
+        action: HotkeyAction,
+        live: Option<hotkey::HotKey>,
+        status: Option<HotkeyStatus>,
+        draft: String,
+    },
+    AxTreeActivation(bool),
+    FileRoots(Option<Vec<String>>),
+    MonthlyBudget {
+        configured: bool,
+        hard_stop: bool,
+        spend_fraction: Option<f32>,
+    },
+}
+
+struct PendingPersistence {
+    generation: u64,
+    rollback: PersistenceSnapshot,
+}
 
 // ---------------------------------------------------------------------------
 // Configuration and handles
@@ -75,6 +110,11 @@ pub struct UiConfig {
     /// The panel hotkey. `None` uses the platform default from §9 — `⌥Space`
     /// on macOS, `Ctrl+Shift+Space` on Windows.
     pub panel_hotkey: Option<global_hotkey::hotkey::HotKey>,
+    /// Optional override for the screen-region shortcut. `None` uses its
+    /// platform default when one exists.
+    pub screen_capture_hotkey: Option<global_hotkey::hotkey::HotKey>,
+    /// Optional task-window shortcut. This action is unbound by default.
+    pub show_tasks_hotkey: Option<global_hotkey::hotkey::HotKey>,
 }
 
 impl Default for UiConfig {
@@ -85,6 +125,8 @@ impl Default for UiConfig {
             appearance_preference: ui_theme::AppearancePreference::Dark,
             motion: Motion::Full,
             panel_hotkey: None,
+            screen_capture_hotkey: None,
+            show_tasks_hotkey: None,
         }
     }
 }
@@ -384,6 +426,18 @@ pub struct Aibo {
 
     settings_window: Option<window::Id>,
     settings: SettingsState,
+    /// Last issued async file-list generation.
+    file_list_generation: u64,
+    /// Last issued async workdir-list generation.
+    workdir_list_generation: u64,
+    /// Current dictation turn id; terminal events from older turns are ignored.
+    dictation_turn: u64,
+    /// A stop was requested and the final transcript is still draining.
+    dictation_stopping: bool,
+    /// Monotonic id shared by independently versioned persistence lanes.
+    persistence_generation: u64,
+    /// Only the newest optimistic mutation in each lane may roll back UI state.
+    pending_persistence: HashMap<PersistenceScope, PendingPersistence>,
 
     /// Open task windows. §6: an agent run outlives the panel and lives here.
     tasks: Vec<(window::Id, TaskState)>,
@@ -429,11 +483,36 @@ fn is_critical_request(request: &UiRequest) -> bool {
             | UiRequest::DiscardSession { .. }
             | UiRequest::Approve { .. }
             | UiRequest::CancelTask { .. }
+            | UiRequest::SetLanguage { .. }
+            | UiRequest::SetAppearance { .. }
+            | UiRequest::SetModel { .. }
+            | UiRequest::SetProviderKey { .. }
+            | UiRequest::RemoveProvider { .. }
+            | UiRequest::SetSttEndOnSend { .. }
+            | UiRequest::SetSttBackend { .. }
+            | UiRequest::SetPinnedModels { .. }
+            | UiRequest::SetHotkey { .. }
+            | UiRequest::SetAxTreeActivation { .. }
+            | UiRequest::SetFileRoots { .. }
+            | UiRequest::SetMonthlyBudget { .. }
             | UiRequest::Quit
     )
 }
 
 impl Aibo {
+    fn begin_persistence(&mut self, scope: PersistenceScope, rollback: PersistenceSnapshot) -> u64 {
+        self.persistence_generation = self.persistence_generation.wrapping_add(1);
+        let generation = self.persistence_generation;
+        self.pending_persistence.insert(
+            scope,
+            PendingPersistence {
+                generation,
+                rollback,
+            },
+        );
+        generation
+    }
+
     fn role_of(&self, id: window::Id) -> Option<Role> {
         if id == self.panel_window {
             return Some(Role::Panel);
@@ -577,42 +656,49 @@ impl Aibo {
 
         match Hotkeys::new() {
             Ok(mut hotkeys) => {
-                let binding = match self.config.panel_hotkey {
-                    Some(combo) => hotkey::Binding::new(HotkeyAction::TogglePanel, combo),
-                    None => hotkey::Binding::default_for(HotkeyAction::TogglePanel)
-                        .expect("TogglePanel always has a platform default"),
-                };
-                let status = hotkeys.register(binding);
-                match &status {
-                    // §9: conflict detection at first run. The app stays usable
-                    // through the tray, and settings shows what happened.
-                    HotkeyStatus::Failed { combo, reason } => {
-                        tracing::error!(%combo, ?reason, "global hotkey unavailable");
-                    }
-                    // §8/§9: shift/option-only is a caution, not a failure. It
-                    // registered — including `⌥Space`, the shipped macOS
-                    // default — so this is `warn`, and the panel and settings
-                    // show it as a soft warning rather than a broken state.
-                    HotkeyStatus::Registered {
-                        combo,
-                        caution: Some(caution),
-                    } => {
-                        tracing::warn!(%combo, ?caution, "global hotkey registered with a caution");
-                    }
-                    HotkeyStatus::Registered { .. } => {}
-                }
-                self.hotkey_status = Some(status.clone());
-                self.settings.hotkey = Some(status);
-                if let Some(binding) =
-                    hotkey::Binding::default_for(HotkeyAction::CaptureScreenRegion)
-                {
-                    match hotkeys.register(binding) {
-                        HotkeyStatus::Registered { combo, .. } => {
-                            tracing::info!(%combo, "screen-region hotkey registered");
-                        }
+                let configured = [
+                    (HotkeyAction::TogglePanel, self.config.panel_hotkey, true),
+                    (
+                        HotkeyAction::CaptureScreenRegion,
+                        self.config.screen_capture_hotkey,
+                        true,
+                    ),
+                    (
+                        HotkeyAction::ShowTasks,
+                        self.config.show_tasks_hotkey,
+                        false,
+                    ),
+                ];
+                for (action, override_hotkey, use_default) in configured {
+                    let binding = override_hotkey
+                        .map(|combo| hotkey::Binding::new(action, combo))
+                        .or_else(|| {
+                            use_default
+                                .then(|| hotkey::Binding::default_for(action))
+                                .flatten()
+                        });
+                    let Some(binding) = binding else {
+                        continue;
+                    };
+                    let status = hotkeys.register(binding);
+                    match &status {
                         HotkeyStatus::Failed { combo, reason } => {
-                            tracing::warn!(%combo, ?reason, "screen-region hotkey unavailable");
+                            tracing::warn!(?action, %combo, ?reason, "global hotkey unavailable");
                         }
+                        HotkeyStatus::Registered {
+                            combo,
+                            caution: Some(caution),
+                        } => {
+                            tracing::warn!(?action, %combo, ?caution, "global hotkey registered with a caution");
+                        }
+                        HotkeyStatus::Registered { combo, .. } => {
+                            tracing::info!(?action, %combo, "global hotkey registered");
+                        }
+                    }
+                    self.settings.hotkeys.insert(action, status.clone());
+                    if action == HotkeyAction::TogglePanel {
+                        self.hotkey_status = Some(status.clone());
+                        self.settings.hotkey = Some(status);
                     }
                 }
                 self.hotkeys = Some(hotkeys);
@@ -670,6 +756,14 @@ impl Aibo {
 
     /// Hide the panel. Never cancels an agent run (§6).
     fn hide_panel(&mut self) -> Task<Message> {
+        // A hidden composer must never leave an invisible microphone running.
+        // Keep the turn id so late terminal events cannot affect a later turn.
+        if self.panel.dictating && !self.dictation_stopping {
+            self.dictation_stopping = true;
+            self.send(UiRequest::StopDictation {
+                turn: self.dictation_turn,
+            });
+        }
         self.panel_visible = false;
         self.panel_focused = false;
         // A show that was still waiting on the window server must not land
@@ -936,6 +1030,12 @@ fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) 
         panel_dragged: false,
         settings_window: None,
         settings: SettingsState::default(),
+        file_list_generation: 0,
+        workdir_list_generation: 0,
+        dictation_turn: 0,
+        dictation_stopping: false,
+        persistence_generation: 0,
+        pending_persistence: HashMap::new(),
         tasks: Vec::new(),
         tray: None,
         hotkeys: None,
@@ -1055,6 +1155,7 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
                 Some(Role::Panel) => tracing::warn!("the panel window was closed"),
                 Some(Role::Settings) => {
                     state.settings_window = None;
+                    state.settings.hotkey_recording = false;
                     // A newly generated history recovery code is a one-time
                     // setup disclosure, not a value retained for later visits.
                     state.settings.recovery_code = None;
@@ -1520,10 +1621,27 @@ fn is_single_char_insertion(old: &str, new: &str) -> bool {
 
 /// Wind down a live microphone before the panel state that owns it moves on.
 fn stop_dictation_if_active(state: &mut Aibo) {
-    if state.panel.dictating {
-        state.panel.dictating = false;
-        state.send(UiRequest::StopDictation);
+    if state.panel.dictating && !state.dictation_stopping {
+        state.dictation_stopping = true;
+        state.send(UiRequest::StopDictation {
+            turn: state.dictation_turn,
+        });
     }
+}
+
+fn request_file_list(state: &mut Aibo) {
+    state.file_list_generation = state.file_list_generation.wrapping_add(1);
+    state.send(UiRequest::ListFiles {
+        session: state.panel.session,
+        generation: state.file_list_generation,
+    });
+}
+
+fn request_workdir_list(state: &mut Aibo) {
+    state.workdir_list_generation = state.workdir_list_generation.wrapping_add(1);
+    state.send(UiRequest::ListWorkdirs {
+        generation: state.workdir_list_generation,
+    });
 }
 
 fn discard_panel_session(state: &Aibo, cancel: bool) {
@@ -1825,7 +1943,7 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 state.panel.file_finder.open();
                 // The walk is re-requested on every open, so a file created
                 // since the last one is findable.
-                state.send(UiRequest::ListFiles);
+                request_file_list(state);
                 return resize_panel_if_visible(state).chain(operation::focus(panel::FINDER_ID));
             }
             // Opening or closing the slash popup re-roots the panel — the
@@ -1889,6 +2007,10 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             window::drag(state.panel_window)
         }
         M::PickerToggleFavourite => {
+            let rollback = PersistenceSnapshot::PinnedModels {
+                pins: state.panel.favourite_models.clone(),
+                customised: state.panel.pins_customised,
+            };
             let rows = state.panel.picker_rows();
             if let Some(option) =
                 crate::model_picker::selectable(&rows).get(state.panel.picker.highlight)
@@ -1897,7 +2019,7 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 state.panel.toggle_favourite(binding);
             }
             sync_settings_models(state);
-            persist_pins(state);
+            persist_pins(state, rollback);
             Task::none()
         }
         M::PickerChoose(index) => {
@@ -1909,13 +2031,17 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             panel_update(state, M::PickerCommit)
         }
         M::PickerPin(index) => {
+            let rollback = PersistenceSnapshot::PinnedModels {
+                pins: state.panel.favourite_models.clone(),
+                customised: state.panel.pins_customised,
+            };
             let rows = state.panel.picker_rows();
             if let Some(option) = crate::model_picker::selectable(&rows).get(index) {
                 let binding = option.binding.clone();
                 state.panel.toggle_favourite(binding);
             }
             sync_settings_models(state);
-            persist_pins(state);
+            persist_pins(state, rollback);
             Task::none()
         }
         M::PickerLane(lane) => {
@@ -1967,7 +2093,10 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 input.push(' ');
                 state.panel.set_input(&input);
             } else {
-                state.send(UiRequest::AttachFile { path: file.path });
+                state.send(UiRequest::AttachFile {
+                    session: state.panel.session,
+                    path: file.path,
+                });
             }
             state.panel.file_finder.close();
             resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
@@ -2042,7 +2171,7 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
         M::AttachPickFile => {
             state.panel.attach_menu_open = false;
             state.panel.file_finder.open();
-            state.send(UiRequest::ListFiles);
+            request_file_list(state);
             resize_panel_if_visible(state).chain(operation::focus(panel::FINDER_ID))
         }
 
@@ -2077,9 +2206,17 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             if matches!(state.panel.phase, Phase::Loading | Phase::Streaming) {
                 return Task::none();
             }
+            let generation = state.begin_persistence(
+                PersistenceScope::Model,
+                PersistenceSnapshot::Model {
+                    selected: state.panel.selected_model.clone(),
+                    recents: state.panel.recent_models.clone(),
+                },
+            );
             state.panel.remember_model(option.binding.clone());
             state.panel.selected_model = Some(option.clone());
             state.send(UiRequest::SetModel {
+                generation,
                 binding: option.binding,
             });
             Task::none()
@@ -2157,7 +2294,7 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                                 // mode match so the chip shows the choice.
                                 if !state.panel.agent_mode {
                                     state.panel.agent_mode = true;
-                                    state.send(UiRequest::ListWorkdirs);
+                                    request_workdir_list(state);
                                 }
                             }
                             _ => {
@@ -2405,7 +2542,7 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             if state.panel.agent_mode {
                 // The chip needs candidates to name the default workdir, and
                 // the picker should open warm.
-                state.send(UiRequest::ListWorkdirs);
+                request_workdir_list(state);
             }
             resize_panel_if_visible(state)
         }
@@ -2414,7 +2551,7 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             state.panel.workdir_picker.open();
             // Re-listed on every open, so a directory created since the last
             // one is choosable.
-            state.send(UiRequest::ListWorkdirs);
+            request_workdir_list(state);
             resize_panel_if_visible(state).chain(operation::focus(panel::WORKDIR_ID))
         }
         M::WorkdirClose => {
@@ -2530,16 +2667,21 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             Task::none()
         }
         M::ToggleDictation => {
+            if state.dictation_stopping {
+                return Task::none();
+            }
             if state.panel.dictating {
-                state.panel.dictating = false;
-                state.send(UiRequest::StopDictation);
+                stop_dictation_if_active(state);
             } else {
                 // Optimistic: the runtime confirms with `DictationStarted` or
                 // corrects with `DictationFailed`. Waiting for the round-trip
                 // would make the button feel dead for exactly the press that
                 // starts the microphone.
                 state.panel.dictating = true;
-                state.send(UiRequest::StartDictation);
+                state.dictation_turn = state.dictation_turn.wrapping_add(1);
+                state.send(UiRequest::StartDictation {
+                    turn: state.dictation_turn,
+                });
             }
             Task::none()
         }
@@ -2646,13 +2788,124 @@ fn sync_settings_models(state: &mut Aibo) {
     state.settings.favourite_models = state.panel.pins(&capable);
 }
 
+fn apply_persistence_result(
+    state: &mut Aibo,
+    scope: PersistenceScope,
+    generation: u64,
+    succeeded: bool,
+) -> Task<Message> {
+    let Some(pending) = state.pending_persistence.get(&scope) else {
+        return Task::none();
+    };
+    if pending.generation != generation {
+        return Task::none();
+    }
+    let pending = state
+        .pending_persistence
+        .remove(&scope)
+        .expect("generation checked above");
+    if succeeded {
+        return Task::none();
+    }
+
+    tracing::warn!(
+        ?scope,
+        generation,
+        "settings write failed; rolling back optimistic state"
+    );
+    match pending.rollback {
+        PersistenceSnapshot::Language(language) => {
+            i18n::set_language(language);
+            state.settings.language = language;
+            state.config.language = language;
+            if let Some(tray) = &state.tray {
+                let _ = tray.relocalise();
+            }
+        }
+        PersistenceSnapshot::Appearance(preference) => {
+            state.settings.appearance = preference;
+            state.config.appearance_preference = preference;
+            state.config.appearance = preference.resolve(aibo_platform::system_prefers_dark());
+        }
+        PersistenceSnapshot::Model { selected, recents } => {
+            state.panel.selected_model = selected;
+            state.panel.recent_models = recents;
+        }
+        PersistenceSnapshot::ProviderSave(draft) => {
+            if state.settings.draft.is_none() {
+                state.settings.draft = Some(draft);
+            }
+        }
+        PersistenceSnapshot::ProviderRemove(armed) => {
+            if state.settings.forget_armed.is_none() {
+                state.settings.forget_armed = armed;
+            }
+        }
+        PersistenceSnapshot::SttEndOnSend(enabled) => {
+            state.settings.stt_end_on_send = enabled;
+        }
+        PersistenceSnapshot::SttBackend(choice) => state.settings.stt_backend = choice,
+        PersistenceSnapshot::PinnedModels { pins, customised } => {
+            state.panel.favourite_models = pins;
+            state.panel.pins_customised = customised;
+            sync_settings_models(state);
+        }
+        PersistenceSnapshot::Hotkey {
+            action,
+            live,
+            status,
+            draft,
+        } => {
+            if let Some(hotkeys) = state.hotkeys.as_mut() {
+                match live {
+                    Some(previous) => {
+                        let _ = hotkeys.rebind(action, previous);
+                    }
+                    None => hotkeys.unbind(action),
+                }
+            }
+            match status.clone() {
+                Some(status) => {
+                    state.settings.hotkeys.insert(action, status);
+                }
+                None => {
+                    state.settings.hotkeys.remove(&action);
+                }
+            }
+            if action == HotkeyAction::TogglePanel {
+                state.hotkey_status = status.clone();
+                state.settings.hotkey = status;
+            }
+            if state.settings.hotkey_draft.is_empty() {
+                state.settings.hotkey_draft = draft;
+            }
+        }
+        PersistenceSnapshot::AxTreeActivation(enabled) => {
+            state.settings.ax_tree_activation = enabled;
+        }
+        PersistenceSnapshot::FileRoots(roots) => state.settings.file_roots = roots,
+        PersistenceSnapshot::MonthlyBudget {
+            configured,
+            hard_stop,
+            spend_fraction,
+        } => {
+            state.settings.budget_configured = configured;
+            state.settings.budget_hard_stop = hard_stop;
+            state.settings.spend_fraction = spend_fraction;
+        }
+    }
+    Task::none()
+}
+
 /// Persist the pin set after a deliberate toggle.
 ///
 /// The literal customised list, not the derived view: `favourite_models` is
 /// what [`panel::PanelState::pins`] honours once `pins_customised` is set,
 /// and it is exactly what must come back at the next launch.
-fn persist_pins(state: &Aibo) {
+fn persist_pins(state: &mut Aibo, rollback: PersistenceSnapshot) {
+    let generation = state.begin_persistence(PersistenceScope::PinnedModels, rollback);
     state.send(UiRequest::SetPinnedModels {
+        generation,
         pins: state.panel.favourite_models.clone(),
     });
 }
@@ -2677,6 +2930,7 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
 
     match message {
         M::Select(section) => {
+            state.settings.hotkey_recording = false;
             state.settings.section = section;
             // Navigating away is a second thought: an armed Forget must not
             // survive it and go off when the user comes back.
@@ -2750,15 +3004,17 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             Task::none()
         }
         M::DraftSave => {
-            let Some(mut draft) = state.settings.draft.take() else {
+            let Some(draft) = state.settings.draft.take() else {
                 return Task::none();
             };
             if !draft.is_saveable() {
                 state.settings.draft = Some(draft);
                 return Task::none();
             }
-            let id = draft.id.trim();
-            let base_url = draft.base_url.trim();
+            let backend = draft.backend.config_value().to_owned();
+            let id = (!draft.id.trim().is_empty()).then(|| draft.id.trim().to_owned());
+            let base_url =
+                (!draft.base_url.trim().is_empty()).then(|| draft.base_url.trim().to_owned());
             // Azure only: the comma-separated deployments become the picker
             // catalogue. Other backends never show the field, so it is empty.
             let models: Vec<String> = draft
@@ -2768,14 +3024,18 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
                 .filter(|model| !model.is_empty())
                 .map(str::to_owned)
                 .collect();
+            let key = draft.key_for_persistence();
+            let generation = state.begin_persistence(
+                PersistenceScope::Provider,
+                PersistenceSnapshot::ProviderSave(draft),
+            );
             state.send(UiRequest::SetProviderKey {
-                backend: draft.backend.config_value().to_owned(),
-                id: (!id.is_empty()).then(|| id.to_owned()),
-                base_url: (!base_url.is_empty()).then(|| base_url.to_owned()),
+                generation,
+                backend,
+                id,
+                base_url,
                 models,
-                // Moves the key out and scrubs the remainder. The draft is
-                // dropped immediately after, so nothing survives this line.
-                key: draft.take_key(),
+                key,
             });
             Task::none()
         }
@@ -2785,8 +3045,13 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             // The task-window equivalent gets a typed confirmation (§5); a
             // two-press with a relabelled button is the settings-scale version.
             if state.settings.forget_armed.as_ref() == Some(&provider) {
+                let generation = state.begin_persistence(
+                    PersistenceScope::Provider,
+                    PersistenceSnapshot::ProviderRemove(Some(provider.clone())),
+                );
                 state.settings.forget_armed = None;
                 state.send(UiRequest::RemoveProvider {
+                    generation,
                     id: provider.as_str().to_owned(),
                 });
             } else {
@@ -2796,9 +3061,13 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
         }
         M::ToggleFavourite(binding) => {
             // The panel owns the pin set; the settings list is a mirror.
+            let rollback = PersistenceSnapshot::PinnedModels {
+                pins: state.panel.favourite_models.clone(),
+                customised: state.panel.pins_customised,
+            };
             state.panel.toggle_favourite(binding);
             sync_settings_models(state);
-            persist_pins(state);
+            persist_pins(state, rollback);
             Task::none()
         }
         M::OpenSystemSettings(permission) => {
@@ -2824,13 +3093,24 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             Task::none()
         }
         M::SetAppearance(preference) => {
+            let generation = state.begin_persistence(
+                PersistenceScope::Appearance,
+                PersistenceSnapshot::Appearance(state.settings.appearance),
+            );
             state.settings.appearance = preference;
             state.config.appearance_preference = preference;
             state.config.appearance = preference.resolve(aibo_platform::system_prefers_dark());
-            state.send(UiRequest::SetAppearance(preference));
+            state.send(UiRequest::SetAppearance {
+                generation,
+                preference,
+            });
             Task::none()
         }
         M::SetLanguage(lang) => {
+            let generation = state.begin_persistence(
+                PersistenceScope::Language,
+                PersistenceSnapshot::Language(state.settings.language),
+            );
             i18n::set_language(lang);
             state.settings.language = lang;
             state.config.language = lang;
@@ -2839,22 +3119,44 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             {
                 tracing::warn!(%error, "could not relocalise the tray menu");
             }
-            state.send(UiRequest::SetLanguage(lang));
+            state.send(UiRequest::SetLanguage {
+                generation,
+                language: lang,
+            });
             Task::none()
         }
         M::AxTreeToggle(enabled) => {
+            let generation = state.begin_persistence(
+                PersistenceScope::AxTreeActivation,
+                PersistenceSnapshot::AxTreeActivation(state.settings.ax_tree_activation),
+            );
             state.settings.ax_tree_activation = enabled;
-            state.send(UiRequest::SetAxTreeActivation { enabled });
+            state.send(UiRequest::SetAxTreeActivation {
+                generation,
+                enabled,
+            });
             Task::none()
         }
         M::SttEndOnSendToggle(enabled) => {
+            let generation = state.begin_persistence(
+                PersistenceScope::SttEndOnSend,
+                PersistenceSnapshot::SttEndOnSend(state.settings.stt_end_on_send),
+            );
             state.settings.stt_end_on_send = enabled;
-            state.send(UiRequest::SetSttEndOnSend { enabled });
+            state.send(UiRequest::SetSttEndOnSend {
+                generation,
+                enabled,
+            });
             Task::none()
         }
         M::SetSttBackend(choice) => {
+            let generation = state.begin_persistence(
+                PersistenceScope::SttBackend,
+                PersistenceSnapshot::SttBackend(state.settings.stt_backend),
+            );
             state.settings.stt_backend = choice;
             state.send(UiRequest::SetSttBackend {
+                generation,
                 backend: choice.tag().map(str::to_owned),
             });
             Task::none()
@@ -2881,9 +3183,16 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             if !roots.contains(&root) {
                 roots.push(root);
             }
+            let generation = state.begin_persistence(
+                PersistenceScope::FileRoots,
+                PersistenceSnapshot::FileRoots(state.settings.file_roots.clone()),
+            );
             state.settings.root_draft.clear();
             state.settings.file_roots = Some(roots.clone());
-            state.send(UiRequest::SetFileRoots { roots: Some(roots) });
+            state.send(UiRequest::SetFileRoots {
+                generation,
+                roots: Some(roots),
+            });
             Task::none()
         }
         M::RootRemove(index) => {
@@ -2895,13 +3204,27 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             if index < roots.len() {
                 roots.remove(index);
             }
+            let generation = state.begin_persistence(
+                PersistenceScope::FileRoots,
+                PersistenceSnapshot::FileRoots(state.settings.file_roots.clone()),
+            );
             state.settings.file_roots = Some(roots.clone());
-            state.send(UiRequest::SetFileRoots { roots: Some(roots) });
+            state.send(UiRequest::SetFileRoots {
+                generation,
+                roots: Some(roots),
+            });
             Task::none()
         }
         M::RootsReset => {
+            let generation = state.begin_persistence(
+                PersistenceScope::FileRoots,
+                PersistenceSnapshot::FileRoots(state.settings.file_roots.clone()),
+            );
             state.settings.file_roots = None;
-            state.send(UiRequest::SetFileRoots { roots: None });
+            state.send(UiRequest::SetFileRoots {
+                generation,
+                roots: None,
+            });
             Task::none()
         }
         M::HotkeyDraft(draft) => {
@@ -2913,7 +3236,28 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             state.settings.hotkey_draft_invalid = false;
             Task::none()
         }
+        M::HotkeySelect(action) => {
+            state.settings.hotkey_action = action;
+            state.settings.hotkey_recording = false;
+            state.settings.hotkey_draft.clear();
+            state.settings.hotkey_draft_invalid = false;
+            Task::none()
+        }
+        M::HotkeyRecord(recording) => {
+            state.settings.hotkey_recording = recording;
+            state.settings.hotkey_draft_invalid = false;
+            Task::none()
+        }
+        M::HotkeyCaptured(spec) => {
+            // The recorder only ever offers combinations `hotkey::parse`
+            // accepts, so this cannot arm Apply with something unusable.
+            state.settings.hotkey_recording = false;
+            state.settings.hotkey_draft = spec;
+            state.settings.hotkey_draft_invalid = false;
+            Task::none()
+        }
         M::HotkeyApply => {
+            let action = state.settings.hotkey_action;
             let spec = state.settings.hotkey_draft.trim().to_owned();
             if spec.is_empty() {
                 return Task::none();
@@ -2923,21 +3267,108 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
                 return Task::none();
             };
             state.settings.hotkey_draft_invalid = false;
+            let rollback = PersistenceSnapshot::Hotkey {
+                action,
+                live: state.hotkeys.as_ref().and_then(|hotkeys| {
+                    hotkeys
+                        .bindings()
+                        .iter()
+                        .find(|binding| binding.action == action)
+                        .map(|binding| binding.hotkey)
+                }),
+                status: state.settings.hotkeys.get(&action).cloned().or_else(|| {
+                    (action == HotkeyAction::TogglePanel)
+                        .then(|| state.hotkey_status.clone())
+                        .flatten()
+                }),
+                draft: state.settings.hotkey_draft.clone(),
+            };
             let Some(hotkeys) = state.hotkeys.as_mut() else {
                 // No registrar (it failed at startup): persist so the next
                 // launch picks the combination up, and claim nothing more.
-                state.send(UiRequest::SetPanelHotkey { spec: Some(spec) });
+                let generation =
+                    state.begin_persistence(PersistenceScope::Hotkey(action), rollback);
+                state.send(UiRequest::SetHotkey {
+                    generation,
+                    action,
+                    spec: Some(spec),
+                });
                 return Task::none();
             };
             // `rebind` restores the previous combination if the OS refuses
             // this one; either way its status is the truth the block renders.
-            let status = hotkeys.rebind(hotkey::HotkeyAction::TogglePanel, parsed);
+            let status = hotkeys.rebind(action, parsed);
             let registered = matches!(status, hotkey::HotkeyStatus::Registered { .. });
-            state.hotkey_status = Some(status.clone());
-            state.settings.hotkey = Some(status);
+            state.settings.hotkeys.insert(action, status.clone());
+            if action == HotkeyAction::TogglePanel {
+                state.hotkey_status = Some(status.clone());
+                state.settings.hotkey = Some(status);
+            }
             if registered {
                 state.settings.hotkey_draft.clear();
-                state.send(UiRequest::SetPanelHotkey { spec: Some(spec) });
+                let generation =
+                    state.begin_persistence(PersistenceScope::Hotkey(action), rollback);
+                state.send(UiRequest::SetHotkey {
+                    generation,
+                    action,
+                    spec: Some(spec),
+                });
+            }
+            Task::none()
+        }
+        M::HotkeyReset => {
+            let action = state.settings.hotkey_action;
+            let rollback = PersistenceSnapshot::Hotkey {
+                action,
+                live: state.hotkeys.as_ref().and_then(|hotkeys| {
+                    hotkeys
+                        .bindings()
+                        .iter()
+                        .find(|binding| binding.action == action)
+                        .map(|binding| binding.hotkey)
+                }),
+                status: state.settings.hotkeys.get(&action).cloned().or_else(|| {
+                    (action == HotkeyAction::TogglePanel)
+                        .then(|| state.hotkey_status.clone())
+                        .flatten()
+                }),
+                draft: state.settings.hotkey_draft.clone(),
+            };
+
+            let reset_succeeded = match state.hotkeys.as_mut() {
+                Some(hotkeys) => match hotkey::Binding::default_for(action) {
+                    Some(default) => {
+                        let status = hotkeys.rebind(action, default.hotkey);
+                        let registered = matches!(status, hotkey::HotkeyStatus::Registered { .. });
+                        state.settings.hotkeys.insert(action, status.clone());
+                        if action == HotkeyAction::TogglePanel {
+                            state.hotkey_status = Some(status.clone());
+                            state.settings.hotkey = Some(status);
+                        }
+                        registered
+                    }
+                    None => {
+                        hotkeys.unbind(action);
+                        state.settings.hotkeys.remove(&action);
+                        true
+                    }
+                },
+                // With no registrar there is no live binding to reset. Removing
+                // the override still restores the shipped state next launch.
+                None => true,
+            };
+
+            if reset_succeeded {
+                state.settings.hotkey_recording = false;
+                state.settings.hotkey_draft.clear();
+                state.settings.hotkey_draft_invalid = false;
+                let generation =
+                    state.begin_persistence(PersistenceScope::Hotkey(action), rollback);
+                state.send(UiRequest::SetHotkey {
+                    generation,
+                    action,
+                    spec: None,
+                });
             }
             Task::none()
         }
@@ -2960,6 +3391,11 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             Task::none()
         }
         M::BudgetHardStop(hard_stop) => {
+            let rollback = PersistenceSnapshot::MonthlyBudget {
+                configured: state.settings.budget_configured,
+                hard_stop: state.settings.budget_hard_stop,
+                spend_fraction: state.settings.spend_fraction,
+            };
             state.settings.budget_hard_stop = hard_stop;
             // Live only while a ceiling is in force; otherwise it rides the
             // next Apply.
@@ -2967,7 +3403,9 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
                 && let Some((limit_micros, warn_at_percent)) =
                     settings::parsed_budget(&state.settings)
             {
+                let generation = state.begin_persistence(PersistenceScope::MonthlyBudget, rollback);
                 state.send(UiRequest::SetMonthlyBudget {
+                    generation,
                     limit_micros: Some(limit_micros),
                     warn_at_percent,
                     hard_stop,
@@ -2980,8 +3418,15 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             else {
                 return Task::none();
             };
+            let rollback = PersistenceSnapshot::MonthlyBudget {
+                configured: state.settings.budget_configured,
+                hard_stop: state.settings.budget_hard_stop,
+                spend_fraction: state.settings.spend_fraction,
+            };
+            let generation = state.begin_persistence(PersistenceScope::MonthlyBudget, rollback);
             state.settings.budget_configured = true;
             state.send(UiRequest::SetMonthlyBudget {
+                generation,
                 limit_micros: Some(limit_micros),
                 warn_at_percent,
                 hard_stop: state.settings.budget_hard_stop,
@@ -2989,9 +3434,16 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             Task::none()
         }
         M::BudgetRemove => {
+            let rollback = PersistenceSnapshot::MonthlyBudget {
+                configured: state.settings.budget_configured,
+                hard_stop: state.settings.budget_hard_stop,
+                spend_fraction: state.settings.spend_fraction,
+            };
+            let generation = state.begin_persistence(PersistenceScope::MonthlyBudget, rollback);
             state.settings.budget_configured = false;
             state.settings.spend_fraction = None;
             state.send(UiRequest::SetMonthlyBudget {
+                generation,
                 limit_micros: None,
                 warn_at_percent: 80,
                 hard_stop: false,
@@ -3024,6 +3476,7 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             Task::none()
         }
         M::Close => {
+            state.settings.hotkey_recording = false;
             state.settings.recovery_code = None;
             match state.settings_window {
                 Some(id) => window::close(id),
@@ -3035,6 +3488,12 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
 
 fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
     match event {
+        UiEvent::PersistenceResult {
+            scope,
+            generation,
+            succeeded,
+        } => apply_persistence_result(state, scope, generation, succeeded),
+
         UiEvent::Context {
             session,
             app,
@@ -3136,6 +3595,10 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             if session != state.panel.session {
                 return Task::none();
             }
+            state.settings.active_model = Some(aibo_core::types::ModelBinding {
+                provider: provider.clone(),
+                model: model.clone(),
+            });
             state.panel.attribution.provider = Some(provider);
             state.panel.attribution.model = Some(model);
             state.panel.attribution.substituted_for = substituted_for;
@@ -3397,6 +3860,13 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             });
             state.panel.model_options = options;
             sync_settings_models(state);
+            if state.settings.active_model.is_none() {
+                state.settings.active_model = state
+                    .panel
+                    .selected_model
+                    .as_ref()
+                    .map(|option| option.binding.clone());
+            }
             Task::none()
         }
 
@@ -3493,8 +3963,12 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             Task::none()
         }
 
-        UiEvent::DictationStarted => {
+        UiEvent::DictationStarted { turn } => {
+            if turn != state.dictation_turn {
+                return Task::none();
+            }
             state.panel.dictating = true;
+            state.dictation_stopping = false;
             // If the input already ends mid-word, the first delta gets one
             // space in front of it so speech never welds onto typed text.
             state.panel.dictation_pad =
@@ -3503,7 +3977,10 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             Task::none()
         }
 
-        UiEvent::DictationDelta { text } => {
+        UiEvent::DictationDelta { turn, text } => {
+            if turn != state.dictation_turn {
+                return Task::none();
+            }
             // Appended even just after a stop: the final fragments of a
             // committed turn arrive between `StopDictation` and
             // `DictationEnded`, and dropping them would eat the last words.
@@ -3518,17 +3995,35 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             resize_panel_if_visible(state)
         }
 
-        UiEvent::DictationEnded => {
+        UiEvent::DictationEnded { turn } => {
+            if turn != state.dictation_turn {
+                return Task::none();
+            }
             state.panel.dictating = false;
+            state.dictation_stopping = false;
             operation::focus(panel::INPUT_ID)
         }
 
-        UiEvent::FileCandidates { files } => {
+        UiEvent::FileCandidates {
+            session,
+            generation,
+            files,
+        } => {
+            if session != state.panel.session || generation != state.file_list_generation {
+                return Task::none();
+            }
             state.panel.file_finder.set_candidates(files);
             Task::none()
         }
 
-        UiEvent::WorkdirCandidates { recents, dirs } => {
+        UiEvent::WorkdirCandidates {
+            generation,
+            recents,
+            dirs,
+        } => {
+            if generation != state.workdir_list_generation {
+                return Task::none();
+            }
             state.panel.workdir_picker.recents = recents;
             state.panel.workdir_picker.dirs = dirs;
             state.panel.workdir_picker.highlight = 0;
@@ -3541,7 +4036,14 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             Task::none()
         }
 
-        UiEvent::FileAttached { name, content } => {
+        UiEvent::FileAttached {
+            session,
+            name,
+            content,
+        } => {
+            if session != state.panel.session {
+                return Task::none();
+            }
             state.panel.attach_file_selection(content);
             let body = i18n::t1(crate::i18n::Key::ToastFileAttached, &name);
             aibo_platform::announce_accessibility(&body);
@@ -3553,7 +4055,10 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             resize_panel_if_visible(state)
         }
 
-        UiEvent::FileAttachFailed { name } => {
+        UiEvent::FileAttachFailed { session, name } => {
+            if session != state.panel.session {
+                return Task::none();
+            }
             let body = i18n::t1(crate::i18n::Key::ToastFileAttachFailed, &name);
             aibo_platform::announce_accessibility(&body);
             state.panel.toast = Some(panel::ToastView {
@@ -3605,8 +4110,12 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             Task::none()
         }
 
-        UiEvent::DictationFailed { failure } => {
+        UiEvent::DictationFailed { turn, failure } => {
+            if turn != state.dictation_turn {
+                return Task::none();
+            }
             state.panel.dictating = false;
+            state.dictation_stopping = false;
             let key = match failure {
                 crate::bridge::DictationFailure::NoOpenAiKey => {
                     crate::i18n::Key::ToastDictationNoKey
@@ -3744,24 +4253,22 @@ fn resize_panel_if_visible(state: &mut Aibo) -> Task<Message> {
     if state.panel_dragged {
         return window::resize(state.panel_window, size).chain(backdrop);
     }
-    // One native, animated frame change instead of separate resize/move
-    // effects (owner report, 2026-08-03: instant streaming resizes "feel
-    // flaky, or flashing"). The window server interpolates the frame while
-    // the chrome re-lays-out under it; reduced motion applies it instantly
-    // inside the platform call, and any failure falls back to the iced path
-    // via `PanelFrameFallback`.
-    animate_panel_geometry(state.panel_window, placement).chain(backdrop)
+    // One native, atomic frame change instead of separate resize/move effects.
+    // It is deliberately not animated: AppKit scales the last Metal frame
+    // while interpolating bounds, which makes the text visibly grow and shrink.
+    // The existing 48 pt height steps keep these instant updates infrequent.
+    set_panel_geometry(state.panel_window, placement).chain(backdrop)
 }
 
-/// Apply `placement` through the platform's animated frame call, falling back
-/// to iced's instant resize/move when the native path is unavailable.
-fn animate_panel_geometry(id: window::Id, placement: Placement) -> Task<Message> {
+/// Apply `placement` through the platform's atomic frame call, falling back to
+/// iced's instant resize/move when the native path is unavailable.
+fn set_panel_geometry(id: window::Id, placement: Placement) -> Task<Message> {
     window::run(id, move |window| {
         let animated = window
             .window_handle()
             .map_err(|error| error.to_string())
             .and_then(|handle| {
-                aibo_platform::animate_panel_frame(
+                aibo_platform::set_panel_frame(
                     handle,
                     f64::from(placement.position.0),
                     f64::from(placement.position.1),
@@ -3773,7 +4280,7 @@ fn animate_panel_geometry(id: window::Id, placement: Placement) -> Task<Message>
         match animated {
             Ok(()) => Message::Ignored,
             Err(error) => {
-                tracing::debug!(%error, "animated frame unavailable; instant resize");
+                tracing::debug!(%error, "native frame update unavailable; iced resize");
                 Message::PanelFrameFallback(placement)
             }
         }
@@ -4027,7 +4534,93 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
         subscriptions.push(window::frames().map(|_| Message::FramePainted));
     }
 
+    // The shortcut recorder, live only while it is listening: a raw key
+    // subscription is exactly the thing that must not be permanently
+    // installed, since it sees every keystroke in the app.
+    if state.settings.hotkey_recording
+        && state.settings_window.is_some()
+        && state.settings.section == settings::Section::Permissions
+    {
+        subscriptions.push(iced::event::listen_with(|event, _status, _window| {
+            let iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+                physical_key,
+                modifiers,
+                ..
+            }) = event
+            else {
+                return None;
+            };
+            if matches!(
+                physical_key,
+                iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::Escape)
+            ) {
+                return Some(Message::Settings(settings::Message::HotkeyRecord(false)));
+            }
+            captured_hotkey(physical_key, modifiers)
+                .map(|spec| Message::Settings(settings::Message::HotkeyCaptured(spec)))
+        }));
+    }
+
     Subscription::batch(subscriptions)
+}
+
+/// One key press as a `hotkey::parse` spec, or `None` if it cannot be one.
+///
+/// Rejected without comment: a bare modifier (the user is still reaching for
+/// the real key), and anything whose physical code aibo cannot name. Escape
+/// is *accepted as a cancel* by the caller rather than bound, because a
+/// shortcut of Escape alone would be unusable.
+fn captured_hotkey(
+    physical_key: iced::keyboard::key::Physical,
+    modifiers: iced::keyboard::Modifiers,
+) -> Option<String> {
+    use iced::keyboard::key::{Code, Physical};
+
+    let Physical::Code(code) = physical_key else {
+        return None;
+    };
+    // Winit's `KeyCode` debug spelling is the UI Events code name — `KeyA`,
+    // `Space`, `Digit1`, `F5` — which is what the hotkey parser reads.
+    let key = format!("{code:?}");
+    if matches!(
+        code,
+        Code::ControlLeft
+            | Code::ControlRight
+            | Code::AltLeft
+            | Code::AltRight
+            | Code::ShiftLeft
+            | Code::ShiftRight
+            | Code::SuperLeft
+            | Code::SuperRight
+    ) {
+        return None;
+    }
+    if code == Code::Escape {
+        // Cancels the recorder; `HotkeyRecord(false)` is the honest message.
+        return None;
+    }
+
+    let mut parts: Vec<&str> = Vec::new();
+    if modifiers.control() {
+        parts.push("control");
+    }
+    if modifiers.alt() {
+        parts.push("alt");
+    }
+    if modifiers.shift() {
+        parts.push("shift");
+    }
+    if modifiers.logo() {
+        parts.push("super");
+    }
+    // A global shortcut with no modifier would swallow that key everywhere.
+    if parts.is_empty() {
+        return None;
+    }
+    parts.push(&key);
+    let spec = parts.join("+");
+    // Only offer what the registrar can actually take.
+    crate::hotkey::parse(&spec).ok().map(|_| spec)
 }
 
 fn shell_event_stream() -> impl iced::futures::Stream<Item = Message> {
@@ -4136,6 +4729,10 @@ pub fn run(config: UiConfig, handles: UiHandles) -> Result<()> {
     .title(title)
     .theme(theme_of)
     .style(app_style)
+    // Make unannotated labels use the same JP-safe face as rich text and
+    // editors. Without this, macOS can resolve Han glyphs through PingFang
+    // even though Japanese is the active UI language.
+    .default_font(ui_theme::UI_FONT)
     .subscription(subscription)
     .run()
     .map_err(|error| UiError::Runtime(error.to_string()))
@@ -4246,7 +4843,7 @@ mod tests {
         let _ = panel_update(&mut state, panel::Message::ToggleAgentMode);
         assert!(state.panel.agent_mode);
         assert!(
-            matches!(received.try_recv(), Ok(UiRequest::ListWorkdirs)),
+            matches!(received.try_recv(), Ok(UiRequest::ListWorkdirs { .. })),
             "agent mode warms the workdir candidates for the chip"
         );
 
@@ -4284,7 +4881,7 @@ mod tests {
 
         let _ = panel_update(&mut state, panel::Message::ToggleAgentMode);
         assert!(
-            matches!(received.try_recv(), Ok(UiRequest::ListWorkdirs)),
+            matches!(received.try_recv(), Ok(UiRequest::ListWorkdirs { .. })),
             "agent mode warms the workdir candidates for the chip"
         );
         state.panel.set_input("hello");
@@ -4343,7 +4940,7 @@ mod tests {
         );
         assert!(matches!(
             received.try_recv(),
-            Ok(UiRequest::SetFileRoots { roots: Some(roots) }) if roots == ["/d/Desktop"]
+            Ok(UiRequest::SetFileRoots { roots: Some(roots), .. }) if roots == ["/d/Desktop"]
         ));
 
         let _ = settings_update(&mut state, settings::Message::RootDraft("~/dev".to_owned()));
@@ -4362,8 +4959,83 @@ mod tests {
         assert_eq!(state.settings.file_roots, None);
         assert!(matches!(
             received.try_recv(),
-            Ok(UiRequest::SetFileRoots { roots: None })
+            Ok(UiRequest::SetFileRoots { roots: None, .. })
         ));
+    }
+
+    #[test]
+    fn stale_persistence_failures_cannot_overwrite_newer_file_root_edits() {
+        let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+        state.settings.file_roots = Some(vec!["/a".to_owned()]);
+
+        state.settings.root_draft = "/b".to_owned();
+        let _ = settings_update(&mut state, settings::Message::RootAdd);
+        let first = match received.try_recv().expect("first write") {
+            UiRequest::SetFileRoots { generation, .. } => generation,
+            other => panic!("unexpected request: {other:?}"),
+        };
+        state.settings.root_draft = "/c".to_owned();
+        let _ = settings_update(&mut state, settings::Message::RootAdd);
+        let second = match received.try_recv().expect("second write") {
+            UiRequest::SetFileRoots { generation, .. } => generation,
+            other => panic!("unexpected request: {other:?}"),
+        };
+
+        let _ = backend_update(
+            &mut state,
+            UiEvent::PersistenceResult {
+                scope: PersistenceScope::FileRoots,
+                generation: first,
+                succeeded: false,
+            },
+        );
+        assert_eq!(
+            state.settings.file_roots,
+            Some(vec!["/a".to_owned(), "/b".to_owned(), "/c".to_owned()])
+        );
+
+        let _ = backend_update(
+            &mut state,
+            UiEvent::PersistenceResult {
+                scope: PersistenceScope::FileRoots,
+                generation: second,
+                succeeded: false,
+            },
+        );
+        assert_eq!(
+            state.settings.file_roots,
+            Some(vec!["/a".to_owned(), "/b".to_owned()])
+        );
+    }
+
+    #[test]
+    fn failed_provider_save_restores_the_secret_draft() {
+        let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+        let mut draft = settings::ProviderDraft::new(settings::Backend::OpenAi);
+        draft.set_key("sk-test-only".to_owned());
+        state.settings.draft = Some(draft);
+
+        let _ = settings_update(&mut state, settings::Message::DraftSave);
+        let generation = match received.try_recv().expect("provider write") {
+            UiRequest::SetProviderKey { generation, .. } => generation,
+            other => panic!("unexpected request: {other:?}"),
+        };
+        assert!(state.settings.draft.is_none());
+
+        let _ = backend_update(
+            &mut state,
+            UiEvent::PersistenceResult {
+                scope: PersistenceScope::Provider,
+                generation,
+                succeeded: false,
+            },
+        );
+        assert_eq!(
+            state.settings.draft.as_ref().map(|draft| draft.key_field()),
+            Some("sk-test-only")
+        );
     }
 
     #[test]
@@ -4383,6 +5055,53 @@ mod tests {
     }
 
     #[test]
+    fn shortcut_editor_persists_the_selected_action() {
+        let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+        let _ = settings_update(
+            &mut state,
+            settings::Message::HotkeySelect(HotkeyAction::ShowTasks),
+        );
+        let _ = settings_update(
+            &mut state,
+            settings::Message::HotkeyDraft("control+shift+Space".to_owned()),
+        );
+        let _ = settings_update(&mut state, settings::Message::HotkeyApply);
+
+        assert!(matches!(
+            received.try_recv(),
+            Ok(UiRequest::SetHotkey {
+                action: HotkeyAction::ShowTasks,
+                spec: Some(spec),
+                ..
+            }) if spec == "control+shift+Space"
+        ));
+    }
+
+    #[test]
+    fn shortcut_reset_removes_only_the_selected_override() {
+        let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+        let _ = settings_update(
+            &mut state,
+            settings::Message::HotkeySelect(HotkeyAction::CaptureScreenRegion),
+        );
+        state.settings.hotkey_draft = "control+shift+Space".to_owned();
+
+        let _ = settings_update(&mut state, settings::Message::HotkeyReset);
+
+        assert!(state.settings.hotkey_draft.is_empty());
+        assert!(matches!(
+            received.try_recv(),
+            Ok(UiRequest::SetHotkey {
+                action: HotkeyAction::CaptureScreenRegion,
+                spec: None,
+                ..
+            })
+        ));
+    }
+
+    #[test]
     fn an_applied_budget_sends_micros_and_remove_clears_the_meter() {
         let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
         let (mut state, _task) = boot(UiConfig::default(), requests);
@@ -4398,6 +5117,7 @@ mod tests {
                 limit_micros: Some(15_000_000),
                 warn_at_percent: 80,
                 hard_stop: false,
+                ..
             })
         ));
 
@@ -4432,7 +5152,7 @@ mod tests {
         let _ = panel_update(&mut state, panel::Message::SelectModel(selected.clone()));
         assert!(matches!(
             received.try_recv(),
-            Ok(UiRequest::SetModel { binding }) if binding == selected.binding
+            Ok(UiRequest::SetModel { binding, .. }) if binding == selected.binding
         ));
 
         state.panel.phase = Phase::Streaming;
@@ -4483,7 +5203,7 @@ mod tests {
         assert!(state.settings.forget_armed.is_none());
         assert!(matches!(
             received.try_recv(),
-            Ok(UiRequest::RemoveProvider { id }) if id == provider.as_str()
+            Ok(UiRequest::RemoveProvider { id, .. }) if id == provider.as_str()
         ));
 
         // Arm again, then navigate away: the armed state must not survive to
@@ -4608,9 +5328,42 @@ mod tests {
             },
         );
         assert!(state.settings.recovery_code.is_some());
+        state.settings.hotkey_recording = true;
 
         let _ = update(&mut state, Message::WindowClosed(settings_window));
         assert!(state.settings.recovery_code.is_none());
+        assert!(!state.settings.hotkey_recording);
+    }
+
+    #[test]
+    fn stale_file_and_dictation_results_cannot_mutate_a_new_turn() {
+        let mut state = app();
+        state.file_list_generation = 2;
+        state.dictation_turn = 7;
+        state.panel.input = "typed".to_owned();
+        let session = state.panel.session;
+
+        let _ = backend_update(
+            &mut state,
+            UiEvent::FileCandidates {
+                session,
+                generation: 1,
+                files: vec![crate::bridge::FileCandidate {
+                    display: "stale.txt".to_owned(),
+                    path: "/stale.txt".to_owned(),
+                }],
+            },
+        );
+        let _ = backend_update(
+            &mut state,
+            UiEvent::DictationDelta {
+                turn: 6,
+                text: " stale speech".to_owned(),
+            },
+        );
+
+        assert!(state.panel.file_finder.results().is_empty());
+        assert_eq!(state.panel.input, "typed");
     }
 
     #[test]

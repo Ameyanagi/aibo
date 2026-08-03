@@ -620,10 +620,10 @@ impl Usage {
     /// Total tokens, for [`AgentLimits::max_total_tokens`] enforcement.
     pub const fn total(&self) -> u64 {
         self.input_tokens
-            + self.cached_input_tokens
-            + self.output_tokens
-            + self.reasoning_tokens
-            + self.image_tokens
+            .saturating_add(self.cached_input_tokens)
+            .saturating_add(self.output_tokens)
+            .saturating_add(self.reasoning_tokens)
+            .saturating_add(self.image_tokens)
     }
 }
 
@@ -1772,6 +1772,18 @@ mod tests {
         assert_eq!(l.max_tool_calls, 50);
         assert_eq!(l.max_wall_clock, Duration::from_secs(300));
         assert_eq!(l.max_total_tokens, 200_000);
+    }
+
+    #[test]
+    fn usage_total_saturates_instead_of_wrapping() {
+        let usage = Usage {
+            input_tokens: u64::MAX,
+            cached_input_tokens: 1,
+            output_tokens: 1,
+            reasoning_tokens: 1,
+            image_tokens: 1,
+        };
+        assert_eq!(usage.total(), u64::MAX);
     }
 
     // -- attachments --------------------------------------------------------

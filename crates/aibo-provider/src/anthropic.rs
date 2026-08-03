@@ -35,8 +35,8 @@ use url::Url;
 use crate::auth::{AuthStyle, apply_credential};
 use crate::http::{HttpConfig, build_client, map_transport_error};
 use crate::sse::{
-    Flow, MAX_BUFFERED_TOOL_BYTES, MAX_TOOL_CALLS_PER_RESPONSE, SseDecoder, decode,
-    events_from_response, read_error_body,
+    Flow, MAX_BUFFERED_TOOL_BYTES, MAX_TOOL_CALLS_PER_RESPONSE, SseDecoder, cancelled_stream,
+    decode, events_from_response, read_error_body, read_json_body, unexpected_eof,
 };
 use crate::wire::{ErrorShape, flatten_text, map_status, parse_retry_after, parse_tool_args};
 
@@ -163,7 +163,11 @@ impl Provider for Anthropic {
         // Refuse, never strip (§10) — then downscale before the pixels are
         // base64'd into the body (§14). See `crate::attachment`.
         crate::attachment::guard(&self.capabilities, &req, Vec::new())?;
-        let req = crate::attachment::prepare(req).await?;
+        let req = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(cancelled_stream()),
+            prepared = crate::attachment::prepare(req) => prepared?,
+        };
 
         let body = build_messages_body(&req);
         let rb = self
@@ -174,11 +178,17 @@ impl Provider for Anthropic {
             .json(&body);
         let rb = apply_credential(&self.id, &self.credential, AuthStyle::XApiKey, rb).await?;
 
-        let response = rb
-            .send()
-            .await
-            .map_err(|e| map_transport_error(&self.id, &e))?;
-        let response = self.check_status(response).await?;
+        let response = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(cancelled_stream()),
+            response = async {
+                let response = rb
+                    .send()
+                    .await
+                    .map_err(|e| map_transport_error(&self.id, &e))?;
+                self.check_status(response).await
+            } => response?,
+        };
 
         Ok(decode(
             events_from_response(response),
@@ -189,22 +199,14 @@ impl Provider for Anthropic {
     }
 
     async fn models(&self) -> Result<Vec<ModelInfo>> {
-        let rb = self
-            .client
-            .get(self.url("models")?)
-            .header("anthropic-version", API_VERSION)
-            .timeout(Duration::from_secs(10));
-        let rb = apply_credential(&self.id, &self.credential, AuthStyle::XApiKey, rb).await?;
-        let response = rb
-            .send()
-            .await
-            .map_err(|e| map_transport_error(&self.id, &e))?;
-        let response = self.check_status(response).await?;
-
         #[derive(Deserialize)]
         struct List {
             #[serde(default)]
             data: Vec<Entry>,
+            #[serde(default)]
+            has_more: bool,
+            #[serde(default)]
+            last_id: Option<String>,
         }
         #[derive(Deserialize)]
         struct Entry {
@@ -213,14 +215,31 @@ impl Provider for Anthropic {
             display_name: Option<String>,
         }
 
-        let list: List = response
-            .json()
-            .await
-            .map_err(|e| map_transport_error(&self.id, &e))?;
-        Ok(list
-            .data
-            .into_iter()
-            .map(|e| ModelInfo {
+        const MAX_PAGES: usize = 64;
+        let mut after_id: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut models = Vec::new();
+        for _ in 0..MAX_PAGES {
+            let mut url = self.url("models")?;
+            url.query_pairs_mut().append_pair("limit", "100");
+            if let Some(after) = after_id.as_deref() {
+                url.query_pairs_mut().append_pair("after_id", after);
+            }
+            let rb = self
+                .client
+                .get(url)
+                .header("anthropic-version", API_VERSION)
+                .timeout(Duration::from_secs(10));
+            let rb = apply_credential(&self.id, &self.credential, AuthStyle::XApiKey, rb).await?;
+            let response = rb
+                .send()
+                .await
+                .map_err(|e| map_transport_error(&self.id, &e))?;
+            let response = self.check_status(response).await?;
+            let body = read_json_body(response, &self.id).await?;
+            let list: List =
+                serde_json::from_str(&body).map_err(|e| AiboError::Internal(Box::new(e)))?;
+            models.extend(list.data.into_iter().map(|e| ModelInfo {
                 provider: self.id.clone(),
                 display_name: e.display_name.unwrap_or_else(|| e.id.clone()),
                 id: e.id,
@@ -228,8 +247,28 @@ impl Provider for Anthropic {
                 released_at: None,
                 deprecated: false,
                 replaced_by: None,
-            })
-            .collect())
+            }));
+            if !list.has_more {
+                return Ok(models);
+            }
+            let next = list.last_id.filter(|id| !id.is_empty()).ok_or_else(|| {
+                AiboError::Internal(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Anthropic model page said has_more without last_id",
+                )))
+            })?;
+            if !seen.insert(next.clone()) {
+                return Err(AiboError::Internal(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Anthropic model pagination repeated a cursor",
+                ))));
+            }
+            after_id = Some(next);
+        }
+        Err(AiboError::Internal(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Anthropic model pagination exceeded the page limit",
+        ))))
     }
 
     async fn health(&self) -> Result<Health> {
@@ -328,9 +367,27 @@ pub fn build_messages_body(req: &ChatRequest) -> Value {
     });
     let obj = body.as_object_mut().expect("object literal");
 
+    // §15's prefix cache, which Anthropic only applies where it is *asked*:
+    // unlike the OpenAI-shaped endpoints there is no automatic caching, so
+    // without these breakpoints every Anthropic turn paid full price for a
+    // prompt it had already sent (owner question, 2026-08-04).
+    //
+    // Two breakpoints, both on the stable prefix's trailing edge: the system
+    // prompt, and the last turn before the one being asked. Everything after
+    // the second — this turn's captured context, attachments and instruction
+    // — is new by construction and never worth a breakpoint. Anthropic
+    // allows four; two is what aibo's prompt shape has to offer.
     if !system.is_empty() {
-        obj.insert("system".into(), json!(system));
+        obj.insert(
+            "system".into(),
+            json!([{
+                "type": "text",
+                "text": system,
+                "cache_control": { "type": "ephemeral" },
+            }]),
+        );
     }
+    mark_history_breakpoint(obj);
     if let Some(p) = req.params.top_p {
         obj.insert("top_p".into(), json!(p));
     }
@@ -390,6 +447,29 @@ pub fn build_messages_body(req: &ChatRequest) -> Value {
     }
 
     body
+}
+
+/// Put a cache breakpoint on the last turn *before* the one being asked.
+///
+/// The prefix worth caching ends there: history is replayed byte-identically
+/// (`prompts::assemble` guarantees it), while this turn's message carries the
+/// capture, the attachments and the instruction — all new. A no-op with fewer
+/// than two messages, where there is no prefix to speak of.
+fn mark_history_breakpoint(body: &mut serde_json::Map<String, Value>) {
+    let Some(messages) = body.get_mut("messages").and_then(Value::as_array_mut) else {
+        return;
+    };
+    let Some(index) = messages.len().checked_sub(2) else {
+        return;
+    };
+    if let Some(block) = messages[index]
+        .get_mut("content")
+        .and_then(Value::as_array_mut)
+        .and_then(|blocks| blocks.last_mut())
+        .and_then(Value::as_object_mut)
+    {
+        block.insert("cache_control".into(), json!({ "type": "ephemeral" }));
+    }
 }
 
 fn content_blocks(msg: &Message) -> Vec<Value> {
@@ -692,7 +772,10 @@ impl SseDecoder for MessagesDecoder {
     }
 
     fn on_end(&mut self, out: &mut Vec<Result<StreamEvent>>) {
-        self.finish(out);
+        if !self.emitted_terminal {
+            self.emitted_terminal = true;
+            out.push(Err(unexpected_eof()));
+        }
     }
 }
 
@@ -722,6 +805,51 @@ mod tests {
             blocks[0]["input"],
             json!({"command": "ls"}),
             "input stays a JSON object here, unlike OpenAI's stringified spelling"
+        );
+    }
+
+    /// §15: Anthropic caches only where asked. The breakpoint belongs on the
+    /// *previous* turn — history is byte-identical across requests — and
+    /// never on the turn being asked, which is new every time.
+    #[test]
+    fn the_cache_breakpoint_lands_on_the_last_settled_turn() {
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "messages".into(),
+            json!([
+                { "role": "user", "content": [{"type": "text", "text": "one"}] },
+                { "role": "assistant", "content": [{"type": "text", "text": "two"}] },
+                { "role": "user", "content": [{"type": "text", "text": "asking now"}] },
+            ]),
+        );
+        mark_history_breakpoint(&mut body);
+
+        let messages = body["messages"].as_array().expect("messages");
+        assert_eq!(
+            messages[1]["content"][0]["cache_control"]["type"],
+            json!("ephemeral"),
+            "the settled assistant turn ends the cacheable prefix"
+        );
+        assert!(
+            messages[2]["content"][0].get("cache_control").is_none(),
+            "the turn being asked is never a breakpoint"
+        );
+        assert!(messages[0]["content"][0].get("cache_control").is_none());
+    }
+
+    /// A first turn has no prefix to cache, and must not panic reaching for one.
+    #[test]
+    fn a_single_turn_body_gets_no_history_breakpoint() {
+        let mut body = serde_json::Map::new();
+        body.insert(
+            "messages".into(),
+            json!([{ "role": "user", "content": [{"type": "text", "text": "hello"}] }]),
+        );
+        mark_history_breakpoint(&mut body);
+        assert!(
+            body["messages"][0]["content"][0]
+                .get("cache_control")
+                .is_none()
         );
     }
 

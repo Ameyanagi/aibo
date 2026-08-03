@@ -202,6 +202,48 @@ async fn a_cancelled_stop_reason_is_also_a_partial() {
 }
 
 #[tokio::test]
+async fn a_content_filter_stop_is_not_insertable() {
+    let mock = Mock::new(ProviderId::OPENAI);
+    mock.push(Script::Events(vec![
+        Ok(StreamEvent::Text("partial blocked text".to_owned())),
+        Ok(StreamEvent::Done(StopReason::ContentFilter)),
+    ]));
+
+    let outcome = engine_with(&[&mock], false)
+        .run(ask("go"), &EventSink::null())
+        .await;
+    assert!(matches!(
+        outcome,
+        Outcome::Partial {
+            reason: PartialReason::StoppedEarly(StopReason::ContentFilter),
+            ..
+        }
+    ));
+    assert_eq!(outcome.insertable_text(), None);
+}
+
+#[tokio::test]
+async fn a_tool_use_stop_is_not_a_completed_answer() {
+    let mock = Mock::new(ProviderId::OPENAI);
+    mock.push(Script::Events(vec![
+        Ok(StreamEvent::Text("I need a tool".to_owned())),
+        Ok(StreamEvent::Done(StopReason::ToolUse)),
+    ]));
+
+    let outcome = engine_with(&[&mock], false)
+        .run(ask("go"), &EventSink::null())
+        .await;
+    assert!(matches!(
+        outcome,
+        Outcome::Partial {
+            reason: PartialReason::StoppedEarly(StopReason::ToolUse),
+            ..
+        }
+    ));
+    assert_eq!(outcome.insertable_text(), None);
+}
+
+#[tokio::test]
 async fn a_stream_that_simply_stops_is_not_treated_as_complete() {
     // No `Done` event. Accepting this as a completion would auto-insert a
     // truncated rewrite, which is the exact failure §13 forbids.
@@ -233,4 +275,132 @@ async fn cancel_all_stops_everything() {
         .expect("shutdown must not hang")
         .unwrap();
     assert!(matches!(outcome, Outcome::Partial { .. }));
+}
+
+#[tokio::test]
+async fn an_old_run_with_the_same_session_cannot_retire_the_new_slot() {
+    let mock = Mock::new(ProviderId::OPENAI);
+    mock.push(Script::Hang(vec![StreamEvent::Text("first".to_owned())]));
+    mock.push(Script::Hang(vec![StreamEvent::Text("second".to_owned())]));
+    let engine = engine_with(&[&mock], false);
+    let session = Uuid::now_v7();
+
+    let first = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .run(Submission::new(session, "first"), &EventSink::null())
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    let second = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .run(Submission::new(session, "second"), &EventSink::null())
+                .await
+        })
+    };
+
+    tokio::time::timeout(Duration::from_secs(1), first)
+        .await
+        .expect("the first run is superseded")
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(20)).await;
+    engine.cancel(session);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(1), second)
+        .await
+        .expect("the new slot still belongs to the second run")
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        Outcome::Partial {
+            reason: PartialReason::Cancelled,
+            ..
+        }
+    ));
+}
+
+#[tokio::test]
+async fn esc_interrupts_a_pending_initial_post_even_if_provider_ignores_the_token() {
+    struct PendingPost(Arc<tokio::sync::Notify>);
+
+    #[async_trait::async_trait]
+    impl aibo_core::traits::Provider for PendingPost {
+        fn id(&self) -> ProviderId {
+            ProviderId::OPENAI
+        }
+
+        fn capabilities(&self) -> aibo_core::types::Capabilities {
+            aibo_core::types::Capabilities {
+                max_context: 128_000,
+                max_output: Some(4_096),
+                ..aibo_core::types::Capabilities::default()
+            }
+        }
+
+        async fn chat(
+            &self,
+            _req: aibo_core::types::ChatRequest,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> aibo_core::error::Result<
+            aibo_core::types::BoxStream<'static, aibo_core::error::Result<StreamEvent>>,
+        > {
+            self.0.notify_one();
+            std::future::pending().await
+        }
+
+        async fn models(&self) -> aibo_core::error::Result<Vec<aibo_core::types::ModelInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn health(&self) -> aibo_core::error::Result<aibo_core::types::Health> {
+            Ok(aibo_core::types::Health::Unknown)
+        }
+    }
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let mut registry = ProviderRegistry::new();
+    registry.insert(ProviderId::OPENAI, Arc::new(PendingPost(entered.clone())));
+    let engine = Arc::new(Engine::new(
+        registry,
+        EngineConfig {
+            bindings: RoleBindings::from_chains([RoleChain {
+                role: Role::Smart,
+                entries: vec![ModelBinding {
+                    provider: ProviderId::OPENAI,
+                    model: "model-x".to_owned(),
+                }],
+                fallback_enabled: false,
+                allow_crossing_trust_boundary: false,
+            }])
+            .unwrap(),
+            ..EngineConfig::default()
+        },
+    ));
+    let session = Uuid::now_v7();
+    let run = {
+        let engine = engine.clone();
+        tokio::spawn(async move {
+            engine
+                .run(Submission::new(session, "go"), &EventSink::null())
+                .await
+        })
+    };
+    entered.notified().await;
+    engine.cancel(session);
+
+    let outcome = tokio::time::timeout(Duration::from_secs(1), run)
+        .await
+        .expect("engine owns cancellation of the initial POST")
+        .unwrap();
+    assert!(matches!(
+        outcome,
+        Outcome::Partial {
+            reason: PartialReason::Cancelled,
+            ..
+        }
+    ));
 }

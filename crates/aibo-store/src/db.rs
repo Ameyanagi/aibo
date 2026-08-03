@@ -132,7 +132,13 @@ impl Db {
         // a Rust closure — so recover rather than propagating the poison and
         // taking the tray down with it (§6).
         let mut guard = self.conn.lock().unwrap_or_else(|e| e.into_inner());
-        f(&mut guard)
+        f(&mut guard).map_err(|error| match error {
+            StoreError::Sqlite(source) => {
+                let path = self.path.as_deref().unwrap_or_else(|| Path::new(""));
+                StoreError::from_sqlite(source, path, BUSY_TIMEOUT)
+            }
+            other => other,
+        })
     }
 
     /// Run a closure against the connection on the blocking pool.
@@ -257,20 +263,36 @@ pub fn archive_unreadable(path: &Path) -> Result<PathBuf> {
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let mut name = path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".unreadable.{stamp}"));
+    // Include a random component: start-fresh may be retried within one second,
+    // and `rename` replaces an existing destination on Unix.
+    name.push(format!(".unreadable.{stamp}.{}", uuid::Uuid::now_v7()));
     let archived = path.with_file_name(name);
 
-    fs::rename(path, &archived).map_err(|source| StoreError::io(path, source))?;
+    move_file_no_replace(path, &archived)?;
     for suffix in ["-wal", "-shm"] {
         let sidecar = migrations::sidecar_path(path, suffix);
         if sidecar.exists() {
             let mut target = archived.file_name().unwrap_or_default().to_os_string();
             target.push(suffix);
             let target = archived.with_file_name(target);
-            fs::rename(&sidecar, &target).map_err(|source| StoreError::io(&sidecar, source))?;
+            move_file_no_replace(&sidecar, &target)?;
         }
     }
     Ok(archived)
+}
+
+/// Move a file without ever replacing an existing recovery artifact.
+///
+/// The archive lives beside the database, so a hard link is on the same
+/// filesystem. A crash between linking and unlinking leaves two recoverable
+/// names instead of losing either copy.
+fn move_file_no_replace(source: &Path, destination: &Path) -> Result<()> {
+    fs::hard_link(source, destination).map_err(|error| StoreError::io(destination, error))?;
+    if let Err(error) = fs::remove_file(source) {
+        let _ = fs::remove_file(destination);
+        return Err(StoreError::io(source, error));
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -284,7 +306,10 @@ mod tests {
         let path = dir.path().join("nested").join("aibo.db");
         let key = DbKey::generate().expect("key");
         let db = Db::open(&path, &key).expect("open");
-        assert_eq!(db.schema_version().expect("version"), 1);
+        assert_eq!(
+            db.schema_version().expect("version"),
+            migrations::SCHEMA_VERSION
+        );
         assert!(path.exists());
     }
 
@@ -357,6 +382,34 @@ mod tests {
         let archived = archive_unreadable(&path).expect("archive");
         assert!(!path.exists());
         assert!(archived.exists());
+    }
+
+    #[test]
+    fn repeated_archives_cannot_replace_each_other() {
+        let dir = tempdir().expect("tempdir");
+        let path = dir.path().join("aibo.db");
+        fs::write(&path, b"first").expect("first file");
+        let first = archive_unreadable(&path).expect("first archive");
+        fs::write(&path, b"second").expect("second file");
+        let second = archive_unreadable(&path).expect("second archive");
+
+        assert_ne!(first, second);
+        assert_eq!(fs::read(first).expect("first remains"), b"first");
+        assert_eq!(fs::read(second).expect("second remains"), b"second");
+    }
+
+    #[test]
+    fn runtime_busy_errors_are_normalized_to_locked() {
+        let db = Db::open_in_memory().expect("open");
+        let error = db
+            .with_conn::<()>(|_| {
+                Err(StoreError::Sqlite(rusqlite::Error::SqliteFailure(
+                    rusqlite::ffi::Error::new(rusqlite::ffi::SQLITE_BUSY),
+                    None,
+                )))
+            })
+            .expect_err("busy");
+        assert!(matches!(error, StoreError::Locked { .. }));
     }
 
     #[tokio::test(flavor = "current_thread")]

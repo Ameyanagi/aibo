@@ -19,15 +19,19 @@
 //!    replacing rich content with plain text is data loss dressed up as a
 //!    feature.
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aibo_core::types::{ClipboardItem, ClipboardKind};
 use tokio::sync::{mpsc, oneshot};
+use windows::Win32::Foundation::{GlobalFree, HANDLE, HGLOBAL};
 use windows::Win32::System::DataExchange::{
-    CloseClipboard, EnumClipboardFormats, GetClipboardData, GetClipboardSequenceNumber,
-    IsClipboardFormatAvailable, OpenClipboard, RegisterClipboardFormatW,
+    CloseClipboard, EmptyClipboard, EnumClipboardFormats, GetClipboardData,
+    GetClipboardSequenceNumber, IsClipboardFormatAvailable, OpenClipboard,
+    RegisterClipboardFormatW, SetClipboardData,
 };
-use windows::Win32::System::Memory::{GlobalLock, GlobalUnlock};
+use windows::Win32::System::Memory::{
+    GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalSize, GlobalUnlock,
+};
 use windows::Win32::UI::Shell::{DragQueryFileW, HDROP};
 use windows_core::w;
 
@@ -82,6 +86,7 @@ enum ClipOp {
 
 struct ClipJob {
     deadline: Instant,
+    budget: Duration,
     op: ClipOp,
 }
 
@@ -105,7 +110,12 @@ impl ClipboardHandle {
     }
 
     fn submit(&self, deadline: Instant, op: ClipOp) -> WinResult<()> {
-        match self.tx.try_send(ClipJob { deadline, op }) {
+        let budget = deadline.saturating_duration_since(Instant::now());
+        match self.tx.try_send(ClipJob {
+            deadline,
+            budget,
+            op,
+        }) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Err(WindowsPlatformError::WorkerBusy {
                 worker: "clipboard",
@@ -176,17 +186,20 @@ fn worker(mut rx: mpsc::Receiver<ClipJob>) {
         // global clipboard lock for nothing.
         if Instant::now() > job.deadline {
             tracing::debug!("clipboard job dropped: past deadline before it started");
+            reply_deadline(job.op, job.budget);
             continue;
         }
+        let deadline = job.deadline;
+        let budget = job.budget;
         match job.op {
             ClipOp::Read {
                 conceal_source,
                 reply,
             } => {
-                let _ = reply.send(read_now(conceal_source));
+                let _ = reply.send(read_now(conceal_source, deadline, budget));
             }
             ClipOp::Write { text, reply } => {
-                let _ = reply.send(write_now(&text).map(|()| ClipboardHandle::sequence()));
+                let _ = reply.send(write_now(Some(&text), deadline, budget));
             }
             ClipOp::Restore {
                 previous,
@@ -199,12 +212,10 @@ fn worker(mut rx: mpsc::Receiver<ClipJob>) {
                     tracing::debug!("clipboard restore skipped: sequence moved");
                     Ok(false)
                 } else {
-                    match previous {
-                        Some(text) => write_now(&text).map(|()| true),
-                        // Nothing to put back — leaving aibo's payload is the
-                        // lesser evil versus clearing something.
-                        None => Ok(false),
-                    }
+                    // `None` is an explicitly empty prior clipboard. Callers
+                    // only enqueue a restore for faithfully restorable items,
+                    // so it is safe (and necessary) to clear aibo's payload.
+                    write_now(previous.as_deref(), deadline, budget).map(|_| true)
                 };
                 let _ = reply.send(result);
             }
@@ -212,15 +223,123 @@ fn worker(mut rx: mpsc::Receiver<ClipJob>) {
     }
 }
 
-fn write_now(text: &str) -> WinResult<()> {
-    let mut clipboard = arboard::Clipboard::new()
-        .map_err(|e| WindowsPlatformError::Clipboard(format!("open for write: {e}")))?;
-    clipboard
-        .set_text(text.to_owned())
-        .map_err(|e| WindowsPlatformError::Clipboard(format!("set text: {e}")))
+fn reply_deadline(op: ClipOp, budget: Duration) {
+    let error = || WindowsPlatformError::Deadline(budget);
+    match op {
+        ClipOp::Read { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        ClipOp::Write { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+        ClipOp::Restore { reply, .. } => {
+            let _ = reply.send(Err(error()));
+        }
+    }
 }
 
-fn read_now(conceal_source: bool) -> WinResult<ClipboardItem> {
+/// An open clipboard lock. Windows makes the lock process-global, so closing
+/// it in `Drop` is more than cleanup: every missed close would wedge all later
+/// clipboard operations in aibo and other applications.
+struct OpenClipboardGuard;
+
+impl OpenClipboardGuard {
+    fn acquire(deadline: Instant, budget: Duration) -> WinResult<Self> {
+        loop {
+            // SAFETY: a null owner is valid for a short-lived read/write operation.
+            if unsafe { OpenClipboard(None) }.is_ok() {
+                return Ok(Self);
+            }
+            if Instant::now() >= deadline {
+                return Err(WindowsPlatformError::Deadline(budget));
+            }
+            // This is the dedicated clipboard thread. A small bounded sleep
+            // avoids turning another process's brief lock into a false failure.
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+}
+
+impl Drop for OpenClipboardGuard {
+    fn drop(&mut self) {
+        // SAFETY: this value is only constructed after OpenClipboard succeeds.
+        let _ = unsafe { CloseClipboard() };
+    }
+}
+
+/// Movable global memory prepared for `SetClipboardData`.
+///
+/// Until ownership is transferred to the clipboard, failures free the block.
+struct ClipboardMemory(Option<HGLOBAL>);
+
+impl ClipboardMemory {
+    fn unicode(text: &str) -> WinResult<Self> {
+        let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+        let byte_len = wide.len() * std::mem::size_of::<u16>();
+        // SAFETY: the size is derived from a live vector and GMEM_MOVEABLE is
+        // required by SetClipboardData.
+        let memory = unsafe { GlobalAlloc(GMEM_MOVEABLE, byte_len) }
+            .map_err(|e| WindowsPlatformError::win32("GlobalAlloc", e))?;
+        let owned = Self(Some(memory));
+        // SAFETY: `memory` was just allocated for exactly `byte_len` bytes.
+        let ptr = unsafe { GlobalLock(memory) };
+        if ptr.is_null() {
+            return Err(WindowsPlatformError::win32_bare(
+                "GlobalLock",
+                "could not lock clipboard text memory",
+            ));
+        }
+        // SAFETY: source and destination are valid for `byte_len` bytes and do
+        // not overlap. The memory is unlocked before it is handed to Windows.
+        unsafe {
+            std::ptr::copy_nonoverlapping(wide.as_ptr().cast::<u8>(), ptr.cast(), byte_len);
+            let _ = GlobalUnlock(memory);
+        }
+        Ok(owned)
+    }
+
+    fn transfer(mut self) -> HGLOBAL {
+        self.0.take().expect("clipboard memory already transferred")
+    }
+}
+
+impl Drop for ClipboardMemory {
+    fn drop(&mut self) {
+        if let Some(memory) = self.0.take() {
+            // SAFETY: ownership has not been transferred to SetClipboardData.
+            let _ = unsafe { GlobalFree(Some(memory)) };
+        }
+    }
+}
+
+/// Replace the clipboard with text, or clear it for an explicitly empty saved
+/// clipboard. Returns the generation while the clipboard lock is still held,
+/// so another process cannot interpose a write between ours and the snapshot.
+fn write_now(text: Option<&str>, deadline: Instant, budget: Duration) -> WinResult<u32> {
+    // Allocate before EmptyClipboard: an allocation failure must not destroy
+    // the user's existing contents.
+    let memory = text.map(ClipboardMemory::unicode).transpose()?;
+    let _clipboard = OpenClipboardGuard::acquire(deadline, budget)?;
+    // SAFETY: the current thread owns the clipboard lock.
+    unsafe { EmptyClipboard() }.map_err(|e| WindowsPlatformError::win32("EmptyClipboard", e))?;
+    if let Some(memory) = memory {
+        let memory = memory.transfer();
+        // SAFETY: the global block is movable, unlocked, NUL-terminated UTF-16.
+        // A successful call transfers ownership to Windows.
+        if let Err(error) = unsafe { SetClipboardData(CF_UNICODETEXT, Some(HANDLE(memory.0))) } {
+            // SetClipboardData did not take ownership on failure.
+            let _ = unsafe { GlobalFree(Some(memory)) };
+            return Err(WindowsPlatformError::win32("SetClipboardData", error));
+        }
+    }
+    Ok(ClipboardHandle::sequence())
+}
+
+fn read_now(conceal_source: bool, deadline: Instant, budget: Duration) -> WinResult<ClipboardItem> {
+    // Hygiene flags, formats, payload and generation must describe one locked
+    // clipboard state. Splitting these reads can combine a password manager's
+    // flags with another application's text (or vice versa).
+    let _clipboard = OpenClipboardGuard::acquire(deadline, budget)?;
     let sequence = ClipboardHandle::sequence();
     let mut hygiene = read_hygiene();
     hygiene.concealed |= conceal_source;
@@ -235,11 +354,13 @@ fn read_now(conceal_source: bool) -> WinResult<ClipboardItem> {
         // all, so there is nothing to leak into a log or a prompt.
         None
     } else {
-        arboard::Clipboard::new()
-            .and_then(|mut c| c.get_text())
-            .ok()
-            .filter(|t| !t.is_empty())
+        read_text()
     };
+    if hygiene.any_format && hygiene.restorable && text.is_none() {
+        // A Unicode format existed but could not be decoded/read. `None` must
+        // remain reserved for a genuinely empty clipboard during restoration.
+        hygiene.restorable = false;
+    }
 
     let kind = if text.is_some() {
         ClipboardKind::Text
@@ -288,20 +409,11 @@ fn read_hygiene() -> Hygiene {
         ..Default::default()
     };
 
-    // SAFETY: the clipboard is opened with a null owner, every read is bounded
-    // by the format enumeration, and `CloseClipboard` runs on every path.
+    // SAFETY: `read_now` holds the clipboard lock for this entire snapshot.
     unsafe {
         let exclude = RegisterClipboardFormatW(w!("ExcludeClipboardContentFromMonitorProcessing"));
         let history = RegisterClipboardFormatW(w!("CanIncludeInClipboardHistory"));
         let cloud = RegisterClipboardFormatW(w!("CanUploadToCloudClipboard"));
-
-        if OpenClipboard(None).is_err() {
-            // Another process holds the lock. Fail closed: assume concealed
-            // rather than reading a payload aibo could not vet.
-            h.concealed = true;
-            h.restorable = false;
-            return h;
-        }
 
         h.concealed = exclude != 0 && IsClipboardFormatAvailable(exclude).is_ok();
         h.transient = [history, cloud]
@@ -312,15 +424,21 @@ fn read_hygiene() -> Hygiene {
         // Enumerate what is on the clipboard: anything outside the plain-text
         // family means a plain-text restore would lose information (§12).
         let mut format = EnumClipboardFormats(0);
+        let mut saw_unicode = false;
         while format != 0 {
             h.any_format = true;
+            saw_unicode |= format == CF_UNICODETEXT;
             if !RESTORABLE_FORMATS.contains(&format) {
                 h.restorable = false;
             }
             format = EnumClipboardFormats(format);
         }
-
-        let _ = CloseClipboard();
+        // The native restore path reproduces Unicode text. A legacy ANSI/OEM
+        // item without CF_UNICODETEXT cannot be reconstructed without knowing
+        // its source code page, so it is not faithfully restorable.
+        if h.any_format && !saw_unicode {
+            h.restorable = false;
+        }
     }
     h
 }
@@ -335,7 +453,10 @@ unsafe fn read_dword(format: u32) -> Option<u32> {
             return None;
         }
         let handle = GetClipboardData(format).ok()?;
-        let hglobal = windows::Win32::Foundation::HGLOBAL(handle.0);
+        let hglobal = HGLOBAL(handle.0);
+        if GlobalSize(hglobal) < std::mem::size_of::<u32>() {
+            return None;
+        }
         let ptr = GlobalLock(hglobal);
         if ptr.is_null() {
             return None;
@@ -346,14 +467,39 @@ unsafe fn read_dword(format: u32) -> Option<u32> {
     }
 }
 
+/// Read `CF_UNICODETEXT`. The clipboard must already be open.
+fn read_text() -> Option<String> {
+    // SAFETY: `read_now` owns the clipboard lock. GlobalSize bounds the slice,
+    // and the locked handle is released on every path after a successful lock.
+    unsafe {
+        if IsClipboardFormatAvailable(CF_UNICODETEXT).is_err() {
+            return None;
+        }
+        let handle = GetClipboardData(CF_UNICODETEXT).ok()?;
+        let memory = HGLOBAL(handle.0);
+        let units = GlobalSize(memory) / std::mem::size_of::<u16>();
+        if units == 0 {
+            return None;
+        }
+        let ptr = GlobalLock(memory);
+        if ptr.is_null() {
+            return None;
+        }
+        let slice = std::slice::from_raw_parts(ptr.cast::<u16>(), units);
+        let end = slice.iter().position(|unit| *unit == 0).unwrap_or(units);
+        let text = String::from_utf16(&slice[..end]).ok();
+        let _ = GlobalUnlock(memory);
+        text
+    }
+}
+
 /// Read `CF_HDROP` as a list of paths.
 fn read_files() -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
-    // SAFETY: the clipboard is opened and closed around the whole read;
-    // `DragQueryFileW` is called first for the count, then per index with a
-    // buffer sized from the same API.
+    // SAFETY: `read_now` holds the clipboard lock; `DragQueryFileW` is called
+    // first for the count, then per index with a buffer sized from the same API.
     unsafe {
-        if IsClipboardFormatAvailable(CF_HDROP).is_err() || OpenClipboard(None).is_err() {
+        if IsClipboardFormatAvailable(CF_HDROP).is_err() {
             return out;
         }
         if let Ok(handle) = GetClipboardData(CF_HDROP) {
@@ -373,7 +519,6 @@ fn read_files() -> Vec<std::path::PathBuf> {
                 }
             }
         }
-        let _ = CloseClipboard();
     }
     out
 }
@@ -418,6 +563,24 @@ mod queue_tests {
         assert!(matches!(
             handle.submit(Instant::now(), read_op()),
             Err(WindowsPlatformError::ClipboardThreadGone)
+        ));
+    }
+
+    #[test]
+    fn stale_job_receives_a_typed_deadline_reply() {
+        let (reply, reply_rx) = oneshot::channel();
+        let budget = Duration::from_millis(123);
+        reply_deadline(
+            ClipOp::Write {
+                text: "secret payload is never formatted into the error".to_owned(),
+                reply,
+            },
+            budget,
+        );
+
+        assert!(matches!(
+            reply_rx.blocking_recv(),
+            Ok(Err(WindowsPlatformError::Deadline(value))) if value == budget
         ));
     }
 }

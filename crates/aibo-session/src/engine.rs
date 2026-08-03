@@ -28,7 +28,7 @@
 //!   cancelled or failed stream.
 
 use std::collections::BTreeMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use aibo_core::AiboError;
@@ -142,15 +142,81 @@ pub struct Engine {
     providers: ProviderRegistry,
     router: Router,
     config: EngineConfig,
+    /// Runtime-refreshed per-model facts. `EngineConfig::catalogue` remains the
+    /// construction snapshot exposed for diagnostics; dispatch reads this
+    /// lock so a successful `/models` refresh affects the very next request.
+    live_catalogue: RwLock<BTreeMap<(ProviderId, String), Capabilities>>,
     health: Arc<HealthTable>,
     spend: Mutex<SpendMeter>,
     store: Arc<dyn SessionStore>,
     /// §13: *"one panel, one session"*. At most one panel request is ever in
     /// flight; installing a new one cancels the old.
-    inflight: Mutex<Option<(Uuid, CancellationToken)>>,
+    inflight: Mutex<Option<InflightRequest>>,
     /// Agent runs, which §13 explicitly exempts: *"pressing it during an agent
     /// run does not interrupt — the run continues in the task window"*.
-    tasks: Mutex<BTreeMap<Uuid, CancellationToken>>,
+    tasks: Mutex<BTreeMap<Uuid, RegisteredTask>>,
+}
+
+struct InflightRequest {
+    session: Uuid,
+    run: Uuid,
+    cancel: CancellationToken,
+}
+
+struct RegisteredTask {
+    run: Uuid,
+    cancel: CancellationToken,
+}
+
+/// Scope ownership for the panel slot. Dropping an aborted `Engine::run`
+/// future retires only the generation it installed.
+struct InflightGuard<'a> {
+    engine: &'a Engine,
+    session: Uuid,
+    run: Uuid,
+}
+
+impl Drop for InflightGuard<'_> {
+    fn drop(&mut self) {
+        self.engine.finish(self.session, self.run);
+    }
+}
+
+/// Scope ownership for an agent registry entry.
+pub(crate) struct TaskGuard<'a> {
+    engine: &'a Engine,
+    task: Uuid,
+    run: Uuid,
+    /// Token passed to the backend and polled by the engine.
+    pub(crate) cancel: CancellationToken,
+}
+
+impl Drop for TaskGuard<'_> {
+    fn drop(&mut self) {
+        self.engine.retire_task(self.task, self.run);
+    }
+}
+
+/// Releases a held estimate if an attempt future is aborted or returns along
+/// an error path before explicit reconciliation.
+struct ReservationGuard<'a> {
+    engine: &'a Engine,
+    request: Uuid,
+    active: bool,
+}
+
+impl ReservationGuard<'_> {
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for ReservationGuard<'_> {
+    fn drop(&mut self) {
+        if self.active {
+            self.engine.release(self.request);
+        }
+    }
 }
 
 impl std::fmt::Debug for Engine {
@@ -174,11 +240,13 @@ impl Engine {
         };
         let mut spend = SpendMeter::new();
         spend.set_budget(config.monthly_budget);
+        let live_catalogue = RwLock::new(config.catalogue.clone());
         Self {
             health: Arc::new(HealthTable::new(config.hysteresis)),
             providers,
             router: Router::with_defaults(),
             config,
+            live_catalogue,
             spend: Mutex::new(spend),
             store: Arc::new(NoStore),
             inflight: Mutex::new(None),
@@ -198,6 +266,29 @@ impl Engine {
     /// Attach §12 persistence. Without this history is simply not written.
     #[must_use]
     pub fn with_store(mut self, store: Arc<dyn SessionStore>) -> Self {
+        self.store = store;
+        self
+    }
+
+    /// Attach persistence and seed this engine with spend already settled in
+    /// the current month. Use this construction path for a durable store so an
+    /// app restart or provider-registry rebuild cannot reset the hard stop.
+    #[must_use]
+    pub async fn with_store_loaded(mut self, store: Arc<dyn SessionStore>) -> Self {
+        match store.settled_spend_this_month().await {
+            Ok(settled) => {
+                let mut meter = self.spend.lock().unwrap_or_else(|e| e.into_inner());
+                let budget = meter.budget();
+                *meter = SpendMeter::with_settled(settled);
+                meter.set_budget(budget);
+            }
+            Err(error) => {
+                // History remains optional. If it cannot be read, requests
+                // still work, but the failure is visible rather than silently
+                // claiming the month began at zero.
+                tracing::warn!(%error, "could not load this month's settled spend (§12, §14)");
+            }
+        }
         self.store = store;
         self
     }
@@ -251,6 +342,16 @@ impl Engine {
         &self.config
     }
 
+    /// Replace the per-model capability snapshot after a live catalogue
+    /// refresh. Dispatch takes only a short read lock and never holds it over
+    /// provider I/O.
+    pub fn replace_model_catalogue(&self, catalogue: BTreeMap<(ProviderId, String), Capabilities>) {
+        *self
+            .live_catalogue
+            .write()
+            .unwrap_or_else(|error| error.into_inner()) = catalogue;
+    }
+
     /// Settled spend, committed spend (settled + reserved) and where that sits
     /// against the monthly budget (§14).
     pub fn spend_snapshot(&self) -> (Micros, Micros, BudgetStatus) {
@@ -271,22 +372,30 @@ impl Engine {
     /// the old session is discarded."* That is one slot, not a map — a map
     /// would let two panel requests stream at once, which the product does not
     /// have a place to show.
-    fn begin(&self, session: Uuid) -> CancellationToken {
+    fn begin(&self, session: Uuid) -> (Uuid, CancellationToken) {
         let token = CancellationToken::new();
+        let run = Uuid::now_v7();
         let mut slot = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((previous, cancel)) = slot.replace((session, token.clone())) {
-            if previous != session {
-                tracing::debug!(%previous, %session, "a new submission cancels the previous one");
+        if let Some(previous) = slot.replace(InflightRequest {
+            session,
+            run,
+            cancel: token.clone(),
+        }) {
+            if previous.session != session {
+                tracing::debug!(previous = %previous.session, %session, "a new submission cancels the previous one");
             }
-            cancel.cancel();
+            previous.cancel.cancel();
         }
-        token
+        (run, token)
     }
 
     /// Retire our slot, if it is still ours.
-    fn finish(&self, session: Uuid) {
+    fn finish(&self, session: Uuid, run: Uuid) {
         let mut slot = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-        if slot.as_ref().is_some_and(|(s, _)| *s == session) {
+        if slot
+            .as_ref()
+            .is_some_and(|current| current.session == session && current.run == run)
+        {
             *slot = None;
         }
     }
@@ -298,55 +407,65 @@ impl Engine {
     /// must not cancel the *new* request.
     pub fn cancel(&self, session: Uuid) {
         let slot = self.inflight.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some((current, cancel)) = slot.as_ref()
-            && *current == session
+        if let Some(current) = slot.as_ref()
+            && current.session == session
         {
-            cancel.cancel();
+            current.cancel.cancel();
         }
     }
 
     /// Cancel everything, panel and agent runs alike. Shutdown only.
     pub fn cancel_all(&self) {
-        if let Some((_, cancel)) = self
+        if let Some(current) = self
             .inflight
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .take()
         {
-            cancel.cancel();
+            current.cancel.cancel();
         }
-        for (_, cancel) in
-            std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|e| e.into_inner()))
+        for (_, task) in std::mem::take(&mut *self.tasks.lock().unwrap_or_else(|e| e.into_inner()))
         {
-            cancel.cancel();
+            task.cancel.cancel();
         }
     }
 
-    pub(crate) fn register_task(&self, task: Uuid) -> CancellationToken {
+    pub(crate) fn register_task(&self, task: Uuid) -> TaskGuard<'_> {
         let token = CancellationToken::new();
-        self.tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(task, token.clone());
-        token
+        let run = Uuid::now_v7();
+        if let Some(previous) = self.tasks.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            task,
+            RegisteredTask {
+                run,
+                cancel: token.clone(),
+            },
+        ) {
+            previous.cancel.cancel();
+        }
+        TaskGuard {
+            engine: self,
+            task,
+            run,
+            cancel: token,
+        }
     }
 
-    pub(crate) fn retire_task(&self, task: Uuid) {
-        self.tasks
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .remove(&task);
+    fn retire_task(&self, task: Uuid, run: Uuid) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if tasks.get(&task).is_some_and(|current| current.run == run) {
+            tasks.remove(&task);
+        }
     }
 
     /// Cancel one agent run.
     pub fn cancel_task(&self, task: Uuid) {
-        if let Some(cancel) = self
+        if let Some(current) = self
             .tasks
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .get(&task)
         {
-            cancel.cancel();
+            current.cancel.cancel();
         }
     }
 
@@ -359,9 +478,13 @@ impl Engine {
     /// its own (§13).
     pub async fn run(&self, submission: Submission, events: &EventSink) -> Outcome {
         let session = submission.session;
-        let cancel = self.begin(session);
+        let (run, cancel) = self.begin(session);
+        let _guard = InflightGuard {
+            engine: self,
+            session,
+            run,
+        };
         let outcome = self.run_inner(submission, &cancel, events).await;
-        self.finish(session);
 
         if let Outcome::Failed(error) = &outcome {
             events.emit(SessionEvent::Failed(error.clone()));
@@ -566,7 +689,21 @@ impl Engine {
                     continue;
                 }
                 Usability::ProbeRequired => {
-                    let (usable, changed) = crate::health::probe(&self.health, &*provider).await;
+                    let probe = tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {
+                            return Outcome::Partial {
+                                text: String::new(),
+                                reason: PartialReason::Cancelled,
+                                provider: None,
+                            };
+                        }
+                        () = tokio::time::sleep_until(deadline) => {
+                            return failed(deadline_expired());
+                        }
+                        result = crate::health::probe(&self.health, &*provider) => result,
+                    };
+                    let (usable, changed) = probe;
                     if let Some(health) = changed {
                         events.emit(SessionEvent::ProviderHealth {
                             provider: binding.provider.clone(),
@@ -700,8 +837,9 @@ impl Engine {
         role: Role,
     ) -> Capabilities {
         let base = self
-            .config
-            .catalogue
+            .live_catalogue
+            .read()
+            .unwrap_or_else(|error| error.into_inner())
             .get(&(binding.provider.clone(), binding.model.clone()))
             .cloned()
             .unwrap_or_else(|| provider.capabilities());
@@ -751,9 +889,11 @@ impl Engine {
         // "switch model" rather than on "copy diagnostics". Before the reserve
         // too: §14 must not charge for a request that was never going to go.
         //
-        // Fatal, not `TryNext`: `VisionUnsupported::is_fallback_eligible()` is
-        // false, and walking the rest of the chain to rediscover the same
-        // refusal spends the user's money to learn nothing (§4, §14).
+        // This binding is unusable without spending a request. When fallback
+        // is enabled, let the loop inspect the next binding: capabilities are
+        // per model, so a blind primary says nothing about a vision-capable
+        // secondary. With fallback disabled, dispatch_order contains only this
+        // entry and the same typed error is returned below.
         let unsupported = submission
             .attachments
             .iter()
@@ -766,7 +906,7 @@ impl Engine {
                 attachments = unsupported,
                 "binding cannot accept the attachments; refusing rather than dropping them (§10)"
             );
-            return AttemptResult::Fatal(AiboError::vision_unsupported(
+            return AttemptResult::TryNext(AiboError::vision_unsupported(
                 binding.clone(),
                 unsupported,
                 self.config.bindings.vision_alternatives(),
@@ -842,6 +982,11 @@ impl Engine {
             }
         };
         request.budget.reserved_cost_micros = reserved;
+        let mut reservation = ReservationGuard {
+            engine: self,
+            request: request_id,
+            active: true,
+        };
 
         // §13's wall-clock ceiling covers the initial POST too: a provider that
         // accepts the connection and then never answers must not park the panel
@@ -850,15 +995,60 @@ impl Engine {
         // attempt's in-flight request without cancelling the session — `esc`
         // still propagates down from the parent.
         let attempt_cancel = cancel.child_token();
-        let stream =
-            match tokio::time::timeout_at(deadline, provider.chat(request, attempt_cancel.clone()))
-                .await
-            {
-                Ok(Ok(stream)) => stream,
-                Ok(Err(error)) => {
-                    self.release(request_id);
+        let stream = loop {
+            let chat = provider.chat(request.clone(), attempt_cancel.clone());
+            let result = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    attempt_cancel.cancel();
+                    return AttemptResult::Done(Outcome::Partial {
+                        text: String::new(),
+                        reason: PartialReason::Cancelled,
+                        provider: Some(binding.provider.clone()),
+                    });
+                }
+                () = tokio::time::sleep_until(deadline) => {
+                    attempt_cancel.cancel();
+                    return AttemptResult::Fatal(deadline_expired());
+                }
+                result = chat => result,
+            };
+
+            match result {
+                Ok(stream) => break stream,
+                Err(AiboError::RateLimited {
+                    provider: limited_provider,
+                    retry_after: Some(wait),
+                }) if wait <= surface.first_token_target() => {
+                    // A short server-directed pause is cheaper and more
+                    // private than substituting another provider. It remains
+                    // inside the request's absolute deadline and is
+                    // cancellation-aware.
+                    tracing::debug!(
+                        provider = %limited_provider,
+                        retry_after_ms = wait.as_millis(),
+                        "short rate limit; waiting within the surface budget"
+                    );
+                    tokio::select! {
+                        biased;
+                        () = cancel.cancelled() => {
+                            attempt_cancel.cancel();
+                            return AttemptResult::Done(Outcome::Partial {
+                                text: String::new(),
+                                reason: PartialReason::Cancelled,
+                                provider: Some(binding.provider.clone()),
+                            });
+                        }
+                        () = tokio::time::sleep_until(deadline) => {
+                            attempt_cancel.cancel();
+                            return AttemptResult::Fatal(deadline_expired());
+                        }
+                        () = tokio::time::sleep(wait) => {}
+                    }
+                }
+                Err(error) => {
                     self.note_failure(&binding.provider, &error, events);
-                    return if error.is_fallback_eligible() {
+                    return if fallback_eligible_for_surface(&error, surface) {
                         AttemptResult::TryNext(error)
                     } else {
                         // §4: "It does not trigger on a 400 — that's a bug in aibo,
@@ -867,15 +1057,8 @@ impl Engine {
                         AttemptResult::Fatal(error)
                     };
                 }
-                Err(_elapsed) => {
-                    // Cancelling is what aborts the request the provider is still
-                    // waiting on; dropping the future alone would only stop *us*
-                    // polling it.
-                    attempt_cancel.cancel();
-                    self.release(request_id);
-                    return AttemptResult::Fatal(deadline_expired());
-                }
-            };
+            }
+        };
 
         events.emit(SessionEvent::Dispatched {
             provider: binding.provider.clone(),
@@ -916,14 +1099,22 @@ impl Engine {
                     cost_micros: cost,
                     committed_micros: committed,
                 });
+                reservation.disarm();
             }
             // §14: "release on failure". No usage means no bill we can prove,
             // and holding the reserve forever would block the monthly cap.
-            None => self.release(request_id),
+            None => {
+                self.release(request_id);
+                reservation.disarm();
+            }
         }
 
         // -- §13 health ------------------------------------------------------
-        if result.tokens_seen {
+        let clean_terminal = result.error.is_none()
+            && result.stop.is_some()
+            && result.stop.as_ref() != Some(&StopReason::Cancelled)
+            && !result.cancelled;
+        if clean_terminal {
             if let Some(health) = self
                 .health
                 .record_success(&binding.provider, Duration::from_millis(latency_ms))
@@ -991,6 +1182,21 @@ impl Engine {
                     binding,
                     result.text,
                     PartialReason::Cancelled,
+                    usage_or_default(&result.usage),
+                    cost,
+                    latency_ms,
+                )
+                .await,
+            );
+        }
+        if matches!(stop, StopReason::ToolUse | StopReason::ContentFilter) {
+            return AttemptResult::Done(
+                self.partial(
+                    submission,
+                    surface,
+                    binding,
+                    result.text,
+                    PartialReason::StoppedEarly(stop),
                     usage_or_default(&result.usage),
                     cost,
                     latency_ms,
@@ -1265,6 +1471,20 @@ fn failed(error: AiboError) -> Outcome {
 const fn deadline_expired() -> AiboError {
     AiboError::Timeout {
         phase: aibo_core::error::TimeoutPhase::Stream,
+    }
+}
+
+/// §4's fallback predicate with the surface-specific part kept at the
+/// orchestration boundary. A short `Retry-After` is handled by waiting and
+/// retrying the same provider; only a wait that misses the target (or an
+/// unspecified wait) is a substitution signal.
+fn fallback_eligible_for_surface(error: &AiboError, surface: Surface) -> bool {
+    match error {
+        AiboError::RateLimited {
+            retry_after: Some(wait),
+            ..
+        } => *wait > surface.first_token_target(),
+        _ => error.is_fallback_eligible(),
     }
 }
 

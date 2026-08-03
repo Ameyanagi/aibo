@@ -18,6 +18,7 @@
 //! denylist) is the platform layer's job; by the time an item reaches here the
 //! flags on `ClipboardItem` are authoritative.
 
+use std::path::PathBuf;
 use std::time::Duration;
 
 use aibo_core::types::{ClipboardItem, ClipboardKind};
@@ -69,6 +70,8 @@ pub struct HistoryEntry {
     pub kind: ClipboardKind,
     /// The text payload. Always `None` for a concealed row.
     pub content: Option<String>,
+    /// Referenced image or file payload. Empty for text and concealed rows.
+    pub files: Vec<PathBuf>,
     /// The app that placed the item, when known.
     pub source_app: Option<String>,
     /// This row is a marker for a skipped secret.
@@ -92,16 +95,26 @@ pub fn record(conn: &Connection, item: &ClipboardItem, retention: Duration) -> R
 
     let id = Uuid::now_v7();
     let created_at = now_unix();
-    let expires_at = created_at.saturating_add(retention.as_secs() as i64);
+    let retention_seconds = i64::try_from(retention.as_secs()).unwrap_or(i64::MAX);
+    let expires_at = created_at.saturating_add(retention_seconds);
 
     // The one place the concealed rule is enforced. Note the content column is
     // bound to NULL, not to a redacted string: a redacted string is still a
     // decision made at render time, and this must be a decision made at write
     // time.
-    let content: Option<&str> = if item.concealed {
+    let content: Option<String> = if item.concealed {
         None
     } else {
-        item.text.as_deref()
+        match item.kind {
+            ClipboardKind::Text => item.text.clone(),
+            ClipboardKind::ImageRef | ClipboardKind::Files => {
+                if item.files.is_empty() {
+                    return Ok(Recorded::Skipped);
+                }
+                Some(serde_json::to_string(&item.files)?)
+            }
+            ClipboardKind::Unsupported | ClipboardKind::Empty => unreachable!("filtered above"),
+        }
     };
 
     conn.execute(
@@ -111,7 +124,7 @@ pub fn record(conn: &Connection, item: &ClipboardItem, retention: Duration) -> R
         params![
             id,
             kind,
-            content,
+            content.as_deref(),
             item.source_app,
             i64::from(item.concealed),
             created_at,
@@ -132,6 +145,7 @@ pub fn record(conn: &Connection, item: &ClipboardItem, retention: Duration) -> R
 /// surfaced, never sent" — the marker exists for the count and the explanation,
 /// not for the picker.
 pub fn recent(conn: &Connection, limit: usize) -> Result<Vec<HistoryEntry>> {
+    let limit = sql_limit(limit)?;
     let mut stmt = conn.prepare(
         "SELECT id, kind, content, source_app, concealed, created_at, expires_at
          FROM clipboard_history
@@ -139,7 +153,7 @@ pub fn recent(conn: &Connection, limit: usize) -> Result<Vec<HistoryEntry>> {
          ORDER BY created_at DESC
          LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![now_unix(), limit as i64], read_entry)?;
+    let rows = stmt.query_map(params![now_unix(), limit], read_entry)?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row??);
@@ -178,11 +192,12 @@ pub fn purge_expired(conn: &Connection) -> Result<usize> {
 
 /// Trim to the newest `max` items, expired or not.
 pub fn enforce_cap(conn: &Connection, max: usize) -> Result<usize> {
+    let max = sql_limit(max)?;
     Ok(conn.execute(
         "DELETE FROM clipboard_history WHERE id NOT IN (
              SELECT id FROM clipboard_history ORDER BY created_at DESC, id DESC LIMIT ?1
          )",
-        params![max as i64],
+        params![max],
     )?)
 }
 
@@ -196,19 +211,41 @@ type Mapped<T> = rusqlite::Result<Result<T>>;
 fn read_entry(row: &rusqlite::Row<'_>) -> Mapped<HistoryEntry> {
     let kind: String = row.get(1)?;
     let concealed: i64 = row.get(4)?;
+    let stored_content: Option<String> = row.get(2)?;
     Ok((|| {
+        let kind = codec::clipboard_kind_from_str(&kind)?;
+        let (content, files) = if concealed != 0 {
+            (None, Vec::new())
+        } else {
+            match kind {
+                ClipboardKind::Text => (stored_content, Vec::new()),
+                ClipboardKind::ImageRef | ClipboardKind::Files => {
+                    let files = match stored_content {
+                        Some(payload) => serde_json::from_str(&payload)?,
+                        None => Vec::new(),
+                    };
+                    (None, files)
+                }
+                ClipboardKind::Unsupported | ClipboardKind::Empty => (None, Vec::new()),
+            }
+        };
         Ok(HistoryEntry {
             id: row.get(0)?,
-            kind: codec::clipboard_kind_from_str(&kind)?,
+            kind,
             // Belt and braces: even if a row somehow carried content with
             // `concealed = 1`, it does not leave this function.
-            content: if concealed != 0 { None } else { row.get(2)? },
+            content,
+            files,
             source_app: row.get(3)?,
             concealed: concealed != 0,
             created_at: row.get(5)?,
             expires_at: row.get(6)?,
         })
     })())
+}
+
+fn sql_limit(limit: usize) -> Result<i64> {
+    i64::try_from(limit).map_err(|_| crate::StoreError::InvalidLimit { value: limit })
 }
 
 #[cfg(test)]
@@ -240,6 +277,37 @@ mod tests {
         let entries = db.with_conn(|c| recent(c, 10)).expect("recent");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].content.as_deref(), Some("hello"));
+        assert!(entries[0].files.is_empty());
+    }
+
+    #[test]
+    fn file_references_round_trip_without_being_discarded() {
+        let db = Db::open_in_memory().expect("open");
+        let mut files = item("");
+        files.kind = ClipboardKind::Files;
+        files.text = None;
+        files.files = vec![PathBuf::from("/tmp/one.txt"), PathBuf::from("/tmp/two.txt")];
+
+        let recorded = db
+            .with_conn(|c| record(c, &files, DEFAULT_RETENTION))
+            .expect("record");
+        assert!(matches!(recorded, Recorded::Stored(_)));
+        let entries = db.with_conn(|c| recent(c, 10)).expect("recent");
+        assert_eq!(entries[0].files, files.files);
+        assert_eq!(entries[0].content, None);
+    }
+
+    #[test]
+    fn a_reference_kind_without_a_reference_is_not_reported_as_stored() {
+        let db = Db::open_in_memory().expect("open");
+        let mut image = item("");
+        image.kind = ClipboardKind::ImageRef;
+        image.text = None;
+        assert_eq!(
+            db.with_conn(|c| record(c, &image, DEFAULT_RETENTION))
+                .expect("record"),
+            Recorded::Skipped
+        );
     }
 
     #[test]

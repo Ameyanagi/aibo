@@ -42,7 +42,7 @@
 //   * whether `get_active_composition` actually reports a live IME composition
 //     in Chromium and in native Win32 controls (§9, S7).
 
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use aibo_core::types::{AppRef, DocumentBudget, DocumentText, FieldContext, InsertTarget, Rect};
 use tokio::sync::{mpsc, oneshot};
@@ -104,6 +104,7 @@ enum UiaOp {
 
 struct UiaJob {
     deadline: Instant,
+    timeout: Duration,
     op: UiaOp,
 }
 
@@ -127,7 +128,12 @@ impl UiaHandle {
     }
 
     fn submit(&self, deadline: Instant, op: UiaOp) -> WinResult<()> {
-        match self.tx.try_send(UiaJob { deadline, op }) {
+        let timeout = deadline.saturating_duration_since(Instant::now());
+        match self.tx.try_send(UiaJob {
+            deadline,
+            timeout,
+            op,
+        }) {
             Ok(()) => Ok(()),
             Err(mpsc::error::TrySendError::Full(_)) => Err(WindowsPlatformError::WorkerBusy {
                 worker: "UI Automation",
@@ -271,7 +277,8 @@ fn worker(mut rx: mpsc::Receiver<UiaJob>) {
 
     while let Some(job) = rx.blocking_recv() {
         if Instant::now() > job.deadline {
-            tracing::debug!("UIA job dropped: past deadline before it started");
+            tracing::debug!("UIA job rejected: past deadline before it started");
+            reply_with_error(job.op, WindowsPlatformError::Deadline(job.timeout));
             continue;
         }
         match job.op {
@@ -293,32 +300,40 @@ fn worker(mut rx: mpsc::Receiver<UiaJob>) {
         }
     }
 
+    // UIAutomation and every interface obtained from it are apartment-bound
+    // COM objects. Release the client while this thread is still initialized;
+    // Rust would otherwise drop it after the explicit `CoUninitialize` below.
+    drop(automation);
     // SAFETY: paired with the successful CoInitializeEx above; the automation
-    // client has been dropped by now.
+    // client and all per-job COM interfaces have been dropped by now.
     unsafe { CoUninitialize() };
+}
+
+fn reply_with_error(op: UiaOp, error: WindowsPlatformError) {
+    match op {
+        UiaOp::SelectedText { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        UiaOp::FieldContext { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        UiaOp::FocusedElementId { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        UiaOp::ReadDocument { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+        UiaOp::ValidateTarget { reply, .. } => {
+            let _ = reply.send(Err(error));
+        }
+    }
 }
 
 /// Answer every queued and future job with an error rather than leaving callers
 /// to time out on a dead channel.
 fn drain_with_error(mut rx: mpsc::Receiver<UiaJob>, error: impl Fn() -> WindowsPlatformError) {
     while let Some(job) = rx.blocking_recv() {
-        match job.op {
-            UiaOp::SelectedText { reply, .. } => {
-                let _ = reply.send(Err(error()));
-            }
-            UiaOp::FieldContext { reply, .. } => {
-                let _ = reply.send(Err(error()));
-            }
-            UiaOp::FocusedElementId { reply, .. } => {
-                let _ = reply.send(Err(error()));
-            }
-            UiaOp::ReadDocument { reply, .. } => {
-                let _ = reply.send(Err(error()));
-            }
-            UiaOp::ValidateTarget { reply, .. } => {
-                let _ = reply.send(Err(error()));
-            }
-        }
+        reply_with_error(job.op, error());
     }
 }
 
@@ -477,19 +492,12 @@ fn field_context(automation: &UIAutomation, of: &AppRef) -> WinResult<Option<Fie
     guard_uipi(of)?;
     let element = focused_in(automation, of)?;
 
-    // §9: while composing, a read returns the pre-composition text or the
-    // uncommitted reading — neither is what the user sees — so aibo declines
-    // and the panel says "finish typing to continue".
-    if composition_active(&element, of) {
-        return Err(WindowsPlatformError::ImeActive);
-    }
-
     // §5: never capture from a secure field. This mirrors the macOS
     // `AXSecureTextField` branch exactly — empty `prefix`/`suffix` plus
     // `is_secure`, which `FieldContext` documents as mandatory and which
     // `aibo_core::prompts::assemble` uses as the second line of the same
-    // defence. `Ok(None)` (the previous answer) carried no such signal: the
-    // panel could not distinguish "password field" from "not a text field".
+    // defence. Check the property before asking the text-edit pattern about an
+    // active composition: that query can itself return text from the field.
     if element.is_password().unwrap_or(false) {
         return Ok(Some(FieldContext {
             prefix: String::new(),
@@ -501,6 +509,13 @@ fn field_context(automation: &UIAutomation, of: &AppRef) -> WinResult<Option<Fie
             truncated: false,
             caret_bounds: None,
         }));
+    }
+
+    // §9: while composing, a read returns the pre-composition text or the
+    // uncommitted reading — neither is what the user sees — so aibo declines
+    // and the panel says "finish typing to continue".
+    if composition_active(&element, of) {
+        return Err(WindowsPlatformError::ImeActive);
     }
 
     let pattern = text_pattern(&element)?;
@@ -630,7 +645,16 @@ fn read_document(
     of: &AppRef,
     budget: DocumentBudget,
 ) -> WinResult<Option<DocumentText>> {
+    guard_uipi(of)?;
     let element = focused_in(automation, of)?;
+    // Do not touch a text pattern until the cheap secure-field property has
+    // ruled out reading a password control.
+    if element.is_password().unwrap_or(false) {
+        return Err(WindowsPlatformError::SecureField);
+    }
+    if composition_active(&element, of) {
+        return Err(WindowsPlatformError::ImeActive);
+    }
     let Ok(pattern) = text_pattern(&element) else {
         // No text provider: a canvas, a game, a remote desktop session. Not a
         // failure — this app simply cannot be read (§13).
@@ -736,22 +760,58 @@ fn validate_target(automation: &UIAutomation, target: &InsertTarget) -> WinResul
 
     // And the text must not have moved underneath us. This is the case that
     // makes a paste unrecoverable: same window, same field, different content.
-    if let Some(expected) = target.selection_hash
-        && let Ok(pattern) = text_pattern(&element)
-        && let Ok(ranges) = pattern.get_selection()
-    {
-        let mut current = String::new();
-        for range in &ranges {
-            if let Ok(text) = range.get_text(SELECTION_MAX_CHARS) {
-                current.push_str(&text);
-            }
-        }
-        if text_hash(&current) != expected {
-            return Ok(false);
-        }
+    if !hash_matches(target.selection_hash, || {
+        selection_text_for_validation(&element)
+    }) {
+        return Ok(false);
+    }
+    if !hash_matches(target.prefix_hash, || prefix_text_for_validation(&element)) {
+        return Ok(false);
     }
 
     Ok(true)
+}
+
+/// Validate an optional captured hash without allowing an unreadable live value
+/// to weaken insert safety. A missing capture hash means that comparison was
+/// unavailable at capture time; a present hash makes every live read failure a
+/// mismatch.
+fn hash_matches(expected: Option<u64>, read_live: impl FnOnce() -> WinResult<String>) -> bool {
+    match expected {
+        None => true,
+        Some(expected) => read_live().is_ok_and(|live| text_hash(&live) == expected),
+    }
+}
+
+fn selection_text_for_validation(element: &UIElement) -> WinResult<String> {
+    let pattern = text_pattern(element)?;
+    require_text_selection(&pattern)?;
+    let ranges = pattern.get_selection().map_err(uia_err)?;
+    let mut current = String::new();
+    for range in &ranges {
+        // A partial selection is not safe to compare. If any range refuses the
+        // bounded read, propagate the failure so `hash_matches` fails closed.
+        current.push_str(&range.get_text(SELECTION_MAX_CHARS).map_err(uia_err)?);
+    }
+    Ok(current)
+}
+
+fn prefix_text_for_validation(element: &UIElement) -> WinResult<String> {
+    let pattern = text_pattern(element)?;
+    require_text_selection(&pattern)?;
+    let range = caret_range(&pattern).ok_or_else(|| {
+        WindowsPlatformError::Uia("the focused control exposes no caret range".into())
+    })?;
+    range
+        .move_endpoint_by_unit(
+            TextPatternRangeEndpoint::Start,
+            TextUnit::Character,
+            -PREFIX_CHARS,
+        )
+        .map_err(uia_err)?;
+    // This exactly matches the capture path's request bound. It never asks UIA
+    // to marshal the whole document merely to validate a prefix hash.
+    range.get_text(PREFIX_CHARS).map_err(uia_err)
 }
 
 #[cfg(test)]
@@ -798,5 +858,48 @@ mod queue_tests {
             handle.submit(Instant::now(), selected_text_op()),
             Err(WindowsPlatformError::UiaThreadGone)
         ));
+    }
+
+    #[test]
+    fn expired_job_receives_deadline_error() {
+        let (reply, mut rx) = oneshot::channel();
+        reply_with_error(
+            UiaOp::SelectedText {
+                of: AppRef {
+                    pid: 1,
+                    window: None,
+                },
+                reply,
+            },
+            WindowsPlatformError::Deadline(Duration::from_millis(120)),
+        );
+
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(Err(WindowsPlatformError::Deadline(duration)))
+                if duration == Duration::from_millis(120)
+        ));
+    }
+
+    #[test]
+    fn present_hash_fails_closed_when_live_text_is_unreadable() {
+        let expected = text_hash("captured");
+        assert!(!hash_matches(Some(expected), || {
+            Err(WindowsPlatformError::NoTextPattern)
+        }));
+    }
+
+    #[test]
+    fn optional_hash_check_accepts_only_an_exact_readable_match() {
+        let expected = text_hash("captured");
+        assert!(hash_matches(Some(expected), || Ok("captured".into())));
+        assert!(!hash_matches(Some(expected), || Ok("changed".into())));
+
+        let mut read = false;
+        assert!(hash_matches(None, || {
+            read = true;
+            Ok(String::new())
+        }));
+        assert!(!read, "an absent capture hash does not require a live read");
     }
 }

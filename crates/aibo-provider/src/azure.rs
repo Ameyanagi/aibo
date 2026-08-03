@@ -24,6 +24,7 @@
 
 use aibo_core::error::{AiboError, Result};
 use aibo_core::types::{Capabilities, Credential, MultiCandidate, ProviderId};
+use secrecy::ExposeSecret;
 use url::Url;
 
 use crate::auth::AuthStyle;
@@ -48,7 +49,7 @@ pub fn default_capabilities() -> Capabilities {
         streaming: true,
         json_schema: true,
         prompt_cache: true,
-        multi_candidate: MultiCandidate::Native,
+        multi_candidate: MultiCandidate::Unsupported,
         max_context: 128_000,
         max_output: Some(16_384),
         ..Capabilities::default()
@@ -94,14 +95,30 @@ pub fn provider(
     let (deployment, api_version, auth) = match (&credential, deployment, api_version) {
         (
             Credential::AzureKey {
+                key,
                 deployment: d,
                 api_version: v,
                 ..
             },
             _,
             _,
-        ) => (d.clone(), v.clone(), AuthStyle::AzureApiKey),
-        (Credential::EntraId(_), Some(d), Some(v)) => (d, v, AuthStyle::Bearer),
+        ) if !key.expose_secret().trim().is_empty()
+            && !d.trim().is_empty()
+            && !v.trim().is_empty() =>
+        {
+            (d.clone(), v.clone(), AuthStyle::AzureApiKey)
+        }
+        (Credential::AzureKey { .. }, _, _) => {
+            return Err(AiboError::Auth {
+                provider: id,
+                kind: aibo_core::error::AuthKind::Invalid,
+            });
+        }
+        (Credential::EntraId(_), Some(d), Some(v))
+            if !d.trim().is_empty() && !v.trim().is_empty() =>
+        {
+            (d, v, AuthStyle::Bearer)
+        }
         (Credential::EntraId(_), _, _) => {
             return Err(Unimplemented::err(
                 id,
@@ -181,7 +198,15 @@ pub fn v1_provider(
     let base = format!("{}/openai/v1", endpoint.trim_end_matches('/'));
     let url = Url::parse(&base).map_err(|e| AiboError::Internal(Box::new(e)))?;
     let auth = match &credential {
-        Credential::AzureKey { .. } => AuthStyle::AzureApiKey,
+        Credential::AzureKey { key, .. } if !key.expose_secret().trim().is_empty() => {
+            AuthStyle::AzureApiKey
+        }
+        Credential::AzureKey { .. } => {
+            return Err(AiboError::Auth {
+                provider: id,
+                kind: aibo_core::error::AuthKind::Invalid,
+            });
+        }
         Credential::EntraId(_) => AuthStyle::Bearer,
         _ => {
             return Err(Unimplemented::err(
@@ -264,6 +289,16 @@ mod tests {
     #[test]
     fn an_api_key_credential_is_rejected_rather_than_silently_mis_signed() {
         let cred = Credential::ApiKey(SecretString::from("k".to_string()));
+        assert!(provider("https://r.openai.azure.com", cred, None, None).is_err());
+    }
+
+    #[test]
+    fn empty_azure_key_fields_are_rejected_at_construction() {
+        let cred = Credential::AzureKey {
+            key: SecretString::from(String::new()),
+            deployment: String::new(),
+            api_version: String::new(),
+        };
         assert!(provider("https://r.openai.azure.com", cred, None, None).is_err());
     }
 }

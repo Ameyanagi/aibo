@@ -185,13 +185,20 @@ impl PlatformBackend for MacosBackend {
         let inner = timeout.mul_f32(0.9);
         let of = of.clone();
         let label = of.clone();
-        match self
-            .thread
-            .call(timeout, move |w| {
-                w.selected_text(&of, inner, allow_fallback)
-            })
-            .await
-        {
+        let capture = if allow_fallback {
+            self.thread
+                .call_side_effect(timeout, move |w| {
+                    w.selected_text(&of, inner, allow_fallback)
+                })
+                .await
+        } else {
+            self.thread
+                .call(timeout, move |w| {
+                    w.selected_text(&of, inner, allow_fallback)
+                })
+                .await
+        };
+        match capture {
             Ok(text) => Ok(text),
             Err(MacosError::Deadline(_)) => Ok(None),
             Err(err) => Err(err.into_capture_error(&Self::identifier_of(&label))),
@@ -275,7 +282,7 @@ impl PlatformBackend for MacosBackend {
         let text = text.to_owned();
         let budget = insert_budget(text.len());
         self.thread
-            .call(budget, move |w| w.insert_text(&text, mode))
+            .call_side_effect(budget, move |w| w.insert_text(&text, mode))
             .await
             .map_err(MacosError::into_insert_error)
     }
@@ -284,7 +291,7 @@ impl PlatformBackend for MacosBackend {
         let text = text.to_owned();
         let budget = insert_budget(text.len());
         self.thread
-            .call(budget, move |w| w.replace_selection(&text))
+            .call_side_effect(budget, move |w| w.replace_selection(&text))
             .await
             .map_err(MacosError::into_insert_error)
     }
@@ -304,7 +311,7 @@ impl PlatformBackend for MacosBackend {
         // reported as a failure and the caller would refuse to paste.
         let inner = timeout.mul_f32(0.9);
         self.thread
-            .call(timeout, move |w| w.restore_focus(&prev, inner))
+            .call_side_effect(timeout, move |w| w.restore_focus(&prev, inner))
             .await
             .map_err(MacosError::into_insert_error)
     }

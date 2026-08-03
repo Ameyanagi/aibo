@@ -73,6 +73,7 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Search
         return scan(conn, trimmed, limit);
     }
 
+    let limit = sql_limit(limit)?;
     let mut stmt = conn.prepare(
         "SELECT m.id, m.conv_id, c.title, c.surface, m.role,
                 snippet(messages_fts, 0, '[', ']', '…', 12),
@@ -84,7 +85,7 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Search
          ORDER BY bm25(messages_fts)
          LIMIT ?2",
     )?;
-    let rows = stmt.query_map(params![as_fts_phrase(trimmed), limit as i64], |row| {
+    let rows = stmt.query_map(params![as_fts_phrase(trimmed), limit], |row| {
         let surface: String = row.get(3)?;
         let role: String = row.get(4)?;
         Ok((|| -> Result<SearchHit> {
@@ -111,6 +112,7 @@ pub fn search(conn: &Connection, query: &str, limit: usize) -> Result<Vec<Search
 
 /// The sub-trigram fallback: an unranked substring scan, newest first.
 fn scan(conn: &Connection, query: &str, limit: usize) -> Result<Vec<SearchHit>> {
+    let limit = sql_limit(limit)?;
     let mut stmt = conn.prepare(
         "SELECT m.id, m.conv_id, c.title, c.surface, m.role, m.content, m.created_at
          FROM messages m
@@ -120,7 +122,7 @@ fn scan(conn: &Connection, query: &str, limit: usize) -> Result<Vec<SearchHit>> 
          LIMIT ?2",
     )?;
     let pattern = format!("%{}%", escape_like(query));
-    let rows = stmt.query_map(params![pattern, limit as i64], |row| {
+    let rows = stmt.query_map(params![pattern, limit], |row| {
         let surface: String = row.get(3)?;
         let role: String = row.get(4)?;
         let content: String = row.get(5)?;
@@ -153,7 +155,7 @@ fn scan(conn: &Connection, query: &str, limit: usize) -> Result<Vec<SearchHit>> 
 /// them; the fix is [`rebuild_index`].
 pub fn index_is_consistent(conn: &Connection) -> Result<bool> {
     match conn.execute(
-        "INSERT INTO messages_fts(messages_fts) VALUES('integrity-check')",
+        "INSERT INTO messages_fts(messages_fts, rank) VALUES('integrity-check', 1)",
         [],
     ) {
         Ok(_) => Ok(true),
@@ -202,14 +204,13 @@ fn escape_like(query: &str) -> String {
 /// delimited the same way `snippet()` delimits.
 fn excerpt(content: &str, needle: &str) -> String {
     const CONTEXT: usize = 32;
-    let Some(byte_idx) = content.find(needle) else {
+    let chars: Vec<char> = content.chars().collect();
+    let needle_chars: Vec<char> = needle.chars().collect();
+    let Some(char_idx) = find_like_match(&chars, &needle_chars) else {
         return content.chars().take(CONTEXT * 2).collect();
     };
-    // Work in chars so the window never splits a multi-byte character.
-    let char_idx = content[..byte_idx].chars().count();
     let start = char_idx.saturating_sub(CONTEXT);
-    let chars: Vec<char> = content.chars().collect();
-    let needle_len = needle.chars().count();
+    let needle_len = needle_chars.len();
     let end = (char_idx + needle_len + CONTEXT).min(chars.len());
 
     let mut out = String::new();
@@ -225,6 +226,27 @@ fn excerpt(content: &str, needle: &str) -> String {
         out.push('…');
     }
     out
+}
+
+/// Locate a substring using SQLite LIKE's default case rules: ASCII letters
+/// are case-insensitive, while non-ASCII characters compare exactly.
+fn find_like_match(haystack: &[char], needle: &[char]) -> Option<usize> {
+    if needle.is_empty() {
+        return Some(0);
+    }
+    haystack.windows(needle.len()).position(|window| {
+        window.iter().zip(needle).all(|(left, right)| {
+            if left.is_ascii() && right.is_ascii() {
+                left.eq_ignore_ascii_case(right)
+            } else {
+                left == right
+            }
+        })
+    })
+}
+
+fn sql_limit(limit: usize) -> Result<i64> {
+    i64::try_from(limit).map_err(|_| StoreError::InvalidLimit { value: limit })
 }
 
 #[cfg(test)]
@@ -319,6 +341,37 @@ mod tests {
 
         let hits = db.with_conn(|c| search(c, "0%", 10)).expect("search");
         assert_eq!(hits.len(), 1, "`%` must not act as a wildcard");
+    }
+
+    #[test]
+    fn scan_highlight_uses_the_same_ascii_case_rules_as_like() {
+        let db = Db::open_in_memory().expect("open");
+        db.with_conn(|c| {
+            let conv = create_conversation(c, Surface::Ask, None)?;
+            insert_message(
+                c,
+                conv,
+                &NewMessage {
+                    content: "Fox".into(),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        })
+        .expect("seed");
+
+        let hits = db.with_conn(|c| search(c, "fo", 10)).expect("search");
+        assert_eq!(hits[0].snippet, "[Fo]x");
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn oversized_limit_is_rejected_instead_of_becoming_unlimited() {
+        let db = seeded();
+        let err = db
+            .with_conn(|c| search(c, "brown", usize::MAX))
+            .expect_err("limit must not wrap");
+        assert!(matches!(err, StoreError::InvalidLimit { .. }));
     }
 
     #[test]

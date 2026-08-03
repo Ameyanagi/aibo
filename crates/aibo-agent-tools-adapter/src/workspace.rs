@@ -16,6 +16,7 @@
 //! unified diffs that make `write`/`edit` reviewable in the task window.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use aibo_agent::{
@@ -23,10 +24,11 @@ use aibo_agent::{
     ToolOutput as AgentToolOutput,
 };
 use aibo_core::error::Result;
+use aibo_core::traits::ChildProcessObserver;
 use aibo_core::types::{ApprovalKind, ToolSchema, ToolTier};
 use aibo_tools::shell::{
-    CommandApproval, Scope, ShellExecutor, ShellRequest, is_platform_shell_tool,
-    platform_shell_tool_name, read_file, write_file,
+    CommandApproval, CommandRisk, Scope, ShellExecutor, ShellRequest, classify_command,
+    is_platform_shell_tool, platform_shell_tool_name, read_file, write_file,
 };
 use async_trait::async_trait;
 use serde_json::json;
@@ -92,6 +94,9 @@ impl WorkspaceExecutor {
         let workspace = roots.first().ok_or(WorkspaceError::NoRoots)?;
         let workspace =
             std::fs::canonicalize(workspace).map_err(|_| WorkspaceError::UnresolvableRoot)?;
+        if !workspace.is_dir() {
+            return Err(WorkspaceError::UnresolvableRoot);
+        }
         let scope = Scope::new(roots).map_err(|_| WorkspaceError::UnresolvableRoot)?;
         let shell = ShellExecutor::new(scope.clone());
         Ok(Self {
@@ -99,6 +104,13 @@ impl WorkspaceExecutor {
             shell,
             workspace,
         })
+    }
+
+    /// Report workspace shell children to the application's process ledger.
+    #[must_use]
+    pub fn with_process_observer(mut self, observer: Arc<dyn ChildProcessObserver>) -> Self {
+        self.shell = self.shell.with_process_observer(observer);
+        self
     }
 
     /// A model-supplied path, absolutised against the workspace.
@@ -436,7 +448,13 @@ async fn run_shell(
     // is refused with instructions; the retry carries an explicit flag, and
     // the model's restated reasoning lands in the transcript where a human
     // can audit it afterwards.
-    if aibo_agent::is_destructive_command(command)
+    // Keep the adapter's existing broad speed bump while also honouring the
+    // executor's authoritative classification. Otherwise a command known only
+    // to the lower layer is granted ordinary approval and fails without the
+    // adapter's actionable confirmation/retry response.
+    let destructive = aibo_agent::is_destructive_command(command)
+        || matches!(classify_command(command), CommandRisk::TypedConfirmation(_));
+    if destructive
         && !args
             .get("confirm_destructive")
             .and_then(serde_json::Value::as_bool)
@@ -467,7 +485,7 @@ async fn run_shell(
     // retry above, so the adapter supplies the executor's typed-confirmation
     // binding itself. The token still binds the exact command text and cwd,
     // so the TOCTOU revalidation keeps its teeth.
-    let approval = if aibo_agent::is_destructive_command(command) {
+    let approval = if destructive {
         CommandApproval::typed(&request, command)
     } else {
         CommandApproval::granted(&request)
@@ -630,6 +648,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn workspace_roots_must_be_directories() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file = dir.path().join("not-a-directory");
+        std::fs::write(&file, "content").expect("write fixture");
+
+        assert_eq!(
+            WorkspaceExecutor::new([file]).unwrap_err(),
+            WorkspaceError::UnresolvableRoot
+        );
+    }
+
     #[tokio::test]
     async fn relative_paths_anchor_to_the_workspace_not_the_process() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -776,6 +806,28 @@ mod tests {
             .unwrap();
         assert!(!out.is_error, "{}", out.content);
         assert!(!root.join("junk").exists(), "the confirmed retry ran");
+    }
+
+    #[tokio::test]
+    async fn executor_destructive_classification_gets_retry_instructions() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let exec = executor(&dir.path().canonicalize().expect("canonical"));
+        // `filter-repo` is classified by the shell executor even when the
+        // adapter's broader permission-gate heuristic does not know it.
+        let call = authorized(
+            &exec,
+            platform_shell_tool_name(),
+            json!({ "command": "git filter-repo --force" }),
+        );
+
+        let out = exec.execute(call, CancellationToken::new()).await.unwrap();
+
+        assert!(out.is_error);
+        assert!(
+            out.content.contains("confirm_destructive"),
+            "{}",
+            out.content
+        );
     }
 
     /// Interactive commands: stdin text is delivered and then closed, so a

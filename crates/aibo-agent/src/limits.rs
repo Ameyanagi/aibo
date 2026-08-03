@@ -36,11 +36,54 @@ pub const fn budget_error(kind: BudgetKind) -> AiboError {
 /// [`Usage`] is `Copy` and has no arithmetic impl in `aibo-core`; the agent loop
 /// is the only place that needs to sum it, so the helper lives here.
 pub fn accumulate(total: &mut Usage, delta: Usage) {
-    total.input_tokens += delta.input_tokens;
-    total.cached_input_tokens += delta.cached_input_tokens;
-    total.output_tokens += delta.output_tokens;
-    total.reasoning_tokens += delta.reasoning_tokens;
-    total.image_tokens += delta.image_tokens;
+    total.input_tokens = total.input_tokens.saturating_add(delta.input_tokens);
+    total.cached_input_tokens = total
+        .cached_input_tokens
+        .saturating_add(delta.cached_input_tokens);
+    total.output_tokens = total.output_tokens.saturating_add(delta.output_tokens);
+    total.reasoning_tokens = total
+        .reasoning_tokens
+        .saturating_add(delta.reasoning_tokens);
+    total.image_tokens = total.image_tokens.saturating_add(delta.image_tokens);
+    clamp_total(total);
+}
+
+/// Sum usage without allowing an external counter to wrap below the budget.
+fn checked_total(usage: Usage) -> Option<u64> {
+    usage
+        .input_tokens
+        .checked_add(usage.cached_input_tokens)?
+        .checked_add(usage.output_tokens)?
+        .checked_add(usage.reasoning_tokens)?
+        .checked_add(usage.image_tokens)
+}
+
+fn checked_accumulated_total(total: Usage, delta: Usage) -> Option<u64> {
+    checked_total(Usage {
+        input_tokens: total.input_tokens.checked_add(delta.input_tokens)?,
+        cached_input_tokens: total
+            .cached_input_tokens
+            .checked_add(delta.cached_input_tokens)?,
+        output_tokens: total.output_tokens.checked_add(delta.output_tokens)?,
+        reasoning_tokens: total.reasoning_tokens.checked_add(delta.reasoning_tokens)?,
+        image_tokens: total.image_tokens.checked_add(delta.image_tokens)?,
+    })
+}
+
+/// Keep `Usage::total()` safe even after a malformed counter overflows u64.
+fn clamp_total(usage: &mut Usage) {
+    let mut remaining = u64::MAX;
+    for field in [
+        &mut usage.input_tokens,
+        &mut usage.cached_input_tokens,
+        &mut usage.output_tokens,
+        &mut usage.reasoning_tokens,
+        &mut usage.image_tokens,
+    ] {
+        let retained = (*field).min(remaining);
+        *field = retained;
+        remaining -= retained;
+    }
 }
 
 /// Running enforcement state for one agent run (§14).
@@ -136,8 +179,9 @@ impl LimitTracker {
         if let Some(kind) = self.exceeded {
             return Err(kind);
         }
+        let accumulated_total = checked_accumulated_total(self.usage, delta);
         accumulate(&mut self.usage, delta);
-        if self.usage.total() > self.limits.max_total_tokens {
+        if accumulated_total.is_none_or(|total| total > self.limits.max_total_tokens) {
             return Err(self.trip(BudgetKind::Tokens));
         }
         self.check_wall_clock()
@@ -256,6 +300,30 @@ mod tests {
         assert!(t.record_usage(turn).is_ok());
         assert_eq!(t.record_usage(turn), Err(BudgetKind::Tokens));
         assert_eq!(t.usage().total(), 120);
+    }
+
+    #[test]
+    fn overflowing_usage_trips_the_token_budget_instead_of_wrapping() {
+        let mut t = LimitTracker::new(AgentLimits {
+            max_total_tokens: u64::MAX,
+            ..AgentLimits::default()
+        });
+        assert!(
+            t.record_usage(Usage {
+                input_tokens: u64::MAX,
+                ..Usage::default()
+            })
+            .is_ok()
+        );
+        assert_eq!(
+            t.record_usage(Usage {
+                output_tokens: 1,
+                ..Usage::default()
+            }),
+            Err(BudgetKind::Tokens)
+        );
+        assert_eq!(t.exceeded(), Some(BudgetKind::Tokens));
+        assert_eq!(t.usage().total(), u64::MAX);
     }
 
     #[test]

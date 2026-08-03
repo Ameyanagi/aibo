@@ -5,6 +5,7 @@
 //! the single place the contract is defined, and so the router, prompt
 //! assembly and the UI can be tested against fakes.
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -17,6 +18,52 @@ use crate::types::{
     InsertMode, InsertTarget, ModelInfo, Permission, PermissionStatus, PowerEvent, ProviderId,
     StreamEvent,
 };
+
+/// Receives lifecycle notifications for subprocesses owned by aibo.
+///
+/// The desktop runtime uses this to maintain a crash-recovery ledger. Process
+/// crates depend only on this small callback contract, so they do not need to
+/// know where or how that ledger is stored.
+pub trait ChildProcessObserver: Send + Sync + std::fmt::Debug {
+    /// A child was spawned. `identity_token` must identify its executable in
+    /// the platform process listing so PID reuse can be rejected safely.
+    fn spawned(&self, pid: u32, identity_token: &str);
+
+    /// A previously reported child has exited or been reaped.
+    fn exited(&self, pid: u32);
+}
+
+/// Drop guard pairing one [`ChildProcessObserver::spawned`] notification with
+/// [`ChildProcessObserver::exited`] on every normal, error, and cancellation
+/// path. A hard parent-process crash intentionally skips `Drop`; that is what
+/// leaves the durable ledger entry for the next launch to reap.
+#[derive(Debug)]
+pub struct ChildProcessRegistration {
+    observer: Option<Arc<dyn ChildProcessObserver>>,
+    pid: Option<u32>,
+}
+
+impl ChildProcessRegistration {
+    /// Register `pid` when both a PID and observer are available.
+    pub fn new(
+        observer: Option<Arc<dyn ChildProcessObserver>>,
+        pid: Option<u32>,
+        identity_token: &str,
+    ) -> Self {
+        if let (Some(observer), Some(pid)) = (&observer, pid) {
+            observer.spawned(pid, identity_token);
+        }
+        Self { observer, pid }
+    }
+}
+
+impl Drop for ChildProcessRegistration {
+    fn drop(&mut self) {
+        if let (Some(observer), Some(pid)) = (&self.observer, self.pid) {
+            observer.exited(pid);
+        }
+    }
+}
 
 /// A model backend. One implementation per provider — no
 /// lowest-common-denominator layer (§7, §10).

@@ -48,6 +48,7 @@
 //! the provider the user turned on.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -108,6 +109,20 @@ pub enum ConfigError {
     #[error("provider `{provider}` requires `base_url`")]
     MissingBaseUrl {
         /// The provider.
+        provider: String,
+    },
+
+    /// Two configured backends would occupy the same registry slot.
+    #[error("provider id `{provider}` is configured more than once")]
+    DuplicateProviderId {
+        /// The colliding id.
+        provider: String,
+    },
+
+    /// A custom id impersonates a different built-in backend.
+    #[error("provider id `{provider}` is reserved for a built-in backend")]
+    ReservedProviderId {
+        /// The reserved id.
         provider: String,
     },
 
@@ -252,6 +267,55 @@ impl Backend {
     const fn wants_api_key(self) -> bool {
         !matches!(self, Self::Ollama)
     }
+
+    /// The conservative default privacy classification for this concrete
+    /// backend. This deliberately does not inspect the user-selectable id: an
+    /// OpenAI-compatible endpoint called `vertex` is still a public custom
+    /// endpoint unless the user explicitly says otherwise.
+    fn default_trust(self, base_url: Option<&str>) -> TrustBoundary {
+        match self {
+            Self::Azure => TrustBoundary::Private,
+            Self::Ollama => {
+                let remote = base_url
+                    .and_then(|raw| Url::parse(raw).ok())
+                    .is_some_and(|url| !Config::endpoint_is_loopback(&url));
+                if remote {
+                    TrustBoundary::Public
+                } else {
+                    TrustBoundary::Private
+                }
+            }
+            Self::Cerebras
+            | Self::SambaNova
+            | Self::Groq
+            | Self::Xai
+            | Self::OpenRouter
+            | Self::Gemini
+            | Self::OpenAi
+            | Self::OpenAiChatCompletions
+            | Self::Anthropic
+            | Self::Custom => TrustBoundary::Public,
+        }
+    }
+}
+
+fn is_reserved_provider_id(id: &ProviderId) -> bool {
+    matches!(
+        id.as_str(),
+        "cerebras"
+            | "sambanova"
+            | "groq"
+            | "xai"
+            | "openrouter"
+            | "gemini"
+            | "openai"
+            | "anthropic"
+            | "azure-openai"
+            | "vertex"
+            | "bedrock"
+            | "ollama"
+            | "codex"
+    )
 }
 
 /// One `[[providers]]` entry.
@@ -583,12 +647,6 @@ pub struct UiSettings {
     pub allow_ax_tree_activation: bool,
     /// Override the panel hotkey, e.g. `"control+alt+Space"`.
     ///
-    /// **The only way to change it.** §9 planned a picker in settings; it is
-    /// not built yet, and the settings window now says so and points here
-    /// rather than offering a dead rebind button. Without this override, a
-    /// taken shortcut locked the user out of their own app: the panel would
-    /// not open, and the panel is how you reach settings.
-    ///
     /// The syntax is what `aibo_ui::hotkey::parse` accepts — modifiers
     /// from `control`, `alt`, `shift`, `super`, joined by `+`, then one key
     /// code. An unparseable value is reported and ignored rather than fatal;
@@ -596,6 +654,13 @@ pub struct UiSettings {
     /// another route.
     #[serde(default)]
     pub panel_hotkey: Option<String>,
+    /// Override the screen-region capture hotkey.
+    #[serde(default)]
+    pub screen_capture_hotkey: Option<String>,
+    /// Global shortcut that brings the task window forward. Unbound by
+    /// default because common editors already claim the obvious choices.
+    #[serde(default)]
+    pub show_tasks_hotkey: Option<String>,
     /// `"dark"`, `"light"` or `"system"`. Absent means dark — the product
     /// default (§16) — so existing installs keep their look. The UI layer
     /// parses and applies it; an unknown value is reported and falls dark.
@@ -661,6 +726,7 @@ impl Config {
         let mut trust = TrustMap::new();
         let mut tiers = BTreeMap::new();
         let mut failures: Vec<ConfigError> = Vec::new();
+        let mut provider_ids = BTreeSet::new();
 
         for provider in &self.providers {
             let id = provider
@@ -669,20 +735,30 @@ impl Config {
                 .map(ProviderId::new)
                 .unwrap_or_else(|| provider.backend.default_id());
 
-            if let Some(t) = provider.trust {
-                trust.set(id.clone(), t.into());
-            } else if provider.backend == Backend::Ollama
-                && provider
-                    .base_url
-                    .as_deref()
-                    .and_then(|raw| Url::parse(raw).ok())
-                    .is_some_and(|url| !Self::endpoint_is_loopback(&url))
+            if provider.id.is_some()
+                && id != provider.backend.default_id()
+                && is_reserved_provider_id(&id)
             {
-                // A remote Ollama is not automatically the user's machine.
-                // Classify it conservatively unless the user explicitly marks
-                // administered infrastructure as private.
-                trust.set(id.clone(), TrustBoundary::Public);
+                return Err(ConfigError::ReservedProviderId {
+                    provider: id.to_string(),
+                });
             }
+            if !provider_ids.insert(id.clone()) {
+                return Err(ConfigError::DuplicateProviderId {
+                    provider: id.to_string(),
+                });
+            }
+
+            // Always classify the concrete backend, then key that decision by
+            // the configured id. Falling back to TrustMap's id-based shipped
+            // table here lets a custom endpoint impersonate `vertex` or
+            // `azure-openai` and silently cross a private -> public boundary.
+            trust.set(
+                id.clone(),
+                provider.trust.map(Into::into).unwrap_or_else(|| {
+                    provider.backend.default_trust(provider.base_url.as_deref())
+                }),
+            );
             if let Some(tier) = &provider.tier {
                 tiers.insert(id.clone(), ProviderTier::new(tier.clone()));
             }
@@ -1531,6 +1607,61 @@ mod tests {
         assert_eq!(
             engine.trust.boundary(&ProviderId::OLLAMA),
             TrustBoundary::Private
+        );
+    }
+
+    #[test]
+    fn custom_provider_cannot_impersonate_a_private_builtin_id() {
+        let config = Config::from_toml_str(
+            r#"
+            [[providers]]
+            id = "vertex"
+            backend = "custom"
+            base_url = "https://shared.example.test/v1"
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            config.build(&FixedKey, PriceTable::empty()),
+            Err(ConfigError::ReservedProviderId { provider }) if provider == "vertex"
+        ));
+    }
+
+    #[test]
+    fn duplicate_provider_ids_are_rejected_before_registry_overwrite() {
+        let config = Config::from_toml_str(
+            r#"
+            [[providers]]
+            backend = "open-ai"
+
+            [[providers]]
+            backend = "open-ai-chat-completions"
+            "#,
+        )
+        .unwrap();
+
+        assert!(matches!(
+            config.build(&FixedKey, PriceTable::empty()),
+            Err(ConfigError::DuplicateProviderId { provider }) if provider == "openai"
+        ));
+    }
+
+    #[test]
+    fn a_custom_alias_is_public_by_backend_not_by_its_name() {
+        let config = Config::from_toml_str(
+            r#"
+            [[providers]]
+            id = "shared-edge"
+            backend = "custom"
+            base_url = "https://shared.example.test/v1"
+            "#,
+        )
+        .unwrap();
+        let (_, engine) = config.build(&FixedKey, PriceTable::empty()).unwrap();
+        assert_eq!(
+            engine.trust.boundary(&ProviderId::new("shared-edge")),
+            TrustBoundary::Public
         );
     }
 }

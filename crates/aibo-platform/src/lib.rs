@@ -25,9 +25,8 @@ pub use accessibility::{
 };
 pub use overlay::{
     BackdropStatus, OverlayWindowConfiguration, OverlayWindowError, activate_self,
-    animate_panel_frame, announce_accessibility, configure_panel_window,
-    present_panel_without_activation, reduced_motion_preferred, set_panel_backdrop_height,
-    system_prefers_dark,
+    announce_accessibility, configure_panel_window, present_panel_without_activation,
+    reduced_motion_preferred, set_panel_backdrop_height, set_panel_frame, system_prefers_dark,
 };
 pub use screen_capture::{ScreenCaptureError, capture_screen_region};
 

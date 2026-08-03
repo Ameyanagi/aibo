@@ -202,10 +202,15 @@ pub const RAIL_GUTTER: f32 = 16.0;
 /// resolution is to bundle Latin faces for identity and declare an explicit
 /// CJK fallback chain, accepting mixed rendering in Japanese.
 ///
-/// `Font::DEFAULT` until the licensed faces are vendored; swapping this
-/// constant is the only change required then.
-#[cfg(not(target_os = "windows"))]
-pub const UI_FONT: Font = Font::DEFAULT;
+/// macOS: name the Japanese system face explicitly.
+///
+/// A generic sans request leaves Han-unified glyph selection to CoreText.
+/// On a non-Japanese process locale that can resolve Japanese strings through
+/// PingFang SC, giving them Mandarin glyph forms even though Hiragino ships on
+/// every supported macOS release. Hiragino also has clean Latin coverage, so
+/// it is safe as the renderer default for mixed UI strings.
+#[cfg(target_os = "macos")]
+pub const UI_FONT: Font = Font::with_name("Hiragino Sans");
 
 /// Windows: name the system's *Japanese* UI face outright.
 ///
@@ -217,6 +222,10 @@ pub const UI_FONT: Font = Font::DEFAULT;
 /// somehow absent the shaper falls back exactly as before.
 #[cfg(target_os = "windows")]
 pub const UI_FONT: Font = Font::with_name("Yu Gothic UI");
+
+/// Other platforms use their configured system UI face.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+pub const UI_FONT: Font = Font::DEFAULT;
 
 /// The face for the input and for code in responses. The caret is the accent.
 pub const MONO_FONT: Font = Font::MONOSPACE;
@@ -1227,6 +1236,12 @@ pub fn scroller(theme: &Theme, status: scrollable::Status) -> scrollable::Style 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_ui_font_is_explicitly_japanese() {
+        assert_eq!(UI_FONT.family, iced::font::Family::Name("Hiragino Sans"));
+    }
 
     fn composite_over(foreground: Color, background: Color) -> Color {
         let alpha = foreground.a;

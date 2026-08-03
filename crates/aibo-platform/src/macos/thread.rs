@@ -19,14 +19,20 @@
 //! 2. `tokio::time::timeout` on the reply channel here, so the caller is never
 //!    blocked past its §8 budget even if step 1 is not honoured.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::mpsc::{self, SyncSender};
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::error::{MacosError, MacosResult};
 use super::worker::{MacosConfig, Worker};
 
 type Job = Box<dyn FnOnce(&mut Worker) + Send + 'static>;
+
+const JOB_QUEUED: u8 = 0;
+const JOB_RUNNING: u8 = 1;
+const JOB_CANCELLED: u8 = 2;
 
 /// Maximum AX operations waiting behind the in-flight operation.
 ///
@@ -81,8 +87,13 @@ impl PlatformThread {
         F: FnOnce(&mut Worker) -> MacosResult<T> + Send + 'static,
         T: Send + 'static,
     {
+        let expires = Instant::now() + deadline;
         let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.submit(Box::new(move |worker| {
+            if Instant::now() >= expires {
+                let _ = reply_tx.send(Err(MacosError::Deadline(deadline.as_millis() as u64)));
+                return;
+            }
             let _ = reply_tx.send(f(worker));
         }))?;
 
@@ -90,6 +101,55 @@ impl PlatformThread {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(MacosError::ThreadGone),
             Err(_) => Err(MacosError::Deadline(deadline.as_millis() as u64)),
+        }
+    }
+
+    /// Run a side-effecting operation without allowing an abandoned queued job
+    /// to execute later.
+    ///
+    /// If the caller's deadline expires while the job is still queued, the job
+    /// is atomically cancelled. If it has already begun, the caller waits for
+    /// the result instead of reporting failure while the mutation continues in
+    /// the background. Side-effecting worker operations are themselves bounded.
+    pub(crate) async fn call_side_effect<T, F>(&self, deadline: Duration, f: F) -> MacosResult<T>
+    where
+        F: FnOnce(&mut Worker) -> MacosResult<T> + Send + 'static,
+        T: Send + 'static,
+    {
+        let expires = Instant::now() + deadline;
+        let state = Arc::new(AtomicU8::new(JOB_QUEUED));
+        let worker_state = Arc::clone(&state);
+        let (reply_tx, mut reply_rx) = tokio::sync::oneshot::channel();
+        self.submit(Box::new(move |worker| {
+            if Instant::now() >= expires
+                || worker_state
+                    .compare_exchange(JOB_QUEUED, JOB_RUNNING, Ordering::AcqRel, Ordering::Acquire)
+                    .is_err()
+            {
+                let _ = reply_tx.send(Err(MacosError::Deadline(deadline.as_millis() as u64)));
+                return;
+            }
+            let _ = reply_tx.send(f(worker));
+        }))?;
+
+        match tokio::time::timeout(deadline, &mut reply_rx).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(MacosError::ThreadGone),
+            Err(_) => {
+                if state
+                    .compare_exchange(
+                        JOB_QUEUED,
+                        JOB_CANCELLED,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    Err(MacosError::Deadline(deadline.as_millis() as u64))
+                } else {
+                    reply_rx.await.map_err(|_| MacosError::ThreadGone)?
+                }
+            }
         }
     }
 }
@@ -107,6 +167,8 @@ impl Drop for PlatformThread {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicUsize;
+
     use super::*;
 
     fn no_op() -> Job {
@@ -136,5 +198,29 @@ mod tests {
             thread.submit(no_op()),
             Err(MacosError::ThreadGone)
         ));
+    }
+
+    #[tokio::test]
+    async fn expired_side_effect_is_cancelled_before_it_starts() {
+        let thread = PlatformThread::spawn(MacosConfig::default());
+        thread
+            .submit(Box::new(|_| {
+                std::thread::sleep(Duration::from_millis(40));
+            }))
+            .unwrap();
+        let mutations = Arc::new(AtomicUsize::new(0));
+        let worker_mutations = Arc::clone(&mutations);
+
+        assert!(matches!(
+            thread
+                .call_side_effect(Duration::from_millis(5), move |_| {
+                    worker_mutations.fetch_add(1, Ordering::Relaxed);
+                    Ok(())
+                })
+                .await,
+            Err(MacosError::Deadline(_))
+        ));
+        tokio::time::sleep(Duration::from_millis(60)).await;
+        assert_eq!(mutations.load(Ordering::Relaxed), 0);
     }
 }

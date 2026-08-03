@@ -12,17 +12,17 @@
 //!   attempt; the retry loop and its sleeps live on the async side so nothing
 //!   blocks.
 //!
-//! UIPI shows up here as `SendInput` returning fewer events than it was given
-//! with `ERROR_ACCESS_DENIED`. That is reported, never ignored — see
-//! [`WindowsPlatformError::UipiBlocked`].
+//! UIPI can make `SendInput` return fewer events, but Microsoft explicitly says
+//! neither the return value nor `GetLastError` identifies UIPI. The foreground
+//! process token's integrity level supplies that classification instead.
 
-use windows::Win32::Foundation::{ERROR_ACCESS_DENIED, GetLastError, HWND};
+use windows::Win32::Foundation::HWND;
 use windows::Win32::System::Threading::AttachThreadInput;
 use windows::Win32::System::Threading::GetCurrentThreadId;
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetAsyncKeyState, INPUT, INPUT_0, INPUT_KEYBOARD, KEYBD_EVENT_FLAGS, KEYBDINPUT,
-    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput, SetFocus, VIRTUAL_KEY, VK_CONTROL, VK_LWIN,
-    VK_MENU, VK_RWIN, VK_SHIFT,
+    KEYEVENTF_KEYUP, KEYEVENTF_UNICODE, SendInput, VIRTUAL_KEY, VK_CONTROL, VK_LWIN, VK_MENU,
+    VK_RWIN, VK_SHIFT,
 };
 use windows::Win32::UI::WindowsAndMessaging::{
     GUITHREADINFO, GetForegroundWindow, GetGUIThreadInfo, GetWindowThreadProcessId,
@@ -30,6 +30,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
 };
 
 use super::error::{WinResult, WindowsPlatformError};
+use super::permissions;
 
 /// Virtual key for `V`. `VK_V` has no named constant in the Win32 metadata.
 pub(crate) const VK_V: VIRTUAL_KEY = VIRTUAL_KEY(0x56);
@@ -74,12 +75,19 @@ fn unicode_event(unit: u16, flags: KEYBD_EVENT_FLAGS) -> INPUT {
 /// Push a batch of synthesised events, turning the two silent failure modes
 /// into errors.
 ///
-/// `SendInput` returning a short count with `ERROR_ACCESS_DENIED` is UIPI: the
-/// foreground window is owned by a higher-integrity process and a
-/// non-`uiAccess` build cannot type into it (§8).
+/// A short `SendInput` result is only called UIPI when token integrity proves
+/// that the foreground process is above us; Windows does not identify UIPI in
+/// `GetLastError` (§8).
 fn send(inputs: &[INPUT]) -> WinResult<()> {
     if inputs.is_empty() {
         return Ok(());
+    }
+    // SendInput is explicitly documented not to report UIPI through
+    // GetLastError. Classify the target from token integrity before sending;
+    // an OpenProcess/last-error guess can mislabel protected or exited apps.
+    let target_pid = foreground_pid().unwrap_or(0);
+    if permissions::process_is_out_of_reach(target_pid) {
+        return Err(WindowsPlatformError::UipiBlocked { pid: target_pid });
     }
     // SAFETY: `inputs` is a live slice of correctly initialised `INPUT` values
     // and `cbSize` is the exact size of one element, as the API requires.
@@ -87,16 +95,15 @@ fn send(inputs: &[INPUT]) -> WinResult<()> {
     if sent as usize == inputs.len() {
         return Ok(());
     }
-    // SAFETY: reading the calling thread's last-error value; no pointers.
-    let last = unsafe { GetLastError() };
-    if last == ERROR_ACCESS_DENIED {
-        Err(WindowsPlatformError::UipiBlocked {
-            pid: foreground_pid().unwrap_or(0),
-        })
+    // Recheck because focus may have changed between the preflight and the
+    // actual call. This is still only a UIPI error when integrity proves it.
+    let target_pid = foreground_pid().unwrap_or(0);
+    if permissions::process_is_out_of_reach(target_pid) {
+        Err(WindowsPlatformError::UipiBlocked { pid: target_pid })
     } else {
         Err(WindowsPlatformError::win32_bare(
             "SendInput",
-            format!("inserted {sent} of {} events ({last:?})", inputs.len()),
+            format!("inserted {sent} of {} events", inputs.len()),
         ))
     }
 }
@@ -223,8 +230,11 @@ pub(crate) fn try_restore_focus(hwnd: HWND) -> bool {
         let attached =
             target != 0 && target != current && AttachThreadInput(current, target, true).as_bool();
 
+        // SetFocus only operates within an attached input queue and is for a
+        // child/control, not for forcing a foreign top-level HWND. Restoring
+        // the foreground window lets its UI thread retain/restore its own
+        // focused child.
         let _ = SetForegroundWindow(hwnd);
-        let _ = SetFocus(Some(hwnd));
 
         if attached {
             let _ = AttachThreadInput(current, target, false);

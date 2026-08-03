@@ -137,6 +137,8 @@ ed25519-dalek = "2.2"                # §19 [plan note: prefer the 2.2 line over
 objc2 = "0.6"
 objc2-foundation = "0.3"
 objc2-app-kit = "0.3"
+# CALayer, for pinning the panel's content gravity during animated resizes.
+objc2-quartz-core = "0.3"
 accessibility-sys = "0.2"            # §20 [plan note: single maintainer; expect to vendor]
 core-foundation = "0.10"
 core-graphics = "0.24"
@@ -241,6 +243,11 @@ async-trait = { workspace = true }
 # trait means naming the type. Same crate `aibo-store` already uses.
 zeroize = { workspace = true }
 unicode-segmentation = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Safe wrapper around ReplaceFileW. Keeping the FFI inside this dependency lets
+# the binary retain its workspace-wide `unsafe_code = "forbid"` boundary.
+winsafe = { version = "0.0.19", features = ["kernel"] }
 
 [build-dependencies]
 # The Windows exe icon (`build.rs`); inert on every other target and host.

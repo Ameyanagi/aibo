@@ -151,7 +151,26 @@ pub fn insert_message(conn: &mut Connection, conv_id: Uuid, msg: &NewMessage) ->
 pub fn insert_exchange(conn: &mut Connection, exchange: &NewExchange) -> Result<Uuid> {
     let tx = conn.transaction()?;
     let conv_id = match exchange.conversation_id {
-        Some(id) => id,
+        Some(id) => {
+            // The runtime assigns an id before dispatch so every turn in the
+            // live session can share it.  On the first successful turn that id
+            // does not exist in history yet, so establish the parent row in
+            // the same transaction as its messages.  `OR IGNORE` preserves
+            // the metadata of an existing conversation on later turns.
+            let now = now_unix();
+            tx.execute(
+                "INSERT OR IGNORE INTO conversations
+                   (id, surface, source_app, created_at, updated_at, title)
+                 VALUES (?1, ?2, ?3, ?4, ?4, NULL)",
+                params![
+                    id,
+                    codec::surface_to_str(exchange.surface),
+                    exchange.source_app,
+                    now
+                ],
+            )?;
+            id
+        }
         None => create_conversation(&tx, exchange.surface, exchange.source_app.as_deref())?,
     };
 
@@ -225,11 +244,12 @@ pub fn get_conversation(conn: &Connection, id: Uuid) -> Result<Option<Conversati
 /// Most recently updated conversations first — the order `idx_conv_updated`
 /// exists to serve.
 pub fn recent_conversations(conn: &Connection, limit: usize) -> Result<Vec<Conversation>> {
+    let limit = sql_limit(limit)?;
     let mut stmt = conn.prepare(
         "SELECT id, surface, source_app, created_at, updated_at, title
-         FROM conversations ORDER BY updated_at DESC LIMIT ?1",
+         FROM conversations ORDER BY updated_at DESC, id DESC LIMIT ?1",
     )?;
-    let rows = stmt.query_map(params![limit as i64], read_conversation)?;
+    let rows = stmt.query_map(params![limit], read_conversation)?;
     let mut out = Vec::new();
     for row in rows {
         out.push(row??);
@@ -377,14 +397,14 @@ pub fn export_markdown(conn: &Connection, filter: &ExportFilter) -> Result<Strin
 
     for entry in &export.conversations {
         let conv = &entry.conversation;
-        let title = conv.title.clone().unwrap_or_else(|| "Untitled".to_owned());
+        let title = heading_text(conv.title.as_deref().unwrap_or("Untitled"));
         out.push_str(&format!("## {title}\n\n"));
         out.push_str(&format!(
             "- Surface: `{}`\n",
             codec::surface_to_str(conv.surface)
         ));
         if let Some(app) = &conv.source_app {
-            out.push_str(&format!("- App: `{app}`\n"));
+            out.push_str(&format!("- App: {}\n", inline_code(app)));
         }
         out.push_str(&format!(
             "- Started: {}\n\n",
@@ -394,8 +414,10 @@ pub fn export_markdown(conn: &Connection, filter: &ExportFilter) -> Result<Strin
         for msg in &entry.messages {
             let role = codec::message_role_to_str(msg.role);
             let model = match (&msg.provider, &msg.model) {
-                (Some(p), Some(m)) => format!(" · {p}/{m}"),
-                (Some(p), None) => format!(" · {p}"),
+                (Some(p), Some(m)) => {
+                    format!(" · {}/{}", heading_text(p), heading_text(m))
+                }
+                (Some(p), None) => format!(" · {}", heading_text(p)),
                 _ => String::new(),
             };
             out.push_str(&format!(
@@ -423,9 +445,7 @@ fn iso8601(conn: &Connection, unix_seconds: i64) -> Result<String> {
 
 /// Wrap a body in a fence when it would otherwise be read as Markdown.
 fn fence_if_needed(content: &str) -> String {
-    let structural = content
-        .lines()
-        .any(|line| line.starts_with('#') || line.starts_with("```") || line.starts_with("---"));
+    let structural = content.lines().any(is_markdown_structural);
     if structural {
         // Longer fence than anything inside, so nested fences cannot close it.
         let longest = content
@@ -439,6 +459,77 @@ fn fence_if_needed(content: &str) -> String {
     } else {
         content.to_owned()
     }
+}
+
+fn is_markdown_structural(line: &str) -> bool {
+    if line.starts_with('\t') || line.starts_with("    ") {
+        return true;
+    }
+    let line = line.trim_start_matches(' ');
+    if line.is_empty() {
+        return false;
+    }
+    if line.starts_with('#')
+        || line.starts_with('>')
+        || line.starts_with("```")
+        || line.starts_with("~~~")
+        || line.starts_with('<')
+        || line.starts_with('|')
+        || line.starts_with("---")
+        || line.starts_with("===")
+        || line.starts_with("- ")
+        || line.starts_with("* ")
+        || line.starts_with("+ ")
+    {
+        return true;
+    }
+    let Some((prefix, _)) = line.split_once(['.', ')']) else {
+        return line.starts_with('[') && line.contains("]:");
+    };
+    !prefix.is_empty()
+        && prefix.len() <= 9
+        && prefix.chars().all(|character| character.is_ascii_digit())
+}
+
+/// Escape untrusted text used in an ATX heading and keep it on one line.
+fn heading_text(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\n' | '\r' => out.push(' '),
+            '\\' | '`' | '*' | '_' | '{' | '}' | '[' | ']' | '<' | '>' | '#' | '|' => {
+                out.push('\\');
+                out.push(character);
+            }
+            _ => out.push(character),
+        }
+    }
+    out
+}
+
+/// Render arbitrary text as inline code using a delimiter longer than any
+/// backtick run in the value.
+fn inline_code(value: &str) -> String {
+    let longest = value
+        .split(|character| character != '`')
+        .map(str::len)
+        .max()
+        .unwrap_or(0);
+    let fence = "`".repeat(longest + 1);
+    let value = value.replace(['\n', '\r'], " ");
+    if value.starts_with('`')
+        || value.ends_with('`')
+        || value.starts_with(' ')
+        || value.ends_with(' ')
+    {
+        format!("{fence} {value} {fence}")
+    } else {
+        format!("{fence}{value}{fence}")
+    }
+}
+
+fn sql_limit(limit: usize) -> Result<i64> {
+    i64::try_from(limit).map_err(|_| StoreError::InvalidLimit { value: limit })
 }
 
 // ---------------------------------------------------------------------------
@@ -580,6 +671,41 @@ mod tests {
     }
 
     #[test]
+    fn exchange_with_a_preassigned_id_creates_then_appends_to_one_conversation() {
+        let db = Db::open_in_memory().expect("open");
+        let conv = Uuid::now_v7();
+
+        for instruction in ["first", "second"] {
+            let returned = db
+                .with_conn(|conn| {
+                    insert_exchange(
+                        conn,
+                        &NewExchange {
+                            conversation_id: Some(conv),
+                            surface: Surface::Ask,
+                            source_app: Some("com.example.Editor".into()),
+                            instruction: Some(instruction.into()),
+                            assistant: NewMessage {
+                                role: MessageRole::Assistant,
+                                content: format!("reply to {instruction}"),
+                                ..Default::default()
+                            },
+                        },
+                    )
+                })
+                .expect("exchange");
+            assert_eq!(returned, conv);
+        }
+
+        let conversations = db
+            .with_conn(|conn| recent_conversations(conn, 10))
+            .expect("conversations");
+        let messages = db.with_conn(|conn| messages(conn, conv)).expect("messages");
+        assert_eq!(conversations.len(), 1);
+        assert_eq!(messages.len(), 4);
+    }
+
+    #[test]
     fn failed_assistant_insert_rolls_back_the_whole_exchange() {
         let db = Db::open_in_memory().expect("open");
         db.with_conn(|conn| {
@@ -686,6 +812,47 @@ mod tests {
             .with_conn(|c| export_markdown(c, &ExportFilter::default()))
             .expect("export");
         assert!(md.contains("````\n# not a heading"));
+    }
+
+    #[test]
+    fn markdown_export_neutralizes_structure_in_all_user_metadata() {
+        let db = Db::open_in_memory().expect("open");
+        let conv = db
+            .with_conn(|c| create_conversation(c, Surface::Ask, Some("app`name")))
+            .expect("conversation");
+        db.with_conn(|c| {
+            set_title(c, conv, Some("title\n## injected"))?;
+            insert_message(
+                c,
+                conv,
+                &NewMessage {
+                    role: MessageRole::Assistant,
+                    content: "- list item".into(),
+                    provider: Some("provider\n## injected".into()),
+                    model: Some("model".into()),
+                    ..Default::default()
+                },
+            )?;
+            Ok(())
+        })
+        .expect("seed");
+
+        let markdown = db
+            .with_conn(|c| export_markdown(c, &ExportFilter::default()))
+            .expect("export");
+        assert!(!markdown.contains("\n## injected\n"));
+        assert!(markdown.contains("``app`name``"));
+        assert!(markdown.contains("````\n- list item\n````"));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn oversized_recent_limit_is_rejected() {
+        let db = Db::open_in_memory().expect("open");
+        let error = db
+            .with_conn(|c| recent_conversations(c, usize::MAX))
+            .expect_err("limit must not wrap");
+        assert!(matches!(error, StoreError::InvalidLimit { .. }));
     }
 
     #[test]

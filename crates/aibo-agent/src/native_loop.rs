@@ -352,10 +352,9 @@ impl Driver {
         // is not possible to attribute individual generated tokens back to one
         // input block, so the safe unit is the whole turn.
         let mut call_origin = context_call_origin(&task.context);
-        let deadline = tokio::time::Instant::from_std(self.tracker.deadline());
 
         loop {
-            if cancel.is_cancelled() {
+            if cancel.is_cancelled() || self.tx.is_closed() {
                 self.finish(AgentStatus::Cancelled).await;
                 return;
             }
@@ -379,7 +378,23 @@ impl Driver {
             }
 
             let request = self.build_request(&task, messages.clone());
-            let mut stream = match self.provider.chat(request, cancel.clone()).await {
+            let chat = self.provider.chat(request, cancel.clone());
+            let mut stream = match tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    self.finish(AgentStatus::Cancelled).await;
+                    return;
+                }
+                () = self.tx.closed() => return,
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(self.tracker.deadline())) => {
+                    let kind = aibo_core::types::BudgetKind::Steps;
+                    let outcome = self.tracker.budget_outcome(kind);
+                    let _ = self.tx.send(Err(crate::limits::budget_error(kind))).await;
+                    let _ = self.tx.send(Ok(AgentStep::Done(outcome))).await;
+                    return;
+                }
+                result = chat => result,
+            } {
                 Ok(s) => s,
                 Err(e) => return self.fail(e).await,
             };
@@ -394,7 +409,8 @@ impl Driver {
                         self.finish(AgentStatus::Cancelled).await;
                         return;
                     }
-                    () = tokio::time::sleep_until(deadline) => {
+                    () = self.tx.closed() => return,
+                    () = tokio::time::sleep_until(tokio::time::Instant::from_std(self.tracker.deadline())) => {
                         // §14: the wall clock has to stop a hung stream, so it
                         // is raced against it rather than checked on events.
                         let kind = aibo_core::types::BudgetKind::Steps;
@@ -561,6 +577,7 @@ impl Driver {
                 self.finish(AgentStatus::Cancelled).await;
                 return Ok(None);
             }
+            () = self.tx.closed() => return Ok(None),
             result = self.gate.authorise(&gated) => result?,
         };
         self.tracker.credit_wait(authorise_started.elapsed());
@@ -605,7 +622,33 @@ impl Driver {
         };
 
         let approved = AuthorizedToolInvocation::new(call.clone(), resolved_paths);
-        let output = self.tools.execute(approved, cancel.clone()).await?;
+        // Enforce the loop's own deadline even if an executor violates the
+        // cooperative-cancellation contract. A child token lets every losing
+        // branch notify work spawned by the executor before its future is
+        // dropped.
+        let execution_cancel = CancellationToken::new();
+        let execute = self.tools.execute(approved, execution_cancel.clone());
+        let output = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                execution_cancel.cancel();
+                self.finish(AgentStatus::Cancelled).await;
+                return Ok(None);
+            }
+            () = self.tx.closed() => {
+                execution_cancel.cancel();
+                return Ok(None);
+            }
+            () = tokio::time::sleep_until(tokio::time::Instant::from_std(self.tracker.deadline())) => {
+                execution_cancel.cancel();
+                let kind = aibo_core::types::BudgetKind::Steps;
+                let outcome = self.tracker.budget_outcome(kind);
+                let _ = self.tx.send(Err(crate::limits::budget_error(kind))).await;
+                let _ = self.tx.send(Ok(AgentStep::Done(outcome))).await;
+                return Ok(None);
+            }
+            output = execute => output?,
+        };
 
         for (path, unified_diff) in &output.diffs {
             if !self
@@ -825,6 +868,116 @@ fn origin_tag(origin: ContentOrigin) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use aibo_core::types::{Capabilities, Health, ModelInfo, ProviderId};
+
+    #[derive(Debug)]
+    struct ToolCallProvider;
+
+    #[async_trait]
+    impl Provider for ToolCallProvider {
+        fn id(&self) -> ProviderId {
+            ProviderId::OPENAI
+        }
+
+        fn capabilities(&self) -> Capabilities {
+            Capabilities::default()
+        }
+
+        async fn chat(
+            &self,
+            _req: ChatRequest,
+            _cancel: CancellationToken,
+        ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+            Ok(Box::pin(futures::stream::iter([
+                Ok(StreamEvent::ToolCall {
+                    id: "c1".to_owned(),
+                    name: "hang".to_owned(),
+                    args: Value::Null,
+                }),
+                Ok(StreamEvent::Done(StopReason::ToolUse)),
+            ])))
+        }
+
+        async fn models(&self) -> Result<Vec<ModelInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn health(&self) -> Result<Health> {
+            Ok(Health::Unknown)
+        }
+    }
+
+    #[derive(Debug)]
+    struct HangingTools {
+        started: Arc<AtomicBool>,
+        dropped: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl ToolExecutor for HangingTools {
+        fn schemas(&self) -> Vec<ToolSchema> {
+            vec![ToolSchema {
+                name: "hang".to_owned(),
+                description: "hang for a cancellation test".to_owned(),
+                parameters: serde_json::json!({"type": "object"}),
+                tier: 0,
+            }]
+        }
+
+        fn intent(&self, call: &ToolInvocation) -> Option<ToolIntent> {
+            (call.name == "hang").then(|| ToolIntent {
+                tier: ToolTier::Builtin,
+                kind: ApprovalKind::Builtin,
+                summary: "hang".to_owned(),
+                command: None,
+                paths: Vec::new(),
+            })
+        }
+
+        async fn execute(
+            &self,
+            _call: AuthorizedToolInvocation,
+            _cancel: CancellationToken,
+        ) -> Result<ToolOutput> {
+            struct MarkDropped(Arc<AtomicBool>);
+            impl Drop for MarkDropped {
+                fn drop(&mut self) {
+                    self.0.store(true, Ordering::Release);
+                }
+            }
+            self.started.store(true, Ordering::Release);
+            let _mark = MarkDropped(Arc::clone(&self.dropped));
+            futures::future::pending().await
+        }
+    }
+
+    fn hanging_loop(started: Arc<AtomicBool>, dropped: Arc<AtomicBool>) -> NativeLoop {
+        NativeLoop::new(
+            Arc::new(ToolCallProvider),
+            Arc::new(HangingTools { started, dropped }),
+            Arc::new(PermissionGate::new(
+                Arc::new(crate::permission_gate::ApproveAll),
+                [],
+            )),
+            NativeLoopConfig::new(ModelBinding {
+                provider: ProviderId::OPENAI,
+                model: "test".to_owned(),
+            }),
+        )
+    }
+
+    fn task() -> AgentTask {
+        AgentTask {
+            id: Uuid::now_v7(),
+            instruction: "run the tool".to_owned(),
+            workspace: None,
+            context: Vec::new(),
+            binding: None,
+            conversation_id: None,
+        }
+    }
 
     #[test]
     fn fenced_context_labels_and_terminates_every_block() {
@@ -897,5 +1050,60 @@ mod tests {
         );
         assert_eq!(msg.role, MessageRole::Tool);
         assert!(matches!(msg.parts[0], ContentPart::Untrusted(_)));
+    }
+
+    #[tokio::test]
+    async fn tool_execution_is_stopped_by_the_agent_wall_clock() {
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut stream = hanging_loop(started, Arc::clone(&dropped))
+            .run(
+                task(),
+                AgentLimits {
+                    max_wall_clock: Duration::from_millis(50),
+                    ..AgentLimits::default()
+                },
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(AgentStep::ToolUse { .. }))
+        ));
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(AiboError::BudgetExceeded { .. }))
+        ));
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[tokio::test]
+    async fn dropping_the_step_stream_drops_inflight_tool_execution() {
+        let started = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::new(AtomicBool::new(false));
+        let mut stream = hanging_loop(Arc::clone(&started), Arc::clone(&dropped))
+            .run(task(), AgentLimits::default(), CancellationToken::new())
+            .await
+            .unwrap();
+        assert!(matches!(
+            stream.next().await,
+            Some(Ok(AgentStep::ToolUse { .. }))
+        ));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !started.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tool future should start");
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !dropped.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("tool future should be dropped when the receiver closes");
     }
 }

@@ -76,7 +76,7 @@ mod workdirs;
 /// commit; short enough that quitting feels immediate.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
-/// The panel hotkey from `config.toml`, if the user set one.
+/// Global hotkey overrides from `config.toml`.
 ///
 /// Read here rather than taken from the backend's already-loaded config because
 /// the backend owns that on another thread and iced needs this before it starts.
@@ -87,29 +87,46 @@ const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 /// or malformed config must not stop aibo starting — and a hotkey that cannot
 /// be parsed least of all, since the reason this setting exists is that a user
 /// whose shortcut does not work has no other way in.
-fn panel_hotkey_override(paths: &paths::Paths) -> Option<aibo_ui::hotkey::HotKey> {
+#[derive(Default)]
+struct HotkeyOverrides {
+    panel: Option<aibo_ui::hotkey::HotKey>,
+    screen_capture: Option<aibo_ui::hotkey::HotKey>,
+    show_tasks: Option<aibo_ui::hotkey::HotKey>,
+}
+
+fn hotkey_overrides(paths: &paths::Paths) -> HotkeyOverrides {
     let config = match aibo_session::config::Config::load(&paths.config()) {
         Ok(config) => config,
         // Silent: the backend loads the same file and reports properly on it.
         // Two errors for one typo reads as two problems.
-        Err(_) => return None,
+        Err(_) => return HotkeyOverrides::default(),
     };
-    let spec = config.ui.panel_hotkey.as_deref()?;
-    match aibo_ui::hotkey::parse(spec) {
-        Ok(hotkey) => {
-            tracing::info!(spec, "using the configured panel hotkey");
-            Some(hotkey)
+    fn parse(spec: Option<&str>, key: &'static str) -> Option<aibo_ui::hotkey::HotKey> {
+        let spec = spec?;
+        match aibo_ui::hotkey::parse(spec) {
+            Ok(hotkey) => {
+                tracing::info!(spec, key, "using configured global hotkey");
+                Some(hotkey)
+            }
+            Err(error) => {
+                tracing::error!(spec, key, %error, "configured global hotkey is invalid; using the default");
+                None
+            }
         }
-        Err(error) => {
-            tracing::error!(spec, %error, "ui.panel_hotkey is not a valid combination; using the default");
-            None
-        }
+    }
+    HotkeyOverrides {
+        panel: parse(config.ui.panel_hotkey.as_deref(), "panel_hotkey"),
+        screen_capture: parse(
+            config.ui.screen_capture_hotkey.as_deref(),
+            "screen_capture_hotkey",
+        ),
+        show_tasks: parse(config.ui.show_tasks_hotkey.as_deref(), "show_tasks_hotkey"),
     }
 }
 
 /// The appearance preference from `config.toml`, if the user set one.
 ///
-/// Same shape as [`panel_hotkey_override`]: read here because iced needs it
+/// Same shape as [`hotkey_overrides`]: read here because iced needs it
 /// before the backend thread has loaded anything, and every failure falls
 /// back to the default (dark, §16) rather than stopping startup.
 fn appearance_preference(paths: &paths::Paths) -> aibo_ui::theme::AppearancePreference {
@@ -215,6 +232,8 @@ fn main() -> anyhow::Result<()> {
         }));
 
         // iced owns the main thread from here until the user quits.
+        let appearance_preference = appearance_preference(&paths);
+        let hotkeys = hotkey_overrides(&paths);
         let ui_config = aibo_ui::UiConfig {
             motion: if aibo_platform::reduced_motion_preferred() {
                 aibo_ui::theme::motion::Motion::Reduced
@@ -230,11 +249,13 @@ fn main() -> anyhow::Result<()> {
             // A bad value is reported and dropped rather than fatal. Refusing
             // to start because a shortcut is mistyped is the same lockout by
             // another route.
-            panel_hotkey: panel_hotkey_override(&paths),
-            appearance_preference: appearance_preference(&paths),
+            panel_hotkey: hotkeys.panel,
+            screen_capture_hotkey: hotkeys.screen_capture,
+            show_tasks_hotkey: hotkeys.show_tasks,
+            appearance_preference,
             // `main` runs on the main thread, so the OS can answer "system"
             // here; later re-resolutions happen on panel/settings open.
-            appearance: appearance_preference(&paths).resolve(aibo_platform::system_prefers_dark()),
+            appearance: appearance_preference.resolve(aibo_platform::system_prefers_dark()),
             ..aibo_ui::UiConfig::default()
         };
         aibo_ui::run(
@@ -405,7 +426,32 @@ mod paths {
             file.sync_all()?;
         }
 
-        std::fs::rename(&temp, path)
+        replace_file(&temp, path)
+    }
+
+    #[cfg(not(windows))]
+    fn replace_file(temp: &Path, path: &Path) -> io::Result<()> {
+        std::fs::rename(temp, path)
+    }
+
+    // `std::fs::rename` cannot replace an existing destination on Windows.
+    // ReplaceFileW performs that replacement as one filesystem operation; a
+    // backup-then-rename sequence leaves a crash window where `path` is absent.
+    // `winsafe` contains the FFI so this crate keeps `unsafe_code = "forbid"`.
+    #[cfg(windows)]
+    fn replace_file(temp: &Path, path: &Path) -> io::Result<()> {
+        if !path.exists() {
+            return std::fs::rename(temp, path);
+        }
+        let replaced = path.to_string_lossy();
+        let replacement = temp.to_string_lossy();
+        winsafe::ReplaceFile(
+            &replaced,
+            &replacement,
+            None,
+            winsafe::co::REPLACEFILE::WRITE_THROUGH,
+        )
+        .map_err(|error| io::Error::from_raw_os_error(u32::from(error) as i32))
     }
 
     #[cfg(test)]
@@ -686,10 +732,12 @@ mod diagnostics {
             });
 
             let records = snapshot();
-            let last = records.last().expect("trace record");
-            assert_eq!(last.kind, "warn");
-            assert!(last.message.contains(module_path!()));
-            assert!(!last.message.contains(secret));
+            let record = records
+                .iter()
+                .rev()
+                .find(|record| record.kind == "warn" && record.message.contains(module_path!()))
+                .expect("this test's trace record");
+            assert!(!record.message.contains(secret));
         }
 
         #[tokio::test]
@@ -1034,13 +1082,11 @@ mod children {
 
         /// Record a freshly spawned child. `token` must appear in the child's
         /// command line.
-        // TODO(P1): call from the `codex app-server` and MCP stdio spawn sites.
-        // Both rely on `kill_on_drop` alone today, which §6 says is not enough.
-        #[allow(dead_code)]
         pub fn record(&self, pid: u32, token: impl Into<String>) {
             let Ok(mut live) = self.live.lock() else {
                 return;
             };
+            live.retain(|entry| entry.pid != pid);
             live.push(Entry {
                 pid,
                 token: token.into(),
@@ -1049,7 +1095,6 @@ mod children {
         }
 
         /// Forget a child that exited normally.
-        #[allow(dead_code)]
         pub fn forget(&self, pid: u32) {
             let Ok(mut live) = self.live.lock() else {
                 return;
@@ -1082,14 +1127,28 @@ mod children {
         }
     }
 
+    impl aibo_core::traits::ChildProcessObserver for Registry {
+        fn spawned(&self, pid: u32, identity_token: &str) {
+            self.record(pid, identity_token);
+        }
+
+        fn exited(&self, pid: u32) {
+            self.forget(pid);
+        }
+    }
+
     fn parse_ledger(contents: &str) -> Vec<Entry> {
         contents
             .lines()
             .filter_map(|line| {
                 let (pid, token) = line.split_once('\t')?;
+                let token = token.trim();
+                if token.is_empty() {
+                    return None;
+                }
                 Some(Entry {
                     pid: pid.trim().parse().ok()?,
-                    token: token.trim().to_owned(),
+                    token: token.to_owned(),
                 })
             })
             .collect()
@@ -1103,6 +1162,9 @@ mod children {
     /// matters.
     #[cfg(unix)]
     pub fn process_matches(pid: u32, token: &str) -> bool {
+        if token.is_empty() {
+            return false;
+        }
         let Ok(output) = std::process::Command::new("/bin/ps")
             .args(["-o", "command=", "-p", &pid.to_string()])
             .output()
@@ -1122,6 +1184,9 @@ mod children {
     /// (`codex.exe`), not an argument.
     #[cfg(windows)]
     pub fn process_matches(pid: u32, token: &str) -> bool {
+        if token.is_empty() {
+            return false;
+        }
         let Ok(output) = std::process::Command::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
             .output()
@@ -1164,7 +1229,7 @@ mod children {
 
         #[test]
         fn ledger_round_trips_and_skips_rubbish() {
-            let parsed = parse_ledger("123\tcodex\n456\tmcp-server\nrubbish\n");
+            let parsed = parse_ledger("123\tcodex\n456\tmcp-server\n789\t   \nrubbish\n");
             assert_eq!(parsed.len(), 2);
             assert_eq!(parsed[0].pid, 123);
             assert_eq!(parsed[1].token, "mcp-server");
@@ -1173,6 +1238,7 @@ mod children {
         #[test]
         fn a_dead_pid_never_matches() {
             assert!(!process_matches(0, "aibo"));
+            assert!(!process_matches(std::process::id(), ""));
         }
 
         #[test]
@@ -1547,7 +1613,13 @@ mod bootstrap {
 
             let mut engine = aibo_session::Engine::new(registry, engine_config);
             if let Some(store) = self.session_store() {
-                engine = engine.with_store(store);
+                // Production rebuilds happen on the multi-thread runtime, but
+                // the store's settled-spend query is async. `block_in_place`
+                // moves this short construction wait off the worker so every
+                // rebuilt engine starts with the durable month total.
+                engine = tokio::task::block_in_place(|| {
+                    tokio::runtime::Handle::current().block_on(engine.with_store_loaded(store))
+                });
             }
             Arc::new(engine)
         }
@@ -1673,6 +1745,24 @@ mod bootstrap {
     mod tests {
         use super::*;
 
+        struct SpendStore;
+
+        #[async_trait::async_trait]
+        impl aibo_session::SessionStore for SpendStore {
+            async fn record(
+                &self,
+                _exchange: aibo_session::Exchange,
+            ) -> aibo_core::error::Result<Option<uuid::Uuid>> {
+                Ok(None)
+            }
+
+            async fn settled_spend_this_month(
+                &self,
+            ) -> aibo_core::error::Result<aibo_core::cost::Micros> {
+                Ok(42_000)
+            }
+        }
+
         /// The fresh-install path, and the one this test can assert without
         /// touching credential contents — which is exactly the property the
         /// early return exists to guarantee.
@@ -1690,6 +1780,29 @@ mod bootstrap {
             assert!(engine.providers().is_empty());
             assert!(!dir.join("aibo.db").exists(), "no database was created");
             let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn production_engine_build_seeds_settled_month_spend() {
+            let dir = std::env::temp_dir().join(format!(
+                "aibo-bootstrap-spend-test-{}",
+                uuid::Uuid::now_v7()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let paths = Paths::for_root(dir.clone());
+            std::fs::write(paths.config(), "").unwrap();
+            let boot = Bootstrap {
+                paths,
+                secrets: Arc::new(aibo_store::SecretStorage::owner_only_plaintext_files(
+                    dir.join("credentials"),
+                    aibo_store::secrets::OwnerOnlyPlaintext::acknowledge_risk(),
+                )),
+                store: Mutex::new(Some(Some(Arc::new(SpendStore)))),
+            };
+
+            let engine = boot.engine();
+            assert_eq!(engine.spend_snapshot().0, 42_000);
+            let _ = std::fs::remove_dir_all(dir);
         }
 
         /// Building a Codex token provider must stay free of I/O, because it
@@ -1831,9 +1944,24 @@ mod config_file {
         write_ui_key(path, "allow_ax_tree_activation", Some(&enabled.to_string()))
     }
 
-    /// Persist the panel hotkey override; `None` returns to the default.
-    pub fn write_ui_panel_hotkey(path: &Path, spec: Option<&str>) -> io::Result<()> {
-        write_ui_key(path, "panel_hotkey", spec.map(quote).as_deref())
+    /// Persist one configurable global hotkey override.
+    pub fn write_ui_hotkey(
+        path: &Path,
+        action: aibo_ui::hotkey::HotkeyAction,
+        spec: Option<&str>,
+    ) -> io::Result<()> {
+        let key = match action {
+            aibo_ui::hotkey::HotkeyAction::TogglePanel => "panel_hotkey",
+            aibo_ui::hotkey::HotkeyAction::CaptureScreenRegion => "screen_capture_hotkey",
+            aibo_ui::hotkey::HotkeyAction::ShowTasks => "show_tasks_hotkey",
+            aibo_ui::hotkey::HotkeyAction::RevertLastTransform => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "revert-last-transform is not configurable yet",
+                ));
+            }
+        };
+        write_ui_key(path, key, spec.map(quote).as_deref())
     }
 
     /// Persist the appearance preference (`dark`/`light`/`system`).
@@ -2106,9 +2234,12 @@ mod config_file {
 
     /// How `Config::build` addresses a provider entry: explicit id, else backend.
     fn provider_key(id: Option<&str>, backend: &str) -> String {
-        id.filter(|value| !value.trim().is_empty())
-            .unwrap_or(backend)
-            .to_owned()
+        if let Some(id) = id.filter(|value| !value.trim().is_empty()) {
+            return id.to_owned();
+        }
+        aibo_session::provider_id_for_backend(backend)
+            .map(|id| id.as_str().to_owned())
+            .unwrap_or_else(|| backend.to_owned())
     }
 
     /// A file split around its `[[providers]]` array: what came before, the
@@ -2163,13 +2294,37 @@ mod config_file {
         let value_of = |name: &str| {
             block.iter().find_map(|line| {
                 let (key, value) = line.split_once('=')?;
-                (key.trim() == name).then(|| value.trim().trim_matches('"').to_owned())
+                (key.trim() == name)
+                    .then(|| parse_toml_string(value.trim()))
+                    .flatten()
             })
         };
         let backend = value_of("backend").unwrap_or_default();
-        value_of("id")
-            .filter(|id| !id.is_empty())
-            .unwrap_or(backend)
+        provider_key(value_of("id").as_deref(), &backend)
+    }
+
+    /// One basic/literal TOML string at the start of `value`, ignoring a
+    /// trailing comment. Provider ids and backend tags are single-line by
+    /// schema, so multiline strings are deliberately outside this splice.
+    fn parse_toml_string(value: &str) -> Option<String> {
+        if let Some(rest) = value.strip_prefix('\'') {
+            return rest.find('\'').map(|end| rest[..end].to_owned());
+        }
+        let bytes = value.as_bytes();
+        if bytes.first() != Some(&b'"') {
+            return None;
+        }
+        let mut escaped = false;
+        for (index, byte) in bytes.iter().copied().enumerate().skip(1) {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == b'"' {
+                return serde_json::from_str(&value[..=index]).ok();
+            }
+        }
+        None
     }
 
     fn splice_provider(
@@ -2412,6 +2567,16 @@ enabled = true
         }
 
         #[test]
+        fn removal_uses_the_registrys_canonical_provider_id() {
+            let source = "[[providers]]\nbackend = \"open-ai\" # preferred endpoint\n\n[[providers]]\nbackend = \"groq\"\n";
+            let out = drop_provider(source, "openai");
+            let parsed = aibo_session::Config::from_toml_str(&out).expect("valid toml");
+            assert_eq!(parsed.providers.len(), 1);
+            assert!(out.contains("backend = \"groq\""));
+            assert!(!out.contains("open-ai"));
+        }
+
+        #[test]
         fn a_missing_table_is_appended() {
             let out = splice_table(
                 "[[providers]]\nbackend = \"groq\"\n",
@@ -2520,6 +2685,37 @@ degrade_after = 4
             assert_eq!(config.ui.language.as_deref(), Some("ja"));
             assert_eq!(config.providers.len(), 1);
             assert!(!config.codex.enabled);
+            let _ = std::fs::remove_dir_all(dir);
+        }
+
+        #[test]
+        fn each_configurable_hotkey_writes_its_own_ui_key() {
+            use aibo_ui::hotkey::HotkeyAction;
+
+            let dir = std::env::temp_dir()
+                .join(format!("aibo-config-hotkey-test-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let path = dir.join("config.toml");
+
+            write_ui_hotkey(&path, HotkeyAction::TogglePanel, Some("alt+Space")).unwrap();
+            write_ui_hotkey(
+                &path,
+                HotkeyAction::CaptureScreenRegion,
+                Some("alt+shift+Space"),
+            )
+            .unwrap();
+            write_ui_hotkey(&path, HotkeyAction::ShowTasks, Some("control+alt+KeyT")).unwrap();
+
+            let config = aibo_session::Config::load(&path).unwrap();
+            assert_eq!(config.ui.panel_hotkey.as_deref(), Some("alt+Space"));
+            assert_eq!(
+                config.ui.screen_capture_hotkey.as_deref(),
+                Some("alt+shift+Space")
+            );
+            assert_eq!(
+                config.ui.show_tasks_hotkey.as_deref(),
+                Some("control+alt+KeyT")
+            );
             let _ = std::fs::remove_dir_all(dir);
         }
     }
@@ -2844,6 +3040,7 @@ mod runtime {
         AgentEvent, AgentSink, Capture, Config, Engine, EventSink, Outcome, SessionEvent,
         Submission,
     };
+    use aibo_ui::bridge::PersistenceScope;
     use aibo_ui::settings::CodexPhase;
     use aibo_ui::{Lang, ModelOption, SessionId, UiEvent, UiRequest};
     use futures::StreamExt as _;
@@ -2893,6 +3090,9 @@ mod runtime {
         target: Option<InsertTarget>,
         /// The captured selection.
         selection: Option<String>,
+        /// A file deliberately chosen through the `@` finder. Kept separate
+        /// so a late ambient capture cannot overwrite an explicit gesture.
+        attached_file: Option<String>,
         /// The captured field.
         field: Option<FieldContext>,
         /// The captured clipboard, for §5's priority-4 attachment.
@@ -2900,6 +3100,8 @@ mod runtime {
         /// The last submission, so `Retry` can re-run it at another role
         /// without asking the user to retype (§13's "Retry with Smart").
         last: Option<LastSubmission>,
+        /// Stable across follow-ups and retries within this panel invocation.
+        conversation_id: Option<uuid::Uuid>,
     }
 
     impl Drop for Session {
@@ -2910,6 +3112,9 @@ mod runtime {
             }
             if let Some(selection) = &mut self.selection {
                 selection.zeroize();
+            }
+            if let Some(content) = &mut self.attached_file {
+                content.zeroize();
             }
             if let Some(field) = &mut self.field {
                 field.prefix.zeroize();
@@ -3042,7 +3247,7 @@ mod runtime {
     /// Everything collected from another application remains tainted, and
     /// concealed clipboard data and secure fields are excluded even if a
     /// platform backend violates the stronger capture-time invariant.
-    fn captured_agent_context(session: &Session) -> Vec<UntrustedBlock> {
+    fn captured_agent_context(session: &Session, include_selection: bool) -> Vec<UntrustedBlock> {
         let app_name = session
             .app
             .as_ref()
@@ -3050,9 +3255,15 @@ mod runtime {
             .filter(|name| !name.is_empty());
         let mut context = Vec::with_capacity(4);
 
-        if let Some(selection) = session
-            .selection
-            .as_deref()
+        if let Some(selection) = include_selection
+            .then(|| {
+                session
+                    .attached_file
+                    .as_ref()
+                    .or(session.selection.as_ref())
+            })
+            .flatten()
+            .map(String::as_str)
             .filter(|selection| !selection.is_empty())
         {
             context.push(UntrustedBlock {
@@ -3149,7 +3360,16 @@ mod runtime {
         /// for a probe.
         Woke,
         /// A step of the Codex device-code login (§3a).
-        CodexAuth(codex_signin::Event),
+        CodexAuth {
+            generation: u64,
+            event: codex_signin::Event,
+        },
+        /// A bounded file read completed for one panel invocation.
+        FileRead {
+            session: SessionId,
+            name: String,
+            content: Option<String>,
+        },
         /// Explicit encrypted-history setup finished off the runtime workers.
         HistoryInitialized(aibo_store::Result<Option<secrecy::SecretString>>),
         /// A `Provider::models()` sweep finished (§10).
@@ -3157,7 +3377,10 @@ mod runtime {
         /// Boxed for the same reason as `Captured`: a catalogue of several
         /// hundred OpenRouter entries must not set the size of every message on
         /// this channel.
-        CatalogueRefreshed(Box<aibo_provider::ModelCatalogue>),
+        CatalogueRefreshed {
+            generation: u64,
+            catalogue: Box<aibo_provider::ModelCatalogue>,
+        },
     }
 
     /// What the backend remembers about the Codex login (§3a).
@@ -3167,9 +3390,15 @@ mod runtime {
     /// that has never been opened has said nothing at all.
     struct CodexAuth {
         phase: CodexPhase,
+        /// Invalidates terminal/progress events from cancelled older flows.
+        generation: u64,
         /// Set only while a login is running; dropping it is how the one
         /// button's "cancel" meaning is implemented.
         cancel: Option<CancellationToken>,
+        /// Credential deletion is asynchronous. A new login must not start
+        /// until it finishes, or the old sign-out task can delete the newly
+        /// written token pair from the same storage key.
+        signout_in_progress: bool,
     }
 
     impl CodexAuth {
@@ -3185,7 +3414,9 @@ mod runtime {
                 } else {
                     CodexPhase::SignedOut
                 },
+                generation: 0,
                 cancel: None,
+                signout_in_progress: false,
             }
         }
     }
@@ -3212,30 +3443,6 @@ mod runtime {
         else {
             unreachable!("codex_model_options_event returns ModelOptions");
         };
-
-        for entry in catalogue.entries() {
-            // Codex is already represented, with latency the catalogue lacks.
-            // A retired id is offered to nobody.
-            if entry.provider == ProviderId::CODEX || entry.deprecated {
-                continue;
-            }
-            let binding = ModelBinding {
-                provider: entry.provider.clone(),
-                model: entry.id.clone(),
-            };
-            if options.iter().any(|option| option.binding == binding) {
-                continue;
-            }
-            let (abilities, cost) = model_facts(catalogue, prices, &binding);
-            options.push(ModelOption {
-                binding,
-                display_name: entry.display_name.clone(),
-                latency_ms: None,
-                released_at: entry.released_at,
-                abilities,
-                cost,
-            });
-        }
 
         // Codex rows come from `CODEX_MODELS` for their measured latency, so
         // their abilities and cost are filled here rather than at construction.
@@ -3333,20 +3540,23 @@ mod runtime {
         }
         UiEvent::ModelOptions {
             options,
-            selected: Some(selected),
+            // A configured model is not an active selection while its provider
+            // is disabled. The actual dispatched binding supersedes this in
+            // the UI as soon as a request routes or falls back.
+            selected: config.codex.enabled.then_some(selected),
         }
     }
 
     /// Whether a selection the UI sent is one the runtime actually offered.
     ///
     /// The guard exists to reject an *injected* binding, not to narrow the
-    /// picker. It used to require `provider == CODEX`, which was correct only
-    /// while Codex was the sole provider — offering a model and then silently
-    /// refusing it is the "advertised and inert" defect §17 treats as worse than
-    /// an absent control.
+    /// picker. The current persistence schema exposes one selected-model slot,
+    /// `[codex].model`; until role bindings are editable, advertising another
+    /// provider here would create a control that writes its model id into the
+    /// Codex slot and never activates the provider the user selected.
     fn model_selection_allowed(
         config: &Config,
-        catalogue: &aibo_provider::ModelCatalogue,
+        _catalogue: &aibo_provider::ModelCatalogue,
         binding: &ModelBinding,
     ) -> bool {
         if binding.provider == ProviderId::CODEX {
@@ -3355,10 +3565,7 @@ mod runtime {
             return aibo_provider::registry::is_codex_model_allowed(&binding.model)
                 || binding.model == config.codex.model;
         }
-        catalogue
-            .entries()
-            .iter()
-            .any(|entry| entry.provider == binding.provider && entry.id == binding.model)
+        false
     }
 
     /// The deadline-bounded half of §8's capture, once it has landed.
@@ -3461,11 +3668,12 @@ mod runtime {
         /// and `model_selection_allowed`. When they disagreed, the picker offered
         /// models the guard then refused.
         catalogue: aibo_provider::ModelCatalogue,
-        /// TODO(P1): hand to the agent and MCP spawn sites (§6).
-        #[allow(dead_code)]
+        /// Last-started catalogue refresh. Only its result may publish.
+        catalogue_generation: u64,
+        /// Crash-recovery ledger shared by every subprocess spawn site.
         children: ChildRegistry,
         /// The one live dictation turn, if any (§P9+). Dropping it commits.
-        dictation: Option<crate::stt::DictationHandle>,
+        dictation: Option<(u64, crate::stt::DictationHandle)>,
         /// The `@` finder's roots as currently configured — the live copy
         /// settings edits, so a change applies to the very next walk.
         file_roots: Option<Vec<String>>,
@@ -3575,8 +3783,8 @@ mod runtime {
                     })
                     .collect()
             });
-            let onboarding_required = config.providers.is_empty() && !config.codex.enabled;
             let engine = bootstrap.engine();
+            let onboarding_required = engine.providers().ids().is_empty();
             let startup_history_ready = bootstrap.history_ready();
             Self {
                 platform: platform_backend(&config),
@@ -3595,6 +3803,7 @@ mod runtime {
                 internal: None,
                 // Shipped entries only until the first refresh answers.
                 catalogue: aibo_provider::ModelCatalogue::shipped(),
+                catalogue_generation: 0,
                 dictation: None,
                 file_roots: config.files.roots.clone(),
                 stt_backend: config.stt.backend.clone(),
@@ -3619,10 +3828,16 @@ mod runtime {
 
             // The first thing the UI should know is which providers exist and
             // what aibo currently believes about them.
-            for (provider, health) in self.engine.health().snapshot() {
-                if provider == ProviderId::CODEX {
-                    continue; // Owned by the sign-in state machine below.
-                }
+            //
+            // Sourced from the **registry**, not the health table: the table
+            // only gains an entry once a provider has answered or failed
+            // something, so a freshly configured provider was invisible in
+            // settings until it had been used — which is precisely when a
+            // user goes looking to check they configured it right (owner
+            // report, 2026-08-04: "I don't see which providers is currently
+            // set up"). `Health::Unknown` is the honest starting value.
+            for provider in self.configured_provider_ids() {
+                let health = self.engine.health().health(&provider);
                 if self
                     .events
                     .send(UiEvent::ProviderHealth { provider, health })
@@ -3795,7 +4010,23 @@ mod runtime {
         fn emit(&self, event: UiEvent) {
             // The UI having hung up is not an error: it means the daemon exited
             // and this loop is about to notice.
-            let _ = self.events.try_send(event);
+            match self.events.try_send(event) {
+                Ok(()) | Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {}
+                Err(tokio::sync::mpsc::error::TrySendError::Full(event)) => {
+                    let events = self.events.clone();
+                    tokio::spawn(async move {
+                        let _ = events.send(event).await;
+                    });
+                }
+            }
+        }
+
+        fn persistence_result(&self, scope: PersistenceScope, generation: u64, succeeded: bool) {
+            self.emit(UiEvent::PersistenceResult {
+                scope,
+                generation,
+                succeeded,
+            });
         }
 
         async fn handle(&mut self, request: UiRequest, internal: &Sender<Internal>) {
@@ -3814,7 +4045,14 @@ mod runtime {
                 // OpenAI key; "chatgpt" records the turn and uploads it to the
                 // ChatGPT plan's transcription endpoint with the Codex tokens;
                 // auto prefers the key and falls back to the plan.
-                UiRequest::StartDictation => {
+                UiRequest::StartDictation { turn } => {
+                    if self
+                        .dictation
+                        .as_ref()
+                        .is_some_and(|(_, handle)| handle.is_finished())
+                    {
+                        self.dictation = None;
+                    }
                     if self.dictation.is_none() {
                         let choice = self.stt_backend.as_deref().unwrap_or("auto");
                         let openai_key = self.bootstrap.api_key(&ProviderId::OPENAI);
@@ -3824,30 +4062,39 @@ mod runtime {
                         };
                         self.dictation = match choice {
                             "chatgpt" => chatgpt_tokens().map(|tokens| {
-                                crate::stt::start_chatgpt(tokens, self.events.clone())
+                                crate::stt::start_chatgpt(tokens, self.events.clone(), turn)
                             }),
-                            "openai" => {
-                                openai_key.map(|key| crate::stt::start(key, self.events.clone()))
-                            }
-                            "azure" => self
-                                .azure_stt()
-                                .map(|azure| crate::stt::start_azure(azure, self.events.clone())),
+                            "openai" => openai_key
+                                .map(|key| crate::stt::start(key, self.events.clone(), turn)),
+                            "azure" => self.azure_stt().map(|azure| {
+                                crate::stt::start_azure(azure, self.events.clone(), turn)
+                            }),
                             _ => match openai_key {
-                                Some(key) => Some(crate::stt::start(key, self.events.clone())),
+                                Some(key) => {
+                                    Some(crate::stt::start(key, self.events.clone(), turn))
+                                }
                                 None => chatgpt_tokens().map(|tokens| {
-                                    crate::stt::start_chatgpt(tokens, self.events.clone())
+                                    crate::stt::start_chatgpt(tokens, self.events.clone(), turn)
                                 }),
                             },
-                        };
+                        }
+                        .map(|handle| (turn, handle));
                         if self.dictation.is_none() {
                             self.emit(UiEvent::DictationFailed {
+                                turn,
                                 failure: aibo_ui::DictationFailure::NoOpenAiKey,
                             });
                         }
+                    } else {
+                        // Do not overlap microphone workers. Reset the new UI
+                        // turn so another press can retry after the drain.
+                        self.emit(UiEvent::DictationEnded { turn });
                     }
                 }
-                UiRequest::StopDictation => {
-                    if let Some(dictation) = self.dictation.take() {
+                UiRequest::StopDictation { turn } => {
+                    if let Some((active_turn, dictation)) = &self.dictation
+                        && *active_turn == turn
+                    {
                         dictation.finish();
                     }
                 }
@@ -3898,27 +4145,44 @@ mod runtime {
                     }
                 }
 
-                UiRequest::SetLanguage(language) => {
-                    if let Err(error) = crate::config_file::write_ui_language(
+                UiRequest::SetLanguage {
+                    generation,
+                    language,
+                } => {
+                    let result = crate::config_file::write_ui_language(
                         &self.bootstrap.paths().config(),
                         language.tag(),
-                    ) {
+                    );
+                    if let Err(error) = &result {
                         tracing::warn!(%error, "could not persist UI language");
                     }
+                    self.persistence_result(PersistenceScope::Language, generation, result.is_ok());
                 }
 
-                UiRequest::SetAppearance(preference) => {
-                    if let Err(error) = crate::config_file::write_ui_appearance(
+                UiRequest::SetAppearance {
+                    generation,
+                    preference,
+                } => {
+                    let result = crate::config_file::write_ui_appearance(
                         &self.bootstrap.paths().config(),
                         preference.tag(),
-                    ) {
+                    );
+                    if let Err(error) = &result {
                         tracing::warn!(%error, "could not persist the appearance preference");
                     }
+                    self.persistence_result(
+                        PersistenceScope::Appearance,
+                        generation,
+                        result.is_ok(),
+                    );
                 }
 
                 // §P9+ @ file mentions. The walk and the read are blocking
                 // filesystem work and stay off the async workers.
-                UiRequest::ListFiles => {
+                UiRequest::ListFiles {
+                    session,
+                    generation,
+                } => {
                     let roots = crate::files::roots(self.file_roots.as_deref());
                     let events = self.events.clone();
                     tokio::spawn(crate::diagnostics::supervise("file-walk", async move {
@@ -3929,27 +4193,52 @@ mod runtime {
                             // "the finder can't see my file": an absent file
                             // and a starved walk look identical in the UI.
                             tracing::info!(count = files.len(), "file walk complete");
-                            let _ = events.send(UiEvent::FileCandidates { files }).await;
+                            let _ = events
+                                .send(UiEvent::FileCandidates {
+                                    session,
+                                    generation,
+                                    files,
+                                })
+                                .await;
                         }
                     }));
                 }
-                UiRequest::SetSttEndOnSend { enabled } => {
-                    if let Err(error) = crate::config_file::write_stt_end_on_send(
+                UiRequest::SetSttEndOnSend {
+                    generation,
+                    enabled,
+                } => {
+                    let result = crate::config_file::write_stt_end_on_send(
                         &self.bootstrap.paths().config(),
                         enabled,
-                    ) {
+                    );
+                    if let Err(error) = &result {
                         tracing::warn!(%error, "could not persist the dictation end-on-send choice");
                     }
+                    self.persistence_result(
+                        PersistenceScope::SttEndOnSend,
+                        generation,
+                        result.is_ok(),
+                    );
                 }
 
-                UiRequest::SetSttBackend { backend } => {
-                    if let Err(error) = crate::config_file::write_stt_backend(
+                UiRequest::SetSttBackend {
+                    generation,
+                    backend,
+                } => {
+                    let result = crate::config_file::write_stt_backend(
                         &self.bootstrap.paths().config(),
                         backend.as_deref(),
-                    ) {
+                    );
+                    if let Err(error) = &result {
                         tracing::warn!(%error, "could not persist the STT backend");
+                    } else {
+                        self.stt_backend = backend;
                     }
-                    self.stt_backend = backend;
+                    self.persistence_result(
+                        PersistenceScope::SttBackend,
+                        generation,
+                        result.is_ok(),
+                    );
                 }
 
                 UiRequest::ListSkills => {
@@ -3970,7 +4259,7 @@ mod runtime {
                     }));
                 }
 
-                UiRequest::ListWorkdirs => {
+                UiRequest::ListWorkdirs { generation } => {
                     let roots = crate::files::roots(self.file_roots.as_deref());
                     let state_file = self.bootstrap.paths().recent_workdirs();
                     let events = self.events.clone();
@@ -3984,92 +4273,152 @@ mod runtime {
                         .await;
                         if let Ok((recents, dirs)) = listed {
                             let _ = events
-                                .send(UiEvent::WorkdirCandidates { recents, dirs })
+                                .send(UiEvent::WorkdirCandidates {
+                                    generation,
+                                    recents,
+                                    dirs,
+                                })
                                 .await;
                         }
                     }));
                 }
 
-                UiRequest::AttachFile { path } => {
-                    let events = self.events.clone();
+                UiRequest::AttachFile { session, path } => {
+                    let internal = internal.clone();
                     tokio::spawn(crate::diagnostics::supervise("file-attach", async move {
-                        if let Ok(event) = tokio::task::spawn_blocking(move || {
-                            crate::files::attach_event(std::path::Path::new(&path))
+                        let name = std::path::Path::new(&path)
+                            .file_name()
+                            .map(|name| name.to_string_lossy().into_owned())
+                            .unwrap_or_else(|| path.clone());
+                        if let Ok(content) = tokio::task::spawn_blocking(move || {
+                            crate::files::read_bounded(std::path::Path::new(&path)).ok()
                         })
                         .await
                         {
-                            let _ = events.send(event).await;
+                            let _ = internal
+                                .send(Internal::FileRead {
+                                    session,
+                                    name,
+                                    content,
+                                })
+                                .await;
                         }
                     }));
                 }
 
-                UiRequest::SetPinnedModels { pins } => {
+                UiRequest::SetPinnedModels { generation, pins } => {
                     let models: Vec<String> = pins
                         .iter()
                         .map(|binding| format!("{}/{}", binding.provider.as_str(), binding.model))
                         .collect();
-                    if let Err(error) = crate::config_file::write_pinned_models(
+                    let result = crate::config_file::write_pinned_models(
                         &self.bootstrap.paths().config(),
                         &models,
-                    ) {
+                    );
+                    if let Err(error) = &result {
                         tracing::warn!(%error, "could not persist the pinned models");
                     }
+                    self.persistence_result(
+                        PersistenceScope::PinnedModels,
+                        generation,
+                        result.is_ok(),
+                    );
                 }
 
-                UiRequest::SetPanelHotkey { spec } => {
-                    if let Err(error) = crate::config_file::write_ui_panel_hotkey(
+                UiRequest::SetHotkey {
+                    generation,
+                    action,
+                    spec,
+                } => {
+                    let result = crate::config_file::write_ui_hotkey(
                         &self.bootstrap.paths().config(),
+                        action,
                         spec.as_deref(),
-                    ) {
-                        tracing::warn!(%error, "could not persist the panel hotkey");
+                    );
+                    if let Err(error) = &result {
+                        tracing::warn!(?action, %error, "could not persist the global hotkey");
                     }
+                    self.persistence_result(
+                        PersistenceScope::Hotkey(action),
+                        generation,
+                        result.is_ok(),
+                    );
                 }
 
-                UiRequest::SetAxTreeActivation { enabled } => {
+                UiRequest::SetAxTreeActivation {
+                    generation,
+                    enabled,
+                } => {
                     // Persist only: the flag is baked into the platform worker
                     // at construction and the settings row says it applies at
                     // the next start.
-                    if let Err(error) = crate::config_file::write_ui_ax_activation(
+                    let result = crate::config_file::write_ui_ax_activation(
                         &self.bootstrap.paths().config(),
                         enabled,
-                    ) {
+                    );
+                    if let Err(error) = &result {
                         tracing::warn!(%error, "could not persist the AX activation opt-in");
                     }
+                    self.persistence_result(
+                        PersistenceScope::AxTreeActivation,
+                        generation,
+                        result.is_ok(),
+                    );
                 }
 
-                UiRequest::SetFileRoots { roots } => {
-                    if let Err(error) = crate::config_file::write_files_roots(
+                UiRequest::SetFileRoots { generation, roots } => {
+                    let result = crate::config_file::write_files_roots(
                         &self.bootstrap.paths().config(),
                         roots.as_deref(),
-                    ) {
+                    );
+                    if let Err(error) = &result {
                         tracing::warn!(%error, "could not persist the finder roots");
+                    } else {
+                        // The live copy: the next `ListFiles` walks the new set.
+                        self.file_roots = roots;
                     }
-                    // The live copy: the next `ListFiles` walks the new set.
-                    self.file_roots = roots;
+                    self.persistence_result(
+                        PersistenceScope::FileRoots,
+                        generation,
+                        result.is_ok(),
+                    );
                 }
 
                 UiRequest::SetMonthlyBudget {
+                    generation,
                     limit_micros,
                     warn_at_percent,
                     hard_stop,
                 } => {
                     let budget = limit_micros.map(|limit| (limit, warn_at_percent, hard_stop));
-                    if let Err(error) =
-                        crate::config_file::write_budget(&self.bootstrap.paths().config(), budget)
-                    {
+                    let result =
+                        crate::config_file::write_budget(&self.bootstrap.paths().config(), budget);
+                    if let Err(error) = &result {
                         tracing::warn!(%error, "could not persist the monthly budget");
+                    } else {
+                        // Enforcement reads the meter, so the next request sees it.
+                        self.engine.set_monthly_budget(limit_micros.map(|limit| {
+                            aibo_core::cost::MonthlyBudget {
+                                limit_micros: limit,
+                                warn_at_percent,
+                                hard_stop,
+                            }
+                        }));
                     }
-                    // Enforcement reads the meter, so the next request sees it.
-                    self.engine.set_monthly_budget(limit_micros.map(|limit| {
-                        aibo_core::cost::MonthlyBudget {
-                            limit_micros: limit,
-                            warn_at_percent,
-                            hard_stop,
-                        }
-                    }));
+                    self.persistence_result(
+                        PersistenceScope::MonthlyBudget,
+                        generation,
+                        result.is_ok(),
+                    );
                 }
 
-                UiRequest::SetModel { binding } => self.set_model(binding),
+                UiRequest::SetModel {
+                    generation,
+                    binding,
+                } => {
+                    let succeeded = self.set_model(binding);
+                    self.persistence_result(PersistenceScope::Model, generation, succeeded);
+                }
 
                 UiRequest::Approve {
                     task,
@@ -4157,23 +4506,26 @@ mod runtime {
                 }
 
                 UiRequest::SetProviderKey {
+                    generation,
                     backend,
                     id,
                     base_url,
                     models,
                     key,
                 } => {
-                    self.set_provider_key(
+                    let succeeded = self.set_provider_key(
                         &backend,
                         id.as_deref(),
                         base_url.as_deref(),
                         &models,
                         &key,
                     );
+                    self.persistence_result(PersistenceScope::Provider, generation, succeeded);
                 }
 
-                UiRequest::RemoveProvider { id } => {
-                    self.remove_provider(&id);
+                UiRequest::RemoveProvider { generation, id } => {
+                    let succeeded = self.remove_provider(&id);
+                    self.persistence_result(PersistenceScope::Provider, generation, succeeded);
                 }
 
                 UiRequest::OpenUrl { url } => {
@@ -4233,7 +4585,20 @@ mod runtime {
         async fn handle_internal(&mut self, message: Internal) {
             match message {
                 Internal::Captured(captured) => {
-                    if !apply_captured(self.active_session, &mut self.sessions, *captured) {
+                    let ui = UiEvent::Context {
+                        session: captured.session,
+                        app: captured.app.clone(),
+                        field: captured.field.clone().map(Box::new),
+                        selection: captured.selection.clone(),
+                        clipboard: captured.clipboard.clone().map(Box::new),
+                    };
+                    if apply_captured(self.active_session, &mut self.sessions, *captured) {
+                        // Publish only after the backend session contains the
+                        // exact context shown by the UI.  Sending these over
+                        // two independent channels from the capture task let a
+                        // fast submit overtake the internal state update.
+                        self.emit(ui);
+                    } else {
                         tracing::debug!("discarded context captured for a stale panel session");
                     }
                 }
@@ -4247,9 +4612,47 @@ mod runtime {
                     self.engine.health().probe_all_now();
                 }
 
-                Internal::CodexAuth(event) => self.handle_codex_auth(event),
-                Internal::CatalogueRefreshed(catalogue) => {
+                Internal::CodexAuth { generation, event } => {
+                    if generation == self.codex.generation {
+                        self.handle_codex_auth(event);
+                    } else {
+                        tracing::debug!(generation, "dropped a stale Codex auth event");
+                    }
+                }
+                Internal::FileRead {
+                    session,
+                    name,
+                    content,
+                } => {
+                    if self.active_session != Some(session) {
+                        tracing::debug!(%session, "discarded a file read for a stale session");
+                        return;
+                    }
+                    match content {
+                        Some(content) => {
+                            if let Some(state) = self.sessions.get_mut(&session) {
+                                state.attached_file = Some(content.clone());
+                            }
+                            self.emit(UiEvent::FileAttached {
+                                session,
+                                name,
+                                content,
+                            });
+                        }
+                        None => self.emit(UiEvent::FileAttachFailed { session, name }),
+                    }
+                }
+                Internal::CatalogueRefreshed {
+                    generation,
+                    catalogue,
+                } => {
+                    if generation != self.catalogue_generation {
+                        tracing::debug!(generation, "dropped a stale model catalogue refresh");
+                        return;
+                    }
                     let before = self.catalogue.entries().len();
+                    self.engine
+                        .replace_model_catalogue(catalogue.capabilities_by_binding());
                     self.catalogue = *catalogue;
                     tracing::info!(
                         models = self.catalogue.entries().len(),
@@ -4404,11 +4807,11 @@ mod runtime {
         /// already-configured future id emitted by [`Self::model_options_event`]
         /// while rejecting arbitrary provider/model pairs injected across the
         /// UI bridge.
-        fn set_model(&mut self, binding: ModelBinding) {
+        fn set_model(&mut self, binding: ModelBinding) -> bool {
             let config = self.bootstrap.config();
             if !model_selection_allowed(&config, &self.catalogue, &binding) {
                 tracing::warn!("refused a model selection outside the offered catalogue");
-                return;
+                return false;
             }
 
             let path = self.bootstrap.paths().config();
@@ -4419,9 +4822,10 @@ mod runtime {
                 config.codex.client_id.as_deref(),
             ) {
                 tracing::warn!(%error, "could not persist the selected model");
-                return;
+                return false;
             }
             self.rebuild_engine();
+            true
         }
 
         /// The Providers tab's one Codex action.
@@ -4430,6 +4834,12 @@ mod runtime {
         /// is derived from the same phase, so what the user reads is always
         /// what pressing it does.
         fn codex_sign_in_pressed(&mut self, internal: Sender<Internal>) {
+            if self.codex.signout_in_progress {
+                self.publish_codex_detail(
+                    "Finishing sign-out before another sign-in can start.".to_owned(),
+                );
+                return;
+            }
             match codex_button_action(self.codex.phase) {
                 CodexAction::Cancel => self.codex_cancel(),
                 CodexAction::SignOut => self.codex_sign_out(internal),
@@ -4441,11 +4851,15 @@ mod runtime {
             if let Some(cancel) = self.codex.cancel.take() {
                 cancel.cancel();
             }
+            self.codex.generation = self.codex.generation.wrapping_add(1);
             self.codex.phase = CodexPhase::SignedOut;
             self.publish_codex_phase();
         }
 
         fn codex_start(&mut self, internal: Sender<Internal>) {
+            if self.codex.signout_in_progress {
+                return;
+            }
             let config = self.bootstrap.config();
             let Some(tokens) = self.bootstrap.codex_tokens(&config) else {
                 self.codex.phase = CodexPhase::Failed;
@@ -4458,6 +4872,8 @@ mod runtime {
             };
 
             let cancel = CancellationToken::new();
+            self.codex.generation = self.codex.generation.wrapping_add(1);
+            let generation = self.codex.generation;
             self.codex.cancel = Some(cancel.clone());
             self.codex.phase = CodexPhase::Starting;
             self.publish_codex_phase();
@@ -4481,7 +4897,9 @@ mod runtime {
                         // at whether the flow has finished.
                         biased;
                         Some(event) = rx.recv() => {
-                            let _ = internal.send(Internal::CodexAuth(event)).await;
+                            let _ = internal
+                                .send(Internal::CodexAuth { generation, event })
+                                .await;
                         }
                         outcome = &mut flow => break outcome,
                     }
@@ -4493,13 +4911,22 @@ mod runtime {
                 // `run` sent is already queued — the sends are synchronous —
                 // so draining what is present is exactly right.
                 while let Ok(event) = rx.try_recv() {
-                    let _ = internal.send(Internal::CodexAuth(event)).await;
+                    let _ = internal
+                        .send(Internal::CodexAuth { generation, event })
+                        .await;
                 }
-                let _ = internal.send(Internal::CodexAuth(outcome)).await;
+                let _ = internal
+                    .send(Internal::CodexAuth {
+                        generation,
+                        event: outcome,
+                    })
+                    .await;
             }));
         }
 
         fn codex_sign_out(&mut self, internal: Sender<Internal>) {
+            self.codex.generation = self.codex.generation.wrapping_add(1);
+            let generation = self.codex.generation;
             let config = self.bootstrap.config();
             let tokens = self.bootstrap.codex_tokens(&config);
             let path = self.bootstrap.paths().config();
@@ -4516,9 +4943,13 @@ mod runtime {
                 config.codex.client_id.as_deref(),
             ) {
                 tracing::error!(%error, "could not record the Codex sign-out in the config");
+                self.codex.phase = CodexPhase::Failed;
+                self.publish_codex_detail("Could not save the sign-out. Try again.".to_owned());
+                return;
             }
 
             self.codex.phase = CodexPhase::SignedOut;
+            self.codex.signout_in_progress = tokens.is_some();
             self.publish_codex_phase();
             self.rebuild_engine();
 
@@ -4532,10 +4963,13 @@ mod runtime {
                     Err(error) => tracing::error!(%error, "could not clear the Codex tokens"),
                 }
                 let _ = internal
-                    .send(Internal::CodexAuth(codex_signin::Event::Progress {
-                        phase: CodexPhase::SignedOut,
-                        detail: default_codex_detail(CodexPhase::SignedOut),
-                    }))
+                    .send(Internal::CodexAuth {
+                        generation,
+                        event: codex_signin::Event::Progress {
+                            phase: CodexPhase::SignedOut,
+                            detail: default_codex_detail(CodexPhase::SignedOut),
+                        },
+                    })
                     .await;
             }));
         }
@@ -4550,6 +4984,9 @@ mod runtime {
                         return;
                     }
                     self.codex.phase = phase;
+                    if phase == CodexPhase::SignedOut {
+                        self.codex.signout_in_progress = false;
+                    }
                     self.publish_codex_detail(detail);
                 }
 
@@ -4624,7 +5061,7 @@ mod runtime {
             base_url: Option<&str>,
             models: &[String],
             key: &secrecy::SecretString,
-        ) {
+        ) -> bool {
             use secrecy::ExposeSecret as _;
 
             // The id the *registry* will address this provider by, which is not
@@ -4646,11 +5083,17 @@ mod runtime {
             let addressed_as = addressed_as.as_str();
 
             if key.expose_secret().trim().is_empty() {
-                self.remove_provider(addressed_as);
-                return;
+                return self.remove_provider(addressed_as);
             }
 
             let account = aibo_store::secrets::provider_account(addressed_as);
+            let previous = match self.bootstrap.secrets().get(&account) {
+                Ok(previous) => previous,
+                Err(error) => {
+                    tracing::error!(provider = %addressed_as, %error, "could not read the existing credential");
+                    return false;
+                }
+            };
             if let Err(error) = self.bootstrap.secrets().set(&account, key.expose_secret()) {
                 // Never log the key, and never log anything derived from it.
                 // Never log the key itself, nor anything derived from it.
@@ -4658,7 +5101,7 @@ mod runtime {
                 // as configured — the settings row staying empty is the
                 // user-visible signal that this failed.
                 tracing::error!(provider = %addressed_as, %error, "could not store the credential");
-                return;
+                return false;
             }
 
             if let Err(error) = crate::config_file::upsert_provider(
@@ -4669,13 +5112,25 @@ mod runtime {
                 models,
             ) {
                 tracing::error!(provider = %addressed_as, %error, "could not write config.toml");
-                return;
+                let rollback = match previous {
+                    Some(previous) => self.bootstrap.secrets().set(&account, &previous),
+                    None => self.bootstrap.secrets().delete(&account),
+                };
+                if let Err(rollback_error) = rollback {
+                    tracing::error!(
+                        provider = %addressed_as,
+                        %rollback_error,
+                        "could not roll back the credential after a config write failure"
+                    );
+                }
+                return false;
             }
 
             tracing::info!(provider = %addressed_as, "provider configured from settings");
             // `rebuild_engine` republishes health for every provider in the new
             // registry, which is what makes the new row appear.
             self.rebuild_engine();
+            true
         }
 
         /// Forget a provider entirely: credential first, then the config entry.
@@ -4685,8 +5140,15 @@ mod runtime {
         /// the loader already handles, whereas a key without a config entry is
         /// an orphaned secret sitting on disk for a provider nothing will ever
         /// construct.
-        fn remove_provider(&mut self, id: &str) {
+        fn remove_provider(&mut self, id: &str) -> bool {
             let account = aibo_store::secrets::provider_account(id);
+            let previous = match self.bootstrap.secrets().get(&account) {
+                Ok(previous) => previous,
+                Err(error) => {
+                    tracing::error!(provider = %id, %error, "could not read the credential before removal");
+                    return false;
+                }
+            };
             if let Err(error) = self.bootstrap.secrets().delete(&account) {
                 tracing::warn!(provider = %id, %error, "could not delete the credential");
             }
@@ -4694,7 +5156,16 @@ mod runtime {
                 crate::config_file::remove_provider(&self.bootstrap.paths().config(), id)
             {
                 tracing::error!(provider = %id, %error, "could not write config.toml");
-                return;
+                if let Some(previous) = previous
+                    && let Err(rollback_error) = self.bootstrap.secrets().set(&account, &previous)
+                {
+                    tracing::error!(
+                        provider = %id,
+                        %rollback_error,
+                        "could not restore the credential after a config write failure"
+                    );
+                }
+                return false;
             }
             tracing::info!(provider = %id, "provider removed from settings");
             // Health events only ever *add* a row, so a rebuild alone would
@@ -4704,6 +5175,7 @@ mod runtime {
                 provider: ProviderId::new(id),
             });
             self.rebuild_engine();
+            true
         }
 
         /// Rebuild the engine so a provider set change takes effect at once.
@@ -4719,13 +5191,26 @@ mod runtime {
                 providers = ?self.engine.providers().ids(),
                 "engine rebuilt after a provider change"
             );
-            for (provider, health) in self.engine.health().snapshot() {
-                if provider != ProviderId::CODEX {
-                    self.emit(UiEvent::ProviderHealth { provider, health });
-                }
+            for provider in self.configured_provider_ids() {
+                let health = self.engine.health().health(&provider);
+                self.emit(UiEvent::ProviderHealth { provider, health });
             }
             self.publish_model_options();
             self.spawn_model_refresh();
+        }
+
+        /// Every provider the registry actually built, minus Codex.
+        ///
+        /// Codex is excluded because its settings row has exactly one
+        /// publisher — the sign-in state machine — and a second one would
+        /// make the row's button mean different things at different moments.
+        fn configured_provider_ids(&self) -> Vec<ProviderId> {
+            self.engine
+                .providers()
+                .ids()
+                .into_iter()
+                .filter(|id| *id != ProviderId::CODEX)
+                .collect()
         }
 
         /// Ask every configured provider what it serves, off the hot path.
@@ -4734,10 +5219,12 @@ mod runtime {
         /// round trip per provider, and this runs where a user has just signed
         /// in or saved a key — the panel must stay usable throughout. The
         /// shipped entries are already on screen; a refresh only ever adds.
-        fn spawn_model_refresh(&self) {
+        fn spawn_model_refresh(&mut self) {
             let Some(internal) = self.internal.clone() else {
                 return;
             };
+            self.catalogue_generation = self.catalogue_generation.wrapping_add(1);
+            let generation = self.catalogue_generation;
             let engine = Arc::clone(&self.engine);
             tokio::spawn(async move {
                 let mut catalogue = aibo_provider::ModelCatalogue::shipped();
@@ -4745,7 +5232,10 @@ mod runtime {
                     .refresh_from(engine.providers(), MODEL_REFRESH_TIMEOUT)
                     .await;
                 let _ = internal
-                    .send(Internal::CatalogueRefreshed(Box::new(catalogue)))
+                    .send(Internal::CatalogueRefreshed {
+                        generation,
+                        catalogue: Box::new(catalogue),
+                    })
                     .await;
             });
         }
@@ -4803,16 +5293,7 @@ mod runtime {
 
             tokio::spawn(crate::diagnostics::supervise("capture", async move {
                 let captured = capture_context(platform.as_ref(), &app_ref, session).await;
-
-                let ui = UiEvent::Context {
-                    session,
-                    app: captured.app.clone(),
-                    field: captured.field.clone().map(Box::new),
-                    selection: captured.selection.clone(),
-                    clipboard: captured.clipboard.clone().map(Box::new),
-                };
                 let _ = internal.send(Internal::Captured(Box::new(captured))).await;
-                let _ = events.send(ui).await;
             }));
         }
 
@@ -4837,6 +5318,7 @@ mod runtime {
                 tracing::warn!(%session, "ignoring submission without captured session state");
                 return;
             };
+            let conversation_id = *state.conversation_id.get_or_insert_with(uuid::Uuid::now_v7);
             state.last = Some(request.clone());
             let LastSubmission {
                 instruction,
@@ -4880,7 +5362,7 @@ mod runtime {
             };
 
             if surface == Surface::Do {
-                let mut context = captured_agent_context(state);
+                let mut context = captured_agent_context(state, include_selection);
                 // The conversation so far, fenced (§5): an agent follow-up —
                 // "no, a *file* called テスト" — is meaningless without the
                 // turns it corrects. Untrusted like every non-instruction
@@ -4913,8 +5395,15 @@ mod runtime {
                         truncated: false,
                     });
                 }
-                self.submit_agent(session, instruction, role_override, context, workdir)
-                    .await;
+                self.submit_agent(
+                    session,
+                    instruction,
+                    role_override,
+                    context,
+                    workdir,
+                    conversation_id,
+                )
+                .await;
                 return;
             }
 
@@ -4926,18 +5415,26 @@ mod runtime {
                 capture: Capture {
                     app: state.app.clone(),
                     field: state.field.clone(),
-                    selection: include_selection.then(|| state.selection.clone()).flatten(),
+                    selection: include_selection
+                        .then(|| {
+                            state
+                                .attached_file
+                                .clone()
+                                .or_else(|| state.selection.clone())
+                        })
+                        .flatten(),
                     clipboard: state.clipboard.clone(),
                 },
                 // Deliberate UI gestures only. `state.clipboard` remains
                 // ambient context above and is never promoted into this list.
                 attachments,
-                conversation_id: None,
+                conversation_id: Some(conversation_id),
                 history,
             };
 
             let engine = self.engine.clone();
             let events = self.events.clone();
+            let codex_generation = self.codex.generation;
             let (sink, session_events) = EventSink::channel();
 
             // The event pump and the request run concurrently in one task, so
@@ -4989,12 +5486,15 @@ mod runtime {
                             && *provider == ProviderId::CODEX
                         {
                             let _ = internal
-                                .send(Internal::CodexAuth(codex_signin::Event::Failed {
-                                    detail: format!(
-                                        "Your ChatGPT sign-in is no longer valid ({kind}). \
-                                         Sign in again to keep using Codex."
-                                    ),
-                                }))
+                                .send(Internal::CodexAuth {
+                                    generation: codex_generation,
+                                    event: codex_signin::Event::Failed {
+                                        detail: format!(
+                                            "Your ChatGPT sign-in is no longer valid ({kind}). \
+                                             Sign in again to keep using Codex."
+                                        ),
+                                    },
+                                })
                                 .await;
                         }
                     }
@@ -5012,6 +5512,7 @@ mod runtime {
             role_override: Option<Role>,
             context: Vec<UntrustedBlock>,
             workdir: Option<std::path::PathBuf>,
+            conversation_id: uuid::Uuid,
         ) {
             let task_id = uuid::Uuid::now_v7();
             let events = self.events.clone();
@@ -5057,17 +5558,62 @@ mod runtime {
             // §11: writes are scoped to directories the user added. The same
             // roots the settings window's Files section edits are the agent's
             // workspace — one list, one mental model, already user-curated.
-            let mut roots = crate::files::roots(self.file_roots.as_deref());
+            let requested_workdir = match workdir {
+                Some(dir) => match dir.canonicalize() {
+                    Ok(dir) if dir.is_dir() => Some(dir),
+                    _ => {
+                        let _ = events
+                            .send(UiEvent::TaskStarted {
+                                task: task_id,
+                                session,
+                                instruction,
+                            })
+                            .await;
+                        let _ = events
+                            .send(UiEvent::TaskStep {
+                                task: task_id,
+                                step: Box::new(AgentStep::Done(failed_agent_outcome(
+                                    "The selected working folder no longer exists or is inaccessible.",
+                                ))),
+                            })
+                            .await;
+                        return;
+                    }
+                },
+                None => None,
+            };
+            let mut seen = std::collections::HashSet::new();
+            let mut roots: Vec<_> = crate::files::roots(self.file_roots.as_deref())
+                .into_iter()
+                .filter_map(|root| root.canonicalize().ok())
+                .filter(|root| root.is_dir() && seen.insert(root.clone()))
+                .collect();
             // A chosen workdir (owner redesign, 2026-08-02) becomes the
             // anchor — the first root is what `WorkspaceExecutor` treats as
             // the working directory — while the other roots stay in scope.
             // Recorded as a recent only when the run actually starts with it.
-            if let Some(dir) = workdir.and_then(|dir| dir.canonicalize().ok())
-                && dir.is_dir()
-            {
+            if let Some(dir) = requested_workdir {
                 crate::workdirs::remember(&self.bootstrap.paths().recent_workdirs(), &dir);
                 roots.retain(|root| root != &dir);
                 roots.insert(0, dir);
+            }
+            if roots.is_empty() {
+                let _ = events
+                    .send(UiEvent::TaskStarted {
+                        task: task_id,
+                        session,
+                        instruction,
+                    })
+                    .await;
+                let _ = events
+                    .send(UiEvent::TaskStep {
+                        task: task_id,
+                        step: Box::new(AgentStep::Done(failed_agent_outcome(
+                            "No usable workspace folder. Add one under Settings → Files.",
+                        ))),
+                    })
+                    .await;
+                return;
             }
             // The skills folder rides along as an ordinary root: readable so
             // the agent can load a skill's body and run its scripts, writable
@@ -5083,7 +5629,8 @@ mod runtime {
             let skills = crate::skills::load(&skills_dir);
             let roots = roots;
             let tools = match aibo_agent_tools_adapter::WorkspaceExecutor::new(roots.clone()) {
-                Ok(tools) => Arc::new(tools) as Arc<dyn aibo_agent::ToolExecutor>,
+                Ok(tools) => Arc::new(tools.with_process_observer(Arc::new(self.children.clone())))
+                    as Arc<dyn aibo_agent::ToolExecutor>,
                 Err(error) => {
                     tracing::error!(%error, "could not construct the workspace tool adapter");
                     let _ = events
@@ -5141,7 +5688,7 @@ mod runtime {
                 workspace: roots.first().cloned(),
                 context,
                 binding: Some(binding),
-                conversation_id: None,
+                conversation_id: Some(conversation_id),
             };
             let engine = Arc::clone(&self.engine);
             let pending = Arc::clone(&self.pending_approvals);
@@ -5885,6 +6432,19 @@ mod runtime {
         }
 
         #[test]
+        fn a_disabled_codex_provider_does_not_claim_an_active_model() {
+            let config =
+                Config::from_toml_str("[codex]\nenabled = false\nmodel = \"gpt-5.6-terra\"\n")
+                    .unwrap();
+            let UiEvent::ModelOptions { options, selected } = codex_model_options_event(&config)
+            else {
+                panic!("expected model options");
+            };
+            assert!(!options.is_empty());
+            assert_eq!(selected, None);
+        }
+
+        #[test]
         fn agent_context_keeps_ambient_content_tainted() {
             let mut session = Session::default();
             session.app = Some(AppInfo {
@@ -5905,7 +6465,7 @@ mod runtime {
                 caret_bounds: None,
             });
 
-            let context = captured_agent_context(&session);
+            let context = captured_agent_context(&session, true);
             assert_eq!(context.len(), 3);
             assert_eq!(context[0].origin, ContentOrigin::Selection);
             assert_eq!(context[1].origin, ContentOrigin::FieldPrefix);
@@ -5918,6 +6478,12 @@ mod runtime {
             );
             assert!(context[1].truncated);
             assert!(context[2].truncated);
+            assert!(
+                captured_agent_context(&session, false)
+                    .iter()
+                    .all(|block| block.origin != ContentOrigin::Selection),
+                "removing the context card must exclude explicit file/selection content"
+            );
         }
 
         #[test]
@@ -5945,7 +6511,7 @@ mod runtime {
             });
 
             assert!(
-                captured_agent_context(&session).is_empty(),
+                captured_agent_context(&session, true).is_empty(),
                 "defence in depth must exclude protected capture even if a platform violates its contract"
             );
         }

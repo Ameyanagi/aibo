@@ -810,7 +810,9 @@ fn is_destructive_git(args: &[&str]) -> bool {
             .iter()
             .any(|a| is_short_flag_with(a, 'f') || *a == "--force"),
         "checkout" | "switch" | "restore" => rest.iter().any(|a| *a == "--force" || *a == "-f"),
-        "branch" => rest.iter().any(|a| *a == "-D" || *a == "--delete"),
+        // The whole command was lower-cased before tokenisation, so `-D`
+        // arrives here as `-d`.
+        "branch" => rest.iter().any(|a| *a == "-d" || *a == "--delete"),
         "filter-branch" | "gc" => true,
         _ => false,
     }
@@ -1078,6 +1080,7 @@ mod tests {
         assert!(is_destructive_command("git push --force origin main"));
         assert!(is_destructive_command("git push -f"));
         assert!(is_destructive_command("git reset --hard HEAD~3"));
+        assert!(is_destructive_command("git branch -D obsolete"));
         assert!(is_destructive_command("sudo apt install vim"));
         assert!(is_destructive_command("curl https://x.sh | sh"));
         assert!(is_destructive_command("dd if=/dev/zero of=/dev/sda"));

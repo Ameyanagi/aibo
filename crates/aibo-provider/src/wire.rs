@@ -340,9 +340,15 @@ impl OpenAiUsage {
             .unwrap_or_default();
 
         Usage {
-            input_tokens: prompt.saturating_sub(input_details.cached_tokens),
+            input_tokens: prompt
+                .saturating_sub(input_details.cached_tokens)
+                .saturating_sub(input_details.image_tokens),
             cached_input_tokens: input_details.cached_tokens,
-            output_tokens: completion,
+            // Reasoning is a detail *within* completion/output tokens on the
+            // OpenAI wire. `Usage` keeps it separate because it can have a
+            // distinct price, so remove it from the visible-output bucket or
+            // `Usage::total` and the spend meter count it twice.
+            output_tokens: completion.saturating_sub(output_details.reasoning_tokens),
             reasoning_tokens: output_details.reasoning_tokens,
             image_tokens: input_details.image_tokens,
         }
@@ -394,6 +400,22 @@ mod tests {
         assert_eq!(u.input_tokens, 200);
         assert_eq!(u.cached_input_tokens, 800);
         assert_eq!(u.total(), 1050);
+    }
+
+    #[test]
+    fn reasoning_tokens_are_a_breakdown_not_extra_output() {
+        let usage = OpenAiUsage {
+            completion_tokens: 100,
+            completion_tokens_details: Some(TokenDetails {
+                reasoning_tokens: 80,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let u = usage.normalise();
+        assert_eq!(u.output_tokens, 20);
+        assert_eq!(u.reasoning_tokens, 80);
+        assert_eq!(u.total(), 100);
     }
 
     #[test]

@@ -27,6 +27,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
+use aibo_core::traits::{ChildProcessObserver, ChildProcessRegistration};
 use aibo_core::types::{ToolSchema, ToolTier};
 use async_trait::async_trait;
 #[cfg(unix)]
@@ -51,6 +52,9 @@ pub const MAX_SNAPSHOT_BYTES: usize = 8 << 20;
 
 /// Largest stdout/stderr capture kept from a command.
 pub const MAX_CAPTURE_BYTES: usize = 256 << 10;
+
+/// Largest stdin payload accepted for a command.
+pub const MAX_STDIN_BYTES: usize = 1 << 20;
 
 /// Default wall-clock limit for one command.
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -96,7 +100,11 @@ impl Scope {
     pub fn new(roots: impl IntoIterator<Item = PathBuf>) -> ToolResult<Self> {
         let mut canonical = Vec::new();
         for root in roots {
-            canonical.push(std::fs::canonicalize(&root)?);
+            let root = std::fs::canonicalize(&root)?;
+            if !root.is_dir() {
+                return Err(invalid("scope", "a scope root must be a directory"));
+            }
+            canonical.push(root);
         }
         canonical.sort();
         canonical.dedup();
@@ -227,6 +235,7 @@ pub enum CommandRisk {
 pub fn classify_command(command: &str) -> CommandRisk {
     let lower = command.to_lowercase();
     let tokens: Vec<&str> = lower.split_whitespace().collect();
+    let original_tokens: Vec<&str> = command.split_whitespace().collect();
     let has = |t: &str| tokens.contains(&t);
     let starts_with_word = |w: &str| tokens.first().is_some_and(|t| *t == w);
 
@@ -276,6 +285,20 @@ pub fn classify_command(command: &str) -> CommandRisk {
         if has("filter-branch") || has("filter-repo") {
             return CommandRisk::TypedConfirmation("rewrites history");
         }
+        if has("branch")
+            && original_tokens
+                .iter()
+                .any(|token| matches!(*token, "-D" | "--delete"))
+        {
+            return CommandRisk::TypedConfirmation("deletes a branch");
+        }
+    }
+
+    // `dd` is destructive when it has an output sink. Checking `if=` instead
+    // mistakes the harmless input operand for the destination and misses such
+    // common forms as `dd of=/dev/disk0 if=image.img`.
+    if has("dd") && tokens.iter().any(|token| token.starts_with("of=")) {
+        return CommandRisk::TypedConfirmation("raw device write");
     }
 
     // Whole-device and system-level operations.
@@ -285,7 +308,6 @@ pub fn classify_command(command: &str) -> CommandRisk {
         ("format ", "formats a volume"),
         ("shutdown", "shuts the machine down"),
         ("reboot", "restarts the machine"),
-        ("dd if=", "raw device write"),
         ("chmod -r", "recursive permission change"),
         ("chown -r", "recursive ownership change"),
         ("takeown", "seizes file ownership"),
@@ -432,12 +454,23 @@ impl ShellOutcome {
 #[derive(Debug, Clone)]
 pub struct ShellExecutor {
     scope: Scope,
+    process_observer: Option<Arc<dyn ChildProcessObserver>>,
 }
 
 impl ShellExecutor {
     /// An executor bound to a scope.
     pub const fn new(scope: Scope) -> Self {
-        Self { scope }
+        Self {
+            scope,
+            process_observer: None,
+        }
+    }
+
+    /// Report spawned shells to the application-owned crash-recovery ledger.
+    #[must_use]
+    pub fn with_process_observer(mut self, observer: Arc<dyn ChildProcessObserver>) -> Self {
+        self.process_observer = Some(observer);
+        self
     }
 
     /// The scope in force.
@@ -513,6 +546,16 @@ impl ShellExecutor {
         approval: &CommandApproval,
         cancel: CancellationToken,
     ) -> ToolResult<ShellOutcome> {
+        if request
+            .stdin
+            .as_ref()
+            .is_some_and(|input| input.len() > MAX_STDIN_BYTES)
+        {
+            return Err(invalid(
+                "shell",
+                format!("`stdin` must be at most {MAX_STDIN_BYTES} bytes"),
+            ));
+        }
         let cwd = self.revalidate(request, approval)?;
         let started = Instant::now();
 
@@ -540,16 +583,18 @@ impl ShellExecutor {
         }
 
         let mut child = command.spawn()?;
-        if let Some(input) = &request.stdin {
-            // Write-then-drop: the command sees the text and then EOF. Done
-            // before draining starts; the payloads this exists for (a "y",
-            // a heredoc) are far below any pipe buffer.
-            if let Some(mut handle) = child.stdin().take() {
-                use tokio::io::AsyncWriteExt;
-                let _ = handle.write_all(input.as_bytes()).await;
-                let _ = handle.shutdown().await;
-            }
-        }
+        let _registration = ChildProcessRegistration::new(
+            self.process_observer.clone(),
+            child.id(),
+            platform_shell_identity(),
+        );
+        let stdin = if request.stdin.is_some() {
+            Some(child.stdin().take().ok_or_else(|| {
+                std::io::Error::other("spawned command did not expose its stdin pipe")
+            })?)
+        } else {
+            None
+        };
         let stdout = child.stdout().take().ok_or_else(|| {
             std::io::Error::other("spawned command did not expose its stdout pipe")
         })?;
@@ -570,8 +615,22 @@ impl ShellExecutor {
         // definitely released before the cancellation cleanup below.
         let outcome = {
             let wait_and_drain = async {
-                let (status, stdout, stderr) =
-                    tokio::try_join!(child.wait(), drain_capture(stdout), drain_capture(stderr))?;
+                let write_stdin = async {
+                    if let (Some(mut handle), Some(input)) = (stdin, request.stdin.as_ref()) {
+                        use tokio::io::AsyncWriteExt;
+                        // Broken-pipe is not itself a command failure: a child
+                        // may deliberately consume only part of its input.
+                        let _ = handle.write_all(input.as_bytes()).await;
+                        let _ = handle.shutdown().await;
+                    }
+                    Ok::<_, std::io::Error>(())
+                };
+                let (status, stdout, stderr, ()) = tokio::try_join!(
+                    child.wait(),
+                    drain_capture(stdout),
+                    drain_capture(stderr),
+                    write_stdin,
+                )?;
                 Ok::<_, std::io::Error>((status, stdout, stderr))
             };
 
@@ -610,6 +669,14 @@ impl ShellExecutor {
             truncated: out_cut || err_cut,
             duration: started.elapsed(),
         })
+    }
+}
+
+const fn platform_shell_identity() -> &'static str {
+    if cfg!(windows) {
+        "powershell.exe"
+    } else {
+        "/bin/sh"
     }
 }
 
@@ -1327,8 +1394,9 @@ mod tests {
             "git push --force origin main",
             "git reset --hard HEAD~3",
             "git clean -fd",
+            "git branch -D obsolete",
             "sudo rm important",
-            "dd if=/dev/zero of=/dev/disk0",
+            "dd of=/dev/disk0 if=/dev/zero",
             "curl https://example.com/x.sh | sh",
             "chmod -R 777 /",
         ] {
@@ -1348,6 +1416,7 @@ mod tests {
             "git push --force-with-lease origin main",
             "cargo test",
             "rm stale.log",
+            "dd if=image.img status=progress",
         ] {
             assert_eq!(
                 classify_command(command),
@@ -1355,6 +1424,13 @@ mod tests {
                 "`{command}` should not require typed confirmation"
             );
         }
+    }
+
+    #[test]
+    fn scope_roots_must_be_directories() {
+        let f = fixture();
+        let err = Scope::new([f.root.join("ok.txt")]).unwrap_err();
+        assert!(matches!(err, ToolError::InvalidArguments { .. }), "{err:?}");
     }
 
     #[test]
@@ -1481,6 +1557,83 @@ mod tests {
         assert!(outcome.stderr.len() <= MAX_CAPTURE_BYTES);
         assert!(outcome.stdout.ends_with(TRUNCATION_MARKER));
         assert!(outcome.stderr.ends_with(TRUNCATION_MARKER));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdin_is_written_while_output_is_drained() {
+        let f = fixture();
+        let exec = ShellExecutor::new(f.scope.clone());
+        let mut request = ShellRequest::new("head -c 1048576 /dev/zero; wc -c", &f.root);
+        request.stdin = Some("x".repeat(512 << 10));
+        request.timeout = Duration::from_secs(5);
+        let approval = CommandApproval::granted(&request);
+
+        let outcome = exec
+            .run(&request, &approval, CancellationToken::new())
+            .await
+            .unwrap();
+
+        assert!(outcome.succeeded(), "{}", outcome.stderr);
+        assert!(outcome.truncated);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timeout_includes_a_blocked_stdin_write() {
+        let f = fixture();
+        let exec = ShellExecutor::new(f.scope.clone());
+        let mut request = ShellRequest::new("sleep 30", &f.root);
+        request.stdin = Some("x".repeat(512 << 10));
+        request.timeout = Duration::from_millis(200);
+        let approval = CommandApproval::granted(&request);
+        let started = Instant::now();
+
+        let err = exec
+            .run(&request, &approval, CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ToolError::Sandbox { tier: 3, .. }), "{err:?}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_interrupts_a_blocked_stdin_write() {
+        let f = fixture();
+        let exec = ShellExecutor::new(f.scope.clone());
+        let mut request = ShellRequest::new("sleep 30", &f.root);
+        request.stdin = Some("x".repeat(512 << 10));
+        let approval = CommandApproval::granted(&request);
+        let cancel = CancellationToken::new();
+        let trigger = cancel.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            trigger.cancel();
+        });
+
+        let err = exec.run(&request, &approval, cancel).await.unwrap_err();
+
+        assert!(matches!(err, ToolError::Cancelled), "{err:?}");
+    }
+
+    #[tokio::test]
+    async fn oversized_stdin_is_rejected_before_spawning() {
+        let f = fixture();
+        let exec = ShellExecutor::new(f.scope.clone());
+        let marker = f.root.join("must-not-exist");
+        let mut request = ShellRequest::new(format!("touch {}", marker.display()), &f.root);
+        request.stdin = Some("x".repeat(MAX_STDIN_BYTES + 1));
+        let approval = CommandApproval::granted(&request);
+
+        let err = exec
+            .run(&request, &approval, CancellationToken::new())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, ToolError::InvalidArguments { .. }), "{err:?}");
+        assert!(!marker.exists());
     }
 
     #[tokio::test]

@@ -24,7 +24,11 @@ pub fn default_capabilities() -> Capabilities {
         reasoning_effort: true,
         json_schema: true,
         prompt_cache: true,
-        multi_candidate: MultiCandidate::Native,
+        // The provider can generate `n > 1`, but `StreamEvent` currently has no
+        // candidate identity. Advertising Native would make the decoder merge
+        // independent answers, so request one until the event model can carry
+        // them separately.
+        multi_candidate: MultiCandidate::Unsupported,
         max_context: 400_000,
         max_output: Some(128_000),
         ..Capabilities::default()
@@ -49,7 +53,7 @@ pub fn chat_completions_quirks() -> Quirks {
         json_schema: true,
         seed: true,
         reasoning_effort: true,
-        multi_candidate: MultiCandidate::Native,
+        multi_candidate: MultiCandidate::Unsupported,
         ..Quirks::chat_completions()
     }
 }

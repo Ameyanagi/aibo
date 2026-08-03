@@ -34,6 +34,7 @@ objc2 = { workspace = true }
 # (NSPasteboard, NSWindow/NSPanel, NSVisualEffectView, NSWorkspace, NSScreen …).
 objc2-app-kit = { workspace = true }
 objc2-foundation = { workspace = true }
+objc2-quartz-core = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 accesskit_windows = { workspace = true }

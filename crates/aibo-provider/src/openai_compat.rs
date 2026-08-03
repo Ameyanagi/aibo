@@ -50,8 +50,9 @@ use url::Url;
 use crate::auth::{AuthStyle, apply_credential};
 use crate::http::{HttpConfig, build_client, map_transport_error};
 use crate::sse::{
-    DONE_SENTINEL, Flow, MAX_BUFFERED_TOOL_BYTES, MAX_TOOL_CALLS_PER_RESPONSE, SseDecoder, decode,
-    events_from_response, read_error_body,
+    DONE_SENTINEL, Flow, MAX_BUFFERED_TOOL_BYTES, MAX_TOOL_CALLS_PER_RESPONSE, SseDecoder,
+    cancelled_stream, decode, events_from_response, read_error_body, read_json_body,
+    unexpected_eof,
 };
 use crate::wire::{
     ErrorShape, OpenAiUsage, Unimplemented, data_uri, flatten_text, has_image, map_status,
@@ -465,7 +466,11 @@ impl Provider for OpenAiCompat {
         // Downscale before the bytes are base64'd into the body (§14): a 4 MB
         // retina capture is billed as ~19k image tokens and may be refused
         // outright, and §4 does not fall back on a 400.
-        let req = crate::attachment::prepare(req).await?;
+        let req = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(cancelled_stream()),
+            prepared = crate::attachment::prepare(req) => prepared?,
+        };
 
         let (url, body) = match self.quirks.wire {
             WireFormat::ChatCompletions => (
@@ -478,7 +483,11 @@ impl Provider for OpenAiCompat {
             ),
         };
 
-        let response = self.send(url, body).await?;
+        let response = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(cancelled_stream()),
+            response = self.send(url, body) => response?,
+        };
         let events = events_from_response(response);
 
         Ok(match self.quirks.wire {
@@ -509,10 +518,9 @@ impl Provider for OpenAiCompat {
             .await
             .map_err(|e| map_transport_error(&self.id, &e))?;
         let response = self.check_status(response).await?;
-        let body: ModelsResponse = response
-            .json()
-            .await
-            .map_err(|e| map_transport_error(&self.id, &e))?;
+        let body = read_json_body(response, &self.id).await?;
+        let body: ModelsResponse =
+            serde_json::from_str(&body).map_err(|e| AiboError::Internal(Box::new(e)))?;
 
         Ok(body
             .data
@@ -545,6 +553,9 @@ impl Provider for OpenAiCompat {
             .client
             .get(url)
             .timeout(self.http.request_timeout.min(Duration::from_secs(5)));
+        for (k, v) in &self.quirks.extra_headers {
+            rb = rb.header(k.as_str(), v.as_str());
+        }
         rb = apply_credential(&self.id, &self.credential, self.quirks.auth, rb).await?;
 
         match rb.send().await {
@@ -613,9 +624,12 @@ pub fn build_chat_completions_body(req: &ChatRequest, q: &Quirks) -> Value {
         "model": req.binding.model,
         "messages": messages.iter().map(chat_message).collect::<Vec<_>>(),
         "stream": true,
-        "temperature": req.params.temperature,
     });
     let obj = body.as_object_mut().expect("object literal");
+
+    if q.sampling_params {
+        obj.insert("temperature".into(), json!(req.params.temperature));
+    }
 
     if req.params.max_tokens > 0 {
         let max_tokens = req.params.max_tokens.min(req.budget.max_output_tokens);
@@ -626,7 +640,9 @@ pub fn build_chat_completions_body(req: &ChatRequest, q: &Quirks) -> Value {
         }
     }
 
-    if let Some(p) = req.params.top_p {
+    if q.sampling_params
+        && let Some(p) = req.params.top_p
+    {
         obj.insert("top_p".into(), json!(p));
     }
     if q.stop && !req.params.stop.is_empty() {
@@ -647,7 +663,13 @@ pub fn build_chat_completions_body(req: &ChatRequest, q: &Quirks) -> Value {
     {
         obj.insert(
             "response_format".into(),
-            json!({"type": "json_schema", "json_schema": schema}),
+            json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": "aibo_response",
+                    "schema": schema,
+                }
+            }),
         );
     }
     if req.params.candidates > 1 && q.multi_candidate == MultiCandidate::Native {
@@ -782,6 +804,17 @@ pub fn build_responses_body(req: &ChatRequest, q: &Quirks) -> Value {
     if !instructions.is_empty() {
         obj.insert("instructions".into(), json!(instructions));
     }
+
+    // §15: keep one conversation's turns on one cache shard. Prefix caching
+    // is automatic on this wire, but routing is not — without a stable key,
+    // consecutive turns can land on different machines and miss a prefix
+    // that was cached moments earlier (owner question, 2026-08-04). The
+    // conversation id is exactly the right grain: stable across a session's
+    // turns, different for every fresh session, and not derived from
+    // anything the user typed.
+    if let Some(conversation) = req.conversation_id {
+        obj.insert("prompt_cache_key".into(), json!(conversation.to_string()));
+    }
     if q.sampling_params
         && let Some(p) = req.params.top_p
     {
@@ -797,7 +830,13 @@ pub fn build_responses_body(req: &ChatRequest, q: &Quirks) -> Value {
     {
         obj.insert(
             "text".into(),
-            json!({"format": {"type": "json_schema", "schema": schema}}),
+            json!({
+                "format": {
+                    "type": "json_schema",
+                    "name": "aibo_response",
+                    "schema": schema,
+                }
+            }),
         );
     }
     let mut tools: Vec<Value> = Vec::new();
@@ -943,6 +982,8 @@ struct VendorUsage {
 
 #[derive(Debug, Deserialize)]
 struct ChatChoice {
+    #[serde(default)]
+    index: usize,
     #[serde(default)]
     delta: ChatDelta,
     #[serde(default)]
@@ -1112,7 +1153,10 @@ impl SseDecoder for ChatCompletionsDecoder {
             self.usage = Some(u.normalise());
         }
 
-        for choice in chunk.choices {
+        // `StreamEvent` has no candidate identity. Until it does, accepting
+        // more than candidate zero would interleave independent answers into a
+        // single corrupt text stream.
+        for choice in chunk.choices.into_iter().filter(|choice| choice.index == 0) {
             if let Some(t) = choice.delta.content.filter(|t| !t.is_empty()) {
                 out.push(Ok(StreamEvent::Text(t)));
             }
@@ -1172,7 +1216,15 @@ impl SseDecoder for ChatCompletionsDecoder {
     }
 
     fn on_end(&mut self, out: &mut Vec<Result<StreamEvent>>) {
-        self.finish(out);
+        if self.emitted_terminal {
+            return;
+        }
+        if self.quirks.done_sentinel {
+            self.emitted_terminal = true;
+            out.push(Err(unexpected_eof()));
+        } else {
+            self.finish(out);
+        }
     }
 }
 
@@ -1348,7 +1400,10 @@ impl SseDecoder for ResponsesDecoder {
                         out.push(Ok(StreamEvent::Usage(u.normalise())));
                     }
                     if let Some(d) = body.incomplete_details
-                        && d.reason.as_deref() == Some("max_output_tokens")
+                        && matches!(
+                            d.reason.as_deref(),
+                            Some("max_output_tokens" | "max_tokens")
+                        )
                     {
                         self.stop = Some(StopReason::Length);
                     }
@@ -1374,7 +1429,10 @@ impl SseDecoder for ResponsesDecoder {
     }
 
     fn on_end(&mut self, out: &mut Vec<Result<StreamEvent>>) {
-        self.finish(out);
+        if !self.emitted_terminal {
+            self.emitted_terminal = true;
+            out.push(Err(unexpected_eof()));
+        }
     }
 }
 
@@ -1686,5 +1744,86 @@ mod tests {
             decoder.tool_calls_seen, 0,
             "hosted search is not a client tool call"
         );
+    }
+
+    #[test]
+    fn extra_candidates_are_not_interleaved_into_candidate_zero() {
+        let mut decoder = ChatCompletionsDecoder::new(Quirks::chat_completions());
+        let mut out = Vec::new();
+        let event = Event {
+            data: json!({
+                "choices": [
+                    {"index": 0, "delta": {"content": "primary"}},
+                    {"index": 1, "delta": {"content": "alternative"}}
+                ]
+            })
+            .to_string(),
+            ..Event::default()
+        };
+        assert_eq!(decoder.on_event(&event, &mut out), Flow::Continue);
+        assert!(matches!(
+            out.as_slice(),
+            [Ok(StreamEvent::Text(text))] if text == "primary"
+        ));
+    }
+
+    #[test]
+    fn responses_max_tokens_incomplete_is_a_length_stop() {
+        let mut decoder = ResponsesDecoder::default();
+        let mut out = Vec::new();
+        let event = Event {
+            data: json!({
+                "type": "response.incomplete",
+                "response": {"incomplete_details": {"reason": "max_tokens"}}
+            })
+            .to_string(),
+            ..Event::default()
+        };
+        assert_eq!(decoder.on_event(&event, &mut out), Flow::Stop);
+        assert!(matches!(
+            out.as_slice(),
+            [Ok(StreamEvent::Done(StopReason::Length))]
+        ));
+    }
+
+    #[test]
+    fn responses_eof_without_a_terminal_event_is_an_error() {
+        let mut decoder = ResponsesDecoder::default();
+        let mut out = Vec::new();
+        decoder.on_end(&mut out);
+        assert!(matches!(out.as_slice(), [Err(AiboError::Internal(_))]));
+    }
+
+    #[tokio::test]
+    async fn a_pre_cancelled_chat_never_needs_a_network_response() {
+        let mut quirks = Quirks::chat_completions();
+        quirks.auth = AuthStyle::None;
+        let endpoint = Url::parse("http://127.0.0.1:9/v1").unwrap();
+        let provider = OpenAiCompat::new(
+            ProviderId::new("cancel-test"),
+            endpoint.clone(),
+            quirks,
+            Credential::LocalEndpoint(endpoint),
+            HttpConfig::local(),
+        )
+        .unwrap()
+        .with_capabilities(Capabilities {
+            vision: true,
+            ..Capabilities::default()
+        });
+        let request: ChatRequest =
+            serde_json::from_str(include_str!("../tests/fixtures/request_ask.json")).unwrap();
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let out: Vec<_> = provider
+            .chat(request, cancel)
+            .await
+            .unwrap()
+            .collect()
+            .await;
+        assert!(matches!(
+            out.as_slice(),
+            [Ok(StreamEvent::Done(StopReason::Cancelled))]
+        ));
     }
 }

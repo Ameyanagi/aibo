@@ -7,7 +7,8 @@
 //! index silently goes stale and history search quietly stops finding recent
 //! messages. `tests/fts_staleness.rs` fails if they are ever dropped.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
+use std::io;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -16,7 +17,7 @@ use rusqlite::Connection;
 use crate::error::{Result, StoreError};
 
 /// The schema version this build writes and expects.
-pub const SCHEMA_VERSION: i64 = 1;
+pub const SCHEMA_VERSION: i64 = 2;
 
 /// One forward migration step. There is no `down`: migrating down would drop
 /// columns, and dropping columns is losing data.
@@ -114,10 +115,56 @@ CREATE TABLE settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
 CREATE TABLE schema_version (version INTEGER NOT NULL);
 "#;
 
-const MIGRATIONS: &[Migration] = &[Migration {
-    version: 1,
-    sql: V1,
-}];
+/// v2 — enforce the ownership relationships already represented by
+/// `conv_id`/`tool_call_id`, including cleanup of legacy orphan rows.
+///
+/// Triggers avoid rebuilding tables containing user data. They provide the
+/// same insert/update/delete guarantees as foreign keys for the existing v1
+/// shape and migrate safely while `foreign_keys` is enabled.
+const V2: &str = r#"
+DELETE FROM tool_calls
+ WHERE conv_id NOT IN (SELECT id FROM conversations);
+DELETE FROM file_snapshots
+ WHERE tool_call_id NOT IN (SELECT id FROM tool_calls);
+
+CREATE TRIGGER tool_calls_bi BEFORE INSERT ON tool_calls
+WHEN NOT EXISTS (SELECT 1 FROM conversations WHERE id = new.conv_id)
+BEGIN
+  SELECT RAISE(ABORT, 'tool_calls.conv_id has no conversation');
+END;
+CREATE TRIGGER tool_calls_bu BEFORE UPDATE OF conv_id ON tool_calls
+WHEN NOT EXISTS (SELECT 1 FROM conversations WHERE id = new.conv_id)
+BEGIN
+  SELECT RAISE(ABORT, 'tool_calls.conv_id has no conversation');
+END;
+CREATE TRIGGER tool_calls_ad AFTER DELETE ON tool_calls BEGIN
+  DELETE FROM file_snapshots WHERE tool_call_id = old.id;
+END;
+CREATE TRIGGER conversations_tool_calls_ad AFTER DELETE ON conversations BEGIN
+  DELETE FROM tool_calls WHERE conv_id = old.id;
+END;
+CREATE TRIGGER file_snapshots_bi BEFORE INSERT ON file_snapshots
+WHEN NOT EXISTS (SELECT 1 FROM tool_calls WHERE id = new.tool_call_id)
+BEGIN
+  SELECT RAISE(ABORT, 'file_snapshots.tool_call_id has no tool call');
+END;
+CREATE TRIGGER file_snapshots_bu BEFORE UPDATE OF tool_call_id ON file_snapshots
+WHEN NOT EXISTS (SELECT 1 FROM tool_calls WHERE id = new.tool_call_id)
+BEGIN
+  SELECT RAISE(ABORT, 'file_snapshots.tool_call_id has no tool call');
+END;
+"#;
+
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        version: 1,
+        sql: V1,
+    },
+    Migration {
+        version: 2,
+        sql: V2,
+    },
+];
 
 /// What [`migrate`] did.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -153,15 +200,18 @@ pub fn current_version(conn: &Connection) -> Result<i64> {
     if !exists {
         return Ok(0);
     }
-    let version: i64 = conn
-        .query_row("SELECT version FROM schema_version LIMIT 1", [], |r| {
-            r.get(0)
-        })
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(0),
-            other => Err(other),
-        })?;
-    Ok(version)
+    let mut statement = conn.prepare("SELECT version FROM schema_version ORDER BY rowid")?;
+    let versions = statement
+        .query_map([], |row| row.get::<_, i64>(0))?
+        .collect::<rusqlite::Result<Vec<_>>>()?;
+    match versions.as_slice() {
+        [] => Ok(0),
+        [version] => Ok(*version),
+        [first, ..] => Err(StoreError::HalfMigrated {
+            at: *first,
+            backup: None,
+        }),
+    }
 }
 
 /// Bring `conn` up to [`SCHEMA_VERSION`].
@@ -188,6 +238,7 @@ pub fn migrate(conn: &mut Connection, db_path: Option<&Path>) -> Result<Migratio
         });
     }
     if from == SCHEMA_VERSION {
+        validate_current_schema(conn, from, None)?;
         return Ok(MigrationReport {
             from,
             to: from,
@@ -227,7 +278,7 @@ pub fn migrate(conn: &mut Connection, db_path: Option<&Path>) -> Result<Migratio
             return Err(StoreError::Migration {
                 from,
                 to: step.version,
-                backup,
+                backup: backup.clone(),
                 source,
             });
         }
@@ -243,12 +294,7 @@ pub fn migrate(conn: &mut Connection, db_path: Option<&Path>) -> Result<Migratio
     // A committed transaction that did not land the expected schema means the
     // file is torn under us; §12 wants that named rather than papered over.
     let after = current_version(conn)?;
-    if after != SCHEMA_VERSION {
-        return Err(StoreError::HalfMigrated {
-            at: after,
-            backup: backup.clone(),
-        });
-    }
+    validate_current_schema(conn, after, backup.clone())?;
 
     Ok(MigrationReport {
         from,
@@ -267,10 +313,13 @@ fn backup_file(conn: &Connection, db_path: &Path) -> Result<PathBuf> {
         .unwrap_or(0);
     let version = current_version(conn)?;
     let mut name = db_path.file_name().unwrap_or_default().to_os_string();
-    name.push(format!(".v{version}.{stamp}.bak"));
+    name.push(format!(".v{version}.{stamp}.{}.bak", uuid::Uuid::now_v7()));
     let backup = db_path.with_file_name(name);
 
-    fs::copy(db_path, &backup).map_err(|source| StoreError::io(&backup, source))?;
+    copy_file_create_new(db_path, &backup)?;
+    if let Some(parent) = backup.parent() {
+        sync_directory(parent)?;
+    }
     Ok(backup)
 }
 
@@ -279,11 +328,19 @@ fn backup_file(conn: &Connection, db_path: &Path) -> Result<PathBuf> {
 /// `wal_checkpoint` returns a row even when the database is not in WAL mode, so
 /// the query is run for effect and the row discarded.
 pub(crate) fn checkpoint_truncate(conn: &Connection) -> Result<()> {
-    conn.query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |_| Ok(()))
+    let (busy, _log_frames, _checkpointed): (i64, i64, i64) = conn
+        .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+            Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+        })
         .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(()),
+            rusqlite::Error::QueryReturnedNoRows => Ok((0, 0, 0)),
             other => Err(other),
         })?;
+    if busy != 0 {
+        return Err(StoreError::Locked {
+            timeout: crate::db::BUSY_TIMEOUT,
+        });
+    }
     Ok(())
 }
 
@@ -294,11 +351,113 @@ pub(crate) fn checkpoint_truncate(conn: &Connection) -> Result<()> {
 /// WAL from the failed migration applied on top of the restored main file would
 /// re-apply exactly the change that failed.
 pub fn restore_backup(backup: &Path, db_path: &Path) -> Result<()> {
-    fs::copy(backup, db_path).map_err(|source| StoreError::io(db_path, source))?;
+    let parent = db_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp_name = db_path.file_name().unwrap_or_default().to_os_string();
+    temp_name.push(format!(".restore-{}", uuid::Uuid::now_v7()));
+    let temp = db_path.with_file_name(temp_name);
+
+    copy_file_create_new(backup, &temp)?;
     for suffix in ["-wal", "-shm"] {
         let sidecar = sidecar_path(db_path, suffix);
-        if sidecar.exists() {
-            fs::remove_file(&sidecar).map_err(|source| StoreError::io(&sidecar, source))?;
+        if sidecar.exists()
+            && let Err(error) = fs::remove_file(&sidecar)
+        {
+            let _ = fs::remove_file(&temp);
+            return Err(StoreError::io(&sidecar, error));
+        }
+    }
+    if let Err(error) = fs::rename(&temp, db_path) {
+        let _ = fs::remove_file(&temp);
+        return Err(StoreError::io(db_path, error));
+    }
+    sync_directory(parent)?;
+    Ok(())
+}
+
+fn copy_file_create_new(source: &Path, destination: &Path) -> Result<()> {
+    let mut input = File::open(source).map_err(|error| StoreError::io(source, error))?;
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut output = options
+        .open(destination)
+        .map_err(|error| StoreError::io(destination, error))?;
+    let result = (|| {
+        io::copy(&mut input, &mut output).map_err(|error| StoreError::io(destination, error))?;
+        output
+            .sync_all()
+            .map_err(|error| StoreError::io(destination, error))?;
+        let permissions = input
+            .metadata()
+            .map_err(|error| StoreError::io(source, error))?
+            .permissions();
+        fs::set_permissions(destination, permissions)
+            .map_err(|error| StoreError::io(destination, error))?;
+        Ok(())
+    })();
+    if result.is_err() {
+        let _ = fs::remove_file(destination);
+    }
+    result
+}
+
+fn sync_directory(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    File::open(path)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|error| StoreError::io(path, error))?;
+    #[cfg(not(unix))]
+    let _ = path;
+    Ok(())
+}
+
+fn validate_current_schema(conn: &Connection, version: i64, backup: Option<PathBuf>) -> Result<()> {
+    if version != SCHEMA_VERSION {
+        return Err(StoreError::HalfMigrated {
+            at: version,
+            backup,
+        });
+    }
+
+    const REQUIRED: &[(&str, &str)] = &[
+        ("table", "conversations"),
+        ("table", "messages"),
+        ("table", "messages_fts"),
+        ("table", "clipboard_history"),
+        ("table", "tool_calls"),
+        ("table", "permissions"),
+        ("table", "file_snapshots"),
+        ("table", "actions"),
+        ("table", "settings"),
+        ("table", "schema_version"),
+        ("index", "idx_conv_updated"),
+        ("index", "idx_msg_conv"),
+        ("index", "idx_clip_expiry"),
+        ("trigger", "messages_ai"),
+        ("trigger", "messages_ad"),
+        ("trigger", "messages_au"),
+        ("trigger", "tool_calls_bi"),
+        ("trigger", "tool_calls_bu"),
+        ("trigger", "tool_calls_ad"),
+        ("trigger", "conversations_tool_calls_ad"),
+        ("trigger", "file_snapshots_bi"),
+        ("trigger", "file_snapshots_bu"),
+    ];
+    for (kind, name) in REQUIRED {
+        let exists: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sqlite_schema WHERE type=?1 AND name=?2)",
+            rusqlite::params![kind, name],
+            |row| row.get(0),
+        )?;
+        if !exists {
+            return Err(StoreError::HalfMigrated {
+                at: version,
+                backup: backup.clone(),
+            });
         }
     }
     Ok(())
@@ -335,11 +494,14 @@ mod tests {
     }
 
     #[test]
-    fn v1_creates_the_three_fts_triggers() {
+    fn schema_creates_the_three_fts_triggers() {
         let mut conn = Connection::open_in_memory().expect("open");
         migrate(&mut conn, None).expect("migrate");
         let mut stmt = conn
-            .prepare("SELECT name FROM sqlite_schema WHERE type='trigger' ORDER BY name")
+            .prepare(
+                "SELECT name FROM sqlite_schema
+                 WHERE type='trigger' AND name LIKE 'messages_%' ORDER BY name",
+            )
             .expect("prepare");
         let names: Vec<String> = stmt
             .query_map([], |r| r.get(0))
@@ -347,6 +509,141 @@ mod tests {
             .collect::<rusqlite::Result<_>>()
             .expect("rows");
         assert_eq!(names, vec!["messages_ad", "messages_ai", "messages_au"]);
+    }
+
+    #[test]
+    fn current_version_with_missing_schema_object_is_rejected() {
+        let mut conn = Connection::open_in_memory().expect("open");
+        migrate(&mut conn, None).expect("migrate");
+        conn.execute_batch("DROP TRIGGER messages_ai")
+            .expect("damage schema");
+        let error = migrate(&mut conn, None).expect_err("must validate current schema");
+        assert!(matches!(error, StoreError::HalfMigrated { .. }));
+    }
+
+    #[test]
+    fn duplicate_schema_version_rows_are_rejected() {
+        let mut conn = Connection::open_in_memory().expect("open");
+        migrate(&mut conn, None).expect("migrate");
+        conn.execute(
+            "INSERT INTO schema_version(version) VALUES (?1)",
+            [SCHEMA_VERSION],
+        )
+        .expect("duplicate");
+        assert!(matches!(
+            current_version(&conn),
+            Err(StoreError::HalfMigrated { .. })
+        ));
+    }
+
+    #[test]
+    fn tool_records_follow_their_owners() {
+        let mut conn = Connection::open_in_memory().expect("open");
+        conn.execute_batch("PRAGMA foreign_keys=ON")
+            .expect("foreign keys");
+        migrate(&mut conn, None).expect("migrate");
+        let conversation = vec![1_u8; 16];
+        let tool = vec![2_u8; 16];
+        let snapshot = vec![3_u8; 16];
+        conn.execute(
+            "INSERT INTO conversations(id,surface,created_at,updated_at)
+             VALUES(?1,'do',1,1)",
+            [&conversation],
+        )
+        .expect("conversation");
+        conn.execute(
+            "INSERT INTO tool_calls(id,conv_id,tier,name,created_at)
+             VALUES(?1,?2,1,'test',1)",
+            rusqlite::params![tool, conversation],
+        )
+        .expect("tool call");
+        conn.execute(
+            "INSERT INTO file_snapshots(id,tool_call_id,path,created_at)
+             VALUES(?1,?2,'/tmp/a',1)",
+            rusqlite::params![snapshot, tool],
+        )
+        .expect("snapshot");
+
+        conn.execute("DELETE FROM conversations WHERE id=?1", [&conversation])
+            .expect("delete conversation");
+        let tools: i64 = conn
+            .query_row("SELECT count(*) FROM tool_calls", [], |row| row.get(0))
+            .expect("tools");
+        let snapshots: i64 = conn
+            .query_row("SELECT count(*) FROM file_snapshots", [], |row| row.get(0))
+            .expect("snapshots");
+        assert_eq!((tools, snapshots), (0, 0));
+    }
+
+    #[test]
+    fn v1_to_v2_removes_existing_orphans_before_enforcing_ownership() {
+        let mut conn = Connection::open_in_memory().expect("open");
+        conn.execute_batch(V1).expect("v1 schema");
+        conn.execute("INSERT INTO schema_version(version) VALUES(1)", [])
+            .expect("v1 marker");
+        conn.execute(
+            "INSERT INTO tool_calls(id,conv_id,tier,name,created_at)
+             VALUES(x'01',x'02',1,'orphan',1)",
+            [],
+        )
+        .expect("orphan tool");
+        conn.execute(
+            "INSERT INTO file_snapshots(id,tool_call_id,path,created_at)
+             VALUES(x'03',x'01','/tmp/orphan',1)",
+            [],
+        )
+        .expect("orphan snapshot");
+
+        let report = migrate(&mut conn, None).expect("migrate to v2");
+        assert_eq!((report.from, report.to), (1, SCHEMA_VERSION));
+        let tools: i64 = conn
+            .query_row("SELECT count(*) FROM tool_calls", [], |row| row.get(0))
+            .expect("tools");
+        let snapshots: i64 = conn
+            .query_row("SELECT count(*) FROM file_snapshots", [], |row| row.get(0))
+            .expect("snapshots");
+        assert_eq!((tools, snapshots), (0, 0));
+    }
+
+    #[test]
+    fn busy_checkpoint_is_not_reported_as_success() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("wal.db");
+        let reader = Connection::open(&path).expect("reader");
+        reader
+            .execute_batch(
+                "PRAGMA journal_mode=WAL;
+                 CREATE TABLE values_(value INTEGER);
+                 INSERT INTO values_ VALUES(1);",
+            )
+            .expect("setup");
+        checkpoint_truncate(&reader).expect("initial checkpoint");
+        reader.execute_batch("BEGIN").expect("begin reader");
+        reader
+            .query_row("SELECT value FROM values_", [], |row| row.get::<_, i64>(0))
+            .expect("establish snapshot");
+
+        let writer = Connection::open(&path).expect("writer");
+        writer
+            .execute("INSERT INTO values_ VALUES(2)", [])
+            .expect("write WAL frame");
+        assert!(matches!(
+            checkpoint_truncate(&writer),
+            Err(StoreError::Locked { .. })
+        ));
+        reader.execute_batch("ROLLBACK").expect("end reader");
+    }
+
+    #[test]
+    fn backup_names_do_not_collide_within_one_second() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let path = directory.path().join("database.db");
+        let mut conn = Connection::open(&path).expect("open");
+        migrate(&mut conn, Some(&path)).expect("migrate");
+        let first = backup_file(&conn, &path).expect("first backup");
+        let second = backup_file(&conn, &path).expect("second backup");
+        assert_ne!(first, second);
+        assert!(first.exists() && second.exists());
     }
 
     #[test]
@@ -360,7 +657,7 @@ mod tests {
             err,
             StoreError::SchemaTooNew {
                 found: 99,
-                supported: 1
+                supported: SCHEMA_VERSION
             }
         ));
     }
