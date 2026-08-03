@@ -4277,6 +4277,12 @@ impl PanelState {
             rows += 1.0;
             height += theme::META_LINE_HEIGHT;
         }
+        // The usage footnote — must mirror `footer`'s condition exactly, or
+        // the drift clips the action row off the window edge.
+        if self.usage.total() > 0 {
+            rows += 1.0;
+            height += theme::META_LINE_HEIGHT;
+        }
         if self.attribution.substituted_for.is_some() && self.attribution.provider.is_some() {
             rows += 1.0;
             height += theme::META_LINE_HEIGHT;
@@ -4481,6 +4487,24 @@ fn footer(state: &PanelState) -> Element<'_, Message> {
             state.attribution.latency_ms,
             state.attribution.cost_label.as_deref(),
         ));
+    }
+
+    // §14 made visible (owner, 2026-08-03: "can we see how much token is
+    // used and cached?"): the turn's real accounting, once the provider has
+    // reported it. `↑` is the whole prompt — the cached share is named,
+    // because that is the part billed differently and the part that proves
+    // the prefix cache is working.
+    if state.usage.total() > 0 {
+        let prompt = state.usage.input_tokens + state.usage.cached_input_tokens;
+        let mut line = format!("↑ {prompt} · ↓ {}", state.usage.output_tokens);
+        if state.usage.cached_input_tokens > 0 {
+            line.push_str(" · ");
+            line.push_str(&i18n::t1(
+                Key::FootnoteCachedTokens,
+                &state.usage.cached_input_tokens.to_string(),
+            ));
+        }
+        stack = stack.push(widgets::footnote::<Message>(line));
     }
 
     // §13: a fallback is never silent to the point of invisibility.
