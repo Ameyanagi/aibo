@@ -204,7 +204,19 @@ pub const RAIL_GUTTER: f32 = 16.0;
 ///
 /// `Font::DEFAULT` until the licensed faces are vendored; swapping this
 /// constant is the only change required then.
+#[cfg(not(target_os = "windows"))]
 pub const UI_FONT: Font = Font::DEFAULT;
+
+/// Windows: name the system's *Japanese* UI face outright.
+///
+/// The generic default lets the shaper resolve Han-unified codepoints, and
+/// on Windows that fallback prefers the zh-first faces (SimSun/YaHei) unless
+/// the process locale happens to be ja — Japanese text rendered in a Chinese
+/// font (owner report, 2026-08-03). Yu Gothic UI ships with Windows 10+ and
+/// carries clean Latin, so naming it costs nothing for non-CJK text; if it is
+/// somehow absent the shaper falls back exactly as before.
+#[cfg(target_os = "windows")]
+pub const UI_FONT: Font = Font::with_name("Yu Gothic UI");
 
 /// The face for the input and for code in responses. The caret is the accent.
 pub const MONO_FONT: Font = Font::MONOSPACE;

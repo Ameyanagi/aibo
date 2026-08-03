@@ -252,6 +252,23 @@ fn worker(mut rx: mpsc::Receiver<UiaJob>) {
         }
     };
 
+    // Chromium and Electron keep their UIA trees dormant until a client
+    // *subscribes to events* — a process that only performs raw reads sees
+    // hollow trees, and `GetSelection` answers nothing (the S2 SPIKE's open
+    // question; the owner's 2026-08-03 report — "selected texts are not
+    // passed to aibo" — is its answer, since that surface is mostly
+    // Chromium). A no-op focus-changed subscription is the canonical wake:
+    // it marks this process as a real UIA client and those apps begin
+    // publishing full accessibility. Best-effort — a failed subscription
+    // costs nothing that worked before.
+    let wake: Box<uiautomation::events::CustomFocusChangedEventHandlerFn> = Box::new(|_| Ok(()));
+    if let Err(error) = automation.add_focus_changed_event_handler(
+        None,
+        &uiautomation::events::UIFocusChangedEventHandler::from(wake),
+    ) {
+        tracing::warn!(%error, "UIA focus subscription failed; Chromium apps may stay dormant");
+    }
+
     while let Some(job) = rx.blocking_recv() {
         if Instant::now() > job.deadline {
             tracing::debug!("UIA job dropped: past deadline before it started");

@@ -146,8 +146,11 @@ impl Binding {
 
 /// The crop-and-ask shortcut.
 ///
-/// On macOS this extends the panel's `⌥Space` with Shift: `⌥⇧Space`. Other
-/// platforms keep it unbound until their native picker path is implemented.
+/// On macOS this extends the panel's `⌥Space` with Shift: `⌥⇧Space`. Windows
+/// mirrors it against its own panel default: `Ctrl+Shift+Alt+Space` next to
+/// `Ctrl+Shift+Space` (the picker is `ms-screenclip:`, wired 2026-08-03 —
+/// the same overlay Win+Shift+S opens, which stays untouched as the system's
+/// own binding). Other platforms keep it unbound until they have a picker.
 pub fn default_screen_capture_hotkey() -> Option<HotKey> {
     #[cfg(target_os = "macos")]
     {
@@ -156,7 +159,14 @@ pub fn default_screen_capture_hotkey() -> Option<HotKey> {
             Code::Space,
         ))
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(target_os = "windows")]
+    {
+        Some(HotKey::new(
+            Some(Modifiers::CONTROL | Modifiers::SHIFT | Modifiers::ALT),
+            Code::Space,
+        ))
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         None
     }
