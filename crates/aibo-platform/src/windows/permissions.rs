@@ -333,6 +333,21 @@ pub(crate) fn status(p: Permission) -> PermissionStatus {
     }
 }
 
+/// [`PlatformBackend::request_permission`] for Windows.
+///
+/// [`PlatformBackend::request_permission`]: aibo_core::traits::PlatformBackend::request_permission
+pub(crate) fn request(p: Permission) -> WinResult<()> {
+    match p {
+        Permission::Accessibility | Permission::PostEvents => Ok(()),
+        Permission::Notifications => register_app_user_model_id(),
+        Permission::Autostart => set_autostart(true),
+        // Deliberately an error: there is no runtime path to `uiAccess`, and
+        // silently returning `Ok` would let the onboarding flow (§17) claim it
+        // asked for something it cannot obtain.
+        Permission::ElevatedWindowAccess => Err(WindowsPlatformError::UipiBlocked { pid: 0 }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -359,20 +374,5 @@ mod tests {
             status(Permission::Notifications),
             PermissionStatus::NotDetermined
         );
-    }
-}
-
-/// [`PlatformBackend::request_permission`] for Windows.
-///
-/// [`PlatformBackend::request_permission`]: aibo_core::traits::PlatformBackend::request_permission
-pub(crate) fn request(p: Permission) -> WinResult<()> {
-    match p {
-        Permission::Accessibility | Permission::PostEvents => Ok(()),
-        Permission::Notifications => register_app_user_model_id(),
-        Permission::Autostart => set_autostart(true),
-        // Deliberately an error: there is no runtime path to `uiAccess`, and
-        // silently returning `Ok` would let the onboarding flow (§17) claim it
-        // asked for something it cannot obtain.
-        Permission::ElevatedWindowAccess => Err(WindowsPlatformError::UipiBlocked { pid: 0 }),
     }
 }

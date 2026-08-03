@@ -281,19 +281,19 @@ impl WindowsBackend {
             .and_then(|()| input::send_chord(VK_CONTROL, input::VK_V));
 
         if let Some(previous) = saved {
-            if previous.restorable && !previous.concealed {
-                // A successful paste may consume the clipboard asynchronously;
-                // failed input has nothing to settle and should restore now.
-                if input_result.is_ok() {
-                    tokio::time::sleep(PASTE_SETTLE).await;
-                }
-                if let Err(error) = self
-                    .clipboard
-                    .restore(previous.text, sequence, Instant::now() + INSERT_BUDGET)
-                    .await
-                {
-                    tracing::warn!(%error, "could not restore the saved clipboard");
-                }
+            // `saved` can only be `Some` after the restorable/non-concealed
+            // guard above. A successful paste may consume the clipboard
+            // asynchronously; failed input has nothing to settle and should
+            // restore now.
+            if input_result.is_ok() {
+                tokio::time::sleep(PASTE_SETTLE).await;
+            }
+            if let Err(error) = self
+                .clipboard
+                .restore(previous.text, sequence, Instant::now() + INSERT_BUDGET)
+                .await
+            {
+                tracing::warn!(%error, "could not restore the saved clipboard");
             }
         }
         input_result
