@@ -307,6 +307,8 @@ pub enum Key {
     ProviderBaseUrlPlaceholder,
     /// Azure deployments field placeholder.
     ProviderDeploymentsPlaceholder,
+    /// Usage footnote: the cached share of the prompt.
+    FootnoteCachedTokens,
     /// Placeholder for the API-key field.
     ProviderKeyPlaceholder,
     /// The second line of the no-provider state: what to actually do about it.
@@ -768,6 +770,7 @@ fn en(key: Key) -> &'static str {
         K::ProviderIdPlaceholder => "Name, e.g. deepseek",
         K::ProviderBaseUrlPlaceholder => "Base URL, e.g. https://api.deepseek.com/v1",
         K::ProviderDeploymentsPlaceholder => "Deployments, comma-separated (each becomes a model)",
+        K::FootnoteCachedTokens => "{} from cache",
         K::ProviderKeyPlaceholder => "API key",
         K::ActionDismiss => "Dismiss",
         K::ActionRetry => "Retry",
@@ -1054,6 +1057,7 @@ fn ja(key: Key) -> &'static str {
         K::ProviderIdPlaceholder => "名前（例: deepseek）",
         K::ProviderBaseUrlPlaceholder => "ベース URL（例: https://api.deepseek.com/v1）",
         K::ProviderDeploymentsPlaceholder => "デプロイ名（カンマ区切り。それぞれモデルとして表示）",
+        K::FootnoteCachedTokens => "{} はキャッシュから",
         K::ProviderKeyPlaceholder => "API キー",
         K::ActionDismiss => "閉じる",
         K::ActionRetry => "再試行",
