@@ -432,8 +432,14 @@ pub struct ProviderDraft {
     pub backend: Backend,
     /// Explicit id, for a second endpoint of a backend already configured.
     pub id: String,
-    /// Base URL. Required for a custom endpoint.
+    /// Base URL. Required for a custom endpoint and for Azure (the Foundry
+    /// resource endpoint).
     pub base_url: String,
+    /// Azure only: deployment names, comma-separated, served through the
+    /// `v1` surface — each becomes a model in the picker. Prefilled with
+    /// the current gpt-5.6 trio because the portal suggests naming a
+    /// deployment after its model; edit to match yours.
+    pub models: String,
     /// The API key, as typed.
     key: String,
 }
@@ -448,6 +454,11 @@ impl ProviderDraft {
             backend,
             id: String::new(),
             base_url: String::new(),
+            models: if backend == Backend::Azure {
+                "gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol".to_owned()
+            } else {
+                String::new()
+            },
             key: String::new(),
         }
     }
@@ -488,9 +499,13 @@ impl ProviderDraft {
             return false;
         }
         // A custom endpoint is defined by its URL and needs a name to be
-        // addressed by; every other backend has both compiled in.
-        !(self.backend == Backend::Custom
-            && (self.base_url.trim().is_empty() || self.id.trim().is_empty()))
+        // addressed by; Azure is defined by its resource endpoint; every
+        // other backend has everything compiled in.
+        match self.backend {
+            Backend::Custom => !(self.base_url.trim().is_empty() || self.id.trim().is_empty()),
+            Backend::Azure => !self.base_url.trim().is_empty(),
+            _ => true,
+        }
     }
 }
 
@@ -553,6 +568,9 @@ pub enum Backend {
     Anthropic,
     /// OpenAI.
     OpenAi,
+    /// Azure OpenAI / AI Foundry (owner request, 2026-08-03: settable from
+    /// the window, not only from config.toml).
+    Azure,
     /// Groq.
     Groq,
     /// Cerebras.
@@ -567,11 +585,12 @@ pub enum Backend {
 
 impl Backend {
     /// Everything offerable, in the order the picker shows them.
-    pub const ALL: [Backend; 8] = [
+    pub const ALL: [Backend; 9] = [
         Backend::OpenRouter,
         Backend::Gemini,
         Backend::Anthropic,
         Backend::OpenAi,
+        Backend::Azure,
         Backend::Groq,
         Backend::Cerebras,
         Backend::Xai,
@@ -589,6 +608,7 @@ impl Backend {
             Backend::Gemini => "gemini",
             Backend::Anthropic => "anthropic",
             Backend::OpenAi => "open-ai",
+            Backend::Azure => "azure",
             Backend::Groq => "groq",
             Backend::Cerebras => "cerebras",
             Backend::Xai => "xai",
@@ -603,6 +623,7 @@ impl Backend {
             Backend::Gemini => "Google Gemini",
             Backend::Anthropic => "Anthropic",
             Backend::OpenAi => "OpenAI",
+            Backend::Azure => "Azure OpenAI / Foundry",
             Backend::Groq => "Groq",
             Backend::Cerebras => "Cerebras",
             Backend::Xai => "xAI",
@@ -670,6 +691,8 @@ pub enum Message {
     DraftId(String),
     /// The draft's base-URL field changed.
     DraftBaseUrl(String),
+    /// The draft's Azure deployments field changed.
+    DraftModels(String),
     /// The draft's key field changed.
     DraftKey(String),
     /// Save the draft: store the key, write the config entry, rebuild.
@@ -1268,26 +1291,41 @@ fn provider_draft(state: &SettingsState) -> Element<'_, Message> {
     ]
     .spacing(space(2.0));
 
-    // A custom endpoint is the only one that needs to be told where it is, and
-    // the only one that needs a name — the rest are addressed by their backend.
+    // A custom endpoint is the only one that needs a name — Azure and Custom
+    // both need to be told where they are; the rest are addressed by their
+    // backend alone.
     if draft.backend == Backend::Custom {
-        form = form
-            .push(
-                text_input(i18n::t(Key::ProviderIdPlaceholder), &draft.id)
-                    .on_input(Message::DraftId)
-                    .size(type_scale::BODY)
-                    .font(theme::MONO_FONT)
-                    .padding([space(2.0), space(2.0)])
-                    .style(theme::field),
-            )
-            .push(
-                text_input(i18n::t(Key::ProviderBaseUrlPlaceholder), &draft.base_url)
-                    .on_input(Message::DraftBaseUrl)
-                    .size(type_scale::BODY)
-                    .font(theme::MONO_FONT)
-                    .padding([space(2.0), space(2.0)])
-                    .style(theme::field),
-            );
+        form = form.push(
+            text_input(i18n::t(Key::ProviderIdPlaceholder), &draft.id)
+                .on_input(Message::DraftId)
+                .size(type_scale::BODY)
+                .font(theme::MONO_FONT)
+                .padding([space(2.0), space(2.0)])
+                .style(theme::field),
+        );
+    }
+    if matches!(draft.backend, Backend::Custom | Backend::Azure) {
+        form = form.push(
+            text_input(i18n::t(Key::ProviderBaseUrlPlaceholder), &draft.base_url)
+                .on_input(Message::DraftBaseUrl)
+                .size(type_scale::BODY)
+                .font(theme::MONO_FONT)
+                .padding([space(2.0), space(2.0)])
+                .style(theme::field),
+        );
+    }
+    // Azure: the deployments this resource serves, one picker model each.
+    // Prefilled with the model-named defaults; dictation needs none of this —
+    // the STT deployments are found by their model names automatically.
+    if draft.backend == Backend::Azure {
+        form = form.push(
+            text_input(i18n::t(Key::ProviderDeploymentsPlaceholder), &draft.models)
+                .on_input(Message::DraftModels)
+                .size(type_scale::BODY)
+                .font(theme::MONO_FONT)
+                .padding([space(2.0), space(2.0)])
+                .style(theme::field),
+        );
     }
 
     // `secure` is not cosmetic. A key pasted into a settings window sits on

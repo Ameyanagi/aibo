@@ -2696,7 +2696,15 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
                 // Switching backend mid-draft keeps what was typed: the key is
                 // usually the last thing entered and re-typing it because the
                 // wrong row was picked first is a real annoyance.
-                Some(draft) => draft.backend = backend,
+                Some(draft) => {
+                    draft.backend = backend;
+                    // …but the Azure deployments prefill only exists in
+                    // `new()`, so arriving at Azure with an untouched field
+                    // still gets the model-named defaults.
+                    if backend == settings::Backend::Azure && draft.models.trim().is_empty() {
+                        draft.models = settings::ProviderDraft::new(backend).models.clone();
+                    }
+                }
                 None => state.settings.draft = Some(settings::ProviderDraft::new(backend)),
             }
             Task::none()
@@ -2717,6 +2725,14 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
                 && !(state.command_held && is_single_char_insertion(&draft.base_url, &url))
             {
                 draft.base_url = url;
+            }
+            Task::none()
+        }
+        M::DraftModels(models) => {
+            if let Some(draft) = &mut state.settings.draft
+                && !(state.command_held && is_single_char_insertion(&draft.models, &models))
+            {
+                draft.models = models;
             }
             Task::none()
         }
@@ -2743,10 +2759,20 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             }
             let id = draft.id.trim();
             let base_url = draft.base_url.trim();
+            // Azure only: the comma-separated deployments become the picker
+            // catalogue. Other backends never show the field, so it is empty.
+            let models: Vec<String> = draft
+                .models
+                .split(',')
+                .map(str::trim)
+                .filter(|model| !model.is_empty())
+                .map(str::to_owned)
+                .collect();
             state.send(UiRequest::SetProviderKey {
                 backend: draft.backend.config_value().to_owned(),
                 id: (!id.is_empty()).then(|| id.to_owned()),
                 base_url: (!base_url.is_empty()).then(|| base_url.to_owned()),
+                models,
                 // Moves the key out and scrubs the remainder. The draft is
                 // dropped immediately after, so nothing survives this line.
                 key: draft.take_key(),

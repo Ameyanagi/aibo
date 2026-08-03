@@ -284,8 +284,12 @@ pub enum UiRequest {
         backend: String,
         /// Explicit id, for a second endpoint of a backend already configured.
         id: Option<String>,
-        /// Base URL. Required for a custom endpoint, ignored for the rest.
+        /// Base URL. Required for a custom endpoint and for Azure (the
+        /// Foundry resource endpoint), ignored for the rest.
         base_url: Option<String>,
+        /// Azure only: deployment names served through the `v1` surface,
+        /// written as the entry's `models = [...]`. Empty for the rest.
+        models: Vec<String>,
         /// The key. Empty means "the user cleared the field", which is a
         /// removal rather than an empty credential.
         key: SecretString,

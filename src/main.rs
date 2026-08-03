@@ -2061,13 +2061,14 @@ mod config_file {
         id: Option<&str>,
         backend: &str,
         base_url: Option<&str>,
+        models: &[String],
     ) -> io::Result<()> {
         let existing = match std::fs::read_to_string(path) {
             Ok(source) => source,
             Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
             Err(error) => return Err(error),
         };
-        let updated = splice_provider(&existing, id, backend, base_url);
+        let updated = splice_provider(&existing, id, backend, base_url, models);
         crate::paths::atomic_write(path, updated.as_bytes())
     }
 
@@ -2083,13 +2084,22 @@ mod config_file {
     }
 
     /// The body of one `[[providers]]` entry.
-    fn provider_body(id: Option<&str>, backend: &str, base_url: Option<&str>) -> String {
+    fn provider_body(
+        id: Option<&str>,
+        backend: &str,
+        base_url: Option<&str>,
+        models: &[String],
+    ) -> String {
         let mut body = format!("backend = {}\n", quote(backend));
         if let Some(id) = id.filter(|value| !value.trim().is_empty()) {
             body.push_str(&format!("id = {}\n", quote(id)));
         }
         if let Some(url) = base_url.filter(|value| !value.trim().is_empty()) {
             body.push_str(&format!("base_url = {}\n", quote(url)));
+        }
+        if !models.is_empty() {
+            let quoted: Vec<String> = models.iter().map(|model| quote(model)).collect();
+            body.push_str(&format!("models = [{}]\n", quoted.join(", ")));
         }
         body
     }
@@ -2167,12 +2177,13 @@ mod config_file {
         id: Option<&str>,
         backend: &str,
         base_url: Option<&str>,
+        models: &[String],
     ) -> String {
         let (before, mut blocks, after) = split_providers(source);
         let key = provider_key(id, backend);
         let mut replacement = vec!["[[providers]]".to_owned()];
         replacement.extend(
-            provider_body(id, backend, base_url)
+            provider_body(id, backend, base_url, models)
                 .lines()
                 .map(str::to_owned),
         );
@@ -2353,7 +2364,7 @@ base_url = \"http://localhost:11434\"
 [codex]
 enabled = true
 ";
-            let out = splice_provider(source, None, "anthropic", None);
+            let out = splice_provider(source, None, "anthropic", None, &[]);
 
             assert!(out.contains("# my notes"), "comments survive");
             assert!(out.contains("backend = \"groq\""));
@@ -2371,7 +2382,7 @@ enabled = true
         fn editing_a_provider_updates_in_place() {
             let source =
                 "[[providers]]\nbackend = \"custom\"\nid = \"local\"\nbase_url = \"http://old\"\n";
-            let out = splice_provider(source, Some("local"), "custom", Some("http://new"));
+            let out = splice_provider(source, Some("local"), "custom", Some("http://new"), &[]);
 
             assert!(out.contains("http://new"));
             assert!(!out.contains("http://old"));
@@ -2385,7 +2396,7 @@ enabled = true
         #[test]
         fn two_endpoints_of_one_backend_stay_separate() {
             let source = "[[providers]]\nbackend = \"ollama\"\nid = \"work\"\n";
-            let out = splice_provider(source, Some("home"), "ollama", Some("http://home"));
+            let out = splice_provider(source, Some("home"), "ollama", Some("http://home"), &[]);
             let parsed = aibo_session::Config::from_toml_str(&out).expect("valid toml");
             assert_eq!(parsed.providers.len(), 2);
         }
@@ -4149,9 +4160,16 @@ mod runtime {
                     backend,
                     id,
                     base_url,
+                    models,
                     key,
                 } => {
-                    self.set_provider_key(&backend, id.as_deref(), base_url.as_deref(), &key);
+                    self.set_provider_key(
+                        &backend,
+                        id.as_deref(),
+                        base_url.as_deref(),
+                        &models,
+                        &key,
+                    );
                 }
 
                 UiRequest::RemoveProvider { id } => {
@@ -4604,6 +4622,7 @@ mod runtime {
             backend: &str,
             id: Option<&str>,
             base_url: Option<&str>,
+            models: &[String],
             key: &secrecy::SecretString,
         ) {
             use secrecy::ExposeSecret as _;
@@ -4647,6 +4666,7 @@ mod runtime {
                 id,
                 backend,
                 base_url,
+                models,
             ) {
                 tracing::error!(provider = %addressed_as, %error, "could not write config.toml");
                 return;
