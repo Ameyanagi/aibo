@@ -75,6 +75,12 @@ use windows::Win32::UI::WindowsAndMessaging::{GetWindowTextW, GetWindowThreadPro
 use windows_core::PWSTR;
 
 use self::clipboard::ClipboardHandle;
+
+/// The clipboard sequence number, for [`crate::screen_capture`]'s
+/// crop-landed detection.
+pub(crate) fn clipboard_sequence() -> u32 {
+    ClipboardHandle::sequence()
+}
 pub use self::dpapi::DpapiProtector;
 pub use self::error::{WinResult, WindowsPlatformError};
 use self::uia::UiaHandle;

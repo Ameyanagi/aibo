@@ -144,7 +144,10 @@ core-graphics = "0.24"
 # --- Windows ----------------------------------------------------------------
 windows = "0.62"
 windows-core = "0.62"
-uiautomation = "0.25"                # §8 [!Send + !Sync — dedicated MTA thread]
+# `event` in features: a no-op focus subscription is what wakes Chromium's
+# dormant UIA trees (see windows/uia.rs), and the module is configured out
+# by default.
+uiautomation = { version = "0.25", features = ["event"] } # §8 [!Send + !Sync — dedicated MTA thread]
 
 # --- dev --------------------------------------------------------------------
 insta = "1"
@@ -262,3 +265,9 @@ cosmic-text = { path = "vendor/cosmic-text" }
 # clipped the glyph out. Saturating the adds lets the degenerate glyph fall
 # into the clip path instead of aborting the app.
 cryoglyph = { path = "vendor/cryoglyph" }
+# The IME preedit overlay inherits the window's background color forced to
+# a=1.0 — on aibo's transparent panel that is an opaque black strip, which
+# makes composing text unreadable (worst in light mode). The vendored copy
+# derives an opposing backdrop from the text color when the window clear is
+# fully transparent. See `vendor/iced_winit/src/window.rs`, [AIBO PATCH].
+iced_winit = { path = "vendor/iced_winit" }

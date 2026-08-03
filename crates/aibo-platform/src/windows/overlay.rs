@@ -9,7 +9,7 @@ use windows::Win32::Foundation::{
 };
 use windows::Win32::Graphics::Dwm::{
     DWMSBT_TRANSIENTWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE,
-    DwmSetWindowAttribute,
+    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
 };
 use windows::Win32::Graphics::Gdi::ScreenToClient;
 use windows::Win32::UI::Accessibility::{
@@ -66,6 +66,13 @@ pub(crate) fn configure_panel_window(
         SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_FRAMECHANGED,
         "refresh overlay window style",
     )?;
+
+    // DWM must clip the window to rounded corners, or every square corner of
+    // the rectangular HWND renders opaque — the backdrop below fills the
+    // whole rect, and the chrome's own radius only paints *inside* it (owner
+    // report, 2026-08-03: "the corners are not transparent"). Best-effort:
+    // Windows 10 has no corner preference and degrades to square corners.
+    let _ = set_dwm_attribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, &DWMWCP_ROUND);
 
     // Acrylic is available as DWMSBT_TRANSIENTWINDOW on current Windows 11.
     // Older builds return an unsupported-attribute HRESULT; that is cosmetic

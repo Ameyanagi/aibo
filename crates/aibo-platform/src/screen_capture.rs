@@ -64,8 +64,69 @@ pub async fn capture_screen_region() -> Result<Option<Attachment>, ScreenCapture
     )))
 }
 
-/// Non-macOS builds keep the API available; no default hotkey calls it.
-#[cfg(not(target_os = "macos"))]
+/// Windows: the Snipping Tool's crop overlay, which copies to the clipboard.
+///
+/// There is no scriptable crop-to-file tool on Windows, but `ms-screenclip:`
+/// opens the same region picker Win+Shift+S does. Launch it, watch the
+/// clipboard *sequence number* — Esc never copies, so an unmoved number for
+/// the whole window is a cancelled crop, not a failure — then lift the
+/// bitmap and re-encode as PNG, the attachment contract.
+#[cfg(target_os = "windows")]
+pub async fn capture_screen_region() -> Result<Option<Attachment>, ScreenCaptureError> {
+    use aibo_core::types::AttachmentSource;
+    use std::time::Duration;
+
+    let before = crate::windows::clipboard_sequence();
+    // `explorer.exe` returns immediately; the overlay outlives it, so the
+    // exit status says nothing about the crop.
+    let _ = tokio::process::Command::new("explorer.exe")
+        .arg("ms-screenclip:")
+        .status()
+        .await?;
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(120);
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Ok(None);
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        if crate::windows::clipboard_sequence() != before {
+            break;
+        }
+    }
+
+    let encoded = tokio::task::spawn_blocking(|| {
+        let image = arboard::Clipboard::new()
+            .and_then(|mut c| c.get_image())
+            .ok()?;
+        let width = u32::try_from(image.width).ok()?;
+        let height = u32::try_from(image.height).ok()?;
+        let buffer = image::RgbaImage::from_raw(width, height, image.bytes.into_owned())?;
+        let mut png = Vec::new();
+        image::DynamicImage::ImageRgba8(buffer)
+            .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+            .ok()?;
+        Some((png, width, height))
+    })
+    .await?;
+    let Some((bytes, width, height)) = encoded else {
+        // The sequence moved but no image followed — the user copied text
+        // from somewhere else mid-crop. Treat as cancellation.
+        return Ok(None);
+    };
+
+    Ok(Some(Attachment::image(
+        AttachmentSource::ScreenRegion,
+        bytes,
+        "image/png",
+        width,
+        height,
+        String::new(),
+    )))
+}
+
+/// Other builds keep the API available; no default hotkey calls it.
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
 pub async fn capture_screen_region() -> Result<Option<Attachment>, ScreenCaptureError> {
     Err(ScreenCaptureError::Unsupported)
 }
