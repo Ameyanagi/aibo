@@ -76,9 +76,35 @@ pub(crate) fn configure_panel_window(
         window.setTitlebarAppearsTransparent(true);
         window.setMovableByWindowBackground(true);
 
+        pin_content_gravity(view);
+
         let backdrop = install_backdrop(mtm, view);
         Ok(OverlayWindowConfiguration { backdrop })
     })
+}
+
+/// Stop the renderer's layer from **stretching** while the window resizes.
+///
+/// A Core Animation layer's default `contentsGravity` is `resize`: during an
+/// animated `setFrame`, AppKit scales the last rendered frame to each
+/// intermediate size, so a panel growing by 200 pt smears its text vertically
+/// for the length of the animation (owner report, 2026-08-04: "the animation
+/// is stretching the text … very, very hard to read").
+///
+/// `topLeft` pins those pixels at their natural size against the panel's own
+/// anchor instead. Growth then reveals space the next frame paints into, which
+/// is what "only the outer size changes" means; shrinking crops rather than
+/// squeezes. `setNeedsDisplayOnBoundsChange` asks for that next frame as early
+/// as the bounds move, so the revealed strip is empty for as little time as
+/// possible.
+fn pin_content_gravity(view: &NSView) {
+    let Some(layer) = view.layer() else {
+        return;
+    };
+    // The gravity constants are plain strings; naming the value avoids
+    // linking against `kCAGravityTopLeft` for one assignment.
+    layer.setContentsGravity(&NSString::from_str("topLeft"));
+    layer.setNeedsDisplayOnBoundsChange(true);
 }
 
 pub(crate) fn present_panel_without_activation(
@@ -189,16 +215,16 @@ fn install_backdrop(mtm: MainThreadMarker, host: &NSView) -> BackdropStatus {
     BackdropStatus::Applied
 }
 
-/// Set the panel's frame in one native call, animated by the window server.
+/// Set the panel's frame in one native call without scaling its contents.
 ///
 /// `x`/`y` are top-left-origin global logical points — the shell's own
 /// convention — flipped here against the primary screen into AppKit's
-/// bottom-left frame. One animated `setFrame` replaces the shell's separate
-/// resize-then-move effects: the window server interpolates the frame while
-/// the chrome re-lays-out each animation frame, which is what turns a
-/// streaming height change from a per-event snap into motion. Honors the
-/// system reduced-motion preference by applying the frame instantly.
-pub(crate) fn animate_panel_frame(
+/// bottom-left frame. Applying the complete frame atomically preserves the
+/// top edge without the transient intermediate sizes produced by separate
+/// resize and move effects. Animation stays disabled: AppKit scales the last
+/// Metal frame while interpolating the window bounds, which visibly changes
+/// text size during every growth step.
+pub(crate) fn set_panel_frame(
     handle: AppKitWindowHandle,
     x: f64,
     y: f64,
@@ -220,8 +246,7 @@ pub(crate) fn animate_panel_frame(
             NSPoint::new(x, primary.frame().size.height - y - height),
             NSSize::new(width, height),
         );
-        let animate = !NSWorkspace::sharedWorkspace().accessibilityDisplayShouldReduceMotion();
-        window.setFrame_display_animate(frame, true, animate);
+        window.setFrame_display_animate(frame, true, false);
         Ok(())
     })
 }

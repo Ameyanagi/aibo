@@ -52,7 +52,6 @@
 pub mod protocol;
 
 use std::collections::HashMap;
-use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::sync::Arc;
@@ -60,7 +59,7 @@ use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::time::Duration;
 
 use aibo_core::error::{AiboError, Result};
-use aibo_core::traits::AgentBackend;
+use aibo_core::traits::{AgentBackend, ChildProcessObserver, ChildProcessRegistration};
 use aibo_core::types::{
     AgentFeatures, AgentLimits, AgentStatus, AgentStep, AgentTask, ApprovalDecision,
     ApprovalRequest, BoxStream, BudgetKind, SandboxKind, ToolTier,
@@ -72,7 +71,7 @@ use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 #[cfg(windows)]
 use process_wrap::tokio::{CreationFlags, JobObject};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdin, Command};
 use tokio::sync::{broadcast, mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
@@ -82,6 +81,10 @@ use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 use crate::limits::LimitTracker;
 use crate::native_loop::fenced_context;
 use crate::permission_gate::{ApprovalResponse, ApprovalUi, verify_approval_response};
+use crate::process_io::{
+    BoundedLine, MAX_LOG_LINE_BYTES, MAX_PROTOCOL_LINE_BYTES, read_bounded_line,
+    safe_child_environment,
+};
 use protocol::{
     AccountRead, ExecApprovalParams, Inbound, InitializeParams, InitializeResult, InterruptParams,
     OutboundNotification, OutboundRequest, OutboundResponse, PatchApprovalParams,
@@ -256,54 +259,6 @@ impl Default for CodexConfig {
 // Process spawning
 // ---------------------------------------------------------------------------
 
-// A child inherits only the small set needed to locate binaries, its profile,
-// locale, and temporary directory. In particular, ambient provider/cloud
-// credentials do not cross the process boundary. Configured `env` entries
-// below remain explicit opt-ins.
-#[cfg(not(windows))]
-const SAFE_CHILD_ENVIRONMENT: &[&str] = &[
-    "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
-];
-
-#[cfg(windows)]
-const SAFE_CHILD_ENVIRONMENT: &[&str] = &[
-    "PATH",
-    "SystemRoot",
-    "WINDIR",
-    "COMSPEC",
-    "PATHEXT",
-    "TEMP",
-    "TMP",
-    "USERPROFILE",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "PROGRAMDATA",
-];
-
-fn safe_child_environment_from(
-    environment: impl IntoIterator<Item = (OsString, OsString)>,
-) -> Vec<(OsString, OsString)> {
-    environment
-        .into_iter()
-        .filter(|(key, _)| {
-            SAFE_CHILD_ENVIRONMENT
-                .iter()
-                .any(|allowed| env_key_eq(key, OsStr::new(allowed)))
-        })
-        .collect()
-}
-
-#[cfg(windows)]
-fn env_key_eq(left: &OsStr, right: &OsStr) -> bool {
-    left.to_string_lossy()
-        .eq_ignore_ascii_case(&right.to_string_lossy())
-}
-
-#[cfg(not(windows))]
-fn env_key_eq(left: &OsStr, right: &OsStr) -> bool {
-    left == right
-}
-
 /// Spawn a child in a Unix process group or Windows Job Object.
 ///
 /// `process-wrap` supplies the platform implementation without weakening this
@@ -320,7 +275,7 @@ fn spawn_in_process_group(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     cmd.env_clear();
-    cmd.envs(safe_child_environment_from(std::env::vars_os()));
+    cmd.envs(safe_child_environment());
 
     if let Some(dir) = cwd {
         cmd.current_dir(dir);
@@ -353,12 +308,29 @@ fn spawn_in_process_group(
 /// Large because a Codex turn is chatty and a slow subscriber that lags loses
 /// events irrecoverably. Lag is logged loudly rather than swallowed.
 const INBOUND_CAPACITY: usize = 4096;
+const INTERNAL_TRANSPORT_CLOSED: &str = "__aibo/transportClosed";
+const INTERRUPT_TIMEOUT: Duration = Duration::from_millis(500);
 
 /// In-flight requests, keyed by outgoing id.
 type Pending = Arc<std::sync::Mutex<HashMap<i64, oneshot::Sender<RpcResult>>>>;
 
 /// A response body or the server's error object.
 type RpcResult = std::result::Result<Value, RpcError>;
+
+/// Removes an in-flight request even when its future is cancelled by dropping.
+struct PendingGuard {
+    pending: Pending,
+    id: i64,
+}
+
+impl Drop for PendingGuard {
+    fn drop(&mut self) {
+        self.pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&self.id);
+    }
+}
 
 /// One live `codex app-server` child and its framing.
 struct Connection {
@@ -370,8 +342,11 @@ struct Connection {
     /// `None` after the first shutdown; keeping this behind its own lock lets
     /// shutdown terminate the process even while turns still hold an `Arc`.
     child: tokio::sync::Mutex<Option<Box<dyn ChildWrapper>>>,
+    /// Keeps the crash-recovery ledger entry live exactly as long as the
+    /// connection owns the child.
+    _registration: ChildProcessRegistration,
     request_timeout: Duration,
-    closed: AtomicBool,
+    closed: Arc<AtomicBool>,
     protocol_version: Version,
 }
 
@@ -381,6 +356,7 @@ impl Connection {
     async fn open(
         config: &CodexConfig,
         cwd: Option<&PathBuf>,
+        process_observer: Option<Arc<dyn ChildProcessObserver>>,
     ) -> std::result::Result<Self, CodexError> {
         let mut child = spawn_in_process_group(config, cwd).map_err(|e| {
             if e.kind() == std::io::ErrorKind::NotFound {
@@ -391,6 +367,12 @@ impl Connection {
                 CodexError::Io(e)
             }
         })?;
+        let identity = config
+            .program
+            .file_name()
+            .unwrap_or(config.program.as_os_str())
+            .to_string_lossy();
+        let registration = ChildProcessRegistration::new(process_observer, child.id(), &identity);
 
         let stdin = child.stdin().take().ok_or(CodexError::EarlyExit)?;
         let stdout = child.stdout().take().ok_or(CodexError::EarlyExit)?;
@@ -402,13 +384,27 @@ impl Connection {
         // Codex logs to stderr; drain it so the pipe never fills and blocks the
         // child, and so a crash leaves something in the diagnostics.
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::debug!(target: "codex.stderr", "{line}");
+            let mut reader = BufReader::new(stderr);
+            loop {
+                match read_bounded_line(&mut reader, MAX_LOG_LINE_BYTES).await {
+                    Ok(BoundedLine::Line(line)) => {
+                        tracing::debug!(target: "codex.stderr", bytes = line.len(), "codex emitted a diagnostic line");
+                    }
+                    Ok(BoundedLine::TooLong) => {
+                        tracing::debug!(target: "codex.stderr", "[diagnostic line truncated by aibo]");
+                    }
+                    Ok(BoundedLine::Eof) | Err(_) => break,
+                }
             }
         });
 
-        Self::spawn_reader(stdout, Arc::clone(&pending), inbound.clone());
+        let closed = Arc::new(AtomicBool::new(false));
+        Self::spawn_reader(
+            stdout,
+            Arc::clone(&pending),
+            inbound.clone(),
+            Arc::clone(&closed),
+        );
 
         Ok(Self {
             stdin: tokio::sync::Mutex::new(Some(stdin)),
@@ -416,8 +412,9 @@ impl Connection {
             pending,
             inbound,
             child: tokio::sync::Mutex::new(Some(child)),
+            _registration: registration,
             request_timeout: config.request_timeout,
-            closed: AtomicBool::new(false),
+            closed,
             // Replaced by `handshake`.
             protocol_version: Version::new(0, 0, 0),
         })
@@ -429,12 +426,13 @@ impl Connection {
         stdout: tokio::process::ChildStdout,
         shared: Pending,
         inbound: broadcast::Sender<Arc<Inbound>>,
+        closed: Arc<AtomicBool>,
     ) {
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stdout).lines();
+            let mut reader = BufReader::new(stdout);
             loop {
-                match lines.next_line().await {
-                    Ok(Some(line)) => {
+                match read_bounded_line(&mut reader, MAX_PROTOCOL_LINE_BYTES).await {
+                    Ok(BoundedLine::Line(line)) => {
                         if line.trim().is_empty() {
                             continue;
                         }
@@ -470,7 +468,14 @@ impl Connection {
                         // Notifications and server → client requests fan out.
                         let _ = inbound.send(Arc::new(message));
                     }
-                    Ok(None) => {
+                    Ok(BoundedLine::TooLong) => {
+                        tracing::warn!(
+                            max_bytes = MAX_PROTOCOL_LINE_BYTES,
+                            "oversized app-server frame closed the transport"
+                        );
+                        break;
+                    }
+                    Ok(BoundedLine::Eof) => {
                         tracing::info!("codex app-server closed stdout");
                         break;
                     }
@@ -480,6 +485,11 @@ impl Connection {
                     }
                 }
             }
+            closed.store(true, Ordering::Release);
+            let _ = inbound.send(Arc::new(Inbound::Notification {
+                method: INTERNAL_TRANSPORT_CLOSED.to_owned(),
+                params: Value::Null,
+            }));
             // Release everyone still waiting, rather than letting them time out.
             let mut map = shared.lock().unwrap_or_else(|e| e.into_inner());
             for (_, tx) in map.drain() {
@@ -525,6 +535,10 @@ impl Connection {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .insert(id, tx);
+        let _pending_guard = PendingGuard {
+            pending: Arc::clone(&self.pending),
+            id,
+        };
 
         let frame = serde_json::to_string(&OutboundRequest {
             id: RequestId::Number(id),
@@ -569,15 +583,6 @@ impl Connection {
         }
     }
 
-    async fn notify(
-        &self,
-        method_name: &'static str,
-        params: Option<Value>,
-    ) -> std::result::Result<(), CodexError> {
-        self.notify_with_timeout(method_name, params, self.request_timeout)
-            .await
-    }
-
     async fn notify_with_timeout(
         &self,
         method_name: &'static str,
@@ -606,6 +611,17 @@ impl Connection {
         result: Option<Value>,
         error: Option<RpcError>,
     ) -> std::result::Result<(), CodexError> {
+        self.respond_with_timeout(id, result, error, self.request_timeout)
+            .await
+    }
+
+    async fn respond_with_timeout(
+        &self,
+        id: RequestId,
+        result: Option<Value>,
+        error: Option<RpcError>,
+        timeout: Duration,
+    ) -> std::result::Result<(), CodexError> {
         let frame =
             serde_json::to_string(&OutboundResponse { id, result, error }).map_err(|e| {
                 CodexError::Malformed {
@@ -613,7 +629,7 @@ impl Connection {
                     detail: format!("could not encode response: {e}"),
                 }
             })?;
-        tokio::time::timeout(self.request_timeout, self.write_line_unbounded(frame))
+        tokio::time::timeout(timeout, self.write_line_unbounded(frame))
             .await
             .map_err(|_| CodexError::RequestTimeout { method: "response" })?
     }
@@ -707,6 +723,11 @@ pub struct CodexAppServer {
     approvals: Arc<dyn ApprovalUi>,
     connection: tokio::sync::Mutex<Option<Arc<Connection>>>,
     rate_limits: Arc<std::sync::Mutex<RateLimitSnapshot>>,
+    /// ID-less protocol frames cannot be routed safely between concurrent
+    /// turns. Keep one active turn per connection until the protocol guarantees
+    /// a thread id on every event and request.
+    run_serial: Arc<tokio::sync::Mutex<()>>,
+    process_observer: Option<Arc<dyn ChildProcessObserver>>,
 }
 
 impl std::fmt::Debug for CodexAppServer {
@@ -725,7 +746,17 @@ impl CodexAppServer {
             approvals,
             connection: tokio::sync::Mutex::new(None),
             rate_limits: Arc::new(std::sync::Mutex::new(RateLimitSnapshot::default())),
+            run_serial: Arc::new(tokio::sync::Mutex::new(())),
+            process_observer: None,
         }
+    }
+
+    /// Report the persistent app-server child to the application-owned crash
+    /// recovery ledger.
+    #[must_use]
+    pub fn with_process_observer(mut self, observer: Arc<dyn ChildProcessObserver>) -> Self {
+        self.process_observer = Some(observer);
+        self
     }
 
     /// The merged quota state (§3).
@@ -806,7 +837,7 @@ impl CodexAppServer {
             }
             guard.take();
         }
-        let mut conn = Connection::open(&self.config, cwd)
+        let mut conn = Connection::open(&self.config, cwd, self.process_observer.clone())
             .await
             .map_err(CodexError::into_aibo)?;
         if let Err(error) = conn.handshake(&self.config).await {
@@ -829,7 +860,16 @@ impl AgentBackend for CodexAppServer {
         limits: AgentLimits,
         cancel: CancellationToken,
     ) -> Result<BoxStream<'static, Result<AgentStep>>> {
-        let conn = self.connect(task.workspace.as_ref()).await?;
+        let permit = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(cancelled_stream(limits)),
+            permit = Arc::clone(&self.run_serial).lock_owned() => permit,
+        };
+        let conn = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(cancelled_stream(limits)),
+            result = self.connect(task.workspace.as_ref()) => result?,
+        };
         let inbound = conn.subscribe();
 
         // §3b: Do always starts a **new** thread, seeded with a replayable
@@ -847,14 +887,19 @@ impl AgentBackend for CodexAppServer {
             }
             .into_aibo()
         })?;
-        let raw = conn
-            .request(
-                method::THREAD_START,
-                Some(params),
-                self.config.request_timeout,
-            )
-            .await
-            .map_err(CodexError::into_aibo)?;
+        let start = conn.request(
+            method::THREAD_START,
+            Some(params),
+            self.config.request_timeout,
+        );
+        let raw = tokio::select! {
+            biased;
+            () = cancel.cancelled() => {
+                let _ = conn.shutdown(self.config.shutdown_timeout).await;
+                return Ok(cancelled_stream(limits));
+            }
+            result = start => result.map_err(CodexError::into_aibo)?,
+        };
         let started: ThreadStartResult = serde_json::from_value(raw).map_err(|e| {
             CodexError::Malformed {
                 method: method::THREAD_START,
@@ -881,6 +926,7 @@ impl AgentBackend for CodexAppServer {
             instruction: task.instruction.clone(),
             tracker: LimitTracker::new(limits),
             tx,
+            _run_permit: permit,
         };
         let seed = seed_message(&task);
         tokio::spawn(async move { turn.drive(seed, inbound, cancel).await });
@@ -912,6 +958,13 @@ impl AgentBackend for CodexAppServer {
     }
 }
 
+fn cancelled_stream(limits: AgentLimits) -> BoxStream<'static, Result<AgentStep>> {
+    let outcome = LimitTracker::new(limits).outcome(AgentStatus::Cancelled);
+    Box::pin(futures::stream::once(async move {
+        Ok(AgentStep::Done(outcome))
+    }))
+}
+
 /// Build the text seeded into a fresh Codex thread (§3b).
 fn seed_message(task: &AgentTask) -> String {
     let mut out = task.instruction.clone();
@@ -938,6 +991,7 @@ struct Turn {
     instruction: String,
     tracker: LimitTracker,
     tx: mpsc::Sender<Result<AgentStep>>,
+    _run_permit: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl Turn {
@@ -947,8 +1001,6 @@ impl Turn {
         mut inbound: broadcast::Receiver<Arc<Inbound>>,
         cancel: CancellationToken,
     ) {
-        let deadline = tokio::time::Instant::from_std(self.tracker.deadline());
-
         let send = {
             let conn = Arc::clone(&self.conn);
             let params = serde_json::to_value(SendMessageParams {
@@ -957,10 +1009,10 @@ impl Turn {
             })
             .unwrap_or(Value::Null);
             let timeout = self.request_timeout;
-            tokio::spawn(async move {
+            async move {
                 conn.request(method::THREAD_SEND_MESSAGE, Some(params), timeout)
                     .await
-            })
+            }
         };
         tokio::pin!(send);
         let mut send_done = false;
@@ -978,7 +1030,12 @@ impl Turn {
                     return;
                 }
 
-                () = tokio::time::sleep_until(deadline) => {
+                () = self.tx.closed() => {
+                    self.interrupt().await;
+                    return;
+                }
+
+                () = tokio::time::sleep_until(tokio::time::Instant::from_std(self.tracker.deadline())) => {
                     // §14: mandatory, not advisory. Codex's own limits apply
                     // too, but aibo must not depend on them.
                     self.interrupt().await;
@@ -992,16 +1049,12 @@ impl Turn {
                 result = &mut send, if !send_done => {
                     send_done = true;
                     match result {
-                        Ok(Ok(_)) => {
+                        Ok(_) => {
                             // Some builds answer immediately and stream events
                             // afterwards; others answer at turn end. Either way
                             // the terminal event is what ends the run.
                         }
-                        Ok(Err(e)) => { self.fail(e.into_aibo()).await; return; }
-                        Err(e) => {
-                            self.fail(AiboError::Internal(Box::new(e))).await;
-                            return;
-                        }
+                        Err(e) => { self.fail(e.into_aibo()).await; return; }
                     }
                 }
 
@@ -1009,6 +1062,9 @@ impl Turn {
                     match received {
                         Ok(message) => {
                             if self.handle(&message, &cancel).await == Flow::Stop {
+                                if self.tx.is_closed() {
+                                    self.interrupt().await;
+                                }
                                 return;
                             }
                         }
@@ -1017,6 +1073,12 @@ impl Turn {
                             // is worse than a loud one — say so rather than
                             // pretending the run is intact.
                             tracing::error!(dropped = n, "app-server events dropped: subscriber lagged");
+                            self.interrupt().await;
+                            self.fail(CodexError::Malformed {
+                                method: method::THREAD_EVENT,
+                                detail: "the client lagged and lost one or more events".to_owned(),
+                            }.into_aibo()).await;
+                            return;
                         }
                         Err(broadcast::error::RecvError::Closed) => {
                             self.fail(CodexError::TransportClosed.into_aibo()).await;
@@ -1058,6 +1120,13 @@ impl Turn {
                         .merge(update);
                 }
                 Flow::Continue
+            }
+            INTERNAL_TRANSPORT_CLOSED => {
+                if let Err(error) = self.conn.shutdown(self.shutdown_timeout).await {
+                    tracing::warn!(%error, "could not reap codex after transport closure");
+                }
+                self.fail(CodexError::TransportClosed.into_aibo()).await;
+                Flow::Stop
             }
             method::THREAD_EVENT => {
                 let Ok(event) = serde_json::from_value::<ThreadEvent>(params.clone()) else {
@@ -1110,7 +1179,9 @@ impl Turn {
         }
 
         if event.is_turn_end() {
-            let status = if event.is_turn_failure() {
+            let status = if event.is_turn_aborted() {
+                AgentStatus::Cancelled
+            } else if event.is_turn_failure() {
                 AgentStatus::Failed(
                     event
                         .error
@@ -1204,16 +1275,19 @@ impl Turn {
         // §13: `esc` must abort in-flight work. A pending approval that is
         // cancelled resolves to Deny — the safe answer, and the only one that
         // does not leave the child blocked.
-        let response = tokio::select! {
-            () = cancel.cancelled() => ApprovalResponse::deny(),
+        let approval_started = std::time::Instant::now();
+        let (response, was_cancelled, receiver_closed) = tokio::select! {
+            () = cancel.cancelled() => (ApprovalResponse::deny(), true, false),
+            () = self.tx.closed() => (ApprovalResponse::deny(), false, true),
             answered = self.approvals.request(request.clone()) => match answered {
-                Ok(d) => d,
+                Ok(d) => (d, false, false),
                 Err(e) => {
                     tracing::warn!(error = %e, "approval UI failed; denying");
-                    ApprovalResponse::deny()
+                    (ApprovalResponse::deny(), false, false)
                 }
             },
         };
+        self.tracker.credit_wait(approval_started.elapsed());
         let decision = match verify_approval_response(&request, response) {
             Ok(decision) => decision,
             Err(reason) => {
@@ -1222,11 +1296,30 @@ impl Turn {
             }
         };
 
-        if let Err(e) = self
-            .conn
-            .respond(id, Some(protocol::approval_reply(decision)), None)
-            .await
-        {
+        let response_timeout = if was_cancelled || receiver_closed {
+            INTERRUPT_TIMEOUT
+        } else {
+            self.request_timeout
+        };
+        let response = self.conn.respond_with_timeout(
+            id,
+            Some(protocol::approval_reply(decision)),
+            None,
+            response_timeout,
+        );
+        let response_result = tokio::select! {
+            biased;
+            () = self.tx.closed(), if !receiver_closed => {
+                self.interrupt().await;
+                return Flow::Stop;
+            }
+            result = response => result,
+        };
+        if receiver_closed {
+            self.interrupt().await;
+            return Flow::Stop;
+        }
+        if let Err(e) = response_result {
             self.fail(e.into_aibo()).await;
             return Flow::Stop;
         }
@@ -1250,7 +1343,7 @@ impl Turn {
         .unwrap_or(Value::Null);
         if let Err(e) = self
             .conn
-            .notify(method::THREAD_INTERRUPT, Some(params))
+            .notify_with_timeout(method::THREAD_INTERRUPT, Some(params), INTERRUPT_TIMEOUT)
             .await
         {
             tracing::warn!(error = %e, "could not interrupt the codex thread");
@@ -1495,6 +1588,143 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(100), backend.shutdown())
             .await
             .expect("second shutdown must return immediately");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn stdout_eof_after_send_ack_fails_the_turn_promptly() {
+        let config = CodexConfig {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_owned(),
+                concat!(
+                    "IFS= read -r initialize\n",
+                    "printf '%s\\n' '{\"id\":1,\"result\":",
+                    "{\"protocolVersion\":\"0.63.0\"}}'\n",
+                    "IFS= read -r initialized\n",
+                    "IFS= read -r thread_start\n",
+                    "printf '%s\\n' '{\"id\":2,\"result\":{\"threadId\":\"t1\"}}'\n",
+                    "IFS= read -r send_message\n",
+                    "printf '%s\\n' '{\"id\":3,\"result\":{}}'\n",
+                    "exit 0"
+                )
+                .to_owned(),
+            ],
+            startup_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(2),
+            shutdown_timeout: Duration::from_secs(2),
+            ..CodexConfig::default()
+        };
+        let backend = CodexAppServer::new(config, Arc::new(crate::permission_gate::DenyAll));
+        let task = AgentTask {
+            id: Uuid::now_v7(),
+            instruction: "run".to_owned(),
+            workspace: None,
+            context: Vec::new(),
+            binding: None,
+            conversation_id: None,
+        };
+        let mut stream = backend
+            .run(task, AgentLimits::default(), CancellationToken::new())
+            .await
+            .expect("start turn");
+        let first = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .expect("EOF must wake the turn")
+            .expect("error item");
+        assert!(first.is_err(), "expected transport error, got {first:?}");
+        let done = stream.next().await.unwrap().unwrap();
+        assert!(matches!(done, AgentStep::Done(_)));
+        assert!(
+            backend
+                .connection
+                .lock()
+                .await
+                .as_ref()
+                .is_some_and(|connection| connection.is_closed())
+        );
+        backend.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn dropping_the_turn_stream_sends_an_interrupt() {
+        let temp = tempfile::tempdir().expect("temp dir");
+        let marker = temp.path().join("interrupted");
+        let config = CodexConfig {
+            program: PathBuf::from("/bin/sh"),
+            args: vec![
+                "-c".to_owned(),
+                concat!(
+                    "IFS= read -r initialize\n",
+                    "printf '%s\\n' '{\"id\":1,\"result\":",
+                    "{\"protocolVersion\":\"0.63.0\"}}'\n",
+                    "IFS= read -r initialized\n",
+                    "IFS= read -r thread_start\n",
+                    "printf '%s\\n' '{\"id\":2,\"result\":{\"threadId\":\"t1\"}}'\n",
+                    "while IFS= read -r line; do\n",
+                    "  case \"$line\" in *thread/interrupt*) echo yes > \"$MARKER\"; exit 0;; esac\n",
+                    "done"
+                )
+                .to_owned(),
+            ],
+            env: vec![("MARKER".to_owned(), marker.display().to_string())],
+            startup_timeout: Duration::from_secs(2),
+            request_timeout: Duration::from_secs(2),
+            shutdown_timeout: Duration::from_secs(2),
+            ..CodexConfig::default()
+        };
+        let backend = CodexAppServer::new(config, Arc::new(crate::permission_gate::DenyAll));
+        let task = AgentTask {
+            id: Uuid::now_v7(),
+            instruction: "run".to_owned(),
+            workspace: None,
+            context: Vec::new(),
+            binding: None,
+            conversation_id: None,
+        };
+        let stream = backend
+            .run(task, AgentLimits::default(), CancellationToken::new())
+            .await
+            .expect("start turn");
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while !marker.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("dropping the receiver should interrupt Codex");
+        backend.shutdown().await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_before_start_does_not_spawn_codex() {
+        let config = CodexConfig {
+            program: PathBuf::from("/nonexistent/aibo/codex"),
+            ..CodexConfig::default()
+        };
+        let backend = CodexAppServer::new(config, Arc::new(crate::permission_gate::DenyAll));
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let task = AgentTask {
+            id: Uuid::now_v7(),
+            instruction: "run".to_owned(),
+            workspace: None,
+            context: Vec::new(),
+            binding: None,
+            conversation_id: None,
+        };
+        let mut stream = backend
+            .run(task, AgentLimits::default(), cancel)
+            .await
+            .expect("pre-cancelled runs return a terminal stream");
+        let step = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            step,
+            AgentStep::Done(ref outcome) if outcome.status == AgentStatus::Cancelled
+        ));
     }
 
     #[cfg(unix)]

@@ -110,12 +110,30 @@ pub trait SseDecoder: Send {
     /// Called once when the underlying byte stream ends without the decoder
     /// having produced a terminal event.
     ///
-    /// The default synthesises `Done(EndTurn)`: several endpoints in the §10
-    /// matrix simply close the connection, and every consumer downstream is
-    /// written against "exactly one terminal event".
+    /// The default rejects an unexpected EOF. Providers that are documented to
+    /// use connection-close as their terminator override this explicitly; doing
+    /// it by default would turn a truncated response into a successful one.
     fn on_end(&mut self, out: &mut Vec<Result<StreamEvent>>) {
-        out.push(Ok(StreamEvent::Done(StopReason::EndTurn)));
+        out.push(Err(unexpected_eof()));
     }
+}
+
+/// A one-item stream used when cancellation wins before an HTTP response has
+/// been established.
+pub fn cancelled_stream() -> BoxStream<'static, Result<StreamEvent>> {
+    futures_util::stream::once(futures_util::future::ready(Ok(StreamEvent::Done(
+        StopReason::Cancelled,
+    ))))
+    .boxed()
+}
+
+/// The common failure for a protocol whose required terminal marker never
+/// arrived before the transport closed cleanly.
+pub fn unexpected_eof() -> AiboError {
+    AiboError::Internal(Box::new(std::io::Error::new(
+        std::io::ErrorKind::UnexpectedEof,
+        "provider stream closed before its terminal event",
+    )))
 }
 
 /// Drive `decoder` over `events`, honouring `cancel`.
@@ -451,7 +469,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_unterminated_stream_still_produces_exactly_one_done() {
+    async fn an_unterminated_stream_is_not_mistaken_for_success() {
         let body = b"data: one\n\n".to_vec();
         let out: Vec<_> = decode(
             events_from_bytes(body),
@@ -461,9 +479,9 @@ mod tests {
         )
         .collect()
         .await;
-        let out: Vec<StreamEvent> = out.into_iter().map(|r| r.unwrap()).collect();
         assert_eq!(out.len(), 2);
-        assert_eq!(out[1], StreamEvent::Done(StopReason::EndTurn));
+        assert!(matches!(out[0], Ok(StreamEvent::Text(ref text)) if text == "one"));
+        assert!(out[1].is_err());
     }
 
     #[tokio::test]

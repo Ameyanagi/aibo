@@ -22,6 +22,7 @@ use std::ffi::{OsStr, OsString};
 use std::sync::Arc;
 use std::time::Duration;
 
+use aibo_core::traits::{ChildProcessObserver, ChildProcessRegistration};
 use aibo_core::types::{ToolSchema, ToolTier};
 use async_trait::async_trait;
 #[cfg(unix)]
@@ -208,6 +209,7 @@ pub struct McpClient {
     request_timeout: Duration,
     shutdown_timeout: Duration,
     service: tokio::sync::Mutex<Option<RunningService<RoleClient, ()>>>,
+    _registration: Option<ChildProcessRegistration>,
 }
 
 impl std::fmt::Debug for McpClient {
@@ -224,7 +226,23 @@ impl std::fmt::Debug for McpClient {
 impl McpClient {
     /// Connect and complete the MCP initialize handshake.
     pub async fn connect(config: McpServerConfig) -> ToolResult<Self> {
+        Self::connect_with_process_observer(config, None).await
+    }
+
+    /// Connect while reporting a stdio server child to the application-owned
+    /// crash-recovery ledger. HTTP transports do not create a child.
+    pub async fn connect_with_process_observer(
+        config: McpServerConfig,
+        process_observer: Option<Arc<dyn ChildProcessObserver>>,
+    ) -> ToolResult<Self> {
+        if config.id.trim().is_empty() || config.id.contains("::") {
+            return Err(ToolError::InvalidArguments {
+                tool: "mcp".to_owned(),
+                reason: "server id must be non-empty and must not contain `::`".to_owned(),
+            });
+        }
         let id = config.id.clone();
+        let mut registration = None;
         let service = match &config.transport {
             McpTransport::Stdio {
                 command,
@@ -256,6 +274,15 @@ impl McpClient {
                     tool: id.clone(),
                     message: format!("could not spawn MCP server: {e}"),
                 })?;
+                let identity = std::path::Path::new(command)
+                    .file_name()
+                    .unwrap_or_else(|| std::ffi::OsStr::new(command))
+                    .to_string_lossy();
+                registration = Some(ChildProcessRegistration::new(
+                    process_observer,
+                    transport.id(),
+                    &identity,
+                ));
                 tokio::time::timeout(config.initialization_timeout, ().serve(transport))
                     .await
                     .map_err(|_| ToolError::Failed {
@@ -305,6 +332,7 @@ impl McpClient {
             request_timeout: config.request_timeout,
             shutdown_timeout: config.shutdown_timeout,
             service: tokio::sync::Mutex::new(Some(service)),
+            _registration: registration,
         })
     }
 
@@ -524,7 +552,7 @@ fn strip_prefix<'a>(server: &str, tool: &'a str) -> &'a str {
 /// "there was an image here" reasons better than one shown an empty result.
 fn render_result(
     content: Vec<ContentBlock>,
-    structured: Option<serde_json::Value>,
+    mut structured: Option<serde_json::Value>,
     is_error: bool,
 ) -> ToolOutput {
     let mut text = String::new();
@@ -555,11 +583,43 @@ fn render_result(
         text.push_str("\n[truncated by aibo]");
     }
 
+    // The text cap is not a result cap if a server can put the same (or much
+    // larger) payload in `structuredContent`. Keep the machine-readable value
+    // only when the combined serialized representation fits the same budget.
+    let structured_fits = structured.as_ref().is_none_or(|value| {
+        serialized_json_fits(value, MAX_RESULT_BYTES.saturating_sub(text.len()))
+    });
+    if !structured_fits {
+        structured = None;
+        text.push_str("\n[structured content omitted by aibo: result too large]");
+    }
+
     ToolOutput {
         text,
         structured,
         is_error,
     }
+}
+
+fn serialized_json_fits(value: &serde_json::Value, budget: usize) -> bool {
+    struct Counter {
+        remaining: usize,
+    }
+    impl std::io::Write for Counter {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            if bytes.len() > self.remaining {
+                return Err(std::io::Error::other("structured result exceeds budget"));
+            }
+            self.remaining -= bytes.len();
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    serde_json::to_writer(&mut Counter { remaining: budget }, value).is_ok()
 }
 
 /// One MCP tool, callable through [`Tool`].
@@ -654,6 +714,36 @@ mod tests {
         let out = render_result(vec![ContentBlock::text(huge)], None, false);
         assert!(out.text.len() < MAX_RESULT_BYTES + 64);
         assert!(out.text.ends_with("[truncated by aibo]"));
+    }
+
+    #[test]
+    fn oversized_structured_content_is_omitted() {
+        let out = render_result(
+            vec![ContentBlock::text("small")],
+            Some(serde_json::json!({"payload": "x".repeat(MAX_RESULT_BYTES)})),
+            false,
+        );
+        assert!(out.structured.is_none());
+        assert!(out.text.contains("structured content omitted"));
+    }
+
+    #[tokio::test]
+    async fn invalid_server_ids_fail_before_transport_setup() {
+        for id in ["", "a::b"] {
+            let cfg = McpServerConfig::new(
+                id,
+                McpTransport::Stdio {
+                    command: "this-must-not-be-spawned".to_owned(),
+                    args: vec![],
+                    env: vec![],
+                    cwd: None,
+                },
+            );
+            assert!(matches!(
+                McpClient::connect(cfg).await,
+                Err(ToolError::InvalidArguments { .. })
+            ));
+        }
     }
 
     #[test]

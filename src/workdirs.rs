@@ -28,7 +28,7 @@ pub fn remember(state_file: &Path, dir: &Path) {
         .map(|path| path.display().to_string())
         .collect::<Vec<_>>()
         .join("\n");
-    if let Err(error) = std::fs::write(state_file, body) {
+    if let Err(error) = crate::paths::atomic_write(state_file, body.as_bytes()) {
         tracing::warn!(%error, "could not persist recent workdirs");
     }
 }

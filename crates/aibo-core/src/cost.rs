@@ -368,6 +368,7 @@ impl PriceTable {
 /// lets a runaway request past a hard stop.
 pub fn estimate_request_usage(req: &ChatRequest) -> Usage {
     let input: usize = req.messages.iter().map(message_tokens).sum();
+    let image_tokens = u64::try_from(req.estimated_attachment_tokens()).unwrap_or(u64::MAX);
     // `0` means "let the provider/model choose". Cost reservation still needs
     // a finite estimate, so use prompt assembly's context-planning reserve
     // without turning that estimate into a generation cap.
@@ -382,7 +383,7 @@ pub fn estimate_request_usage(req: &ChatRequest) -> Usage {
         output_tokens: u64::from(estimated_output)
             .saturating_mul(u64::from(req.params.candidates.max(1))),
         reasoning_tokens: 0,
-        image_tokens: 0,
+        image_tokens,
     }
 }
 
@@ -532,10 +533,18 @@ impl SpendMeter {
                 0
             }
         };
+        // A retry with the same request id replaces its old hold. Project the
+        // post-replacement total before enforcing the hard stop; counting both
+        // holds here would reject a retry that actually lowers committed spend.
+        let previous = self.outstanding.get(&request).copied().unwrap_or(0);
+        let projected = self
+            .settled_micros
+            .saturating_add(self.reserved_micros.saturating_sub(previous))
+            .saturating_add(micros);
         if let Some(b) = self.budget
             && b.hard_stop
             && b.limit_micros > 0
-            && self.committed_micros().saturating_add(micros) > b.limit_micros
+            && projected > b.limit_micros
         {
             return Err(AiboError::BudgetExceeded {
                 kind: BudgetKind::Cost,
@@ -806,8 +815,8 @@ fn exceeded(kind: BudgetKind, which: &'static str, value: u64) -> AiboError {
 mod tests {
     use super::*;
     use crate::types::{
-        Capabilities, GenerationParams, Message, MessageRole, ModelBinding, RequestBudget, Role,
-        Surface,
+        Attachment, AttachmentSource, Capabilities, GenerationParams, Message, MessageRole,
+        ModelBinding, RequestBudget, Role, Surface,
     };
 
     fn id(n: u128) -> Uuid {
@@ -1223,6 +1232,30 @@ output = 1
         assert_eq!(u.output_tokens, u64::from(request.budget.max_output_tokens));
     }
 
+    #[test]
+    fn the_estimate_accounts_for_image_attachments() {
+        let mut request = request(64, 1);
+        request.attachments.push(Attachment::image(
+            AttachmentSource::Clipboard,
+            vec![0_u8; 16],
+            "image/png",
+            2_048,
+            2_048,
+            "Screenshot",
+        ));
+        let usage = estimate_request_usage(&request);
+        assert_eq!(
+            usage.image_tokens,
+            request.estimated_attachment_tokens() as u64
+        );
+        assert!(usage.image_tokens > 0);
+
+        let image_cost = estimate_request_cost(&table(), &request, None).unwrap();
+        request.attachments.clear();
+        let text_cost = estimate_request_cost(&table(), &request, None).unwrap();
+        assert!(image_cost > text_cost);
+    }
+
     // -- the spend meter ----------------------------------------------------
 
     #[test]
@@ -1304,6 +1337,21 @@ output = 1
     fn reserving_twice_for_one_request_does_not_double_count() {
         let mut m = SpendMeter::new();
         m.reserve(id(1), Some(1_000)).unwrap();
+        m.reserve(id(1), Some(2_000)).unwrap();
+        assert_eq!(m.reserved_micros(), 2_000);
+    }
+
+    #[test]
+    fn replacement_reservation_is_checked_after_releasing_the_old_hold() {
+        let mut m = SpendMeter::new();
+        m.set_budget(Some(MonthlyBudget {
+            limit_micros: 10_000,
+            warn_at_percent: 80,
+            hard_stop: true,
+        }));
+        m.reserve(id(1), Some(9_000)).unwrap();
+
+        // The post-replacement commitment is 2,000, not 11,000.
         m.reserve(id(1), Some(2_000)).unwrap();
         assert_eq!(m.reserved_micros(), 2_000);
     }

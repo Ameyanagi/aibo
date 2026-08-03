@@ -402,6 +402,83 @@ async fn the_deadline_covers_a_chat_call_that_never_returns() {
     );
 }
 
+#[tokio::test(start_paused = true)]
+async fn the_deadline_covers_a_health_probe_that_never_returns() {
+    struct NeverHealthy(ProviderId);
+
+    #[async_trait::async_trait]
+    impl aibo_core::traits::Provider for NeverHealthy {
+        fn id(&self) -> ProviderId {
+            self.0.clone()
+        }
+        fn capabilities(&self) -> aibo_core::types::Capabilities {
+            aibo_core::types::Capabilities {
+                max_context: 128_000,
+                max_output: Some(4_096),
+                ..aibo_core::types::Capabilities::default()
+            }
+        }
+        async fn chat(
+            &self,
+            _req: aibo_core::types::ChatRequest,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> aibo_core::error::Result<
+            aibo_core::types::BoxStream<'static, aibo_core::error::Result<StreamEvent>>,
+        > {
+            panic!("a hanging probe must never reach dispatch")
+        }
+        async fn models(&self) -> aibo_core::error::Result<Vec<aibo_core::types::ModelInfo>> {
+            Ok(Vec::new())
+        }
+        async fn health(&self) -> aibo_core::error::Result<aibo_core::types::Health> {
+            std::future::pending().await
+        }
+    }
+
+    let mut registry = ProviderRegistry::new();
+    registry.insert(
+        ProviderId::OPENAI,
+        std::sync::Arc::new(NeverHealthy(ProviderId::OPENAI)),
+    );
+    let bindings = RoleBindings::from_chains(
+        [
+            Role::Fast,
+            Role::Smart,
+            Role::Cheap,
+            Role::Vision,
+            Role::Agent,
+        ]
+        .into_iter()
+        .map(|role| chain(role, vec![binding(&ProviderId::OPENAI, "model-x")])),
+    )
+    .unwrap();
+    let engine = Engine::new(
+        registry,
+        EngineConfig {
+            bindings,
+            request_deadline: Duration::from_secs(30),
+            ..EngineConfig::default()
+        },
+    );
+    for _ in 0..3 {
+        engine.health().record_failure(
+            &ProviderId::OPENAI,
+            aibo_session::health::FailureKind::Connect,
+        );
+    }
+    engine.health().probe_all_now();
+
+    let outcome = engine
+        .run(Submission::new(Uuid::now_v7(), "hello"), &EventSink::null())
+        .await;
+    assert!(matches!(
+        outcome.error().map(|e| e.as_ref()),
+        Some(AiboError::Timeout {
+            phase: TimeoutPhase::Stream
+        })
+    ));
+}
+
 /// A ceiling that is not reached must not change anything.
 #[tokio::test(start_paused = true)]
 async fn a_request_inside_the_ceiling_is_untouched() {

@@ -101,7 +101,7 @@ use crate::auth::{
 };
 use crate::http::{HttpConfig, build_client, map_transport_error};
 use crate::openai_compat::{Quirks, ResponsesDecoder, build_responses_body};
-use crate::sse::{decode, events_from_response, read_error_body, read_json_body};
+use crate::sse::{cancelled_stream, decode, events_from_response, read_error_body, read_json_body};
 use crate::wire::{ErrorShape, map_status, parse_retry_after};
 
 // ---------------------------------------------------------------------------
@@ -614,7 +614,14 @@ impl DeviceAuthClient {
                 () = tokio::time::sleep(interval) => {}
             }
 
-            match self.poll_once(challenge).await? {
+            let outcome = tokio::select! {
+                biased;
+                () = cancel.cancelled() => {
+                    return Err(OAuthFailure::AccessDenied.into_error(ProviderId::CODEX));
+                }
+                outcome = self.poll_once(challenge) => outcome?,
+            };
+            match outcome {
                 PollOutcome::Authorised(set) => return Ok(*set),
                 PollOutcome::Pending => {}
                 PollOutcome::SlowDown => interval += Duration::from_secs(5),
@@ -882,6 +889,28 @@ impl CodexProvider {
         Url::parse(&s).map_err(|e| AiboError::Internal(Box::new(e)))
     }
 
+    async fn send_responses(&self, body: &serde_json::Value) -> Result<reqwest::Response> {
+        // Resolve/refresh the token before reading its companion account claim,
+        // so a rotation that supplies a previously-missing ID token cannot send
+        // the new bearer with a stale or absent routing header.
+        let _ = self.tokens.token().await?;
+        let mut rb = self
+            .client
+            .post(self.responses_url()?)
+            .header("accept", "text/event-stream")
+            .header("originator", CODEX_ORIGINATOR)
+            .header("openai-beta", "responses=experimental")
+            .header("session_id", uuid_v4_like())
+            .json(body);
+        if let Some(account) = self.tokens.account_id().await {
+            rb = rb.header("chatgpt-account-id", account);
+        }
+        rb = apply_credential(&self.id, &self.credential, AuthStyle::Bearer, rb).await?;
+        rb.send()
+            .await
+            .map_err(|e| map_transport_error(&self.id, &e))
+    }
+
     /// Whether a failure should move the request down the configured fallback
     /// chain rather than being shown to the user (§3b).
     ///
@@ -891,7 +920,9 @@ impl CodexProvider {
     pub fn is_endpoint_drift(err: &AiboError) -> bool {
         matches!(
             err,
-            AiboError::ProviderUnavailable { status: 404, .. } | AiboError::Internal(_)
+            AiboError::Auth { .. }
+                | AiboError::ProviderUnavailable { status: 404, .. }
+                | AiboError::Internal(_)
         )
     }
 }
@@ -925,34 +956,34 @@ impl Provider for CodexProvider {
             ));
         }
 
+        crate::attachment::guard(&self.capabilities, &req, Vec::new())?;
+        let req = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(cancelled_stream()),
+            prepared = crate::attachment::prepare(req) => prepared?,
+        };
         let body = build_responses_body(&req, &self.quirks);
-        let mut rb = self
-            .client
-            .post(self.responses_url()?)
-            .header("accept", "text/event-stream")
-            // §3a verified header set. `originator` must be a value on Codex's
-            // first-party allowlist — "aibo" is not, and the measured-working
-            // request used these exact headers.
-            .header("originator", CODEX_ORIGINATOR)
-            .header("openai-beta", "responses=experimental")
-            .header("session_id", uuid_v4_like())
-            .json(&body);
+        let mut response = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(cancelled_stream()),
+            response = self.send_responses(&body) => response?,
+        };
 
-        // Mandatory alongside `Authorization` (§3a), sourced from the ID
-        // token's `chatgpt_account_id` claim.
-        if let Some(account) = self.tokens.account_id().await {
-            rb = rb.header("chatgpt-account-id", account);
+        // An access token can be revoked before its expiry. Refresh once and
+        // rebuild the whole request (including ChatGPT-Account-ID) before
+        // surfacing the auth failure; never retry non-auth 4xx responses.
+        if matches!(response.status().as_u16(), 401 | 403) {
+            tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Ok(cancelled_stream()),
+                refreshed = self.tokens.refresh_now() => { refreshed?; }
+            }
+            response = tokio::select! {
+                biased;
+                () = cancel.cancelled() => return Ok(cancelled_stream()),
+                response = self.send_responses(&body) => response?,
+            };
         }
-        // SPIKE: S6 — `x-oai-attestation` would be attached here. aibo cannot
-        // generate one; the header is deliberately absent so the probe measures
-        // the real question.
-
-        rb = apply_credential(&self.id, &self.credential, AuthStyle::Bearer, rb).await?;
-
-        let response = rb
-            .send()
-            .await
-            .map_err(|e| map_transport_error(&self.id, &e))?;
 
         let status = response.status();
         if !status.is_success() {
@@ -1092,5 +1123,20 @@ mod tests {
             "https://chatgpt.com/backend-api/codex"
         );
         assert_eq!(AUTH_ISSUER, "https://auth.openai.com");
+    }
+
+    #[test]
+    fn auth_and_endpoint_drift_are_classified_for_codex_fallback() {
+        assert!(CodexProvider::is_endpoint_drift(&AiboError::Auth {
+            provider: ProviderId::CODEX,
+            kind: AuthKind::Expired,
+        }));
+        assert!(CodexProvider::is_endpoint_drift(
+            &AiboError::ProviderUnavailable {
+                provider: ProviderId::CODEX,
+                status: 404,
+                detail: None,
+            }
+        ));
     }
 }

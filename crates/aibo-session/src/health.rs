@@ -34,7 +34,7 @@
 //! which is the only way to assert "does not flap" without sleeping.
 
 use std::collections::BTreeMap;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use aibo_core::error::{AiboError, TimeoutPhase};
@@ -175,6 +175,7 @@ pub enum Usability {
 pub struct HealthTable {
     policy: HysteresisPolicy,
     states: Mutex<BTreeMap<ProviderId, ProviderState>>,
+    probes: Mutex<BTreeMap<ProviderId, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 impl Default for HealthTable {
@@ -191,6 +192,7 @@ impl HealthTable {
         Self {
             policy,
             states: Mutex::new(BTreeMap::new()),
+            probes: Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -411,6 +413,15 @@ impl HealthTable {
     pub fn probe_all_now(&self) {
         self.probe_all_now_at(Instant::now());
     }
+
+    fn probe_lock(&self, provider: &ProviderId) -> Arc<tokio::sync::Mutex<()>> {
+        self.probes
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(provider.clone())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
 }
 
 /// Run one health probe and fold the result into the table.
@@ -419,6 +430,18 @@ impl HealthTable {
 /// any) so the caller can emit a single `ProviderHealth` event.
 pub async fn probe(table: &HealthTable, provider: &dyn Provider) -> (bool, Option<Health>) {
     let id = provider.id();
+    let probe_lock = table.probe_lock(&id);
+    let _probe = probe_lock.lock_owned().await;
+
+    // Another request may have completed the probe while this one waited for
+    // the single-flight lock. Reuse its decision instead of issuing a second
+    // network request and racing the backoff state.
+    match table.usability(&id) {
+        Usability::Healthy => return (true, None),
+        Usability::Skip => return (false, None),
+        Usability::ProbeRequired => {}
+    }
+
     let result = provider.health().await;
     let usable = matches!(result, Ok(Health::Ok { .. }));
     let changed = table.record_probe_at(&id, &result, Instant::now());
@@ -657,5 +680,65 @@ mod tests {
                 .is_none(),
             "an unchanged health must not produce a second event"
         );
+    }
+
+    #[tokio::test]
+    async fn concurrent_probe_requests_share_one_network_call() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct SlowHealth {
+            calls: AtomicUsize,
+        }
+
+        #[async_trait::async_trait]
+        impl Provider for SlowHealth {
+            fn id(&self) -> ProviderId {
+                ProviderId::CEREBRAS
+            }
+
+            fn capabilities(&self) -> aibo_core::types::Capabilities {
+                aibo_core::types::Capabilities::default()
+            }
+
+            async fn chat(
+                &self,
+                _req: aibo_core::types::ChatRequest,
+                _cancel: tokio_util::sync::CancellationToken,
+            ) -> aibo_core::error::Result<
+                aibo_core::types::BoxStream<
+                    'static,
+                    aibo_core::error::Result<aibo_core::types::StreamEvent>,
+                >,
+            > {
+                unreachable!()
+            }
+
+            async fn models(&self) -> aibo_core::error::Result<Vec<aibo_core::types::ModelInfo>> {
+                Ok(Vec::new())
+            }
+
+            async fn health(&self) -> aibo_core::error::Result<Health> {
+                self.calls.fetch_add(1, Ordering::SeqCst);
+                tokio::task::yield_now().await;
+                Ok(Health::Ok {
+                    latency: Duration::from_millis(1),
+                })
+            }
+        }
+
+        let table = table();
+        let now = Instant::now();
+        for _ in 0..3 {
+            table.record_failure_at(&cerebras(), FailureKind::Connect, now);
+        }
+        table.probe_all_now_at(now);
+        let provider = SlowHealth {
+            calls: AtomicUsize::new(0),
+        };
+
+        let (first, second) = tokio::join!(probe(&table, &provider), probe(&table, &provider));
+        assert!(first.0);
+        assert!(second.0);
+        assert_eq!(provider.calls.load(Ordering::SeqCst), 1);
     }
 }

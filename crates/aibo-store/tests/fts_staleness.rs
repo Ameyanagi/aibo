@@ -192,6 +192,10 @@ fn without_the_insert_trigger_search_silently_goes_blind() {
         1,
         "but only one is in the index — this is the staleness §12 forbids"
     );
+    assert!(
+        !db.with_conn(|c| index_is_consistent(c)).expect("check"),
+        "external-content integrity-check must compare the index with messages"
+    );
 
     // And the designed repair puts it right.
     db.with_conn(|c| rebuild_index(c)).expect("rebuild");

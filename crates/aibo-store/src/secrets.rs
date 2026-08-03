@@ -301,7 +301,24 @@ impl FileSecretStore {
     }
 
     /// The path used by pre-v2 builds. It is consulted only for migration.
-    fn legacy_path_for(&self, account: &str) -> PathBuf {
+    fn legacy_path_for(&self, account: &str) -> Option<PathBuf> {
+        // The old replacement scheme was not injective. Only consult it for
+        // account namespaces whose accepted spelling maps one-to-one. In
+        // particular, never let `provider:a/b` read or delete
+        // `provider:a_b`'s credential.
+        let safe_account = account == DB_KEY_ACCOUNT
+            || account.strip_prefix("provider:").is_some_and(|provider| {
+                !provider.is_empty()
+                    && provider.chars().all(|character| {
+                        character.is_ascii_alphanumeric()
+                            || character == '.'
+                            || character == '-'
+                            || character == '_'
+                    })
+            });
+        if !safe_account {
+            return None;
+        }
         let safe: String = account
             .chars()
             .map(|c| {
@@ -312,7 +329,7 @@ impl FileSecretStore {
                 }
             })
             .collect();
-        self.dir.join(format!("{safe}.secret"))
+        Some(self.dir.join(format!("{safe}.secret")))
     }
 
     fn validate_account(&self, account: &str) -> Result<()> {
@@ -405,7 +422,10 @@ impl SecretStore for FileSecretStore {
         if let Some(secret) = self.read_file(&path, account)? {
             return Ok(Some(secret));
         }
-        self.read_file(&self.legacy_path_for(account), account)
+        match self.legacy_path_for(account) {
+            Some(legacy) => self.read_file(&legacy, account),
+            None => Ok(None),
+        }
     }
 
     fn set(&self, account: &str, secret: &str) -> Result<()> {
@@ -442,7 +462,9 @@ impl SecretStore for FileSecretStore {
 
         // A successful v2 write is the migration boundary. Delete the legacy
         // name only after the new file and directory entry are durable.
-        if self.remove_if_present(&self.legacy_path_for(account))? {
+        if let Some(legacy) = self.legacy_path_for(account)
+            && self.remove_if_present(&legacy)?
+        {
             sync_directory(&self.dir)?;
         }
         Ok(())
@@ -453,8 +475,10 @@ impl SecretStore for FileSecretStore {
         if !validate_existing_directory(&self.dir)? {
             return Ok(());
         }
-        let removed = self.remove_if_present(&self.path_for(account))?
-            | self.remove_if_present(&self.legacy_path_for(account))?;
+        let mut removed = self.remove_if_present(&self.path_for(account))?;
+        if let Some(legacy) = self.legacy_path_for(account) {
+            removed |= self.remove_if_present(&legacy)?;
+        }
         if removed {
             sync_directory(&self.dir)?;
         }
@@ -737,12 +761,21 @@ impl SecretStorage {
 
     /// Fetch a secret from wherever it was put.
     pub fn get(&self, account: &str) -> Result<Option<Zeroizing<String>>> {
-        if let Some(found) = self.primary.get(account)? {
-            return Ok(Some(found));
-        }
-        match &self.secondary {
-            Some(store) => store.get(account),
-            None => Ok(None),
+        let primary = self.primary.get(account)?;
+        let Some(secondary_store) = &self.secondary else {
+            return Ok(primary);
+        };
+        let secondary = secondary_store.get(account)?;
+        match (primary, secondary) {
+            (None, None) => Ok(None),
+            (Some(value), None) | (None, Some(value)) => Ok(Some(value)),
+            (Some(primary), Some(secondary)) if *primary == *secondary => Ok(Some(primary)),
+            (Some(_), Some(_)) => Err(StoreError::Keychain(KeychainError {
+                service: "secret-storage".to_owned(),
+                account: account.to_owned(),
+                kind: KeychainErrorKind::BadData,
+                detail: "conflicting values exist in primary and secondary storage".to_owned(),
+            })),
         }
     }
 
@@ -842,6 +875,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     /// An in-process stand-in for the OS keychain. It enforces the Windows cap
     /// on every platform, so the cap is exercised by CI everywhere rather than
@@ -908,6 +942,43 @@ mod tests {
     #[derive(Default)]
     struct LyingDestination {
         writes: Mutex<usize>,
+    }
+
+    #[derive(Clone, Default)]
+    struct DeleteFailingStore {
+        entries: Arc<Mutex<HashMap<String, String>>>,
+        fail_delete: Arc<AtomicBool>,
+    }
+
+    impl SecretStore for DeleteFailingStore {
+        fn get(&self, account: &str) -> Result<Option<Zeroizing<String>>> {
+            Ok(self
+                .entries
+                .lock()
+                .expect("lock")
+                .get(account)
+                .cloned()
+                .map(Zeroizing::new))
+        }
+
+        fn set(&self, account: &str, secret: &str) -> Result<()> {
+            self.entries
+                .lock()
+                .expect("lock")
+                .insert(account.to_owned(), secret.to_owned());
+            Ok(())
+        }
+
+        fn delete(&self, account: &str) -> Result<()> {
+            if self.fail_delete.load(Ordering::SeqCst) {
+                return Err(StoreError::io(
+                    "<test-delete>",
+                    io::Error::other("injected delete failure"),
+                ));
+            }
+            self.entries.lock().expect("lock").remove(account);
+            Ok(())
+        }
     }
 
     impl SecretStore for LyingDestination {
@@ -1071,7 +1142,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = FileSecretStore::new(dir.path().join("secrets"), Arc::new(ReversingProtector));
         ensure_secure_directory(&store.dir).expect("directory");
-        let legacy_path = store.legacy_path_for("provider:old");
+        let legacy_path = store
+            .legacy_path_for("provider:old")
+            .expect("supported legacy account");
         let legacy_ciphertext: Vec<u8> = b"old-secret".iter().rev().copied().collect();
         fs::write(&legacy_path, legacy_ciphertext).expect("legacy write");
 
@@ -1090,6 +1163,46 @@ mod tests {
             *store.get("provider:old").expect("read").expect("present"),
             "new-secret"
         );
+    }
+
+    #[test]
+    fn ambiguous_legacy_names_are_never_read_or_deleted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = FileSecretStore::new(dir.path().join("secrets"), Arc::new(ReversingProtector));
+        ensure_secure_directory(&store.dir).expect("directory");
+        let legitimate = store
+            .legacy_path_for("provider:a_b")
+            .expect("safe legacy account");
+        let ciphertext: Vec<u8> = b"other-provider-secret".iter().rev().copied().collect();
+        fs::write(&legitimate, ciphertext).expect("legacy write");
+
+        assert!(store.get("provider:a/b").expect("read").is_none());
+        store.delete("provider:a/b").expect("delete");
+        assert!(legitimate.exists(), "colliding account must not delete it");
+    }
+
+    #[test]
+    fn conflicting_backends_fail_closed_after_cleanup_failure() {
+        let primary = DeleteFailingStore::default();
+        let control = primary.clone();
+        let secondary = FakeKeychain::default();
+        let storage = SecretStorage::with_oversize(primary, secondary);
+        storage.set("token", "old").expect("small value");
+
+        control.fail_delete.store(true, Ordering::SeqCst);
+        storage
+            .set("token", &"n".repeat(WINDOWS_CREDENTIAL_BLOB_MAX_BYTES + 1))
+            .expect_err("cleanup fails");
+        let err = storage
+            .get("token")
+            .expect_err("must not return stale primary");
+        assert!(matches!(
+            err,
+            StoreError::Keychain(KeychainError {
+                kind: KeychainErrorKind::BadData,
+                ..
+            })
+        ));
     }
 
     #[cfg(unix)]

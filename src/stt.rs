@@ -29,6 +29,8 @@
 //! and the batch fallback uses the classic deployment-scoped
 //! `audio/transcriptions` route with a preview `api-version`.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use base64::Engine as _;
@@ -64,6 +66,7 @@ const DRAIN_TIMEOUT: Duration = Duration::from_secs(15);
 /// drain, so nothing outlives [`DRAIN_TIMEOUT`].
 pub struct DictationHandle {
     stop: CancellationToken,
+    finished: Arc<AtomicBool>,
 }
 
 impl DictationHandle {
@@ -71,6 +74,11 @@ impl DictationHandle {
     /// final deltas, then reports [`UiEvent::DictationEnded`].
     pub fn finish(&self) {
         self.stop.cancel();
+    }
+
+    /// Whether the worker has fully drained and published its terminal event.
+    pub fn is_finished(&self) -> bool {
+        self.finished.load(Ordering::Acquire)
     }
 }
 
@@ -83,13 +91,16 @@ impl Drop for DictationHandle {
 /// Start a dictation turn. Failure is reported through `events`, never
 /// returned: the caller is the request loop, and §13 puts every user-visible
 /// error on the event channel.
-pub fn start(key: SecretString, events: mpsc::Sender<UiEvent>) -> DictationHandle {
+pub fn start(key: SecretString, events: mpsc::Sender<UiEvent>, turn: u64) -> DictationHandle {
     let stop = CancellationToken::new();
     let task_stop = stop.clone();
+    let finished = Arc::new(AtomicBool::new(false));
+    let task_finished = Arc::clone(&finished);
     tokio::spawn(crate::diagnostics::supervise("dictation", async move {
-        run(key, events, task_stop).await;
+        run(key, events, task_stop, turn).await;
+        task_finished.store(true, Ordering::Release);
     }));
-    DictationHandle { stop }
+    DictationHandle { stop, finished }
 }
 
 /// Start a dictation turn against the ChatGPT plan's transcription endpoint
@@ -104,16 +115,20 @@ pub fn start(key: SecretString, events: mpsc::Sender<UiEvent>) -> DictationHandl
 pub fn start_chatgpt(
     tokens: std::sync::Arc<aibo_provider::auth::RefreshingTokenProvider>,
     events: mpsc::Sender<UiEvent>,
+    turn: u64,
 ) -> DictationHandle {
     let stop = CancellationToken::new();
     let task_stop = stop.clone();
+    let finished = Arc::new(AtomicBool::new(false));
+    let task_finished = Arc::clone(&finished);
     tokio::spawn(crate::diagnostics::supervise(
         "dictation-chatgpt",
         async move {
-            run_chatgpt(tokens, events, task_stop).await;
+            run_chatgpt(tokens, events, task_stop, turn).await;
+            task_finished.store(true, Ordering::Release);
         },
     ));
-    DictationHandle { stop }
+    DictationHandle { stop, finished }
 }
 
 /// Everything the Azure dictation backends need (owner request, 2026-08-03).
@@ -132,19 +147,27 @@ pub struct AzureStt {
 /// falling back to a record-then-upload turn when the socket cannot open —
 /// the user already granted the microphone, and "switch backends and press
 /// ⌘L again" is a worse answer than a transcript that arrives at the end.
-pub fn start_azure(azure: AzureStt, events: mpsc::Sender<UiEvent>) -> DictationHandle {
+pub fn start_azure(azure: AzureStt, events: mpsc::Sender<UiEvent>, turn: u64) -> DictationHandle {
     let stop = CancellationToken::new();
     let task_stop = stop.clone();
+    let finished = Arc::new(AtomicBool::new(false));
+    let task_finished = Arc::clone(&finished);
     tokio::spawn(crate::diagnostics::supervise(
         "dictation-azure",
         async move {
-            run_azure(azure, events, task_stop).await;
+            run_azure(azure, events, task_stop, turn).await;
+            task_finished.store(true, Ordering::Release);
         },
     ));
-    DictationHandle { stop }
+    DictationHandle { stop, finished }
 }
 
-async fn run_azure(azure: AzureStt, events: mpsc::Sender<UiEvent>, stop: CancellationToken) {
+async fn run_azure(
+    azure: AzureStt,
+    events: mpsc::Sender<UiEvent>,
+    stop: CancellationToken,
+    turn: u64,
+) {
     let emit = |event: UiEvent| {
         let events = events.clone();
         async move {
@@ -152,7 +175,7 @@ async fn run_azure(azure: AzureStt, events: mpsc::Sender<UiEvent>, stop: Cancell
         }
     };
 
-    let Some(mut chunks) = open_microphone(&events, &stop).await else {
+    let Some(mut chunks) = open_microphone(&events, &stop, turn).await else {
         return;
     };
 
@@ -164,29 +187,38 @@ async fn run_azure(azure: AzureStt, events: mpsc::Sender<UiEvent>, stop: Cancell
     };
     match connected {
         Ok((ws, _response)) => {
-            stream_turn(ws, &azure.live_deployment, &mut chunks, &events, &stop).await;
+            stream_turn(
+                ws,
+                &azure.live_deployment,
+                &mut chunks,
+                &events,
+                &stop,
+                turn,
+            )
+            .await;
         }
         Err(error) => {
             // The gateway said no (region, firewall, a renamed deployment) —
             // fall back to one upload per turn rather than failing a
             // microphone that is already live.
             tracing::warn!(%error, "azure realtime unavailable; batch transcription fallback");
-            emit(UiEvent::DictationStarted).await;
-            let Some(pcm) = buffer_turn(&mut chunks, &stop, &events).await else {
+            emit(UiEvent::DictationStarted { turn }).await;
+            let Some(pcm) = buffer_turn(&mut chunks, &stop, &events, turn).await else {
                 return;
             };
             if pcm.is_empty() {
-                emit(UiEvent::DictationEnded).await;
+                emit(UiEvent::DictationEnded { turn }).await;
                 return;
             }
             match azure_transcribe_upload(&azure, wav_bytes(&pcm)).await {
                 Some(text) if !text.is_empty() => {
-                    emit(UiEvent::DictationDelta { text }).await;
-                    emit(UiEvent::DictationEnded).await;
+                    emit(UiEvent::DictationDelta { turn, text }).await;
+                    emit(UiEvent::DictationEnded { turn }).await;
                 }
-                Some(_) => emit(UiEvent::DictationEnded).await,
+                Some(_) => emit(UiEvent::DictationEnded { turn }).await,
                 None => {
                     emit(UiEvent::DictationFailed {
+                        turn,
                         failure: DictationFailure::Connection,
                     })
                     .await;
@@ -270,6 +302,7 @@ async fn azure_transcribe_upload(azure: &AzureStt, wav: Vec<u8>) -> Option<Strin
 async fn open_microphone(
     events: &mpsc::Sender<UiEvent>,
     stop: &CancellationToken,
+    turn: u64,
 ) -> Option<mpsc::Receiver<Vec<u8>>> {
     let (chunk_tx, chunks) = mpsc::channel::<Vec<u8>>(64);
     let (ready_tx, ready_rx) = oneshot::channel();
@@ -280,6 +313,7 @@ async fn open_microphone(
     if spawned.is_err() || !matches!(ready_rx.await, Ok(Ok(()))) {
         let _ = events
             .send(UiEvent::DictationFailed {
+                turn,
                 failure: DictationFailure::Microphone,
             })
             .await;
@@ -297,6 +331,7 @@ async fn buffer_turn(
     chunks: &mut mpsc::Receiver<Vec<u8>>,
     stop: &CancellationToken,
     events: &mpsc::Sender<UiEvent>,
+    turn: u64,
 ) -> Option<Vec<u8>> {
     const MAX_PCM_BYTES: usize = 24_000 * 2 * 300;
     let mut pcm: Vec<u8> = Vec::new();
@@ -308,6 +343,7 @@ async fn buffer_turn(
                 let Some(bytes) = chunk else {
                     let _ = events
                         .send(UiEvent::DictationFailed {
+                            turn,
                             failure: DictationFailure::Microphone,
                         })
                         .await;
@@ -344,6 +380,7 @@ async fn run_chatgpt(
     tokens: std::sync::Arc<aibo_provider::auth::RefreshingTokenProvider>,
     events: mpsc::Sender<UiEvent>,
     stop: CancellationToken,
+    turn: u64,
 ) {
     use aibo_core::types::TokenProvider as _;
 
@@ -354,17 +391,17 @@ async fn run_chatgpt(
         }
     };
 
-    let Some(mut chunks) = open_microphone(&events, &stop).await else {
+    let Some(mut chunks) = open_microphone(&events, &stop, turn).await else {
         return;
     };
 
-    emit(UiEvent::DictationStarted).await;
+    emit(UiEvent::DictationStarted { turn }).await;
 
-    let Some(pcm) = buffer_turn(&mut chunks, &stop, &events).await else {
+    let Some(pcm) = buffer_turn(&mut chunks, &stop, &events, turn).await else {
         return;
     };
     if pcm.is_empty() {
-        emit(UiEvent::DictationEnded).await;
+        emit(UiEvent::DictationEnded { turn }).await;
         return;
     }
 
@@ -378,12 +415,13 @@ async fn run_chatgpt(
     .await;
     match outcome {
         Some(text) if !text.is_empty() => {
-            emit(UiEvent::DictationDelta { text }).await;
-            emit(UiEvent::DictationEnded).await;
+            emit(UiEvent::DictationDelta { turn, text }).await;
+            emit(UiEvent::DictationEnded { turn }).await;
         }
-        Some(_) => emit(UiEvent::DictationEnded).await,
+        Some(_) => emit(UiEvent::DictationEnded { turn }).await,
         None => {
             emit(UiEvent::DictationFailed {
+                turn,
                 failure: DictationFailure::Connection,
             })
             .await;
@@ -442,7 +480,7 @@ fn wav_bytes(pcm: &[u8]) -> Vec<u8> {
     wav
 }
 
-async fn run(key: SecretString, events: mpsc::Sender<UiEvent>, stop: CancellationToken) {
+async fn run(key: SecretString, events: mpsc::Sender<UiEvent>, stop: CancellationToken, turn: u64) {
     let emit = |event: UiEvent| {
         let events = events.clone();
         async move {
@@ -452,7 +490,7 @@ async fn run(key: SecretString, events: mpsc::Sender<UiEvent>, stop: Cancellatio
 
     // Microphone first: failing fast on a missing device or permission means
     // no socket is opened for audio that will never exist.
-    let Some(mut chunks) = open_microphone(&events, &stop).await else {
+    let Some(mut chunks) = open_microphone(&events, &stop, turn).await else {
         return;
     };
 
@@ -461,6 +499,7 @@ async fn run(key: SecretString, events: mpsc::Sender<UiEvent>, stop: Cancellatio
         Err(error) => {
             tracing::warn!(%error, "dictation could not build the websocket request");
             emit(UiEvent::DictationFailed {
+                turn,
                 failure: DictationFailure::Connection,
             })
             .await;
@@ -472,13 +511,14 @@ async fn run(key: SecretString, events: mpsc::Sender<UiEvent>, stop: Cancellatio
         Err(error) => {
             tracing::warn!(%error, "dictation could not reach the transcriber");
             emit(UiEvent::DictationFailed {
+                turn,
                 failure: DictationFailure::Connection,
             })
             .await;
             return;
         }
     };
-    stream_turn(ws, MODEL, &mut chunks, &events, &stop).await;
+    stream_turn(ws, MODEL, &mut chunks, &events, &stop, turn).await;
 }
 
 /// The streaming turn: configure the session, relay audio until the user's
@@ -493,6 +533,7 @@ async fn stream_turn(
     chunks: &mut mpsc::Receiver<Vec<u8>>,
     events: &mpsc::Sender<UiEvent>,
     stop: &CancellationToken,
+    turn: u64,
 ) {
     let emit = |event: UiEvent| {
         let events = events.clone();
@@ -522,13 +563,14 @@ async fn stream_turn(
         .is_err()
     {
         emit(UiEvent::DictationFailed {
+            turn,
             failure: DictationFailure::Connection,
         })
         .await;
         return;
     }
 
-    emit(UiEvent::DictationStarted).await;
+    emit(UiEvent::DictationStarted { turn }).await;
 
     // Whether any delta text reached the UI, across BOTH phases. Tracking
     // only the post-commit drain re-emitted the entire transcript after live
@@ -548,12 +590,13 @@ async fn stream_turn(
                 // transcriber to transcribe nothing.
                 if !appended {
                     let _ = sink.close().await;
-                    emit(UiEvent::DictationEnded).await;
+                    emit(UiEvent::DictationEnded { turn }).await;
                     return;
                 }
                 let commit = serde_json::json!({ "type": "input_audio_buffer.commit" });
                 if sink.send(WsMessage::Text(commit.to_string())).await.is_err() {
                     emit(UiEvent::DictationFailed {
+                        turn,
                         failure: DictationFailure::Connection,
                     })
                     .await;
@@ -565,6 +608,7 @@ async fn stream_turn(
                 let Some(pcm) = chunk else {
                     // The microphone thread died mid-turn.
                     emit(UiEvent::DictationFailed {
+                        turn,
                         failure: DictationFailure::Microphone,
                     })
                     .await;
@@ -577,6 +621,7 @@ async fn stream_turn(
                 appended = true;
                 if sink.send(WsMessage::Text(append.to_string())).await.is_err() {
                     emit(UiEvent::DictationFailed {
+                        turn,
                         failure: DictationFailure::Connection,
                     })
                     .await;
@@ -587,11 +632,20 @@ async fn stream_turn(
                 match transcription_event(message) {
                     Transcribed::Delta(text) => {
                         saw_delta_text = true;
-                        emit(UiEvent::DictationDelta { text }).await;
+                        emit(UiEvent::DictationDelta { turn, text }).await;
                     }
                     Transcribed::Completed(_) | Transcribed::Other => {}
+                    Transcribed::Error => {
+                        emit(UiEvent::DictationFailed {
+                            turn,
+                            failure: DictationFailure::Connection,
+                        })
+                        .await;
+                        return;
+                    }
                     Transcribed::Closed => {
                         emit(UiEvent::DictationFailed {
+                            turn,
                             failure: DictationFailure::Connection,
                         })
                         .await;
@@ -605,31 +659,37 @@ async fn stream_turn(
     // Phase 2 — drain the committed turn's final fragments, bounded. An
     // "error" here (for instance, a commit of near-silence) still ends the
     // dictation quietly: the user asked to stop, and there is nothing to fix.
-    while let Ok(message) = tokio::time::timeout(DRAIN_TIMEOUT, source.next()).await {
+    let deadline = tokio::time::Instant::now() + DRAIN_TIMEOUT;
+    while let Ok(message) = tokio::time::timeout_at(deadline, source.next()).await {
         match transcription_event(message) {
             Transcribed::Delta(text) => {
                 saw_delta_text = true;
-                emit(UiEvent::DictationDelta { text }).await;
+                emit(UiEvent::DictationDelta { turn, text }).await;
             }
             Transcribed::Completed(transcript) => {
                 // Some paths deliver the whole transcript only here.
                 if !saw_delta_text && !transcript.is_empty() {
-                    emit(UiEvent::DictationDelta { text: transcript }).await;
+                    emit(UiEvent::DictationDelta {
+                        turn,
+                        text: transcript,
+                    })
+                    .await;
                 }
                 break;
             }
-            Transcribed::Other => {}
+            Transcribed::Other | Transcribed::Error => {}
             Transcribed::Closed => break,
         }
     }
     let _ = sink.close().await;
-    emit(UiEvent::DictationEnded).await;
+    emit(UiEvent::DictationEnded { turn }).await;
 }
 
 /// What one websocket message means for the transcript.
 enum Transcribed {
     Delta(String),
     Completed(String),
+    Error,
     Other,
     Closed,
 }
@@ -665,7 +725,7 @@ fn transcription_event(message: Option<WsResult>) -> Transcribed {
         }
         Some("error") => {
             tracing::warn!(payload = %text, "transcriber reported an error");
-            Transcribed::Completed(String::new())
+            Transcribed::Error
         }
         _ => Transcribed::Other,
     }
@@ -693,7 +753,8 @@ fn capture_thread(
     ready: oneshot::Sender<Result<(), ()>>,
     stop: CancellationToken,
 ) {
-    let built = build_stream(chunks);
+    let failed = Arc::new(AtomicBool::new(false));
+    let built = build_stream(chunks, Arc::clone(&failed));
     let stream = match built {
         Ok(stream) => stream,
         Err(error) => {
@@ -708,13 +769,16 @@ fn capture_thread(
         return;
     }
     let _ = ready.send(Ok(()));
-    while !stop.is_cancelled() {
+    while !stop.is_cancelled() && !failed.load(Ordering::Acquire) {
         std::thread::sleep(Duration::from_millis(50));
     }
     drop(stream);
 }
 
-fn build_stream(chunks: mpsc::Sender<Vec<u8>>) -> anyhow::Result<cpal::Stream> {
+fn build_stream(
+    chunks: mpsc::Sender<Vec<u8>>,
+    failed: Arc<AtomicBool>,
+) -> anyhow::Result<cpal::Stream> {
     use anyhow::Context as _;
 
     let device = cpal::default_host()
@@ -726,33 +790,38 @@ fn build_stream(chunks: mpsc::Sender<Vec<u8>>) -> anyhow::Result<cpal::Stream> {
     let channels = usize::from(config.channels());
     let mut state = CaptureState::new(f64::from(config.sample_rate().0), chunks);
 
-    let err_fn = |error| tracing::warn!(%error, "microphone stream error");
+    let err_fn = || {
+        let failed = Arc::clone(&failed);
+        move |error| {
+            tracing::warn!(%error, "microphone stream error");
+            failed.store(true, Ordering::Release);
+        }
+    };
     let stream = match config.sample_format() {
         cpal::SampleFormat::F32 => device.build_input_stream(
             &config.into(),
-            move |data: &[f32], _: &cpal::InputCallbackInfo| state.push(data, channels),
-            err_fn,
+            move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                state.push_converted(data, channels, |sample| sample)
+            },
+            err_fn(),
             None,
         )?,
         cpal::SampleFormat::I16 => device.build_input_stream(
             &config.into(),
             move |data: &[i16], _: &cpal::InputCallbackInfo| {
-                let converted: Vec<f32> = data.iter().map(|&s| f32::from(s) / 32_768.0).collect();
-                state.push(&converted, channels);
+                state.push_converted(data, channels, |sample| f32::from(sample) / 32_768.0);
             },
-            err_fn,
+            err_fn(),
             None,
         )?,
         cpal::SampleFormat::U16 => device.build_input_stream(
             &config.into(),
             move |data: &[u16], _: &cpal::InputCallbackInfo| {
-                let converted: Vec<f32> = data
-                    .iter()
-                    .map(|&s| (f32::from(s) - 32_768.0) / 32_768.0)
-                    .collect();
-                state.push(&converted, channels);
+                state.push_converted(data, channels, |sample| {
+                    (f32::from(sample) - 32_768.0) / 32_768.0
+                });
             },
-            err_fn,
+            err_fn(),
             None,
         )?,
         other => anyhow::bail!("unsupported microphone sample format {other:?}"),
@@ -764,6 +833,7 @@ fn build_stream(chunks: mpsc::Sender<Vec<u8>>) -> anyhow::Result<cpal::Stream> {
 struct CaptureState {
     resampler: MonoResampler,
     pending: Vec<i16>,
+    pending_start: usize,
     chunks: mpsc::Sender<Vec<u8>>,
 }
 
@@ -772,25 +842,38 @@ impl CaptureState {
         Self {
             resampler: MonoResampler::new(in_rate, f64::from(TARGET_RATE)),
             pending: Vec::with_capacity(CHUNK_SAMPLES * 2),
+            pending_start: 0,
             chunks,
         }
     }
 
-    fn push(&mut self, interleaved: &[f32], channels: usize) {
+    fn push_converted<T: Copy>(
+        &mut self,
+        interleaved: &[T],
+        channels: usize,
+        convert: impl Fn(T) -> f32,
+    ) {
         let channels = channels.max(1);
         for frame in interleaved.chunks_exact(channels) {
             #[expect(clippy::cast_precision_loss, reason = "channel counts are tiny")]
-            let mono = frame.iter().sum::<f32>() / channels as f32;
+            let mono = frame.iter().copied().map(&convert).sum::<f32>() / channels as f32;
             self.resampler.push(mono, &mut self.pending);
         }
-        while self.pending.len() >= CHUNK_SAMPLES {
-            let chunk: Vec<i16> = self.pending.drain(..CHUNK_SAMPLES).collect();
-            let mut bytes = Vec::with_capacity(chunk.len() * 2);
-            for sample in chunk {
+        while self.pending.len().saturating_sub(self.pending_start) >= CHUNK_SAMPLES {
+            let end = self.pending_start + CHUNK_SAMPLES;
+            let mut bytes = Vec::with_capacity(CHUNK_SAMPLES * 2);
+            for sample in &self.pending[self.pending_start..end] {
                 bytes.extend_from_slice(&sample.to_le_bytes());
             }
+            self.pending_start = end;
             // Dropped on overflow rather than blocking the audio callback.
             let _ = self.chunks.try_send(bytes);
+        }
+        // Compact occasionally instead of shifting the whole pending buffer
+        // for every 100 ms chunk.
+        if self.pending_start >= CHUNK_SAMPLES * 8 {
+            self.pending.drain(..self.pending_start);
+            self.pending_start = 0;
         }
     }
 }

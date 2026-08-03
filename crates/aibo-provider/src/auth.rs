@@ -395,6 +395,50 @@ impl RefreshingTokenProvider {
         }
         Ok(loaded)
     }
+
+    async fn refresh_current(&self, current: Option<TokenSet>) -> Result<SecretString> {
+        match self.source.refresh(current.as_ref()).await {
+            Ok(fresh) => {
+                let stored = StoredTokens::from(&fresh);
+                let access = fresh.access_token.clone();
+
+                // A successful OAuth rotation may already have consumed the old
+                // single-use refresh token. Keep the fresh pair in memory before
+                // attempting durable storage, otherwise a transient keychain or
+                // disk failure discards the only usable credential and the next
+                // call retries a token the issuer has already invalidated.
+                *self.cached.write().await = Some(fresh);
+                if let Err(error) = self.store.save(&self.storage_key, &stored).await {
+                    tracing::warn!(
+                        provider = %self.provider,
+                        source = %self.source.label(),
+                        %error,
+                        "refreshed OAuth token is usable in memory but could not be persisted"
+                    );
+                }
+                Ok(access)
+            }
+            Err(err) => {
+                if let AiboError::Auth { kind, .. } = &err
+                    && matches!(kind, AuthKind::Revoked | AuthKind::Expired)
+                {
+                    // Terminal: keeping the dead pair only guarantees the next
+                    // request fails the same way.
+                    let _ = self.forget().await;
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Force a refresh even when the cached access token has not reached its
+    /// refresh-ahead window. Used after a server rejects a token early (revoked
+    /// access token, issuer-side clock change, or account-session invalidation).
+    pub async fn refresh_now(&self) -> Result<SecretString> {
+        let _guard = self.refresh_lock.lock().await;
+        let current = self.current().await?;
+        self.refresh_current(current).await
+    }
 }
 
 #[async_trait]
@@ -418,26 +462,7 @@ impl TokenProvider for RefreshingTokenProvider {
             return Ok(t.access_token.clone());
         }
 
-        match self.source.refresh(current.as_ref()).await {
-            Ok(fresh) => {
-                self.store
-                    .save(&self.storage_key, &StoredTokens::from(&fresh))
-                    .await?;
-                let access = fresh.access_token.clone();
-                *self.cached.write().await = Some(fresh);
-                Ok(access)
-            }
-            Err(err) => {
-                if let AiboError::Auth { kind, .. } = &err
-                    && matches!(kind, AuthKind::Revoked | AuthKind::Expired)
-                {
-                    // Terminal: keeping the dead pair only guarantees the next
-                    // request fails the same way.
-                    let _ = self.forget().await;
-                }
-                Err(err)
-            }
-        }
+        self.refresh_current(current).await
     }
 
     fn label(&self) -> &str {
@@ -573,6 +598,26 @@ mod tests {
         ttl: Duration,
     }
 
+    #[derive(Debug, Default)]
+    struct FailingSaveStore;
+
+    #[async_trait]
+    impl TokenStore for FailingSaveStore {
+        async fn load(&self, _key: &str) -> Result<Option<StoredTokens>> {
+            Ok(None)
+        }
+
+        async fn save(&self, _key: &str, _tokens: &StoredTokens) -> Result<()> {
+            Err(AiboError::Internal(Box::new(std::io::Error::other(
+                "simulated credential-store failure",
+            ))))
+        }
+
+        async fn clear(&self, _key: &str) -> Result<()> {
+            Ok(())
+        }
+    }
+
     #[async_trait]
     impl TokenRefresh for CountingRefresh {
         async fn refresh(&self, _current: Option<&TokenSet>) -> Result<TokenSet> {
@@ -631,6 +676,26 @@ mod tests {
         for h in set {
             h.await.unwrap().unwrap();
         }
+        assert_eq!(source.calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_rotated_token_survives_a_persistence_failure_in_memory() {
+        let source = Arc::new(CountingRefresh {
+            calls: AtomicUsize::new(0),
+            ttl: Duration::from_secs(3_600),
+        });
+        let provider = RefreshingTokenProvider::new(
+            ProviderId::CODEX,
+            "test/failing-store",
+            source.clone(),
+            Arc::new(FailingSaveStore),
+            RefreshPolicy::default(),
+        );
+
+        let first = provider.token().await.unwrap();
+        let second = provider.token().await.unwrap();
+        assert_eq!(first.expose_secret(), second.expose_secret());
         assert_eq!(source.calls.load(Ordering::SeqCst), 1);
     }
 

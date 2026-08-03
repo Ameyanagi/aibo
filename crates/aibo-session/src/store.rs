@@ -52,6 +52,16 @@ pub trait SessionStore: Send + Sync {
     /// Write one exchange. Returns the conversation it landed in, or `None`
     /// when this store does not persist.
     async fn record(&self, exchange: Exchange) -> Result<Option<Uuid>>;
+
+    /// Settled assistant spend since the start of the current UTC calendar
+    /// month. Stores that do not persist history report zero.
+    ///
+    /// This is a default method so embedders with write-only stores keep
+    /// working; a durable store overrides it so rebuilding the engine cannot
+    /// reset a monthly hard stop.
+    async fn settled_spend_this_month(&self) -> Result<Micros> {
+        Ok(0)
+    }
 }
 
 /// The null store: history is disabled, or the database could not be opened.
@@ -119,5 +129,54 @@ impl SessionStore for SqliteStore {
             .map_err(|e| aibo_core::AiboError::Internal(Box::new(PersistFailed(e))))?;
 
         Ok(Some(id))
+    }
+
+    async fn settled_spend_this_month(&self) -> Result<Micros> {
+        let settled = self
+            .db
+            .call(|conn| {
+                let total = conn.query_row(
+                    "SELECT COALESCE(SUM(cost_micros), 0)
+                       FROM messages
+                      WHERE role = 'assistant'
+                        AND cost_micros IS NOT NULL
+                        AND created_at >= CAST(strftime('%s', 'now', 'start of month') AS INTEGER)",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?;
+                Ok(total)
+            })
+            .await
+            .map_err(|e| aibo_core::AiboError::Internal(Box::new(PersistFailed(e))))?;
+
+        Ok(u64::try_from(settled).unwrap_or_default())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn sqlite_store_reports_cost_settled_this_month() {
+        let store = SqliteStore::new(aibo_store::Db::open_in_memory().expect("open"));
+        store
+            .record(Exchange {
+                conversation_id: None,
+                surface: Surface::Ask,
+                source_app: None,
+                instruction: Some("question".to_owned()),
+                assistant: "answer".to_owned(),
+                provider: ProviderId::OPENAI,
+                model: "model-x".to_owned(),
+                usage: Usage::default(),
+                cost_micros: Some(37),
+                latency_ms: 1,
+                truncated: false,
+            })
+            .await
+            .expect("record");
+
+        assert_eq!(store.settled_spend_this_month().await.unwrap(), 37);
     }
 }

@@ -37,7 +37,7 @@ fn message_count(db: &Db) -> i64 {
 }
 
 #[test]
-fn a_fresh_file_migrates_to_v1_and_survives_a_close_and_reopen() {
+fn a_fresh_file_migrates_to_current_and_survives_a_close_and_reopen() {
     let dir = TempDir::new().expect("tempdir");
     let path = dir.path().join("aibo.db");
     let key = DbKey::generate().expect("key");
@@ -162,7 +162,7 @@ fn a_newer_schema_version_is_refused_rather_than_downgraded() {
             err,
             StoreError::SchemaTooNew {
                 found: 7,
-                supported: 1
+                supported: SCHEMA_VERSION
             }
         ),
         "got {err:?}"
@@ -226,7 +226,7 @@ fn export_survives_the_round_trip_in_both_formats() {
         .expect("markdown");
 
     assert!(json.contains("what if I stop paying"));
-    assert!(json.contains("\"schema_version\": 1"));
+    assert!(json.contains(&format!("\"schema_version\": {SCHEMA_VERSION}")));
     assert!(markdown.contains("what if I stop paying"));
     assert!(markdown.contains("com.microsoft.VSCode"));
 

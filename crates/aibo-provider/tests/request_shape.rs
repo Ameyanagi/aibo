@@ -19,6 +19,7 @@ use std::path::PathBuf;
 
 use aibo_core::types::ChatRequest;
 use aibo_provider::anthropic::build_messages_body;
+use aibo_provider::azure;
 use aibo_provider::openai_compat::{
     build_chat_completions_body, build_responses_body, cerebras, openai,
 };
@@ -159,4 +160,53 @@ fn a_zero_output_cap_uses_the_model_default_when_the_protocol_allows_it() {
     // finite reserve prompt assembly already made for context/cost planning.
     let anthropic = build_messages_body(&req);
     assert_eq!(anthropic["max_tokens"], req.budget.max_output_tokens);
+}
+
+#[test]
+fn structured_output_wraps_the_raw_schema_for_both_openai_wires() {
+    let mut req = request();
+    req.params.json_schema = Some(serde_json::json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false,
+    }));
+
+    let chat = build_chat_completions_body(&req, &openai::chat_completions_quirks());
+    assert_eq!(
+        chat["response_format"]["json_schema"]["name"],
+        "aibo_response"
+    );
+    assert_eq!(
+        chat["response_format"]["json_schema"]["schema"]["type"],
+        "object"
+    );
+
+    let responses = build_responses_body(&req, &openai::quirks());
+    assert_eq!(responses["text"]["format"]["name"], "aibo_response");
+    assert_eq!(responses["text"]["format"]["schema"]["type"], "object");
+}
+
+#[test]
+fn chat_sampling_fields_honour_the_quirk_gate() {
+    let mut req = request();
+    req.params.top_p = Some(0.9);
+    let body = build_chat_completions_body(
+        &req,
+        &azure::v1_quirks(aibo_provider::AuthStyle::AzureApiKey),
+    );
+    assert!(body.get("temperature").is_none());
+    assert!(body.get("top_p").is_none());
+}
+
+#[test]
+fn unsupported_multi_candidate_wires_never_send_n() {
+    let mut req = request();
+    req.params.candidates = 3;
+    let body = build_chat_completions_body(&req, &openai::chat_completions_quirks());
+    assert!(body.get("n").is_none());
+    assert_eq!(
+        openai::default_capabilities().multi_candidate,
+        aibo_core::types::MultiCandidate::Unsupported
+    );
 }

@@ -36,7 +36,13 @@ use std::time::Duration;
 
 use aibo_core::error::{AiboError, Result};
 use aibo_core::traits::Provider;
-use aibo_core::types::{Capabilities, Credential, ModelBinding, ModelInfo, ProviderId};
+use aibo_core::types::{
+    BoxStream, Capabilities, ChatRequest, Credential, Health, ModelBinding, ModelInfo, ProviderId,
+    StreamEvent,
+};
+use async_trait::async_trait;
+use futures_util::{StreamExt as _, stream::FuturesUnordered};
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::openai_compat::{
@@ -140,7 +146,8 @@ pub fn build(spec: ProviderSpec) -> Result<Arc<dyn Provider>> {
         credential,
     } = spec;
 
-    Ok(match kind {
+    let requested_id = id.clone();
+    let provider: Arc<dyn Provider> = match kind {
         ProviderKind::Cerebras => boxed(cerebras::provider(credential)?),
         ProviderKind::SambaNova => boxed(sambanova::provider(credential)?),
         ProviderKind::Groq => boxed(groq::provider(credential)?),
@@ -200,7 +207,110 @@ pub fn build(spec: ProviderSpec) -> Result<Arc<dyn Provider>> {
             let id = id.clone().ok_or(AiboError::NoProviderConfigured)?;
             boxed(build_compat(id, url.as_str(), *quirks, credential)?)
         }
+    };
+    Ok(match requested_id {
+        Some(alias) if alias != provider.id() => Arc::new(IdentifiedProvider {
+            id: alias,
+            inner: provider,
+        }),
+        _ => provider,
     })
+}
+
+/// Preserve a configured provider alias across every trait surface without
+/// changing any concrete provider's wire behavior.
+struct IdentifiedProvider {
+    id: ProviderId,
+    inner: Arc<dyn Provider>,
+}
+
+impl std::fmt::Debug for IdentifiedProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("IdentifiedProvider")
+            .field("id", &self.id)
+            .field("inner", &self.inner.id())
+            .finish()
+    }
+}
+
+fn remap_provider_error(error: AiboError, id: &ProviderId) -> AiboError {
+    match error {
+        AiboError::Auth { kind, .. } => AiboError::Auth {
+            provider: id.clone(),
+            kind,
+        },
+        AiboError::RateLimited { retry_after, .. } => AiboError::RateLimited {
+            provider: id.clone(),
+            retry_after,
+        },
+        AiboError::ProviderUnavailable { status, detail, .. } => AiboError::ProviderUnavailable {
+            provider: id.clone(),
+            status,
+            detail,
+        },
+        AiboError::ModelRejected {
+            model,
+            constraint,
+            alternatives,
+            ..
+        } => AiboError::ModelRejected {
+            provider: id.clone(),
+            model,
+            constraint,
+            alternatives,
+        },
+        other => other,
+    }
+}
+
+#[async_trait]
+impl Provider for IdentifiedProvider {
+    fn id(&self) -> ProviderId {
+        self.id.clone()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn prewarm(&self) {
+        self.inner.prewarm().await;
+    }
+
+    async fn chat(
+        &self,
+        req: ChatRequest,
+        cancel: CancellationToken,
+    ) -> Result<BoxStream<'static, Result<StreamEvent>>> {
+        let stream = self
+            .inner
+            .chat(req, cancel)
+            .await
+            .map_err(|error| remap_provider_error(error, &self.id))?;
+        let id = self.id.clone();
+        Ok(stream
+            .map(move |item| item.map_err(|error| remap_provider_error(error, &id)))
+            .boxed())
+    }
+
+    async fn models(&self) -> Result<Vec<ModelInfo>> {
+        let mut models = self
+            .inner
+            .models()
+            .await
+            .map_err(|error| remap_provider_error(error, &self.id))?;
+        for model in &mut models {
+            model.provider = self.id.clone();
+        }
+        Ok(models)
+    }
+
+    async fn health(&self) -> Result<Health> {
+        self.inner
+            .health()
+            .await
+            .map_err(|error| remap_provider_error(error, &self.id))
+    }
 }
 
 /// The set of providers the app has configured.
@@ -592,11 +702,22 @@ impl ModelCatalogue {
     /// * **Off the hot path.** Callers run this in the background; nothing here
     ///   is on the §15 first-token budget.
     pub async fn refresh_from(&mut self, registry: &ProviderRegistry, per_provider: Duration) {
+        let mut refreshes = FuturesUnordered::new();
         for id in registry.ids() {
             let Some(provider) = registry.get(&id) else {
                 continue;
             };
-            match tokio::time::timeout(per_provider, provider.models()).await {
+            refreshes.push(async move {
+                let result = tokio::time::timeout(per_provider, provider.models()).await;
+                (id, result)
+            });
+        }
+
+        // Providers are independent. Running these concurrently means the
+        // refresh takes at most one timeout window instead of N windows when
+        // several endpoints are unreachable.
+        while let Some((id, result)) = refreshes.next().await {
+            match result {
                 Ok(Ok(models)) if !models.is_empty() => self.merge(models),
                 Ok(Ok(_)) => {
                     tracing::debug!(provider = %id, "provider publishes no model list");
@@ -1230,5 +1351,19 @@ mod tests {
             default_id_for(&ProviderKind::Groq),
             default_id_for(&ProviderKind::Xai)
         );
+    }
+
+    #[test]
+    fn a_configured_alias_is_the_provider_identity() {
+        let endpoint = Url::parse("http://127.0.0.1:11434/v1").unwrap();
+        let alias = ProviderId::new("ollama-secondary");
+        let provider = build(ProviderSpec {
+            id: Some(alias.clone()),
+            kind: ProviderKind::Ollama,
+            base_url: Some(endpoint.clone()),
+            credential: Credential::LocalEndpoint(endpoint),
+        })
+        .unwrap();
+        assert_eq!(provider.id(), alias);
     }
 }

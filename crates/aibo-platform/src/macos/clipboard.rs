@@ -122,9 +122,31 @@ fn kind_for(types: &[String]) -> ClipboardKind {
 /// need validating against real password managers and against apps that supply
 /// data lazily.
 pub(crate) fn read(source_app: Option<&str>) -> ClipboardItem {
-    let pb = pasteboard();
-    let sequence = pb.changeCount() as u64;
-    let types = advertised_types(&pb);
+    for _ in 0..3 {
+        let pb = pasteboard();
+        let sequence = pb.changeCount() as u64;
+        let item = read_generation(&pb, source_app, sequence);
+        if pb.changeCount() as u64 == sequence {
+            return item;
+        }
+    }
+
+    // The pasteboard was changing throughout the read. Never return payload
+    // bytes paired with hygiene flags from another generation.
+    ClipboardItem {
+        kind: ClipboardKind::Unsupported,
+        text: None,
+        files: Vec::new(),
+        concealed: true,
+        transient: true,
+        source_app: source_app.map(str::to_owned),
+        sequence: change_count() as u64,
+        restorable: false,
+    }
+}
+
+fn read_generation(pb: &NSPasteboard, source_app: Option<&str>, sequence: u64) -> ClipboardItem {
+    let types = advertised_types(pb);
 
     let denylisted = source_app.is_some_and(super::apps::is_clipboard_denylisted);
     let concealed = denylisted || types.iter().any(|t| t == NS_PASTEBOARD_CONCEALED_TYPE);
@@ -144,7 +166,7 @@ pub(crate) fn read(source_app: Option<&str>) -> ClipboardItem {
     let files = if concealed || kind != ClipboardKind::Files {
         Vec::new()
     } else {
-        read_file_urls(&pb)
+        read_file_urls(pb)
     };
 
     ClipboardItem {
@@ -155,7 +177,7 @@ pub(crate) fn read(source_app: Option<&str>) -> ClipboardItem {
         transient,
         source_app: source_app.map(str::to_owned),
         sequence,
-        restorable: !concealed && is_restorable(&pb, &types),
+        restorable: !concealed && is_restorable(pb, &types),
     }
 }
 
@@ -213,29 +235,41 @@ pub(crate) struct PasteboardSnapshot {
 
 /// Snapshot the clipboard before clobbering it.
 pub(crate) fn snapshot() -> PasteboardSnapshot {
-    let pb = pasteboard();
-    let change_count = pb.changeCount() as i64;
-    let types = advertised_types(&pb);
-    let concealed = types.iter().any(|t| t == NS_PASTEBOARD_CONCEALED_TYPE);
-    let restorable = !concealed && is_restorable(&pb, &types);
+    for _ in 0..3 {
+        let pb = pasteboard();
+        let change_count = pb.changeCount() as i64;
+        let types = advertised_types(&pb);
+        let concealed = types.iter().any(|t| t == NS_PASTEBOARD_CONCEALED_TYPE);
+        let restorable = !concealed && is_restorable(&pb, &types);
 
-    let entries = if restorable {
-        types
-            .iter()
-            .filter_map(|t| {
-                let ns = NSString::from_str(t);
-                pb.dataForType(&ns).map(|d| (t.clone(), d.to_vec()))
-            })
-            .collect()
-    } else {
-        Vec::new()
-    };
+        let entries = if restorable {
+            types
+                .iter()
+                .filter_map(|t| {
+                    let ns = NSString::from_str(t);
+                    pb.dataForType(&ns).map(|d| (t.clone(), d.to_vec()))
+                })
+                .collect()
+        } else {
+            Vec::new()
+        };
+        if pb.changeCount() as i64 == change_count {
+            return PasteboardSnapshot {
+                change_count,
+                entries,
+                restorable,
+                concealed,
+            };
+        }
+    }
 
     PasteboardSnapshot {
-        change_count,
-        entries,
-        restorable,
-        concealed,
+        change_count: change_count(),
+        entries: Vec::new(),
+        restorable: false,
+        // Treat an unstable generation as sensitive so no caller attempts to
+        // reconstruct it from a partial snapshot.
+        concealed: true,
     }
 }
 

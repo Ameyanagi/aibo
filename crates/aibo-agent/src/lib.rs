@@ -16,6 +16,7 @@ pub mod codex_app_server;
 pub mod limits;
 pub mod native_loop;
 pub mod permission_gate;
+mod process_io;
 
 pub use claude_code::{ClaudeCodeCli, ClaudeCodeConfig, ClaudeCodeError};
 pub use codex_app_server::{CodexAppServer, CodexConfig, CodexError};

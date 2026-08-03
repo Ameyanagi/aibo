@@ -20,6 +20,7 @@
 
 use std::sync::Arc;
 
+use crate::hotkey::HotkeyAction;
 use aibo_core::AiboError;
 use aibo_core::context::Turn;
 use aibo_core::types::{
@@ -48,6 +49,34 @@ pub const UI_EVENT_CHANNEL_CAPACITY: usize = 128;
 /// a session it has moved on from. Without this, a slow response from a
 /// cancelled request overwrites a fresh one.
 pub type SessionId = Uuid;
+
+/// Independently versioned persistence lane. A late result may only affect
+/// optimistic UI state when it matches the newest generation in its lane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PersistenceScope {
+    /// UI language.
+    Language,
+    /// Light/dark/system appearance preference.
+    Appearance,
+    /// Selected model.
+    Model,
+    /// Provider credential/config mutations.
+    Provider,
+    /// Whether send ends dictation.
+    SttEndOnSend,
+    /// Selected speech-to-text backend.
+    SttBackend,
+    /// Quick-picker favourites.
+    PinnedModels,
+    /// One configurable global shortcut.
+    Hotkey(HotkeyAction),
+    /// Accessibility-tree activation opt-in.
+    AxTreeActivation,
+    /// File finder roots.
+    FileRoots,
+    /// Monthly spending ceiling.
+    MonthlyBudget,
+}
 
 /// One model the runtime permits the panel to select.
 ///
@@ -276,10 +305,13 @@ pub enum UiRequest {
     /// Add or replace an API-key provider from the settings window (§10, §12).
     ///
     /// The key travels as a [`SecretString`] and is consumed by the credential
-    /// store on arrival. §12 keeps it out of `config.toml`, out of the UI's
-    /// retained state once sent, and out of diagnostics — `SecretString`'s own
-    /// `Debug` redacts, so the enum's derive cannot leak it into a log line.
+    /// store on arrival. The UI retains its original only in a redacted,
+    /// generation-scoped rollback snapshot until this write is acknowledged;
+    /// §12 keeps it out of `config.toml` and diagnostics — `SecretString`'s
+    /// own `Debug` redacts, so the enum's derive cannot leak it into a log line.
     SetProviderKey {
+        /// Correlates the write result with the optimistic draft dismissal.
+        generation: u64,
         /// Which backend, spelled as `config.toml`'s `backend = "…"` value.
         backend: String,
         /// Explicit id, for a second endpoint of a backend already configured.
@@ -297,6 +329,8 @@ pub enum UiRequest {
 
     /// Forget a provider: drop its credential and its `config.toml` entry.
     RemoveProvider {
+        /// Correlates the write result with the armed removal gesture.
+        generation: u64,
         /// The id the provider is addressed by.
         id: String,
     },
@@ -350,25 +384,44 @@ pub enum UiRequest {
     CopyDiagnostics,
 
     /// Persist and apply a new UI language.
-    SetLanguage(Lang),
+    SetLanguage {
+        /// Persistence generation.
+        generation: u64,
+        /// New language.
+        language: Lang,
+    },
 
     /// Persist the appearance preference (`ui.appearance`). The UI applies
     /// the palette itself; the runtime only writes the file.
-    SetAppearance(crate::theme::AppearancePreference),
+    SetAppearance {
+        /// Persistence generation.
+        generation: u64,
+        /// New preference.
+        preference: crate::theme::AppearancePreference,
+    },
 
     /// Persist and immediately activate a model offered by [`UiEvent::ModelOptions`].
     SetModel {
+        /// Persistence generation.
+        generation: u64,
         /// Provider/model pair selected in the panel.
         binding: ModelBinding,
     },
 
     /// Walk the configured file roots for the `@` finder (§P9+). Answered by
     /// [`UiEvent::FileCandidates`]; the walk is bounded runtime-side.
-    ListFiles,
+    ListFiles {
+        /// Panel session that owns this finder request.
+        session: SessionId,
+        /// Monotonic UI generation; stale walks must not replace newer results.
+        generation: u64,
+    },
 
     /// Read one picked file so it can ride the fenced selection pipeline.
     /// Answered by [`UiEvent::FileAttached`] or [`UiEvent::FileAttachFailed`].
     AttachFile {
+        /// Panel session that deliberately chose the file.
+        session: SessionId,
         /// Absolute path, exactly as [`UiEvent::FileCandidates`] reported it.
         path: String,
     },
@@ -376,7 +429,10 @@ pub enum UiRequest {
     /// List candidate agent working directories (owner redesign, 2026-08-02):
     /// recently used first, then the configured roots and their immediate
     /// subdirectories. Answered by [`UiEvent::WorkdirCandidates`].
-    ListWorkdirs,
+    ListWorkdirs {
+        /// Monotonic UI generation; stale listings must not replace newer results.
+        generation: u64,
+    },
 
     /// List installed skills for the `/skills` overlay. Answered by
     /// [`UiEvent::SkillCatalog`].
@@ -384,6 +440,8 @@ pub enum UiRequest {
 
     /// Persist whether ⏎ ends a live dictation turn (owner, 2026-08-03).
     SetSttEndOnSend {
+        /// Persistence generation.
+        generation: u64,
         /// Persisted to `[stt] end_on_send`; the behaviour itself lives in
         /// the shell's submit path.
         enabled: bool,
@@ -392,6 +450,8 @@ pub enum UiRequest {
     /// Persist the dictation backend choice: `"openai"`, `"chatgpt"`,
     /// `"azure"`, or `None` for auto.
     SetSttBackend {
+        /// Persistence generation.
+        generation: u64,
         /// The choice, as `[stt] backend` spells it.
         backend: Option<String>,
     },
@@ -399,15 +459,20 @@ pub enum UiRequest {
     /// Persist the quick-pick pin set. Sent on every deliberate toggle: a pin
     /// must survive a restart, or pinning is pointless.
     SetPinnedModels {
+        /// Persistence generation.
+        generation: u64,
         /// The full pinned set, in pin order. May be empty — an explicitly
         /// emptied set is a choice, not an absence.
         pins: Vec<ModelBinding>,
     },
 
-    /// Persist a rebound panel hotkey (`[ui] panel_hotkey`), or `None` to
-    /// return to the platform default. Registration already happened UI-side —
-    /// the runtime's only job is the file.
-    SetPanelHotkey {
+    /// Persist one rebound global shortcut. Registration already happened
+    /// UI-side; the runtime's only job is updating the matching `[ui]` key.
+    SetHotkey {
+        /// Persistence generation.
+        generation: u64,
+        /// Action whose binding changed.
+        action: HotkeyAction,
         /// The spec in `aibo_ui::hotkey::parse` syntax, e.g.
         /// `"control+alt+Space"`.
         spec: Option<String>,
@@ -417,6 +482,8 @@ pub enum UiRequest {
     /// start: the flag is baked into the platform worker at construction, and
     /// the settings row says so.
     SetAxTreeActivation {
+        /// Persistence generation.
+        generation: u64,
         /// Whether aibo may switch on an app's AX tree to read its content.
         enabled: bool,
     },
@@ -424,6 +491,8 @@ pub enum UiRequest {
     /// Persist the `@` finder's search roots (`[files] roots`) and use them
     /// for every walk from now on. `None` returns to the platform defaults.
     SetFileRoots {
+        /// Persistence generation.
+        generation: u64,
         /// Directories, `~/` prefixes allowed. Empty means "index nothing",
         /// which is a choice the user may make.
         roots: Option<Vec<String>>,
@@ -432,6 +501,8 @@ pub enum UiRequest {
     /// Persist the §14 monthly budget and enforce it from the next request.
     /// `None` removes the ceiling.
     SetMonthlyBudget {
+        /// Persistence generation.
+        generation: u64,
         /// Ceiling in millionths of a currency unit.
         limit_micros: Option<u64>,
         /// Warn at this percentage of the limit.
@@ -442,12 +513,18 @@ pub enum UiRequest {
 
     /// Begin push-to-talk dictation: microphone → realtime transcription,
     /// streaming text back as [`UiEvent::DictationDelta`]s (§P9+).
-    StartDictation,
+    StartDictation {
+        /// Monotonic turn id used to reject late events from an older turn.
+        turn: u64,
+    },
 
     /// Finish dictation: commit the audio turn and close the stream. The final
     /// text arrives through the same delta events before
     /// [`UiEvent::DictationEnded`].
-    StopDictation,
+    StopDictation {
+        /// Turn being stopped; a stale stop must not cancel a newer microphone.
+        turn: u64,
+    },
 
     /// Begin an orderly shutdown: cancel runs, reap children, close the
     /// database. §6 — child processes must not outlive aibo.
@@ -458,6 +535,16 @@ pub enum UiRequest {
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum UiEvent {
+    /// Result of one config/credential mutation. The UI applies it only when
+    /// `generation` is still newest for `scope`.
+    PersistenceResult {
+        /// Independently versioned setting lane.
+        scope: PersistenceScope,
+        /// Request generation.
+        generation: u64,
+        /// Whether every durable mutation succeeded.
+        succeeded: bool,
+    },
     /// Context capture finished, partially or fully.
     ///
     /// §8: the panel "tolerates context arriving late, empty or never". Every
@@ -643,21 +730,31 @@ pub enum UiEvent {
     HistorySetupFailed,
 
     /// The microphone is live and streaming to the transcriber (§P9+).
-    DictationStarted,
+    DictationStarted {
+        /// Dictation turn this event belongs to.
+        turn: u64,
+    },
 
     /// A fragment of transcribed speech. Appended to the panel input verbatim.
     DictationDelta {
+        /// Dictation turn this event belongs to.
+        turn: u64,
         /// The new text, already in reading order.
         text: String,
     },
 
     /// Dictation finished: the final transcript has been delivered through the
     /// deltas and the microphone is closed.
-    DictationEnded,
+    DictationEnded {
+        /// Dictation turn this event belongs to.
+        turn: u64,
+    },
 
     /// Dictation could not start or died. Typed so the UI owns the copy; the
     /// runtime never localises (§9).
     DictationFailed {
+        /// Dictation turn this event belongs to.
+        turn: u64,
         /// What went wrong, in the panel's vocabulary.
         failure: DictationFailure,
     },
@@ -672,6 +769,10 @@ pub enum UiEvent {
 
     /// The `@` finder's candidate list, answering [`UiRequest::ListFiles`].
     FileCandidates {
+        /// Panel session that requested this result.
+        session: SessionId,
+        /// Request generation, for last-request-wins delivery.
+        generation: u64,
         /// Bounded by the runtime's walk limits.
         files: Vec<FileCandidate>,
     },
@@ -679,6 +780,8 @@ pub enum UiEvent {
     /// Candidate agent working directories, answering
     /// [`UiRequest::ListWorkdirs`].
     WorkdirCandidates {
+        /// Request generation, for last-request-wins delivery.
+        generation: u64,
         /// Recently used, most recent first — the "pick up where I was" rows.
         recents: Vec<std::path::PathBuf>,
         /// The configured roots and their immediate subdirectories.
@@ -719,6 +822,8 @@ pub enum UiEvent {
     /// context, and the selection pipeline already treats them as exactly
     /// that.
     FileAttached {
+        /// Panel session that deliberately chose the file.
+        session: SessionId,
         /// The file's name, for the toast.
         name: String,
         /// The content, capped runtime-side.
@@ -727,6 +832,8 @@ pub enum UiEvent {
 
     /// The picked file could not be read as bounded text.
     FileAttachFailed {
+        /// Panel session that deliberately chose the file.
+        session: SessionId,
         /// The file's name, for the toast.
         name: String,
     },

@@ -10,6 +10,8 @@
 //! configured — the permission states (§8, §17) and the hotkey status (§9).
 //! The forms themselves are per-section product work.
 
+use std::collections::HashMap;
+
 use aibo_core::types::{Health, ModelBinding, Permission, PermissionStatus, ProviderId, Role};
 use iced::widget::{
     Space, button, column, container, pick_list, row, rule, scrollable, text, text_editor,
@@ -339,6 +341,11 @@ pub struct SettingsState {
     pub spend_fraction: Option<f32>,
     /// Whether the panel hotkey registered, and under what label (§9).
     pub hotkey: Option<HotkeyStatus>,
+    /// Registration outcome for every configurable global action. The panel
+    /// entry is mirrored in [`Self::hotkey`] for first-run onboarding.
+    pub hotkeys: HashMap<HotkeyAction, HotkeyStatus>,
+    /// Which action the shared shortcut recorder is currently editing.
+    pub hotkey_action: HotkeyAction,
     /// The active UI language.
     pub language: Lang,
     /// The appearance preference (`[ui] appearance`), as chosen — System
@@ -373,6 +380,10 @@ pub struct SettingsState {
     pub forget_armed: Option<ProviderId>,
     /// The model catalogue, mirrored from the panel for the Models section.
     pub models: Vec<crate::bridge::ModelOption>,
+    /// The binding that will answer the next question — the panel's own
+    /// selection, mirrored here so the window can say which provider and
+    /// model are actually in use (owner, 2026-08-04).
+    pub active_model: Option<aibo_core::types::ModelBinding>,
     /// The pinned set the quick-pick shows, including derived defaults —
     /// mirrored so the stars here and the pins there cannot disagree.
     pub favourite_models: Vec<ModelBinding>,
@@ -398,6 +409,11 @@ pub struct SettingsState {
     pub hotkey_draft: String,
     /// Whether the current [`Self::hotkey_draft`] failed to parse on apply.
     pub hotkey_draft_invalid: bool,
+    /// Listening for the next key press to become the shortcut (owner,
+    /// 2026-08-04). A rebind field nobody can use without learning a syntax
+    /// is a rebind nobody performs; while this is set the window captures the
+    /// combination instead of asking for its name.
+    pub hotkey_recording: bool,
     /// The monthly ceiling being typed, in whole currency units (`"15"`).
     pub budget_limit_draft: String,
     /// The warn threshold being typed, percent.
@@ -486,6 +502,14 @@ impl ProviderDraft {
         let mut leftover = key;
         scrub(&mut leftover);
         secret
+    }
+
+    /// Copy the key into the runtime request while this draft remains owned by
+    /// the pending persistence snapshot. If the write fails, the original
+    /// field can be restored without returning secret material over the event
+    /// channel; success drops and scrubs it.
+    pub(crate) fn key_for_persistence(&self) -> SecretString {
+        SecretString::from(self.key.as_str().to_owned())
     }
 
     fn scrub_key(&mut self) {
@@ -746,8 +770,16 @@ pub enum Message {
     RootsReset,
     /// The hotkey spec draft changed.
     HotkeyDraft(String),
+    /// Choose which global action the shared recorder edits.
+    HotkeySelect(HotkeyAction),
+    /// Start listening for a shortcut, or stop without changing it.
+    HotkeyRecord(bool),
+    /// A combination the recorder captured, in `hotkey::parse` syntax.
+    HotkeyCaptured(String),
     /// Parse, re-register and persist the drafted hotkey.
     HotkeyApply,
+    /// Restore the selected action's shipped binding (or unassigned state).
+    HotkeyReset,
     /// The budget ceiling draft changed.
     BudgetLimitDraft(String),
     /// The warn-percent draft changed.
@@ -956,6 +988,20 @@ fn models(state: &SettingsState) -> Element<'_, Message> {
             .style(theme::text_dim),
     ]
     .spacing(space(1.0));
+
+    // The active binding, stated before the catalogue: "which model am I
+    // talking to" should not require reading eighty rows (owner,
+    // 2026-08-04).
+    if let Some(binding) = &state.active_model {
+        list = list.push(
+            text(i18n::t1(
+                Key::SettingsProviderInUse,
+                &format!("{} · {}", binding.provider.as_str(), binding.model),
+            ))
+            .size(type_scale::BODY)
+            .style(theme::text_accent),
+        );
+    }
 
     for option in &state.models {
         let pinned = state.favourite_models.contains(&option.binding);
@@ -1210,12 +1256,32 @@ fn providers(state: &SettingsState) -> Element<'_, Message> {
             (Health::Unknown, _) => (Severity::Info, i18n::t(Key::PermissionNotDetermined)),
         };
 
+        // The one that will answer the next question, named on its own row.
+        // A list of configured providers does not say which is *in use*, and
+        // that is the question the window was being asked (owner,
+        // 2026-08-04).
+        let in_use = state
+            .active_model
+            .as_ref()
+            .filter(|binding| binding.provider == provider.id);
+        let mut identity = column![
+            text(provider.id.to_string())
+                .size(type_scale::BODY)
+                .style(theme::text_primary),
+        ]
+        .spacing(space(0.25));
+        if let Some(binding) = in_use {
+            identity = identity.push(
+                text(i18n::t1(Key::SettingsProviderInUse, &binding.model))
+                    .size(type_scale::META)
+                    .style(theme::text_accent),
+            );
+        }
+
         list = list.push(
             container(
                 row![
-                    text(provider.id.to_string())
-                        .size(type_scale::BODY)
-                        .style(theme::text_primary),
+                    identity,
                     Space::new().width(Length::Fill),
                     text(status)
                         .size(type_scale::META)
@@ -1438,10 +1504,57 @@ fn onboarding_steps(state: &SettingsState) -> Element<'_, Message> {
 fn permissions(state: &SettingsState) -> Element<'_, Message> {
     let mut list = column![].spacing(space(2.0));
 
-    // The hotkey belongs here rather than in a picker of its own: §9 wants
-    // conflict detection surfaced at first run, and this is where a user who
-    // has lost ⌥Space to Raycast will come looking.
-    if let Some(status) = &state.hotkey {
+    // Keep the existing Permissions layout, but let the shared recorder target
+    // every working global action. A compact list makes the current assignment
+    // visible before the user starts recording a replacement.
+    for action in HotkeyAction::CONFIGURABLE {
+        let combo = state
+            .hotkeys
+            .get(&action)
+            .or_else(|| {
+                (action == HotkeyAction::TogglePanel)
+                    .then_some(state.hotkey.as_ref())
+                    .flatten()
+            })
+            .map(|status| match status {
+                HotkeyStatus::Registered { combo, .. } | HotkeyStatus::Failed { combo, .. } => {
+                    combo.as_str()
+                }
+            })
+            .unwrap_or_else(|| i18n::t(Key::SettingsHotkeyUnassigned));
+        list = list.push(
+            button(
+                row![
+                    text(i18n::t(hotkey_action_key(action)))
+                        .size(type_scale::BODY)
+                        .style(theme::text_primary),
+                    Space::new().width(Length::Fill),
+                    text(combo)
+                        .size(type_scale::META)
+                        .font(theme::MONO_FONT)
+                        .style(theme::text_dim),
+                ]
+                .align_y(iced::Alignment::Center),
+            )
+            .width(Length::Fill)
+            .height(Length::Fixed(theme::MIN_HIT_TARGET))
+            .padding([space(1.5), space(2.0)])
+            .style(if state.hotkey_action == action {
+                theme::selected_button
+            } else {
+                theme::action_button
+            })
+            .on_press(Message::HotkeySelect(action)),
+        );
+    }
+
+    // Registration conflicts remain directly below the selected action.
+    let selected_status = state.hotkeys.get(&state.hotkey_action).or_else(|| {
+        (state.hotkey_action == HotkeyAction::TogglePanel)
+            .then_some(state.hotkey.as_ref())
+            .flatten()
+    });
+    if let Some(status) = selected_status {
         // No rebind action here any more: `Message::RebindHotkey` was a
         // no-op behind a button labelled "Open settings" *inside* settings —
         // on a failed registration, the only advertised recovery did nothing.
@@ -1477,34 +1590,73 @@ fn permissions(state: &SettingsState) -> Element<'_, Message> {
         });
     }
 
-    // The rebind that used to be missing: a field in `hotkey::parse` syntax,
-    // applied live through the one process-wide registrar and persisted to
-    // `[ui] panel_hotkey`. The status block above reports the outcome.
-    list = list.push(
-        row![
-            text_input("control+alt+Space", &state.hotkey_draft)
-                .on_input(Message::HotkeyDraft)
-                .on_submit(Message::HotkeyApply)
-                .size(type_scale::BODY)
-                .font(theme::MONO_FONT)
+    // One recorder is shared by the selected action. It applies live through
+    // the one process-wide registrar and persists the action-specific key.
+    // Press the keys, don't spell them (owner, 2026-08-04). The recorder is
+    // the primary control; the typed field stays underneath for the cases a
+    // capture cannot reach — a combination the OS swallows before aibo sees
+    // it, or a shortcut being set from a keyboard that is not to hand.
+    let capture_label = if state.hotkey_recording {
+        i18n::t(Key::SettingsHotkeyListening).to_owned()
+    } else if state.hotkey_draft.trim().is_empty() {
+        i18n::t(Key::SettingsHotkeyRecord).to_owned()
+    } else {
+        crate::hotkey::parse(&state.hotkey_draft)
+            .map(|hotkey| crate::hotkey::describe(&hotkey))
+            .unwrap_or_else(|_| state.hotkey_draft.clone())
+    };
+    list =
+        list.push(
+            row![
+                button(text(capture_label).size(type_scale::BODY).style(
+                    if state.hotkey_recording {
+                        theme::text_accent
+                    } else {
+                        theme::text_primary
+                    }
+                ),)
+                .width(Length::Fill)
+                .height(Length::Fixed(theme::MIN_HIT_TARGET))
                 .padding([space(1.5), space(2.0)])
-                .style(theme::field),
-            {
-                let apply = button(
-                    text(i18n::t(Key::ActionApply))
+                .style(if state.hotkey_recording {
+                    theme::selected_button
+                } else {
+                    theme::action_button
+                })
+                .on_press(Message::HotkeyRecord(!state.hotkey_recording)),
+                {
+                    let apply = button(
+                        text(i18n::t(Key::ActionApply))
+                            .size(type_scale::BODY)
+                            .style(theme::text_primary),
+                    )
+                    .padding([space(1.5), space(2.0)])
+                    .style(theme::action_button);
+                    match state.hotkey_draft.trim().is_empty() || state.hotkey_recording {
+                        true => apply,
+                        false => apply.on_press(Message::HotkeyApply),
+                    }
+                },
+                button(
+                    text(i18n::t(Key::ActionResetDefaults))
                         .size(type_scale::BODY)
                         .style(theme::text_primary),
                 )
                 .padding([space(1.5), space(2.0)])
-                .style(theme::action_button);
-                match state.hotkey_draft.trim().is_empty() {
-                    true => apply,
-                    false => apply.on_press(Message::HotkeyApply),
-                }
-            },
-        ]
-        .align_y(iced::Alignment::Center)
-        .spacing(space(2.0)),
+                .style(theme::action_button)
+                .on_press(Message::HotkeyReset),
+            ]
+            .align_y(iced::Alignment::Center)
+            .spacing(space(2.0)),
+        );
+    list = list.push(
+        text_input("control+alt+Space", &state.hotkey_draft)
+            .on_input(Message::HotkeyDraft)
+            .on_submit(Message::HotkeyApply)
+            .size(type_scale::META)
+            .font(theme::MONO_FONT)
+            .padding([space(1.0), space(2.0)])
+            .style(theme::field),
     );
     list = list.push(
         text(i18n::t(if state.hotkey_draft_invalid {
@@ -1558,6 +1710,17 @@ fn permissions(state: &SettingsState) -> Element<'_, Message> {
     );
 
     list.into()
+}
+
+const fn hotkey_action_key(action: HotkeyAction) -> Key {
+    match action {
+        HotkeyAction::TogglePanel => Key::SettingsHotkeyPanel,
+        HotkeyAction::CaptureScreenRegion => Key::SettingsHotkeyScreenCapture,
+        HotkeyAction::ShowTasks => Key::SettingsHotkeyShowTasks,
+        // This action is deliberately absent from `CONFIGURABLE` until its
+        // runtime revert buffer exists.
+        HotkeyAction::RevertLastTransform => Key::SettingsHotkeyRevert,
+    }
 }
 
 /// The supporting line for a refused hotkey.

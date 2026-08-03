@@ -175,6 +175,15 @@ pub enum StoreError {
         value: String,
     },
 
+    /// A collection limit cannot be represented by SQLite's signed LIMIT
+    /// parameter. Treating the wrapped value as a negative LIMIT would disable
+    /// the limit entirely.
+    #[error("limit {value} is too large for SQLite")]
+    InvalidLimit {
+        /// The caller-supplied limit.
+        value: usize,
+    },
+
     /// The blocking database task panicked or was cancelled (§6: every task
     /// boundary catches panics, so this is reported rather than propagated).
     #[error("the blocking database task did not complete")]

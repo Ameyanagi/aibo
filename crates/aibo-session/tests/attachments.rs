@@ -239,13 +239,14 @@ async fn the_refusal_is_inline_and_never_falls_back() {
     assert!(!error.is_retryable());
 }
 
-/// A second, also-blind entry in the chain is not a second chance: walking it
-/// rediscovers the same refusal and spends the user's money to learn nothing
-/// (§4, §14).
+/// Capabilities are per model. Refusing a blind binding happens before
+/// dispatch and spend, so a vision-capable secondary is a valid next entry
+/// when fallback is explicitly enabled.
 #[tokio::test]
-async fn a_blind_binding_does_not_walk_the_rest_of_the_chain() {
+async fn a_blind_binding_moves_to_a_vision_capable_secondary() {
     let first = Mock::new(ProviderId::OPENAI);
     let second = Mock::new(ProviderId::ANTHROPIC);
+    second.push(Script::ok("the secondary can see it"));
 
     let mut registry = ProviderRegistry::new();
     registry.insert(first.id(), first.provider());
@@ -280,15 +281,12 @@ async fn a_blind_binding_does_not_walk_the_rest_of_the_chain() {
 
     let outcome = engine.run(ask_about_the_image(), &EventSink::null()).await;
 
-    assert!(matches!(
-        outcome.error().unwrap().as_ref(),
-        AiboError::VisionUnsupported { .. }
-    ));
+    assert_eq!(outcome.insertable_text(), Some("the secondary can see it"));
     assert_eq!(first.chat_calls(), 0);
     assert_eq!(
         second.chat_calls(),
-        0,
-        "a capability refusal is not a transport failure; §4 does not fall back on it"
+        1,
+        "the capable alternative must not be dead code behind a blind primary"
     );
 }
 

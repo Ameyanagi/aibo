@@ -200,7 +200,12 @@ impl WindowsBackend {
     /// foreground. The caller must therefore only reach this while the capture
     /// target is still frontmost — see [`PlatformBackend::selected_text`].
     async fn selected_text_via_copy(&self, deadline: Instant) -> WinResult<Option<String>> {
-        let saved = self.clipboard.read(deadline, false).await.ok();
+        let saved = match self.clipboard.read(deadline, false).await {
+            Ok(item) if item.restorable && !item.concealed => item,
+            // Ctrl+C is destructive to the clipboard. If its current contents
+            // cannot be reproduced faithfully, this fallback is unsafe.
+            Ok(_) | Err(_) => return Ok(None),
+        };
         let before = ClipboardHandle::sequence();
         // Subscribe *before* sending the chord, so the notification cannot be
         // missed in the gap.
@@ -229,17 +234,22 @@ impl WindowsBackend {
             return Ok(None);
         }
 
-        let copied = self.clipboard.read(deadline, false).await?;
-        let after = ClipboardHandle::sequence();
-
-        if let Some(previous) = saved {
-            // Only restore what can be restored faithfully (§12): putting plain
-            // text back over HTML or RTF is data loss, so decline instead.
-            let text = previous.restorable.then(|| previous.text.clone()).flatten();
-            let _ = self.clipboard.restore(text, after, deadline).await;
+        let copied = self.clipboard.read(deadline, false).await;
+        if let Ok(item) = &copied {
+            // Use the generation captured under the same lock as the payload.
+            // A separate query could observe another app's later copy and
+            // wrongly authorize overwriting it.
+            let _ = self
+                .clipboard
+                .restore(
+                    saved.text,
+                    item.sequence as u32,
+                    Instant::now() + INSERT_BUDGET,
+                )
+                .await;
         }
 
-        Ok(copied.text.filter(|t| !t.is_empty()))
+        Ok(copied?.text.filter(|t| !t.is_empty()))
     }
 
     /// The shared paste path.
@@ -251,26 +261,42 @@ impl WindowsBackend {
         let deadline = Instant::now() + INSERT_BUDGET;
 
         let saved = if restore_previous {
-            self.clipboard.read(deadline, false).await.ok()
+            let previous = self.clipboard.read(deadline, false).await?;
+            if !previous.restorable || previous.concealed {
+                return Err(WindowsPlatformError::Clipboard(
+                    "the existing clipboard cannot be restored faithfully".into(),
+                ));
+            }
+            Some(previous)
         } else {
             None
         };
 
         let sequence = self.clipboard.write(text.to_owned(), deadline).await?;
 
-        input::release_held_modifiers()?;
-        input::send_chord(VK_CONTROL, input::VK_V)?;
+        // Once aibo has replaced the clipboard, every later input failure must
+        // still pass through restoration. Returning early here strands the
+        // inserted payload in the user's clipboard.
+        let input_result = input::release_held_modifiers()
+            .and_then(|()| input::send_chord(VK_CONTROL, input::VK_V));
 
         if let Some(previous) = saved {
-            tokio::time::sleep(PASTE_SETTLE).await;
-            let restorable = previous.restorable && !previous.concealed;
-            let text = restorable.then(|| previous.text.clone()).flatten();
-            let _ = self
-                .clipboard
-                .restore(text, sequence, Instant::now() + INSERT_BUDGET)
-                .await;
+            if previous.restorable && !previous.concealed {
+                // A successful paste may consume the clipboard asynchronously;
+                // failed input has nothing to settle and should restore now.
+                if input_result.is_ok() {
+                    tokio::time::sleep(PASTE_SETTLE).await;
+                }
+                if let Err(error) = self
+                    .clipboard
+                    .restore(previous.text, sequence, Instant::now() + INSERT_BUDGET)
+                    .await
+                {
+                    tracing::warn!(%error, "could not restore the saved clipboard");
+                }
+            }
         }
-        Ok(())
+        input_result
     }
 
     /// Guard every write-back on §9's IME rule.

@@ -199,7 +199,7 @@ impl std::fmt::Display for AttachmentRejection {
 /// Display strings are the *diagnostic* form. User-facing copy is chosen by the
 /// UI from the variant plus its [`Treatment`]; never render `Display` straight
 /// into the panel.
-#[derive(Debug, Error)]
+#[derive(Error)]
 #[non_exhaustive]
 pub enum AiboError {
     /// No provider has been configured. The only error allowed to interrupt.
@@ -406,6 +406,102 @@ pub enum AiboError {
     Internal(#[source] Box<dyn std::error::Error + Send + Sync + 'static>),
 }
 
+impl std::fmt::Debug for AiboError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NoProviderConfigured => f.write_str("NoProviderConfigured"),
+            Self::Auth { provider, kind } => f
+                .debug_struct("Auth")
+                .field("provider", provider)
+                .field("kind", kind)
+                .finish(),
+            Self::RateLimited {
+                provider,
+                retry_after,
+            } => f
+                .debug_struct("RateLimited")
+                .field("provider", provider)
+                .field("retry_after", retry_after)
+                .finish(),
+            Self::Offline => f.write_str("Offline"),
+            Self::ProviderUnavailable {
+                provider,
+                status,
+                detail,
+            } => f
+                .debug_struct("ProviderUnavailable")
+                .field("provider", provider)
+                .field("status", status)
+                .field("detail", detail)
+                .finish(),
+            Self::ContextTooLarge { limit, actual } => f
+                .debug_struct("ContextTooLarge")
+                .field("limit", limit)
+                .field("actual", actual)
+                .finish(),
+            Self::Timeout { phase } => f.debug_struct("Timeout").field("phase", phase).finish(),
+            Self::CaptureFailed { app, reason } => f
+                .debug_struct("CaptureFailed")
+                .field("app", app)
+                .field("reason", reason)
+                .finish(),
+            Self::InsertFailed { reason } => f
+                .debug_struct("InsertFailed")
+                .field("reason", reason)
+                .finish(),
+            Self::Sandbox { tier, reason } => f
+                .debug_struct("Sandbox")
+                .field("tier", tier)
+                .field("reason", reason)
+                .finish(),
+            Self::AgentBackendMissing { which } => f
+                .debug_struct("AgentBackendMissing")
+                .field("which", which)
+                .finish(),
+            Self::BudgetExceeded { kind } => f
+                .debug_struct("BudgetExceeded")
+                .field("kind", kind)
+                .finish(),
+            Self::ModelRejected {
+                provider,
+                model,
+                constraint,
+                alternatives,
+            } => f
+                .debug_struct("ModelRejected")
+                .field("provider", provider)
+                .field("model", model)
+                .field("constraint", constraint)
+                .field("alternatives", alternatives)
+                .finish(),
+            Self::VisionUnsupported {
+                binding,
+                attachments,
+                alternatives,
+            } => f
+                .debug_struct("VisionUnsupported")
+                .field("binding", binding)
+                .field("attachments", attachments)
+                .field("alternatives", alternatives)
+                .finish(),
+            Self::AttachmentRejected {
+                label,
+                media_type,
+                reason,
+            } => f
+                .debug_struct("AttachmentRejected")
+                .field("label", label)
+                .field("media_type", media_type)
+                .field("reason", reason)
+                .finish(),
+            // Internal sources routinely carry paths, response bodies and
+            // credential-shaped strings. Display was already generic; Debug
+            // must uphold the same redaction boundary for logs/diagnostics.
+            Self::Internal(_) => f.debug_tuple("Internal").field(&"<redacted>").finish(),
+        }
+    }
+}
+
 /// The fixed user-facing treatment for an error (§13).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Treatment {
@@ -607,6 +703,14 @@ mod tests {
         // source's message, only the generic sentence.
         let err = AiboError::Internal(Box::new(std::io::Error::other("stack trace with paths")));
         assert_eq!(err.to_string(), "internal error");
+    }
+
+    #[test]
+    fn internal_debug_redacts_the_raw_source() {
+        let err = AiboError::Internal(Box::new(std::io::Error::other(CANARY)));
+        let rendered = format!("{err:?}");
+        assert!(!rendered.contains(CANARY), "Debug leaked: {rendered}");
+        assert!(rendered.contains("redacted"), "{rendered}");
     }
 
     #[test]

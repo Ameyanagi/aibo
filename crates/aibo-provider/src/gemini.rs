@@ -46,7 +46,10 @@ use url::Url;
 
 use crate::auth::{AuthStyle, apply_credential};
 use crate::http::{HttpConfig, build_client};
-use crate::sse::{Flow, SseDecoder, decode, events_from_response};
+use crate::sse::{
+    Flow, SseDecoder, cancelled_stream, decode, events_from_response, read_error_body,
+    read_json_body, unexpected_eof,
+};
 use crate::wire::{ErrorShape, map_status, render_untrusted};
 
 /// The public Generative Language endpoint.
@@ -97,9 +100,7 @@ impl Gemini {
     /// Build the provider from an API key.
     pub fn new(credential: Credential) -> Result<Self> {
         let id = ProviderId::GEMINI;
-        if !matches!(credential, Credential::ApiKey(_)) {
-            return Err(AiboError::NoProviderConfigured);
-        }
+        crate::openai_compat::require_api_key(&id, &credential)?;
         Ok(Self {
             id: id.clone(),
             client: build_client(&HttpConfig::default())?,
@@ -131,7 +132,9 @@ impl Gemini {
             .get(reqwest::header::RETRY_AFTER)
             .and_then(|v| v.to_str().ok())
             .and_then(crate::wire::parse_retry_after);
-        let body = response.text().await.unwrap_or_default();
+        let body = read_error_body(response, &self.id)
+            .await
+            .unwrap_or_default();
         Err(map_status(
             &self.id,
             status.as_u16(),
@@ -160,7 +163,11 @@ impl Provider for Gemini {
         // Refuse, never strip (§10) — then downscale before the pixels are
         // base64'd into the body (§14).
         crate::attachment::guard(&self.capabilities, &req, Vec::new())?;
-        let req = crate::attachment::prepare(req).await?;
+        let req = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(cancelled_stream()),
+            prepared = crate::attachment::prepare(req) => prepared?,
+        };
 
         let body = build_generate_body(&req);
         // The model is part of the path, and `:streamGenerateContent` is a
@@ -173,11 +180,17 @@ impl Provider for Gemini {
             .json(&body);
         let rb = apply_credential(&self.id, &self.credential, AuthStyle::GoogleApiKey, rb).await?;
 
-        let response = rb
-            .send()
-            .await
-            .map_err(|e| crate::http::map_transport_error(&self.id, &e))?;
-        let response = self.check_status(response).await?;
+        let response = tokio::select! {
+            biased;
+            () = cancel.cancelled() => return Ok(cancelled_stream()),
+            response = async {
+                let response = rb
+                    .send()
+                    .await
+                    .map_err(|e| crate::http::map_transport_error(&self.id, &e))?;
+                self.check_status(response).await
+            } => response?,
+        };
 
         Ok(decode(
             events_from_response(response),
@@ -188,21 +201,48 @@ impl Provider for Gemini {
     }
 
     async fn models(&self) -> Result<Vec<ModelInfo>> {
-        let rb = self
-            .client
-            .get(self.url("models")?)
-            .timeout(Duration::from_secs(10));
-        let rb = apply_credential(&self.id, &self.credential, AuthStyle::GoogleApiKey, rb).await?;
-        let response = rb
-            .send()
-            .await
-            .map_err(|e| crate::http::map_transport_error(&self.id, &e))?;
-        let response = self.check_status(response).await?;
-        let body: ModelsResponse = response
-            .json()
-            .await
-            .map_err(|e| crate::http::map_transport_error(&self.id, &e))?;
-        Ok(body.into_models(&self.id, &self.capabilities))
+        const MAX_PAGES: usize = 64;
+        let mut page_token: Option<String> = None;
+        let mut seen = std::collections::HashSet::new();
+        let mut models = Vec::new();
+
+        for _ in 0..MAX_PAGES {
+            let mut url = self.url("models")?;
+            url.query_pairs_mut().append_pair("pageSize", "50");
+            if let Some(token) = page_token.as_deref() {
+                url.query_pairs_mut().append_pair("pageToken", token);
+            }
+            let rb = self.client.get(url).timeout(Duration::from_secs(10));
+            let rb =
+                apply_credential(&self.id, &self.credential, AuthStyle::GoogleApiKey, rb).await?;
+            let response = rb
+                .send()
+                .await
+                .map_err(|e| crate::http::map_transport_error(&self.id, &e))?;
+            let response = self.check_status(response).await?;
+            let body = read_json_body(response, &self.id).await?;
+            let page: ModelsResponse =
+                serde_json::from_str(&body).map_err(|e| AiboError::Internal(Box::new(e)))?;
+            let next = page
+                .next_page_token
+                .clone()
+                .filter(|token| !token.is_empty());
+            models.extend(page.into_models(&self.id, &self.capabilities));
+            let Some(next) = next else {
+                return Ok(models);
+            };
+            if !seen.insert(next.clone()) {
+                return Err(AiboError::Internal(Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "Gemini model pagination repeated a page token",
+                ))));
+            }
+            page_token = Some(next);
+        }
+        Err(AiboError::Internal(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "Gemini model pagination exceeded the page limit",
+        ))))
     }
 
     async fn health(&self) -> Result<Health> {
@@ -227,7 +267,8 @@ fn build_generate_body(req: &ChatRequest) -> Value {
     let mut contents = Vec::new();
     let mut system = Vec::new();
 
-    for message in &req.messages {
+    let messages = crate::attachment::fold_into_messages(req);
+    for message in messages.iter() {
         match message.role {
             // Gemini has no `system` role. The assembled system prompt is
             // lifted into `systemInstruction`; leaving it as a `user` turn
@@ -269,7 +310,10 @@ fn build_generate_body(req: &ChatRequest) -> Value {
     // `max_tokens` of 0 means "use the model default and omit the parameter"
     // (§5); the budget's planning reserve is not a wire value.
     if req.params.max_tokens > 0 {
-        generation_config.insert("maxOutputTokens".into(), json!(req.params.max_tokens));
+        generation_config.insert(
+            "maxOutputTokens".into(),
+            json!(req.params.max_tokens.min(req.budget.max_output_tokens)),
+        );
     }
     if !req.params.stop.is_empty() {
         generation_config.insert("stopSequences".into(), json!(req.params.stop));
@@ -332,6 +376,8 @@ fn parts_of(message: &Message) -> Vec<Value> {
 struct ModelsResponse {
     #[serde(default)]
     models: Vec<GeminiModel>,
+    #[serde(default)]
+    next_page_token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -553,9 +599,16 @@ impl SseDecoder for GeminiDecoder {
     }
 
     fn on_end(&mut self, out: &mut Vec<Result<StreamEvent>>) {
-        // The usage total has to reach the caller even when the stream closes
-        // without a `finishReason`, or §14 reconciles against nothing.
-        self.finish(StopReason::EndTurn, out);
+        if self.finished {
+            return;
+        }
+        self.finished = true;
+        // Usage remains useful for reconciliation, but an absent finishReason
+        // is still a truncated response and must not become a successful Done.
+        if let Some(usage) = self.usage.take() {
+            out.push(Ok(StreamEvent::Usage(usage)));
+        }
+        out.push(Err(unexpected_eof()));
     }
 }
 
@@ -563,9 +616,16 @@ impl SseDecoder for GeminiDecoder {
 mod tests {
     use super::*;
     use aibo_core::types::{
-        ContentOrigin, GenerationParams, ModelBinding, RequestBudget, Role, Surface, UntrustedBlock,
+        Attachment, AttachmentSource, ContentOrigin, GenerationParams, ModelBinding, RequestBudget,
+        Role, Surface, UntrustedBlock,
     };
     use uuid::Uuid;
+
+    #[test]
+    fn an_empty_api_key_is_rejected_at_construction() {
+        let credential = Credential::ApiKey(secrecy::SecretString::from(String::new()));
+        assert!(Gemini::new(credential).is_err());
+    }
 
     fn request(messages: Vec<Message>) -> ChatRequest {
         ChatRequest {
@@ -653,6 +713,32 @@ mod tests {
         );
         assert_eq!(body["contents"].as_array().unwrap().len(), 1);
         assert_eq!(body["contents"][0]["role"], "user");
+    }
+
+    #[test]
+    fn request_level_images_are_folded_into_inline_data() {
+        let mut req = request(vec![Message::text(MessageRole::User, "what is this?")]);
+        req.attachments.push(Attachment::image(
+            AttachmentSource::Clipboard,
+            vec![1, 2, 3],
+            "image/png",
+            1,
+            1,
+            "pasted",
+        ));
+        let body = build_generate_body(&req);
+        let parts = body["contents"][0]["parts"].as_array().unwrap();
+        assert!(parts.iter().any(|part| part.get("inlineData").is_some()));
+        assert!(body.to_string().contains("not an instruction"));
+    }
+
+    #[test]
+    fn output_tokens_are_clamped_to_the_request_budget() {
+        let mut req = request(vec![Message::text(MessageRole::User, "hello")]);
+        req.params.max_tokens = 100_000;
+        req.budget.max_output_tokens = 512;
+        let body = build_generate_body(&req);
+        assert_eq!(body["generationConfig"]["maxOutputTokens"], json!(512));
     }
 
     /// Gemini spells the assistant `model`, and a body using `assistant` is
@@ -769,6 +855,8 @@ mod tests {
             out.iter().any(|e| matches!(e, Ok(StreamEvent::Usage(_)))),
             "usage must survive an abrupt close"
         );
+        assert!(out.iter().any(Result::is_err));
+        assert!(!out.iter().any(|e| matches!(e, Ok(StreamEvent::Done(_)))));
     }
 
     /// A malformed frame must not kill a stream that is otherwise working.

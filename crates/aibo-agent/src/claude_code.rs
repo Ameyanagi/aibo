@@ -46,13 +46,13 @@
 //! [`parse_line`] never fails — a rename degrades the transcript, it does not
 //! break the run.
 
-use std::ffi::{OsStr, OsString};
 use std::path::PathBuf;
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use aibo_core::error::{AiboError, Result};
-use aibo_core::traits::AgentBackend;
+use aibo_core::traits::{AgentBackend, ChildProcessObserver, ChildProcessRegistration};
 use aibo_core::types::{
     AgentFeatures, AgentLimits, AgentStatus, AgentStep, AgentTask, BoxStream, BudgetKind,
     SandboxKind, ToolTier, Usage,
@@ -65,7 +65,7 @@ use process_wrap::tokio::{ChildWrapper, CommandWrap, KillOnDrop};
 use process_wrap::tokio::{CreationFlags, JobObject};
 use serde::Deserialize;
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::process::{ChildStdout, Command};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -74,6 +74,10 @@ use windows::Win32::System::Threading::CREATE_NO_WINDOW;
 
 use crate::limits::LimitTracker;
 use crate::native_loop::fenced_context;
+use crate::process_io::{
+    BoundedLine, MAX_LOG_LINE_BYTES, MAX_PROTOCOL_LINE_BYTES, read_bounded_line,
+    safe_child_environment,
+};
 
 // ---------------------------------------------------------------------------
 // Errors
@@ -197,53 +201,6 @@ impl Default for ClaudeCodeConfig {
 // Process spawning
 // ---------------------------------------------------------------------------
 
-// A child inherits only the small set needed to locate binaries, its profile,
-// locale, and temporary directory. Ambient provider/cloud credentials do not
-// cross the boundary; `ClaudeCodeConfig::env` remains an explicit opt-in.
-#[cfg(not(windows))]
-const SAFE_CHILD_ENVIRONMENT: &[&str] = &[
-    "PATH", "HOME", "TMPDIR", "LANG", "LC_ALL", "LC_CTYPE", "TERM",
-];
-
-#[cfg(windows)]
-const SAFE_CHILD_ENVIRONMENT: &[&str] = &[
-    "PATH",
-    "SystemRoot",
-    "WINDIR",
-    "COMSPEC",
-    "PATHEXT",
-    "TEMP",
-    "TMP",
-    "USERPROFILE",
-    "APPDATA",
-    "LOCALAPPDATA",
-    "PROGRAMDATA",
-];
-
-fn safe_child_environment_from(
-    environment: impl IntoIterator<Item = (OsString, OsString)>,
-) -> Vec<(OsString, OsString)> {
-    environment
-        .into_iter()
-        .filter(|(key, _)| {
-            SAFE_CHILD_ENVIRONMENT
-                .iter()
-                .any(|allowed| env_key_eq(key, OsStr::new(allowed)))
-        })
-        .collect()
-}
-
-#[cfg(windows)]
-fn env_key_eq(left: &OsStr, right: &OsStr) -> bool {
-    left.to_string_lossy()
-        .eq_ignore_ascii_case(&right.to_string_lossy())
-}
-
-#[cfg(not(windows))]
-fn env_key_eq(left: &OsStr, right: &OsStr) -> bool {
-    left == right
-}
-
 /// Spawn a child in a Unix process group or Windows Job Object. The managed
 /// child kills and waits for the whole tree, including delegated shell/MCP
 /// children.
@@ -276,7 +233,7 @@ fn spawn_in_process_group(
         .stderr(Stdio::piped())
         .kill_on_drop(true);
     cmd.env_clear();
-    cmd.envs(safe_child_environment_from(std::env::vars_os()));
+    cmd.envs(safe_child_environment());
 
     if let Some(dir) = &task.workspace {
         cmd.current_dir(dir);
@@ -309,6 +266,7 @@ fn spawn_in_process_group(
 /// a wedged child can never poison the next invocation.
 pub struct ClaudeCodeCli {
     config: ClaudeCodeConfig,
+    process_observer: Option<Arc<dyn ChildProcessObserver>>,
 }
 
 impl std::fmt::Debug for ClaudeCodeCli {
@@ -322,7 +280,18 @@ impl std::fmt::Debug for ClaudeCodeCli {
 impl ClaudeCodeCli {
     /// Build a backend. Nothing is spawned until [`AgentBackend::run`].
     pub fn new(config: ClaudeCodeConfig) -> Self {
-        Self { config }
+        Self {
+            config,
+            process_observer: None,
+        }
+    }
+
+    /// Report each delegated CLI child to the application-owned crash recovery
+    /// ledger.
+    #[must_use]
+    pub fn with_process_observer(mut self, observer: Arc<dyn ChildProcessObserver>) -> Self {
+        self.process_observer = Some(observer);
+        self
     }
 
     /// The configuration in force.
@@ -345,6 +314,9 @@ impl AgentBackend for ClaudeCodeCli {
         limits: AgentLimits,
         cancel: CancellationToken,
     ) -> Result<BoxStream<'static, Result<AgentStep>>> {
+        if cancel.is_cancelled() {
+            return Ok(cancelled_stream(limits));
+        }
         let mut child = spawn_in_process_group(&self.config, &task)
             .map_err(|e| {
                 if e.kind() == std::io::ErrorKind::NotFound {
@@ -356,6 +328,14 @@ impl AgentBackend for ClaudeCodeCli {
                 }
             })
             .map_err(ClaudeCodeError::into_aibo)?;
+        let identity = self
+            .config
+            .program
+            .file_name()
+            .unwrap_or(self.config.program.as_os_str())
+            .to_string_lossy();
+        let registration =
+            ChildProcessRegistration::new(self.process_observer.clone(), child.id(), &identity);
 
         let stdout = child
             .stdout()
@@ -376,9 +356,17 @@ impl AgentBackend for ClaudeCodeCli {
         // The CLI logs to stderr; drain it so the pipe never fills and blocks
         // the child, and so a crash leaves something in the diagnostics.
         tokio::spawn(async move {
-            let mut lines = BufReader::new(stderr).lines();
-            while let Ok(Some(line)) = lines.next_line().await {
-                tracing::debug!(target: "claude_code.stderr", "{line}");
+            let mut reader = BufReader::new(stderr);
+            loop {
+                match read_bounded_line(&mut reader, MAX_LOG_LINE_BYTES).await {
+                    Ok(BoundedLine::Line(line)) => {
+                        tracing::debug!(target: "claude_code.stderr", bytes = line.len(), "claude emitted a diagnostic line");
+                    }
+                    Ok(BoundedLine::TooLong) => {
+                        tracing::debug!(target: "claude_code.stderr", "[diagnostic line truncated by aibo]");
+                    }
+                    Ok(BoundedLine::Eof) | Err(_) => break,
+                }
             }
         });
 
@@ -388,10 +376,17 @@ impl AgentBackend for ClaudeCodeCli {
         // the child may block writing stdout before it has drained stdin —
         // writing inline would deadlock against our own reader.
         let prompt = prompt_for(&task);
+        let prompt_cancel = cancel.clone();
         tokio::spawn(async move {
-            if let Err(e) = stdin.write_all(prompt.as_bytes()).await {
-                tracing::warn!(error = %e, "could not write the prompt to claude");
-                return;
+            tokio::select! {
+                biased;
+                () = prompt_cancel.cancelled() => return,
+                result = stdin.write_all(prompt.as_bytes()) => {
+                    if let Err(e) = result {
+                        tracing::warn!(error = %e, "could not write the prompt to claude");
+                        return;
+                    }
+                }
             }
             // EOF is what tells `claude -p` the prompt is complete.
             let _ = stdin.shutdown().await;
@@ -401,6 +396,7 @@ impl AgentBackend for ClaudeCodeCli {
         let (tx, rx) = mpsc::channel::<Result<AgentStep>>(64);
         let run = Run {
             child: Some(child),
+            _registration: registration,
             tracker: LimitTracker::new(limits),
             exit_grace: self.config.exit_grace,
             tx,
@@ -438,6 +434,13 @@ impl AgentBackend for ClaudeCodeCli {
             sandbox: SandboxKind::None,
         }
     }
+}
+
+fn cancelled_stream(limits: AgentLimits) -> BoxStream<'static, Result<AgentStep>> {
+    let outcome = LimitTracker::new(limits).outcome(AgentStatus::Cancelled);
+    Box::pin(futures::stream::once(async move {
+        Ok(AgentStep::Done(outcome))
+    }))
 }
 
 /// Build the text handed to `claude -p` on stdin.
@@ -515,8 +518,10 @@ impl WireUsage {
     /// under-price it. §14 cares about the total either way.
     fn to_usage(self) -> Usage {
         Usage {
-            input_tokens: self.input_tokens.unwrap_or(0)
-                + self.cache_creation_input_tokens.unwrap_or(0),
+            input_tokens: self
+                .input_tokens
+                .unwrap_or(0)
+                .saturating_add(self.cache_creation_input_tokens.unwrap_or(0)),
             cached_input_tokens: self.cache_read_input_tokens.unwrap_or(0),
             output_tokens: self.output_tokens.unwrap_or(0),
             // Claude Code does not break thinking tokens out of `output_tokens`,
@@ -709,11 +714,10 @@ fn block_step(raw: &Value) -> Option<AgentStep> {
 
 /// A displayable, payload-free reason for a failed run.
 fn failure_text(subtype: &str, error: Option<&Value>) -> String {
-    if let Some(Value::String(message)) = error
-        && !message.is_empty()
-    {
-        return message.clone();
-    }
+    // The CLI's raw error value is untrusted and can include prompt, tool, path,
+    // or credential material. Presence is useful for diagnostics, but its body
+    // must not become a user-visible status string.
+    let _has_backend_detail = error.is_some();
     match subtype {
         "" => "the claude code run failed".to_owned(),
         "error_max_turns" => "claude code stopped: it hit its own turn limit".to_owned(),
@@ -734,6 +738,7 @@ enum Flow {
 
 struct Run {
     child: Option<Box<dyn ChildWrapper>>,
+    _registration: ChildProcessRegistration,
     tracker: LimitTracker,
     exit_grace: Duration,
     tx: mpsc::Sender<Result<AgentStep>>,
@@ -755,7 +760,7 @@ impl Run {
         // §14: the wall clock keeps running while nothing happens, so it is
         // raced against the event stream rather than checked on arrival.
         let deadline = tokio::time::Instant::from_std(self.tracker.deadline());
-        let mut lines = BufReader::new(stdout).lines();
+        let mut reader = BufReader::new(stdout);
 
         loop {
             tokio::select! {
@@ -768,15 +773,20 @@ impl Run {
                     return;
                 }
 
+                () = self.tx.closed() => {
+                    self.kill().await;
+                    return;
+                }
+
                 () = tokio::time::sleep_until(deadline) => {
                     self.kill().await;
                     self.budget_stop(BudgetKind::Steps).await;
                     return;
                 }
 
-                next = lines.next_line() => {
+                next = read_bounded_line(&mut reader, MAX_PROTOCOL_LINE_BYTES) => {
                     match next {
-                        Ok(Some(line)) => {
+                        Ok(BoundedLine::Line(line)) => {
                             if line.trim().is_empty() {
                                 continue;
                             }
@@ -785,7 +795,14 @@ impl Run {
                                 return;
                             }
                         }
-                        Ok(None) => {
+                        Ok(BoundedLine::TooLong) => {
+                            self.kill().await;
+                            self.fail(ClaudeCodeError::Exited {
+                                detail: "`claude` emitted an oversized protocol frame".to_owned(),
+                            }.into_aibo()).await;
+                            return;
+                        }
+                        Ok(BoundedLine::Eof) => {
                             self.exited_without_result().await;
                             return;
                         }
@@ -1032,6 +1049,16 @@ mod tests {
     }
 
     #[test]
+    fn backend_error_payload_is_not_exposed_in_failure_status() {
+        let line = r#"{"type":"result","subtype":"error","is_error":true,"error":"sk-secret /private/path"}"#;
+        let Some(Terminal::Failed(reason)) = parse_line(line).terminal else {
+            panic!("expected a failed terminal");
+        };
+        assert!(!reason.contains("sk-secret"));
+        assert!(!reason.contains("/private/path"));
+    }
+
+    #[test]
     fn partial_message_deltas_are_ignored() {
         let line = r#"{"type":"stream_event","event":{"type":"content_block_delta",
             "delta":{"type":"text_delta","text":"par"}}}"#;
@@ -1241,6 +1268,26 @@ mod tests {
         assert!(matches!(
             err,
             AiboError::AgentBackendMissing { which: "claude" }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_before_start_does_not_spawn_the_binary() {
+        let cli = ClaudeCodeCli::new(ClaudeCodeConfig {
+            program: PathBuf::from("/nonexistent/aibo/claude"),
+            ..ClaudeCodeConfig::default()
+        });
+        let cancel = CancellationToken::new();
+        cancel.cancel();
+        let mut stream = cli
+            .run(fake::task(), AgentLimits::default(), cancel)
+            .await
+            .expect("pre-cancelled runs return a terminal stream");
+        let step = stream.next().await.unwrap().unwrap();
+        assert!(matches!(
+            step,
+            AgentStep::Done(ref outcome) if outcome.status == AgentStatus::Cancelled
         ));
     }
 

@@ -1018,6 +1018,7 @@ impl ContextBudget {
     /// untruncatable content rather than the other way round.
     pub fn fit(&self, inputs: ContextInputs) -> Result<FittedContext> {
         let ContextInputs {
+            rendering_overhead,
             system,
             preamble,
             instruction,
@@ -1030,19 +1031,32 @@ impl ContextBudget {
         let max_context = self.context();
         let mut report = BudgetReport {
             budget_tokens: max_context,
+            rendering_overhead_tokens: rendering_overhead,
             ..Default::default()
         };
 
+        // Provider chat envelopes and aibo-authored instruction framing are
+        // not represented by any of the content fields below, but they are
+        // still sent. Prompt assembly supplies their exact estimate here so
+        // fitting cannot accept content that only fits before rendering.
+        if report.rendering_overhead_tokens > max_context {
+            return Err(AiboError::ContextTooLarge {
+                limit: max_context.get(),
+                actual: report.rendering_overhead_tokens.get(),
+            });
+        }
+        let mut used = report.rendering_overhead_tokens;
+
         // -- priority 1: system prompt, never truncated ----------------------
         report.system_tokens = Tokens::estimate(&system);
-        if report.system_tokens > max_context {
+        if used + report.system_tokens > max_context {
             // §5: "if it doesn't fit, the model binding is invalid".
             return Err(AiboError::ContextTooLarge {
                 limit: max_context.get(),
-                actual: report.system_tokens.get(),
+                actual: (used + report.system_tokens).get(),
             });
         }
-        let mut used = report.system_tokens;
+        used += report.system_tokens;
 
         // -- priority 2: preamble and user instruction, never truncated ------
         report.preamble_tokens = preamble
@@ -1088,11 +1102,47 @@ impl ContextBudget {
         // The payload shares one budget: the smaller of what is left and the
         // 50%-of-context cap. Blocks are fitted in the order given, so a
         // caller puts the selection before the field prefix.
-        let mut payload_allowance = self.payload().min(max_context.saturating_sub(used));
+        // Reserve the lower-priority clipboard's mandatory structural fence.
+        // Its content may shrink to nothing, but the block itself must not turn
+        // a successful fit into an over-budget request after payload fitting.
+        let clipboard_overhead = clipboard
+            .as_ref()
+            .map(fence_overhead)
+            .unwrap_or(Tokens::ZERO);
+        let remaining = max_context.saturating_sub(used);
+        if clipboard_overhead > remaining {
+            return Err(AiboError::ContextTooLarge {
+                limit: remaining.get(),
+                actual: clipboard_overhead.get(),
+            });
+        }
+        let mut payload_allowance = self
+            .payload()
+            .min(remaining.saturating_sub(clipboard_overhead));
         let mut fitted_payload = Vec::with_capacity(payload.len());
-        for block in payload {
-            let overhead = fence_overhead(&block);
-            let room = payload_allowance.saturating_sub(overhead);
+        let payload: Vec<_> = payload
+            .into_iter()
+            .map(|block| {
+                let overhead = fence_overhead(&block);
+                (block, overhead)
+            })
+            .collect();
+        let mut remaining_overhead: Tokens = payload.iter().map(|(_, overhead)| *overhead).sum();
+        if remaining_overhead > payload_allowance {
+            return Err(AiboError::ContextTooLarge {
+                limit: payload_allowance.get(),
+                actual: remaining_overhead.get(),
+            });
+        }
+        for (block, overhead) in payload {
+            // Earlier content yields before consuming the structural fence a
+            // later block needs. Otherwise the first large selection can take
+            // the entire payload allowance and make an empty second fence push
+            // the supposedly fitted request over budget.
+            remaining_overhead = remaining_overhead.saturating_sub(overhead);
+            let room = payload_allowance
+                .saturating_sub(overhead)
+                .saturating_sub(remaining_overhead);
             let t = truncate_middle_out(&block.content, room);
             let block = UntrustedBlock {
                 truncated: block.truncated || t.truncated,
@@ -1111,11 +1161,15 @@ impl ContextBudget {
         let fitted_clipboard = match clipboard {
             None => None,
             Some(block) => {
-                let overhead = fence_overhead(&block);
-                let room = self
-                    .clipboard()
-                    .min(max_context.saturating_sub(used))
-                    .saturating_sub(overhead);
+                let overhead = clipboard_overhead;
+                let allowance = self.clipboard().min(max_context.saturating_sub(used));
+                if overhead > allowance {
+                    return Err(AiboError::ContextTooLarge {
+                        limit: max_context.get(),
+                        actual: (used + overhead).get(),
+                    });
+                }
+                let room = allowance.saturating_sub(overhead);
                 let t = truncate_head(&block.content, room);
                 let block = UntrustedBlock {
                     truncated: block.truncated || t.truncated,
@@ -1151,6 +1205,12 @@ impl ContextBudget {
         used += history_tokens;
 
         report.total_tokens = used;
+        if report.total_tokens > max_context {
+            return Err(AiboError::ContextTooLarge {
+                limit: max_context.get(),
+                actual: report.total_tokens.get(),
+            });
+        }
         if report.history_turns_dropped > 0
             || report.payload_truncated
             || report.clipboard_truncated
@@ -1209,6 +1269,13 @@ fn fence_overhead(block: &UntrustedBlock) -> Tokens {
 /// Everything prompt assembly wants to send, before the budget is applied.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ContextInputs {
+    /// Mandatory request tokens not represented by the content fields below:
+    /// chat-message envelopes and aibo-authored instruction framing.
+    ///
+    /// Prompt assembly computes this from the exact representation it will
+    /// render. It is charged before priority 1 because none of it can be
+    /// truncated or dropped.
+    pub rendering_overhead: Tokens,
     /// Priority 1. Already rendered.
     pub system: String,
     /// Priority 2, and never truncated: aibo-authored trusted text that leads
@@ -1271,6 +1338,9 @@ pub struct BudgetReport {
     pub budget_tokens: Tokens,
     /// Estimated total input tokens after fitting.
     pub total_tokens: Tokens,
+    /// Mandatory chat envelopes and instruction framing supplied by the
+    /// renderer, which are outside the content-priority fields.
+    pub rendering_overhead_tokens: Tokens,
     /// Priority 1.
     pub system_tokens: Tokens,
     /// Priority 2, the aibo-authored preamble.
@@ -1708,6 +1778,44 @@ mod tests {
     }
 
     #[test]
+    fn payload_fence_overhead_that_cannot_fit_is_rejected() {
+        let b = ContextBudget {
+            max_context_tokens: 100,
+            max_payload_tokens: 100,
+            max_clipboard_tokens: 100,
+            max_output_tokens: 1,
+        };
+        let err = b
+            .fit(ContextInputs {
+                // 400 ASCII characters estimate to exactly 100 tokens, so no
+                // room remains even for an empty structural fence.
+                system: "x".repeat(400),
+                payload: vec![block(ContentOrigin::Selection, "payload")],
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, AiboError::ContextTooLarge { .. }));
+    }
+
+    #[test]
+    fn clipboard_fence_overhead_that_cannot_fit_is_rejected() {
+        let b = ContextBudget {
+            max_context_tokens: 100,
+            max_payload_tokens: 100,
+            max_clipboard_tokens: 100,
+            max_output_tokens: 1,
+        };
+        let err = b
+            .fit(ContextInputs {
+                system: "x".repeat(400),
+                clipboard: Some(block(ContentOrigin::Clipboard, "clipboard")),
+                ..Default::default()
+            })
+            .unwrap_err();
+        assert!(matches!(err, AiboError::ContextTooLarge { .. }));
+    }
+
+    #[test]
     fn payload_never_exceeds_half_the_model_context() {
         let caps = Capabilities {
             max_context: 8_192,
@@ -1923,6 +2031,43 @@ mod tests {
             "{} > {}",
             fitted.report.total_tokens,
             b.context()
+        );
+    }
+
+    #[test]
+    fn every_successful_near_boundary_fit_stays_within_budget() {
+        let mut successes = 0;
+        for remaining in 0..504 {
+            let b = ContextBudget {
+                max_context_tokens: 512,
+                max_payload_tokens: 512,
+                max_clipboard_tokens: 512,
+                max_output_tokens: 1,
+            };
+            let overhead = Tokens::new(8);
+            let result = b.fit(ContextInputs {
+                rendering_overhead: overhead,
+                system: "s".repeat((504 - remaining) * 4),
+                payload: vec![
+                    block(ContentOrigin::Selection, "payload"),
+                    block(ContentOrigin::FieldPrefix, "prefix"),
+                ],
+                clipboard: Some(block(ContentOrigin::Clipboard, "clipboard")),
+                ..Default::default()
+            });
+            if let Ok(fitted) = result {
+                successes += 1;
+                assert!(
+                    fitted.report.total_tokens <= b.context(),
+                    "{} > {} with {remaining} overhead tokens",
+                    fitted.report.total_tokens,
+                    b.context()
+                );
+            }
+        }
+        assert!(
+            successes > 0,
+            "the boundary sweep must exercise successful fits"
         );
     }
 }

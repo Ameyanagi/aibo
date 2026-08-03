@@ -305,6 +305,22 @@ pub enum Key {
     ProviderIdPlaceholder,
     /// Placeholder for a custom endpoint's base URL.
     ProviderBaseUrlPlaceholder,
+    /// The shortcut recorder's idle label.
+    SettingsHotkeyRecord,
+    /// The shortcut recorder while it listens.
+    SettingsHotkeyListening,
+    /// Global shortcut action: open or close the panel.
+    SettingsHotkeyPanel,
+    /// Global shortcut action: capture a screen region.
+    SettingsHotkeyScreenCapture,
+    /// Global shortcut action: bring the task window forward.
+    SettingsHotkeyShowTasks,
+    /// Reserved label for the unfinished revert action.
+    SettingsHotkeyRevert,
+    /// A global action currently has no binding.
+    SettingsHotkeyUnassigned,
+    /// Marks the provider/model that answers the next question.
+    SettingsProviderInUse,
     /// Azure deployments field placeholder.
     ProviderDeploymentsPlaceholder,
     /// Usage footnote: the cached share of the prompt.
@@ -769,6 +785,14 @@ fn en(key: Key) -> &'static str {
         K::SettingsAddProvider => "Add a provider",
         K::ProviderIdPlaceholder => "Name, e.g. deepseek",
         K::ProviderBaseUrlPlaceholder => "Base URL, e.g. https://api.deepseek.com/v1",
+        K::SettingsHotkeyRecord => "Set a shortcut",
+        K::SettingsHotkeyListening => "Press the keys… (esc to cancel)",
+        K::SettingsHotkeyPanel => "Open panel",
+        K::SettingsHotkeyScreenCapture => "Capture screen region",
+        K::SettingsHotkeyShowTasks => "Show tasks",
+        K::SettingsHotkeyRevert => "Revert last transform",
+        K::SettingsHotkeyUnassigned => "Not set",
+        K::SettingsProviderInUse => "In use: {}",
         K::ProviderDeploymentsPlaceholder => "Deployments, comma-separated (each becomes a model)",
         K::FootnoteCachedTokens => "{} from cache",
         K::ProviderKeyPlaceholder => "API key",
@@ -852,7 +876,7 @@ fn en(key: Key) -> &'static str {
         K::HotkeyFailedTitle => "The shortcut {} is unavailable",
         K::HotkeyFailedBody => "Another app has already claimed it.",
         K::HotkeyRejectedByOs => "macOS does not accept this combination as a global shortcut.",
-        K::HotkeyChangeHint => "Set hotkey = \"…\" in config.toml to change it, then restart aibo.",
+        K::HotkeyChangeHint => "Choose a different shortcut below.",
 
         K::TaskWindowTitle => "aibo — task",
         K::TaskSteps => "Steps",
@@ -926,11 +950,15 @@ fn en(key: Key) -> &'static str {
         K::SttAuto => "Automatic",
         K::SttAutoDetail => "OpenAI key when present, otherwise the ChatGPT plan",
         K::SttOpenAi => "OpenAI API key",
-        K::SttOpenAiDetail => "Streaming — words appear as you speak",
+        K::SttOpenAiDetail => "gpt-live-transcribe — streaming; words appear as you speak",
         K::SttChatGpt => "ChatGPT plan",
-        K::SttChatGptDetail => "Uses the Codex sign-in; the text arrives when you stop",
+        K::SttChatGptDetail => {
+            "The ChatGPT app's own transcriber, via the Codex sign-in; the text arrives when you stop"
+        }
         K::SttAzure => "Azure",
-        K::SttAzureDetail => "Streaming via your Foundry deployment, with a batch fallback",
+        K::SttAzureDetail => {
+            "gpt-live-transcribe on your Foundry resource, falling back to gpt-transcribe"
+        }
         K::SttEndOnSendTitle => "Sending ends dictation",
         K::SttEndOnSendBody => "⏎ stops the microphone with the message; turn off to keep talking",
         K::SettingsRoles => "Roles",
@@ -1056,6 +1084,14 @@ fn ja(key: Key) -> &'static str {
         K::SettingsAddProvider => "プロバイダーを追加",
         K::ProviderIdPlaceholder => "名前（例: deepseek）",
         K::ProviderBaseUrlPlaceholder => "ベース URL（例: https://api.deepseek.com/v1）",
+        K::SettingsHotkeyRecord => "ショートカットを設定",
+        K::SettingsHotkeyListening => "キーを押してください…（esc で中止）",
+        K::SettingsHotkeyPanel => "パネルを開く",
+        K::SettingsHotkeyScreenCapture => "画面範囲をキャプチャ",
+        K::SettingsHotkeyShowTasks => "タスクを表示",
+        K::SettingsHotkeyRevert => "直前の変換を元に戻す",
+        K::SettingsHotkeyUnassigned => "未設定",
+        K::SettingsProviderInUse => "使用中: {}",
         K::ProviderDeploymentsPlaceholder => "デプロイ名（カンマ区切り。それぞれモデルとして表示）",
         K::FootnoteCachedTokens => "{} はキャッシュから",
         K::ProviderKeyPlaceholder => "API キー",
@@ -1147,9 +1183,7 @@ fn ja(key: Key) -> &'static str {
         K::HotkeyRejectedByOs => {
             "macOS はこの組み合わせをグローバルショートカットとして受け付けません。"
         }
-        K::HotkeyChangeHint => {
-            "変更するには config.toml に hotkey = \"…\" を設定し、aibo を再起動してください。"
-        }
+        K::HotkeyChangeHint => "下で別のショートカットを選んでください。",
 
         K::TaskWindowTitle => "aibo — タスク",
         K::TaskSteps => "ステップ",
@@ -1221,11 +1255,15 @@ fn ja(key: Key) -> &'static str {
         K::SttAuto => "自動",
         K::SttAutoDetail => "OpenAI キーがあれば使用し、なければ ChatGPT プランを使用",
         K::SttOpenAi => "OpenAI API キー",
-        K::SttOpenAiDetail => "ストリーミング — 話すそばから文字になります",
+        K::SttOpenAiDetail => "gpt-live-transcribe — ストリーミング。話すそばから文字になります",
         K::SttChatGpt => "ChatGPT プラン",
-        K::SttChatGptDetail => "Codex サインインを使用。停止すると文字が届きます",
+        K::SttChatGptDetail => {
+            "ChatGPT アプリと同じ文字起こし（Codex サインイン）。停止すると文字が届きます"
+        }
         K::SttAzure => "Azure",
-        K::SttAzureDetail => "Foundry デプロイでストリーミング。接続できない場合は一括変換",
+        K::SttAzureDetail => {
+            "Foundry の gpt-live-transcribe でストリーミング。失敗時は gpt-transcribe"
+        }
         K::SttEndOnSendTitle => "送信で音声入力を終了",
         K::SttEndOnSendBody => "⏎ でメッセージと同時にマイクを停止します。話し続けるにはオフに",
         K::PanelAgentPlaceholder => "タスクを入力 — エージェントは実行前に確認します",

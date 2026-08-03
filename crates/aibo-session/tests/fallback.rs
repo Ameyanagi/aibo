@@ -173,6 +173,34 @@ async fn a_rate_limit_moves_to_the_next_chain_entry() {
     assert!(!engine.health().is_degraded(&ProviderId::ANTHROPIC));
 }
 
+#[tokio::test(start_paused = true)]
+async fn a_short_rate_limit_waits_and_retries_without_substitution() {
+    let primary = Mock::new(ProviderId::ANTHROPIC);
+    primary.push(Script::Reject(AiboError::RateLimited {
+        provider: ProviderId::ANTHROPIC,
+        retry_after: Some(Duration::from_millis(10)),
+    }));
+    primary.push(Script::ok("primary after a short wait"));
+    let secondary = Mock::new(ProviderId::OPENAI);
+
+    let engine = engine(
+        &[&primary, &secondary],
+        chain(&[ProviderId::ANTHROPIC, ProviderId::OPENAI], true, false),
+    );
+    let outcome = engine.run(ask(), &EventSink::null()).await;
+
+    assert_eq!(
+        outcome.insertable_text(),
+        Some("primary after a short wait")
+    );
+    assert_eq!(primary.chat_calls(), 2);
+    assert_eq!(
+        secondary.chat_calls(),
+        0,
+        "a wait inside Ask's latency target must not spend or disclose elsewhere"
+    );
+}
+
 #[tokio::test]
 async fn a_400_surfaces_as_a_bug_and_never_falls_back() {
     let primary = Mock::new(ProviderId::ANTHROPIC);
@@ -459,5 +487,31 @@ async fn degradation_is_per_provider_not_global() {
     assert!(
         !engine.health().is_degraded(&ProviderId::OPENAI),
         "§13: a failed connection to one provider says nothing about another"
+    );
+}
+
+#[tokio::test]
+async fn repeated_partial_5xx_streams_degrade_the_provider() {
+    let flaky = Mock::new(ProviderId::ANTHROPIC);
+    for _ in 0..3 {
+        flaky.push(Script::breaks_after(
+            "x",
+            AiboError::ProviderUnavailable {
+                provider: ProviderId::ANTHROPIC,
+                status: 503,
+                detail: None,
+            },
+        ));
+    }
+    let engine = engine(&[&flaky], chain(&[ProviderId::ANTHROPIC], false, false));
+
+    for _ in 0..3 {
+        let outcome = engine.run(ask(), &EventSink::null()).await;
+        assert!(matches!(outcome, Outcome::Partial { .. }));
+    }
+
+    assert!(
+        engine.health().is_degraded(&ProviderId::ANTHROPIC),
+        "receiving one token does not turn a terminal 503 into a success"
     );
 }

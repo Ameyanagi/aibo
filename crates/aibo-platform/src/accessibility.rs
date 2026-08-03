@@ -62,6 +62,9 @@ pub enum AccessibilityError {
     /// A semantic adapter was already attached to this surface.
     #[error("an accessibility adapter is already attached to surface {0:?}")]
     AlreadyAttached(AccessibilitySurface),
+    /// An adapter was accessed from a thread other than the one that attached it.
+    #[error("the accessibility adapter for surface {0:?} belongs to another thread")]
+    WrongThread(AccessibilitySurface),
 }
 
 /// Attach a semantic tree to a borrowed iced/winit native window.
@@ -110,7 +113,9 @@ pub fn attach_accessibility(
 /// inactive period initialize synchronously without a placeholder tree.
 pub fn update_accessibility(surface: AccessibilitySurface, tree: TreeUpdate) {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    supported::update(surface, tree);
+    if let Err(error) = supported::update(surface, tree) {
+        tracing::warn!(?surface, %error, "accessibility update rejected");
+    }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = (surface, tree);
 }
@@ -118,7 +123,9 @@ pub fn update_accessibility(surface: AccessibilitySurface, tree: TreeUpdate) {
 /// Tell AccessKit whether the native host window currently has focus.
 pub fn set_accessibility_focus(surface: AccessibilitySurface, focused: bool) {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    supported::set_focus(surface, focused);
+    if let Err(error) = supported::set_focus(surface, focused) {
+        tracing::warn!(?surface, %error, "accessibility focus update rejected");
+    }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = (surface, focused);
 }
@@ -126,7 +133,9 @@ pub fn set_accessibility_focus(surface: AccessibilitySurface, focused: bool) {
 /// Detach and discard a window's semantic adapter.
 pub fn detach_accessibility(surface: AccessibilitySurface) {
     #[cfg(any(target_os = "macos", target_os = "windows"))]
-    supported::detach(surface);
+    if let Err(error) = supported::detach(surface) {
+        tracing::warn!(?surface, %error, "accessibility detach rejected");
+    }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     let _ = surface;
 }
@@ -164,7 +173,8 @@ fn raw_kind(raw: RawWindowHandle) -> &'static str {
 mod supported {
     use std::cell::RefCell;
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, LazyLock, Mutex, MutexGuard};
+    use std::thread::{self, ThreadId};
 
     use accesskit::{ActionHandler, ActionRequest, ActivationHandler, TreeUpdate};
     #[cfg(target_os = "macos")]
@@ -177,9 +187,73 @@ mod supported {
         AccessibilityError, AccessibilityEvent, AccessibilitySurface, Sender, TrySendError,
     };
 
+    static OWNERS: LazyLock<SurfaceOwners> = LazyLock::new(SurfaceOwners::default);
+
     thread_local! {
-        static ADAPTERS: RefCell<HashMap<AccessibilitySurface, AdapterState>> =
-            RefCell::new(HashMap::new());
+        static ADAPTERS: RefCell<ThreadAdapters> =
+            RefCell::new(ThreadAdapters::default());
+    }
+
+    #[derive(Default)]
+    struct SurfaceOwners {
+        inner: Mutex<HashMap<AccessibilitySurface, ThreadId>>,
+    }
+
+    impl SurfaceOwners {
+        fn lock(&self) -> MutexGuard<'_, HashMap<AccessibilitySurface, ThreadId>> {
+            self.inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
+        fn claim(&self, surface: AccessibilitySurface) -> Result<(), AccessibilityError> {
+            let current = thread::current().id();
+            let mut owners = self.lock();
+            match owners.get(&surface) {
+                Some(owner) if *owner != current => Err(AccessibilityError::WrongThread(surface)),
+                Some(_) => Ok(()),
+                None => {
+                    owners.insert(surface, current);
+                    Ok(())
+                }
+            }
+        }
+
+        /// `Ok(false)` means the surface has no adapter. That remains a benign
+        /// no-op for compatibility; only crossing an established affinity is
+        /// an error.
+        fn is_current(&self, surface: AccessibilitySurface) -> Result<bool, AccessibilityError> {
+            let current = thread::current().id();
+            match self.lock().get(&surface) {
+                Some(owner) if *owner != current => Err(AccessibilityError::WrongThread(surface)),
+                Some(_) => Ok(true),
+                None => Ok(false),
+            }
+        }
+
+        fn release(&self, surface: AccessibilitySurface) {
+            let current = thread::current().id();
+            let mut owners = self.lock();
+            if owners.get(&surface) == Some(&current) {
+                owners.remove(&surface);
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct ThreadAdapters {
+        adapters: HashMap<AccessibilitySurface, AdapterState>,
+    }
+
+    impl Drop for ThreadAdapters {
+        fn drop(&mut self) {
+            // A thread-local native adapter cannot outlive its owner thread.
+            // Remove its affinity records as the adapters are dropped so a
+            // later window may safely reuse a surface identifier.
+            for surface in self.adapters.keys().copied() {
+                OWNERS.release(surface);
+            }
+        }
     }
 
     struct AdapterState {
@@ -306,8 +380,9 @@ mod supported {
         initial_tree: TreeUpdate,
         events: Sender<AccessibilityEvent>,
     ) -> Result<(), AccessibilityError> {
-        ADAPTERS.with_borrow_mut(|adapters| {
-            if adapters.contains_key(&surface) {
+        OWNERS.claim(surface)?;
+        ADAPTERS.with_borrow_mut(|thread_adapters| {
+            if thread_adapters.adapters.contains_key(&surface) {
                 return Err(AccessibilityError::AlreadyAttached(surface));
             }
             let latest = Arc::new(Mutex::new(initial_tree));
@@ -318,36 +393,90 @@ mod supported {
                 },
                 ActionSink { surface, events },
             );
-            adapters.insert(surface, AdapterState { adapter, latest });
+            thread_adapters
+                .adapters
+                .insert(surface, AdapterState { adapter, latest });
             Ok(())
         })
     }
 
-    pub(super) fn update(surface: AccessibilitySurface, tree: TreeUpdate) {
-        ADAPTERS.with_borrow_mut(|adapters| {
-            let Some(state) = adapters.get_mut(&surface) else {
-                return;
+    pub(super) fn update(
+        surface: AccessibilitySurface,
+        tree: TreeUpdate,
+    ) -> Result<(), AccessibilityError> {
+        if !OWNERS.is_current(surface)? {
+            return Ok(());
+        }
+        ADAPTERS.with_borrow_mut(|thread_adapters| {
+            let Some(state) = thread_adapters.adapters.get_mut(&surface) else {
+                return Ok(());
             };
             *state
                 .latest
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner()) = tree.clone();
             state.adapter.update_if_active(tree);
-        });
+            Ok(())
+        })
     }
 
-    pub(super) fn set_focus(surface: AccessibilitySurface, focused: bool) {
-        ADAPTERS.with_borrow_mut(|adapters| {
-            if let Some(state) = adapters.get_mut(&surface) {
+    pub(super) fn set_focus(
+        surface: AccessibilitySurface,
+        focused: bool,
+    ) -> Result<(), AccessibilityError> {
+        if !OWNERS.is_current(surface)? {
+            return Ok(());
+        }
+        ADAPTERS.with_borrow_mut(|thread_adapters| {
+            if let Some(state) = thread_adapters.adapters.get_mut(&surface) {
                 state.adapter.set_focus(focused);
             }
-        });
+            Ok(())
+        })
     }
 
-    pub(super) fn detach(surface: AccessibilitySurface) {
-        ADAPTERS.with_borrow_mut(|adapters| {
-            adapters.remove(&surface);
+    pub(super) fn detach(surface: AccessibilitySurface) -> Result<(), AccessibilityError> {
+        if !OWNERS.is_current(surface)? {
+            return Ok(());
+        }
+        ADAPTERS.with_borrow_mut(|thread_adapters| {
+            thread_adapters.adapters.remove(&surface);
         });
+        OWNERS.release(surface);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod affinity_tests {
+        use std::sync::Arc;
+
+        use super::*;
+
+        #[test]
+        fn surface_owner_rejects_a_different_thread() {
+            let owners = Arc::new(SurfaceOwners::default());
+            let surface = AccessibilitySurface(91);
+            owners.claim(surface).unwrap();
+
+            let other = Arc::clone(&owners);
+            let error = std::thread::spawn(move || other.is_current(surface).unwrap_err())
+                .join()
+                .unwrap();
+            assert!(matches!(error, AccessibilityError::WrongThread(s) if s == surface));
+        }
+
+        #[test]
+        fn releasing_a_surface_allows_a_new_owner() {
+            let owners = Arc::new(SurfaceOwners::default());
+            let surface = AccessibilitySurface(92);
+            owners.claim(surface).unwrap();
+            owners.release(surface);
+
+            let other = Arc::clone(&owners);
+            std::thread::spawn(move || other.claim(surface).unwrap())
+                .join()
+                .unwrap();
+        }
     }
 }
 

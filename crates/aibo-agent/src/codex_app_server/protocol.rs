@@ -717,6 +717,13 @@ impl ThreadEvent {
             .as_deref()
             .is_some_and(|k| k.starts_with("turn.failed"))
     }
+
+    /// Whether Codex reports that the turn was aborted rather than completed.
+    pub fn is_turn_aborted(&self) -> bool {
+        self.kind
+            .as_deref()
+            .is_some_and(|k| k.starts_with("turn.aborted"))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -897,6 +904,14 @@ mod tests {
         .expect("permissive parse");
         assert_eq!(event.thread_id.as_deref(), Some("t1"));
         assert!(event.extra.contains_key("somethingNew"));
+    }
+
+    #[test]
+    fn an_aborted_turn_is_terminal_but_not_a_failure() {
+        let event: ThreadEvent = serde_json::from_str(r#"{"type":"turn.aborted"}"#).unwrap();
+        assert!(event.is_turn_end());
+        assert!(event.is_turn_aborted());
+        assert!(!event.is_turn_failure());
     }
 
     #[test]

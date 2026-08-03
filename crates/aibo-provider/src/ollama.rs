@@ -52,6 +52,7 @@ pub fn default_capabilities() -> Capabilities {
 pub fn quirks() -> Quirks {
     Quirks {
         usage: UsagePlacement::FinalChunk,
+        done_sentinel: false,
         error_shape: ErrorShape::FlatError,
         tools: false,
         json_schema: false,

@@ -90,12 +90,13 @@ use crate::error::{Result, UiError};
 ///
 /// One action per binding. The panel hotkey is the only one that is
 /// mandatory; the rest are opt-in from settings.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum HotkeyAction {
     /// Show the panel, capturing context for the frontmost app.
     ///
     /// §13: pressing this during an agent run does **not** interrupt it — the
     /// run continues in the task window and a fresh panel opens.
+    #[default]
     TogglePanel,
     /// Interactively crop a screen region and open it as a deliberate image
     /// attachment in a fresh panel.
@@ -104,6 +105,17 @@ pub enum HotkeyAction {
     ShowTasks,
     /// Re-insert the pre-transform original ("revert last transform", §13).
     RevertLastTransform,
+}
+
+impl HotkeyAction {
+    /// Actions whose handlers are complete and can therefore be offered in
+    /// Settings. Keep unfinished actions out of the picker: recording a
+    /// shortcut for a no-op is worse than leaving it unavailable.
+    pub const CONFIGURABLE: [Self; 3] = [
+        Self::TogglePanel,
+        Self::CaptureScreenRegion,
+        Self::ShowTasks,
+    ];
 }
 
 /// A parsed, displayable binding.
@@ -650,6 +662,22 @@ impl<R: Registrar> Hotkeys<R> {
         }
 
         status
+    }
+
+    /// Remove the live binding for `action`, if one exists.
+    ///
+    /// This is primarily the rollback half of an optimistic first-time bind:
+    /// if persisting an action that was previously unassigned fails, the UI
+    /// must not leave a process-only shortcut active until restart.
+    pub fn unbind(&mut self, action: HotkeyAction) {
+        if let Some(index) = self
+            .bindings
+            .iter()
+            .position(|binding| binding.action == action)
+        {
+            let binding = self.bindings.remove(index);
+            let _ = self.manager.unregister(binding.hotkey);
+        }
     }
 
     /// Examine one candidate with the process's registrar (§9).
@@ -2059,6 +2087,23 @@ mod tests {
         );
         // And it is registered with the OS, not merely recorded.
         assert_eq!(*hotkeys.manager.live.borrow(), vec![user_chosen()]);
+    }
+
+    #[test]
+    fn unbind_removes_the_action_from_both_maps() {
+        let registrar = FakeRegistrar::default();
+        let mut hotkeys = Hotkeys::with_registrar(registrar);
+        let combo = user_chosen();
+        assert!(matches!(
+            hotkeys.register(Binding::new(HotkeyAction::ShowTasks, combo)),
+            HotkeyStatus::Registered { .. }
+        ));
+
+        hotkeys.unbind(HotkeyAction::ShowTasks);
+
+        assert!(hotkeys.bindings().is_empty());
+        assert!(hotkeys.manager.live.borrow().is_empty());
+        assert_eq!(hotkeys.action_for(combo.id()), None);
     }
 
     /// Regression, F6. The restoring `register` was `let _`-discarded, so if the

@@ -7,9 +7,9 @@
 //! string then rides the fenced selection pipeline like any other untrusted
 //! capture.
 
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
 
-use aibo_ui::UiEvent;
 use aibo_ui::bridge::FileCandidate;
 
 /// Directory depth below each root the walk descends.
@@ -76,8 +76,13 @@ pub fn walk(roots: &[PathBuf]) -> Vec<FileCandidate> {
     // could eat the whole candidate budget before Documents was ever visited,
     // and a file that is not in the index cannot be found no matter how good
     // the matcher is (owner report: `tesutofo` missing テスト　フォローアップ).
-    let mut queue: std::collections::VecDeque<(PathBuf, usize)> =
-        roots.iter().map(|root| (root.clone(), 0)).collect();
+    let mut seen_roots = std::collections::HashSet::new();
+    let mut queue: std::collections::VecDeque<(PathBuf, usize)> = roots
+        .iter()
+        .filter_map(|root| root.canonicalize().ok())
+        .filter(|root| root.is_dir() && seen_roots.insert(root.clone()))
+        .map(|root| (root, 0))
+        .collect();
 
     while let Some((dir, depth)) = queue.pop_front() {
         if out.len() >= MAX_CANDIDATES {
@@ -86,7 +91,9 @@ pub fn walk(roots: &[PathBuf]) -> Vec<FileCandidate> {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        for entry in entries.flatten() {
+        let mut entries: Vec<_> = entries.flatten().collect();
+        entries.sort_by_key(|entry| entry.file_name());
+        for entry in entries {
             if out.len() >= MAX_CANDIDATES {
                 break;
             }
@@ -121,28 +128,24 @@ pub fn walk(roots: &[PathBuf]) -> Vec<FileCandidate> {
 /// `Err` carries no detail on purpose: the UI's toast names the file, the
 /// reason lives in diagnostics, and §13 never renders a raw error.
 pub fn read_bounded(path: &Path) -> Result<String, ()> {
-    let metadata = std::fs::metadata(path).map_err(|_| ())?;
+    let mut file = std::fs::File::open(path).map_err(|_| ())?;
+    let metadata = file.metadata().map_err(|_| ())?;
     if !metadata.is_file() || metadata.len() > MAX_FILE_BYTES {
         return Err(());
     }
-    let bytes = std::fs::read(path).map_err(|_| ())?;
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref()
+        .take(MAX_FILE_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ())?;
+    if bytes.len() as u64 > MAX_FILE_BYTES {
+        return Err(());
+    }
     if bytes.contains(&0) {
         // A NUL byte is the honest binary test for the formats people attach.
         return Err(());
     }
     Ok(String::from_utf8_lossy(&bytes).into_owned())
-}
-
-/// The event for one attach attempt, ready to emit.
-pub fn attach_event(path: &Path) -> UiEvent {
-    let name = path
-        .file_name()
-        .map(|name| name.to_string_lossy().into_owned())
-        .unwrap_or_else(|| path.to_string_lossy().into_owned());
-    match read_bounded(path) {
-        Ok(content) => UiEvent::FileAttached { name, content },
-        Err(()) => UiEvent::FileAttachFailed { name },
-    }
 }
 
 fn display_path(path: &Path, home: Option<&Path>) -> String {

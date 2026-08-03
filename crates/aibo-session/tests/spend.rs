@@ -8,12 +8,16 @@
 
 mod common;
 
+use std::sync::Arc;
+
 use aibo_core::AiboError;
 use aibo_core::cost::{BudgetStatus, PriceTable};
 use aibo_core::roles::RoleBindings;
 use aibo_core::types::{ModelBinding, ProviderId, Role, RoleChain, StreamEvent};
 use aibo_provider::ProviderRegistry;
+use aibo_session::store::{Exchange, SessionStore};
 use aibo_session::{Engine, EngineConfig, EventSink, Outcome, SessionEvent, Submission};
+use async_trait::async_trait;
 use common::{Mock, Script};
 use uuid::Uuid;
 
@@ -292,4 +296,123 @@ async fn the_reserve_does_not_stack_across_a_fallback_attempt() {
     // Anthropic is unpriced in the test table, so nothing settles; what matters
     // is that no reserve was left behind by the failed first attempt.
     assert_eq!(committed, 0);
+}
+
+#[tokio::test]
+async fn durable_monthly_spend_seeds_a_rebuilt_engine() {
+    struct SettledStore;
+
+    #[async_trait]
+    impl SessionStore for SettledStore {
+        async fn record(&self, _exchange: Exchange) -> aibo_core::error::Result<Option<Uuid>> {
+            Ok(None)
+        }
+
+        async fn settled_spend_this_month(&self) -> aibo_core::error::Result<u64> {
+            Ok(9_000)
+        }
+    }
+
+    let engine = Engine::new(
+        ProviderRegistry::new(),
+        EngineConfig {
+            monthly_budget: Some(aibo_core::cost::MonthlyBudget {
+                limit_micros: 10_000,
+                warn_at_percent: 80,
+                hard_stop: true,
+            }),
+            ..EngineConfig::default()
+        },
+    )
+    .with_store_loaded(Arc::new(SettledStore))
+    .await;
+
+    assert_eq!(engine.spend_snapshot().0, 9_000);
+    assert_eq!(engine.spend_snapshot().2, BudgetStatus::Warning);
+}
+
+#[tokio::test]
+async fn aborting_a_request_future_releases_its_reservation() {
+    struct PendingPost {
+        entered: Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl aibo_core::traits::Provider for PendingPost {
+        fn id(&self) -> ProviderId {
+            ProviderId::OPENAI
+        }
+
+        fn capabilities(&self) -> aibo_core::types::Capabilities {
+            aibo_core::types::Capabilities {
+                max_context: 128_000,
+                max_output: Some(4_096),
+                ..aibo_core::types::Capabilities::default()
+            }
+        }
+
+        async fn chat(
+            &self,
+            _req: aibo_core::types::ChatRequest,
+            _cancel: tokio_util::sync::CancellationToken,
+        ) -> aibo_core::error::Result<
+            aibo_core::types::BoxStream<
+                'static,
+                aibo_core::error::Result<aibo_core::types::StreamEvent>,
+            >,
+        > {
+            self.entered.notify_one();
+            std::future::pending().await
+        }
+
+        async fn models(&self) -> aibo_core::error::Result<Vec<aibo_core::types::ModelInfo>> {
+            Ok(Vec::new())
+        }
+
+        async fn health(&self) -> aibo_core::error::Result<aibo_core::types::Health> {
+            Ok(aibo_core::types::Health::Unknown)
+        }
+    }
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let mut registry = ProviderRegistry::new();
+    registry.insert(
+        ProviderId::OPENAI,
+        Arc::new(PendingPost {
+            entered: entered.clone(),
+        }),
+    );
+    let bindings = RoleBindings::from_chains([RoleChain {
+        role: Role::Smart,
+        entries: vec![ModelBinding {
+            provider: ProviderId::OPENAI,
+            model: "model-x".to_owned(),
+        }],
+        fallback_enabled: false,
+        allow_crossing_trust_boundary: false,
+    }])
+    .unwrap();
+    let engine = Arc::new(Engine::new(
+        registry,
+        EngineConfig {
+            bindings,
+            prices: PriceTable::from_toml_str(PRICES).unwrap(),
+            ..EngineConfig::default()
+        },
+    ));
+
+    let run = {
+        let engine = engine.clone();
+        tokio::spawn(async move { engine.run(ask(), &EventSink::null()).await })
+    };
+    entered.notified().await;
+    assert!(engine.spend_snapshot().1 > 0, "the estimate is held");
+    run.abort();
+    let _ = run.await;
+
+    assert_eq!(
+        engine.spend_snapshot().1,
+        0,
+        "dropping orchestration cannot strand committed spend"
+    );
 }
