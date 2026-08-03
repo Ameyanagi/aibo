@@ -73,6 +73,11 @@ pub enum ProviderKind {
         deployment: Option<String>,
         /// `api-version`, when the credential does not carry one.
         api_version: Option<String>,
+        /// Deployments served through the `v1` surface, one model each. When
+        /// no classic deployment is named anywhere, the provider is built on
+        /// `{endpoint}/openai/v1` and these become its catalogue (§10 —
+        /// Azure's data plane publishes no deployment listing).
+        models: Vec<String>,
     },
     /// Google Vertex AI.
     Vertex {
@@ -150,14 +155,32 @@ pub fn build(spec: ProviderSpec) -> Result<Arc<dyn Provider>> {
         ProviderKind::Azure {
             deployment,
             api_version,
+            models,
         } => {
             let endpoint = base_url.ok_or(AiboError::NoProviderConfigured)?;
-            boxed(crate::azure::provider(
-                endpoint.as_str(),
-                credential,
-                deployment,
-                api_version,
-            )?)
+            // A named deployment — explicit or riding the key credential —
+            // selects the classic deployment-scoped wire. Without one, the
+            // `v1` surface serves every deployment behind one base URL
+            // (probed 2026-08-03), which is the easy-setup path.
+            let classic = deployment.is_some()
+                || matches!(
+                    &credential,
+                    Credential::AzureKey { deployment: d, .. } if !d.is_empty()
+                );
+            if classic {
+                boxed(crate::azure::provider(
+                    endpoint.as_str(),
+                    credential,
+                    deployment,
+                    api_version,
+                )?)
+            } else {
+                boxed(crate::azure::v1_provider(
+                    endpoint.as_str(),
+                    credential,
+                    models,
+                )?)
+            }
         }
         ProviderKind::Vertex { project, region } => {
             Arc::new(crate::vertex::Vertex::new(project, region, credential)?)

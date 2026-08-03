@@ -346,6 +346,9 @@ pub struct SettingsState {
     pub appearance: theme::AppearancePreference,
     /// The dictation backend choice (`[stt] backend`).
     pub stt_backend: SttChoice,
+    /// Whether ⏎ ends a live dictation turn (`[stt] end_on_send`, owner
+    /// 2026-08-03). The shell's submit path reads this.
+    pub stt_end_on_send: bool,
     /// Whether this window is the first-run setup rather than a later visit.
     pub onboarding: bool,
     /// Whether the optional Codex security/storage explanation is expanded.
@@ -685,6 +688,8 @@ pub enum Message {
     SetAppearance(theme::AppearancePreference),
     /// Change the dictation backend.
     SetSttBackend(SttChoice),
+    /// Toggle whether ⏎ ends a live dictation turn.
+    SttEndOnSendToggle(bool),
     /// Copy the device-code to the clipboard.
     ///
     /// §3a's code looks like `RJF3-XIERE`, and the verification page expects it
@@ -1787,6 +1792,34 @@ fn dictation(state: &SettingsState) -> Element<'_, Message> {
             .on_press(Message::SetSttBackend(choice)),
         );
     }
+
+    // ⏎ ends the turn (owner, 2026-08-03): same control shape as the AX
+    // opt-in — a checkmark row with its explanation underneath.
+    list = list.push(
+        button(
+            column![
+                row![
+                    text(selection_marker(state.stt_end_on_send))
+                        .width(Length::Fixed(space(3.0)))
+                        .size(type_scale::BODY)
+                        .style(theme::text_primary),
+                    text(i18n::t(Key::SttEndOnSendTitle))
+                        .size(type_scale::BODY)
+                        .style(theme::text_primary),
+                ]
+                .align_y(iced::Alignment::Center),
+                text(i18n::t(Key::SttEndOnSendBody))
+                    .size(type_scale::META)
+                    .style(theme::text_dim),
+            ]
+            .spacing(space(0.5)),
+        )
+        .width(Length::Fill)
+        .padding([space(1.5), space(2.0)])
+        .style(theme::action_button)
+        .on_press(Message::SttEndOnSendToggle(!state.stt_end_on_send)),
+    );
+
     list.into()
 }
 
@@ -1801,11 +1834,19 @@ pub enum SttChoice {
     /// The ChatGPT plan's transcription endpoint via the Codex sign-in —
     /// the text arrives when the turn ends.
     ChatGpt,
+    /// An Azure Foundry deployment of the same live model — streaming, with
+    /// a batch fallback (owner request, 2026-08-03).
+    Azure,
 }
 
 impl SttChoice {
     /// Every choice, in display order.
-    pub const ALL: [SttChoice; 3] = [SttChoice::Auto, SttChoice::OpenAi, SttChoice::ChatGpt];
+    pub const ALL: [SttChoice; 4] = [
+        SttChoice::Auto,
+        SttChoice::OpenAi,
+        SttChoice::ChatGpt,
+        SttChoice::Azure,
+    ];
 
     /// The `[stt] backend` spelling; `None` is auto.
     pub fn tag(self) -> Option<&'static str> {
@@ -1813,6 +1854,7 @@ impl SttChoice {
             SttChoice::Auto => None,
             SttChoice::OpenAi => Some("openai"),
             SttChoice::ChatGpt => Some("chatgpt"),
+            SttChoice::Azure => Some("azure"),
         }
     }
 
@@ -1821,6 +1863,7 @@ impl SttChoice {
         match tag {
             Some("openai") => SttChoice::OpenAi,
             Some("chatgpt") => SttChoice::ChatGpt,
+            Some("azure") => SttChoice::Azure,
             _ => SttChoice::Auto,
         }
     }
@@ -1831,6 +1874,7 @@ impl SttChoice {
             SttChoice::Auto => Key::SttAuto,
             SttChoice::OpenAi => Key::SttOpenAi,
             SttChoice::ChatGpt => Key::SttChatGpt,
+            SttChoice::Azure => Key::SttAzure,
         }
     }
 
@@ -1840,6 +1884,7 @@ impl SttChoice {
             SttChoice::Auto => Key::SttAutoDetail,
             SttChoice::OpenAi => Key::SttOpenAiDetail,
             SttChoice::ChatGpt => Key::SttChatGptDetail,
+            SttChoice::Azure => Key::SttAzureDetail,
         }
     }
 }

@@ -538,6 +538,14 @@ pub enum Key {
     SttChatGpt,
     /// STT ChatGPT explanation.
     SttChatGptDetail,
+    /// STT choice: Azure.
+    SttAzure,
+    /// STT Azure explanation.
+    SttAzureDetail,
+    /// Dictation setting: ⏎ ends the turn.
+    SttEndOnSendTitle,
+    /// Its explanation.
+    SttEndOnSendBody,
     /// Section: roles.
     SettingsRoles,
     /// Section: budgets.
@@ -915,6 +923,10 @@ fn en(key: Key) -> &'static str {
         K::SttOpenAiDetail => "Streaming — words appear as you speak",
         K::SttChatGpt => "ChatGPT plan",
         K::SttChatGptDetail => "Uses the Codex sign-in; the text arrives when you stop",
+        K::SttAzure => "Azure",
+        K::SttAzureDetail => "Streaming via your Foundry deployment, with a batch fallback",
+        K::SttEndOnSendTitle => "Sending ends dictation",
+        K::SttEndOnSendBody => "⏎ stops the microphone with the message; turn off to keep talking",
         K::SettingsRoles => "Roles",
         K::SettingsBudgets => "Budgets",
         K::SettingsPermissions => "Permissions",
@@ -1204,6 +1216,10 @@ fn ja(key: Key) -> &'static str {
         K::SttOpenAiDetail => "ストリーミング — 話すそばから文字になります",
         K::SttChatGpt => "ChatGPT プラン",
         K::SttChatGptDetail => "Codex サインインを使用。停止すると文字が届きます",
+        K::SttAzure => "Azure",
+        K::SttAzureDetail => "Foundry デプロイでストリーミング。接続できない場合は一括変換",
+        K::SttEndOnSendTitle => "送信で音声入力を終了",
+        K::SttEndOnSendBody => "⏎ でメッセージと同時にマイクを停止します。話し続けるにはオフに",
         K::PanelAgentPlaceholder => "タスクを入力 — エージェントは実行前に確認します",
         K::PanelTasksTitle => "エージェントの実行",
         K::SettingsRoles => "ロール",
