@@ -270,12 +270,19 @@ pub struct ProviderConfig {
     /// workspace-wide, and parsing here gives a better error than serde's.
     #[serde(default)]
     pub base_url: Option<String>,
-    /// Azure deployment name (part of the URL, not a model id).
+    /// Azure deployment name (part of the URL, not a model id). Omit it to
+    /// use the `v1` surface instead, where `models` below is the catalogue.
     #[serde(default)]
     pub deployment: Option<String>,
-    /// Azure `api-version`. It matters (§10).
+    /// Azure `api-version`. It matters (§10) — classic wire only; the `v1`
+    /// surface has none.
     #[serde(default)]
     pub api_version: Option<String>,
+    /// Deployment names served through Azure's `v1` surface, each listed in
+    /// the model picker as itself. The data plane publishes no deployment
+    /// listing, so this statement is the catalogue (§10).
+    #[serde(default)]
+    pub models: Option<Vec<String>>,
     /// Pricing tier, when the account is on a non-standard one (§14).
     #[serde(default)]
     pub tier: Option<String>,
@@ -523,8 +530,33 @@ pub struct FilesSettings {
 #[derive(Debug, Clone, Default, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct SttSettings {
-    /// `"auto"`, `"openai"` or `"chatgpt"`. Absent means auto.
+    /// `"auto"`, `"openai"`, `"chatgpt"` or `"azure"`. Absent means auto.
     pub backend: Option<String>,
+    /// End the dictation turn when the message is sent (owner, 2026-08-03).
+    /// Absent means true: a microphone that keeps typing into the next
+    /// composer after ⏎ is the surprising behaviour, not the default.
+    #[serde(default)]
+    pub end_on_send: Option<bool>,
+    /// Azure Foundry dictation (owner request, 2026-08-03).
+    #[serde(default)]
+    pub azure: AzureSttSettings,
+}
+
+/// Where the `azure` dictation backend points.
+///
+/// Everything optional, because the easy path needs nothing here: the
+/// endpoint falls back to the first `[[providers]]` azure entry's `base_url`
+/// (one resource serves chat and STT alike), and the deployment names default
+/// to the models' own names — which is what the portal suggests.
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct AzureSttSettings {
+    /// The Foundry resource endpoint, when it differs from the chat entry's.
+    pub endpoint: Option<String>,
+    /// Realtime deployment name. Defaults to `gpt-live-transcribe`.
+    pub live_deployment: Option<String>,
+    /// Batch-fallback deployment name. Defaults to `gpt-transcribe`.
+    pub deployment: Option<String>,
 }
 
 /// Persisted desktop-shell preferences.
@@ -823,6 +855,7 @@ impl Config {
             Backend::Azure => ProviderKind::Azure {
                 deployment: provider.deployment.clone(),
                 api_version: provider.api_version.clone(),
+                models: provider.models.clone().unwrap_or_default(),
             },
             Backend::Ollama => ProviderKind::Ollama,
             Backend::Custom => ProviderKind::Custom {

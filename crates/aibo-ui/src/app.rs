@@ -960,6 +960,9 @@ fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) 
     // The selector shows the *preference* (System/Dark/Light), not its
     // current resolution — the config carries both.
     state.settings.appearance = state.config.appearance_preference;
+    // True until `SettingsLoaded` says otherwise: ending dictation on ⏎ is
+    // the default, and the brief pre-hydration window must agree with it.
+    state.settings.stt_end_on_send = true;
 
     (
         state,
@@ -2102,6 +2105,13 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 return Task::none();
             }
 
+            // ⏎ ends a live dictation turn (owner, 2026-08-03, and a
+            // setting): the alternative is a microphone that keeps typing
+            // into the next composer after the message left.
+            if state.settings.stt_end_on_send {
+                stop_dictation_if_active(state);
+            }
+
             // Slash commands and their bare aliases act locally; they never
             // reach a model (owner redesign, 2026-08-02: help is "?", "help"
             // or "/help" typed into the composer).
@@ -2809,6 +2819,11 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
         M::AxTreeToggle(enabled) => {
             state.settings.ax_tree_activation = enabled;
             state.send(UiRequest::SetAxTreeActivation { enabled });
+            Task::none()
+        }
+        M::SttEndOnSendToggle(enabled) => {
+            state.settings.stt_end_on_send = enabled;
+            state.send(UiRequest::SetSttEndOnSend { enabled });
             Task::none()
         }
         M::SetSttBackend(choice) => {
@@ -3537,8 +3552,10 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             default_file_roots,
             budget,
             stt_backend,
+            stt_end_on_send,
         } => {
             state.settings.ax_tree_activation = ax_tree_activation;
+            state.settings.stt_end_on_send = stt_end_on_send;
             state.settings.stt_backend =
                 crate::settings::SttChoice::from_tag(stt_backend.as_deref());
             state.settings.file_roots = file_roots;
@@ -4288,6 +4305,7 @@ mod tests {
                 default_file_roots: vec!["/d/Documents".to_owned(), "/d/Desktop".to_owned()],
                 budget: None,
                 stt_backend: None,
+                stt_end_on_send: true,
             },
         );
 

@@ -1841,6 +1841,18 @@ mod config_file {
         write_ui_key(path, "appearance", Some(&quote(tag)))
     }
 
+    /// Persist whether ⏎ ends a live dictation turn.
+    pub fn write_stt_end_on_send(path: &Path, enabled: bool) -> io::Result<()> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+        let updated =
+            splice_key_in_table(&existing, "stt", "end_on_send", Some(&enabled.to_string()));
+        crate::paths::atomic_write(path, updated.as_bytes())
+    }
+
     /// Persist the dictation backend choice; `None` returns to auto.
     pub fn write_stt_backend(path: &Path, backend: Option<&str>) -> io::Result<()> {
         let existing = match std::fs::read_to_string(path) {
@@ -3669,6 +3681,7 @@ mod runtime {
                         )
                     }),
                     stt_backend: self.stt_backend.clone(),
+                    stt_end_on_send: config.stt.end_on_send.unwrap_or(true),
                 }
             };
             if self.events.send(startup_settings).await.is_err() {
@@ -3708,6 +3721,45 @@ mod runtime {
             self.engine.cancel_all();
             self.sessions.clear();
             self.active_session = None;
+        }
+
+        /// Assemble the Azure dictation backend from whatever the user has
+        /// already provided — the easy path needs only a key and any one
+        /// statement of the endpoint (owner, 2026-08-03: "easy to set up").
+        ///
+        /// Endpoint precedence: `[stt.azure] endpoint`, then the first azure
+        /// `[[providers]]` entry's `base_url` (one Foundry resource serves
+        /// chat and STT alike), then the dev shell's
+        /// `AIBO_AZURE_OPENAI_ENDPOINT`. `None` — reported as the missing-key
+        /// failure — only when no key or no endpoint exists anywhere.
+        fn azure_stt(&self) -> Option<crate::stt::AzureStt> {
+            let key = self.bootstrap.api_key(&ProviderId::AZURE_OPENAI)?;
+            let config = self.bootstrap.config();
+            let stt = &config.stt.azure;
+            let endpoint = stt
+                .endpoint
+                .clone()
+                .or_else(|| {
+                    config.providers.iter().find_map(|provider| {
+                        matches!(provider.backend, aibo_session::config::Backend::Azure)
+                            .then(|| provider.base_url.clone())
+                            .flatten()
+                    })
+                })
+                .or_else(|| std::env::var("AIBO_AZURE_OPENAI_ENDPOINT").ok())
+                .filter(|endpoint| !endpoint.trim().is_empty())?;
+            Some(crate::stt::AzureStt {
+                endpoint,
+                live_deployment: stt
+                    .live_deployment
+                    .clone()
+                    .unwrap_or_else(|| "gpt-live-transcribe".to_owned()),
+                batch_deployment: stt
+                    .deployment
+                    .clone()
+                    .unwrap_or_else(|| "gpt-transcribe".to_owned()),
+                key,
+            })
         }
 
         fn spawn_power_watch(&self, internal: Sender<Internal>) {
@@ -3766,6 +3818,9 @@ mod runtime {
                             "openai" => {
                                 openai_key.map(|key| crate::stt::start(key, self.events.clone()))
                             }
+                            "azure" => self
+                                .azure_stt()
+                                .map(|azure| crate::stt::start_azure(azure, self.events.clone())),
                             _ => match openai_key {
                                 Some(key) => Some(crate::stt::start(key, self.events.clone())),
                                 None => chatgpt_tokens().map(|tokens| {
@@ -3867,6 +3922,15 @@ mod runtime {
                         }
                     }));
                 }
+                UiRequest::SetSttEndOnSend { enabled } => {
+                    if let Err(error) = crate::config_file::write_stt_end_on_send(
+                        &self.bootstrap.paths().config(),
+                        enabled,
+                    ) {
+                        tracing::warn!(%error, "could not persist the dictation end-on-send choice");
+                    }
+                }
+
                 UiRequest::SetSttBackend { backend } => {
                     if let Err(error) = crate::config_file::write_stt_backend(
                         &self.bootstrap.paths().config(),

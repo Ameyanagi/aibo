@@ -21,6 +21,13 @@
 //! realtime audio callback and are not `Send`, and the callback must never
 //! block — chunks are handed to the websocket task through a bounded channel
 //! and dropped on overflow rather than stalling the device.
+//!
+//! The Azure flavour (owner request, 2026-08-03) speaks the same GA realtime
+//! protocol against a Foundry deployment of the same model. Its wire facts
+//! were probed live: the realtime gateway answers only on the resource's
+//! `*.openai.azure.com` alias host, authenticates with an `api-key` header,
+//! and the batch fallback uses the classic deployment-scoped
+//! `audio/transcriptions` route with a preview `api-version`.
 
 use std::time::Duration;
 
@@ -109,6 +116,228 @@ pub fn start_chatgpt(
     DictationHandle { stop }
 }
 
+/// Everything the Azure dictation backends need (owner request, 2026-08-03).
+pub struct AzureStt {
+    /// The Foundry resource endpoint, either host spelling.
+    pub endpoint: String,
+    /// The realtime deployment; the model is named in-session.
+    pub live_deployment: String,
+    /// The batch deployment for the fallback upload.
+    pub batch_deployment: String,
+    /// The resource key (`api-key` header on both routes).
+    pub key: SecretString,
+}
+
+/// Start a dictation turn against Azure: streaming via the realtime gateway,
+/// falling back to a record-then-upload turn when the socket cannot open —
+/// the user already granted the microphone, and "switch backends and press
+/// ⌘L again" is a worse answer than a transcript that arrives at the end.
+pub fn start_azure(azure: AzureStt, events: mpsc::Sender<UiEvent>) -> DictationHandle {
+    let stop = CancellationToken::new();
+    let task_stop = stop.clone();
+    tokio::spawn(crate::diagnostics::supervise(
+        "dictation-azure",
+        async move {
+            run_azure(azure, events, task_stop).await;
+        },
+    ));
+    DictationHandle { stop }
+}
+
+async fn run_azure(azure: AzureStt, events: mpsc::Sender<UiEvent>, stop: CancellationToken) {
+    let emit = |event: UiEvent| {
+        let events = events.clone();
+        async move {
+            let _ = events.send(event).await;
+        }
+    };
+
+    let Some(mut chunks) = open_microphone(&events, &stop).await else {
+        return;
+    };
+
+    let connected = match azure_realtime_request(&azure.endpoint, &azure.key) {
+        Ok(request) => connect_async(request).await,
+        Err(error) => Err(tokio_tungstenite::tungstenite::Error::Io(
+            std::io::Error::other(error.to_string()),
+        )),
+    };
+    match connected {
+        Ok((ws, _response)) => {
+            stream_turn(ws, &azure.live_deployment, &mut chunks, &events, &stop).await;
+        }
+        Err(error) => {
+            // The gateway said no (region, firewall, a renamed deployment) —
+            // fall back to one upload per turn rather than failing a
+            // microphone that is already live.
+            tracing::warn!(%error, "azure realtime unavailable; batch transcription fallback");
+            emit(UiEvent::DictationStarted).await;
+            let Some(pcm) = buffer_turn(&mut chunks, &stop, &events).await else {
+                return;
+            };
+            if pcm.is_empty() {
+                emit(UiEvent::DictationEnded).await;
+                return;
+            }
+            match azure_transcribe_upload(&azure, wav_bytes(&pcm)).await {
+                Some(text) if !text.is_empty() => {
+                    emit(UiEvent::DictationDelta { text }).await;
+                    emit(UiEvent::DictationEnded).await;
+                }
+                Some(_) => emit(UiEvent::DictationEnded).await,
+                None => {
+                    emit(UiEvent::DictationFailed {
+                        failure: DictationFailure::Connection,
+                    })
+                    .await;
+                }
+            }
+        }
+    }
+}
+
+/// The realtime websocket request for a Foundry resource.
+///
+/// Probed 2026-08-03: only the `*.openai.azure.com` alias serves the realtime
+/// gateway — the `*.services.ai.azure.com` spelling 404s — and the model must
+/// NOT ride the query string (400 `OperationNotSupported`); it is named
+/// in-session by [`stream_turn`].
+fn azure_realtime_request(
+    endpoint: &str,
+    key: &SecretString,
+) -> anyhow::Result<tokio_tungstenite::tungstenite::handshake::client::Request> {
+    let url = azure_realtime_url(endpoint)?;
+    let mut request = url.into_client_request()?;
+    request
+        .headers_mut()
+        .insert("api-key", key.expose_secret().parse()?);
+    Ok(request)
+}
+
+/// `https://{res}.services.ai.azure.com` (or the alias itself, or a stray
+/// trailing slash) → `wss://{res}.openai.azure.com/openai/v1/realtime?…`.
+fn azure_realtime_url(endpoint: &str) -> anyhow::Result<String> {
+    let trimmed = endpoint.trim().trim_end_matches('/');
+    let host = trimmed
+        .strip_prefix("https://")
+        .or_else(|| trimmed.strip_prefix("http://"))
+        .unwrap_or(trimmed)
+        .replace(".services.ai.azure.com", ".openai.azure.com");
+    anyhow::ensure!(
+        !host.is_empty() && !host.contains('/'),
+        "the Azure endpoint should be a bare resource URL, got {endpoint:?}"
+    );
+    Ok(format!(
+        "wss://{host}/openai/v1/realtime?intent=transcription"
+    ))
+}
+
+/// POST the recorded turn to the deployment-scoped transcription route.
+///
+/// The `v1` audio path 404s on Foundry resources (probed 2026-08-03), so this
+/// is the classic spelling with a preview `api-version`.
+async fn azure_transcribe_upload(azure: &AzureStt, wav: Vec<u8>) -> Option<String> {
+    let endpoint = azure.endpoint.trim().trim_end_matches('/');
+    let url = format!(
+        "{endpoint}/openai/deployments/{deployment}/audio/transcriptions?api-version=2025-03-01-preview",
+        deployment = azure.batch_deployment,
+    );
+    let (content_type, body) = multipart_wav(wav);
+    let client = reqwest::Client::new();
+    let response = client
+        .post(url)
+        .header("api-key", azure.key.expose_secret())
+        .header("Content-Type", content_type)
+        .body(body)
+        .timeout(Duration::from_secs(60))
+        .send()
+        .await
+        .ok()?;
+    if !response.status().is_success() {
+        tracing::warn!(status = %response.status(), "azure transcribe refused the upload");
+        return None;
+    }
+    let value: serde_json::Value = response.json().await.ok()?;
+    value
+        .get("text")
+        .and_then(|text| text.as_str())
+        .map(|text| text.trim().to_owned())
+}
+
+/// Spawn the microphone thread and wait for it to come up.
+///
+/// `None` means the failure has already been reported through `events`.
+async fn open_microphone(
+    events: &mpsc::Sender<UiEvent>,
+    stop: &CancellationToken,
+) -> Option<mpsc::Receiver<Vec<u8>>> {
+    let (chunk_tx, chunks) = mpsc::channel::<Vec<u8>>(64);
+    let (ready_tx, ready_rx) = oneshot::channel();
+    let mic_stop = stop.clone();
+    let spawned = std::thread::Builder::new()
+        .name("aibo-dictation-mic".into())
+        .spawn(move || capture_thread(chunk_tx, ready_tx, mic_stop));
+    if spawned.is_err() || !matches!(ready_rx.await, Ok(Ok(()))) {
+        let _ = events
+            .send(UiEvent::DictationFailed {
+                failure: DictationFailure::Microphone,
+            })
+            .await;
+        return None;
+    }
+    Some(chunks)
+}
+
+/// Buffer PCM until the user ends the turn. Bounded: at 48 KB/s the cap below
+/// is several minutes of speech, and a dictation longer than that deserves
+/// the streaming backend anyway.
+///
+/// `None` means the microphone died mid-turn and the failure is reported.
+async fn buffer_turn(
+    chunks: &mut mpsc::Receiver<Vec<u8>>,
+    stop: &CancellationToken,
+    events: &mpsc::Sender<UiEvent>,
+) -> Option<Vec<u8>> {
+    const MAX_PCM_BYTES: usize = 24_000 * 2 * 300;
+    let mut pcm: Vec<u8> = Vec::new();
+    loop {
+        tokio::select! {
+            biased;
+            () = stop.cancelled() => break,
+            chunk = chunks.recv() => {
+                let Some(bytes) = chunk else {
+                    let _ = events
+                        .send(UiEvent::DictationFailed {
+                            failure: DictationFailure::Microphone,
+                        })
+                        .await;
+                    return None;
+                };
+                if pcm.len() + bytes.len() <= MAX_PCM_BYTES {
+                    pcm.extend_from_slice(&bytes);
+                }
+            }
+        }
+    }
+    Some(pcm)
+}
+
+/// One `multipart/form-data` body holding `wav` as its `file` field.
+fn multipart_wav(wav: Vec<u8>) -> (String, Vec<u8>) {
+    const BOUNDARY: &str = "aibo-dictation-boundary";
+    let mut body = Vec::with_capacity(wav.len() + 256);
+    body.extend_from_slice(
+        format!(
+            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; \
+             filename=\"dictation.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
+        )
+        .as_bytes(),
+    );
+    body.extend_from_slice(&wav);
+    body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={BOUNDARY}"), body)
+}
+
 /// The upload flavour: same microphone pipeline, buffered instead of
 /// streamed.
 async fn run_chatgpt(
@@ -125,45 +354,15 @@ async fn run_chatgpt(
         }
     };
 
-    let (chunk_tx, mut chunks) = mpsc::channel::<Vec<u8>>(64);
-    let (ready_tx, ready_rx) = oneshot::channel();
-    let mic_stop = stop.clone();
-    let spawned = std::thread::Builder::new()
-        .name("aibo-dictation-mic".into())
-        .spawn(move || capture_thread(chunk_tx, ready_tx, mic_stop));
-    if spawned.is_err() || !matches!(ready_rx.await, Ok(Ok(()))) {
-        emit(UiEvent::DictationFailed {
-            failure: DictationFailure::Microphone,
-        })
-        .await;
+    let Some(mut chunks) = open_microphone(&events, &stop).await else {
         return;
-    }
+    };
 
     emit(UiEvent::DictationStarted).await;
 
-    // Phase 1 — buffer PCM until the user ends the turn. Bounded: at 48 KB/s
-    // the cap below is several minutes of speech, and a dictation longer than
-    // that deserves the streaming backend anyway.
-    const MAX_PCM_BYTES: usize = 24_000 * 2 * 300;
-    let mut pcm: Vec<u8> = Vec::new();
-    loop {
-        tokio::select! {
-            biased;
-            () = stop.cancelled() => break,
-            chunk = chunks.recv() => {
-                let Some(bytes) = chunk else {
-                    emit(UiEvent::DictationFailed {
-                        failure: DictationFailure::Microphone,
-                    })
-                    .await;
-                    return;
-                };
-                if pcm.len() + bytes.len() <= MAX_PCM_BYTES {
-                    pcm.extend_from_slice(&bytes);
-                }
-            }
-        }
-    }
+    let Some(pcm) = buffer_turn(&mut chunks, &stop, &events).await else {
+        return;
+    };
     if pcm.is_empty() {
         emit(UiEvent::DictationEnded).await;
         return;
@@ -198,26 +397,12 @@ async fn transcribe_upload(
     account: Option<&str>,
     wav: Vec<u8>,
 ) -> Option<String> {
-    const BOUNDARY: &str = "aibo-dictation-boundary";
-    let mut body = Vec::with_capacity(wav.len() + 256);
-    body.extend_from_slice(
-        format!(
-            "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; \
-             filename=\"dictation.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
-        )
-        .as_bytes(),
-    );
-    body.extend_from_slice(&wav);
-    body.extend_from_slice(format!("\r\n--{BOUNDARY}--\r\n").as_bytes());
-
+    let (content_type, body) = multipart_wav(wav);
     let client = reqwest::Client::new();
     let response = client
         .post("https://chatgpt.com/backend-api/transcribe")
         .bearer_auth(token.expose_secret())
-        .header(
-            "Content-Type",
-            format!("multipart/form-data; boundary={BOUNDARY}"),
-        )
+        .header("Content-Type", content_type)
         .header("chatgpt-account-id", account.unwrap_or_default())
         .body(body)
         .timeout(Duration::from_secs(60))
@@ -267,19 +452,9 @@ async fn run(key: SecretString, events: mpsc::Sender<UiEvent>, stop: Cancellatio
 
     // Microphone first: failing fast on a missing device or permission means
     // no socket is opened for audio that will never exist.
-    let (chunk_tx, mut chunks) = mpsc::channel::<Vec<u8>>(64);
-    let (ready_tx, ready_rx) = oneshot::channel();
-    let mic_stop = stop.clone();
-    let spawned = std::thread::Builder::new()
-        .name("aibo-dictation-mic".into())
-        .spawn(move || capture_thread(chunk_tx, ready_tx, mic_stop));
-    if spawned.is_err() || !matches!(ready_rx.await, Ok(Ok(()))) {
-        emit(UiEvent::DictationFailed {
-            failure: DictationFailure::Microphone,
-        })
-        .await;
+    let Some(mut chunks) = open_microphone(&events, &stop).await else {
         return;
-    }
+    };
 
     let request = match client_request(&key) {
         Ok(request) => request,
@@ -303,6 +478,28 @@ async fn run(key: SecretString, events: mpsc::Sender<UiEvent>, stop: Cancellatio
             return;
         }
     };
+    stream_turn(ws, MODEL, &mut chunks, &events, &stop).await;
+}
+
+/// The streaming turn: configure the session, relay audio until the user's
+/// key ends it, drain the final fragments. Shared verbatim between the OpenAI
+/// and Azure realtime backends — both speak the GA transcription protocol,
+/// and the only differences (URL, auth header) live in the callers.
+async fn stream_turn(
+    ws: tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >,
+    model: &str,
+    chunks: &mut mpsc::Receiver<Vec<u8>>,
+    events: &mpsc::Sender<UiEvent>,
+    stop: &CancellationToken,
+) {
+    let emit = |event: UiEvent| {
+        let events = events.clone();
+        async move {
+            let _ = events.send(event).await;
+        }
+    };
     let (mut sink, mut source) = ws.split();
 
     let configure = serde_json::json!({
@@ -312,7 +509,7 @@ async fn run(key: SecretString, events: mpsc::Sender<UiEvent>, stop: Cancellatio
             "audio": {
                 "input": {
                     "format": { "type": "audio/pcm", "rate": TARGET_RATE },
-                    "transcription": { "model": MODEL },
+                    "transcription": { "model": model },
                     // The turn boundary is the user's key, not a server VAD.
                     "turn_detection": null,
                 }
@@ -677,6 +874,25 @@ mod tests {
             "one second of 44.1 kHz should yield ~{expected}, got {}",
             out.len()
         );
+    }
+
+    /// The probe's hard-won facts, pinned: alias host, wss scheme, no model
+    /// in the query string — and portal paste variants all normalize.
+    #[test]
+    fn azure_realtime_url_normalizes_every_portal_spelling() {
+        for endpoint in [
+            "https://res.services.ai.azure.com",
+            "https://res.services.ai.azure.com/",
+            "https://res.openai.azure.com",
+            "res.services.ai.azure.com",
+        ] {
+            assert_eq!(
+                azure_realtime_url(endpoint).unwrap(),
+                "wss://res.openai.azure.com/openai/v1/realtime?intent=transcription",
+                "{endpoint}"
+            );
+        }
+        assert!(azure_realtime_url("https://res.services.ai.azure.com/api/projects/x").is_err());
     }
 
     #[test]

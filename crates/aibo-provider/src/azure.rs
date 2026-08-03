@@ -126,11 +126,124 @@ pub fn provider(
     .with_capabilities(default_capabilities()))
 }
 
+/// Capabilities for a `v1`-surface deployment (probed 2026-08-03 against a
+/// live Foundry resource serving the gpt-5.6 family).
+///
+/// The reasoning family's numbers, mirroring the Codex statement about the
+/// same models: what Azure hosts here is the model, not a different animal.
+pub fn v1_capabilities() -> Capabilities {
+    Capabilities {
+        tools: true,
+        vision: true,
+        streaming: true,
+        reasoning_effort: true,
+        json_schema: true,
+        prompt_cache: true,
+        multi_candidate: MultiCandidate::Unsupported,
+        max_context: 272_000,
+        max_output: Some(128_000),
+        ..Capabilities::default()
+    }
+}
+
+/// The quirk set for the `v1` surface: `{endpoint}/openai/v1/...`, plain
+/// path suffixes, **no `api-version`**, `model` = deployment name.
+///
+/// Probed 2026-08-03: `max_completion_tokens` is accepted; sampling
+/// parameters are withheld because the surface serves reasoning-family
+/// models, which reject `temperature` outright (the same measurement that
+/// shaped the Codex quirks).
+pub fn v1_quirks(auth: AuthStyle) -> Quirks {
+    Quirks {
+        auth,
+        max_completion_tokens: true,
+        json_schema: true,
+        models_endpoint: false,
+        sampling_params: false,
+        ..Quirks::chat_completions()
+    }
+}
+
+/// Build the Azure provider on the `v1` surface.
+///
+/// `models` are the deployment names this resource serves — Azure publishes
+/// no deployment listing on the data plane, so the user's statement is the
+/// catalogue (`[[providers]] models = [...]`), surfaced through
+/// `static_models`.
+pub fn v1_provider(
+    endpoint: &str,
+    credential: Credential,
+    models: Vec<String>,
+) -> Result<OpenAiCompat> {
+    use aibo_core::types::ModelInfo;
+
+    let id = ProviderId::AZURE_OPENAI;
+    let base = format!("{}/openai/v1", endpoint.trim_end_matches('/'));
+    let url = Url::parse(&base).map_err(|e| AiboError::Internal(Box::new(e)))?;
+    let auth = match &credential {
+        Credential::AzureKey { .. } => AuthStyle::AzureApiKey,
+        Credential::EntraId(_) => AuthStyle::Bearer,
+        _ => {
+            return Err(Unimplemented::err(
+                id,
+                "Azure OpenAI accepts only Credential::AzureKey or Credential::EntraId",
+            ));
+        }
+    };
+    let capabilities = v1_capabilities();
+    let catalogue = models
+        .into_iter()
+        .map(|model| ModelInfo {
+            provider: id.clone(),
+            display_name: model.clone(),
+            id: model,
+            capabilities: capabilities.clone(),
+            released_at: None,
+            deprecated: false,
+            replaced_by: None,
+        })
+        .collect();
+
+    Ok(
+        OpenAiCompat::new(id, url, v1_quirks(auth), credential, HttpConfig::default())?
+            .with_capabilities(capabilities)
+            .with_static_models(catalogue),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::openai_compat::UrlStyle;
     use secrecy::SecretString;
+
+    /// The `v1` surface: plain path suffixes, api-key header, no sampling
+    /// params — the probe-verified easy path (2026-08-03).
+    #[test]
+    fn the_v1_surface_is_a_path_suffix_with_reasoning_family_quirks() {
+        let cred = Credential::AzureKey {
+            key: SecretString::from("k".to_string()),
+            deployment: String::new(),
+            api_version: "unused".to_string(),
+        };
+        let p = v1_provider(
+            "https://r.services.ai.azure.com/",
+            cred,
+            vec!["gpt-5.6-luna".to_string()],
+        )
+        .unwrap();
+        assert!(matches!(&p.quirks().url, UrlStyle::PathSuffix));
+        assert_eq!(p.quirks().auth, AuthStyle::AzureApiKey);
+        assert!(
+            !p.quirks().sampling_params,
+            "reasoning family rejects temperature"
+        );
+        assert!(p.quirks().max_completion_tokens, "probed: accepted");
+        assert!(
+            !p.quirks().models_endpoint,
+            "the statement is the catalogue"
+        );
+    }
 
     #[test]
     fn a_key_credential_carries_its_own_deployment_and_version() {
