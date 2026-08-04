@@ -35,6 +35,8 @@ const CODEX_COPY_CODE: NodeId = NodeId(67);
 const CODEX_OPEN_PAGE: NodeId = NodeId(68);
 const SETTINGS_STATUS: NodeId = NodeId(80);
 const SETTINGS_PRIMARY_ACTION: NodeId = NodeId(81);
+const SETTINGS_SECONDARY_ACTION: NodeId = NodeId(82);
+const SETTINGS_TERTIARY_ACTION: NodeId = NodeId(83);
 const SETTINGS_PERMISSION_BASE: u64 = 100;
 const SETTINGS_LANGUAGE_BASE: u64 = 120;
 
@@ -183,11 +185,15 @@ pub fn settings_tree(
             content_children.push(SETTINGS_STATUS);
         }
         Section::About => {
+            let version = format!(
+                "aibo {}",
+                option_env!("AIBO_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"))
+            );
             nodes.push((
                 SETTINGS_STATUS,
                 semantic_node(
                     Role::Label,
-                    concat!("aibo ", env!("CARGO_PKG_VERSION")),
+                    &version,
                     logical_rect(content_x, 68.0, content_width, 28.0),
                 ),
             ));
@@ -195,11 +201,32 @@ pub fn settings_tree(
                 SETTINGS_PRIMARY_ACTION,
                 interactive_node(
                     Role::Button,
-                    i18n::t(Key::ActionCopyDiagnostics),
-                    logical_rect(content_x, 108.0, 220.0, 44.0),
+                    i18n::t(Key::ActionUpdateStable),
+                    logical_rect(content_x, 156.0, 160.0, 44.0),
                 ),
             ));
-            content_children.extend([SETTINGS_STATUS, SETTINGS_PRIMARY_ACTION]);
+            nodes.push((
+                SETTINGS_SECONDARY_ACTION,
+                interactive_node(
+                    Role::Button,
+                    i18n::t(Key::ActionUpdateNightly),
+                    logical_rect(content_x + 172.0, 156.0, 140.0, 44.0),
+                ),
+            ));
+            nodes.push((
+                SETTINGS_TERTIARY_ACTION,
+                interactive_node(
+                    Role::Button,
+                    i18n::t(Key::ActionCopyDiagnostics),
+                    logical_rect(content_x, 212.0, 220.0, 44.0),
+                ),
+            ));
+            content_children.extend([
+                SETTINGS_STATUS,
+                SETTINGS_PRIMARY_ACTION,
+                SETTINGS_SECONDARY_ACTION,
+                SETTINGS_TERTIARY_ACTION,
+            ]);
         }
         Section::Files => {
             // The same summary-node treatment as Models, for the same
@@ -615,7 +642,13 @@ pub fn settings_message(
                 None
             }
         }
-        SETTINGS_PRIMARY_ACTION if state.section == Section::About => {
+        SETTINGS_PRIMARY_ACTION if state.section == Section::About => Some(
+            settings::Message::DownloadUpdate(settings::UpdateChannel::Stable),
+        ),
+        SETTINGS_SECONDARY_ACTION if state.section == Section::About => Some(
+            settings::Message::DownloadUpdate(settings::UpdateChannel::Nightly),
+        ),
+        SETTINGS_TERTIARY_ACTION if state.section == Section::About => {
             Some(settings::Message::CopyDiagnostics)
         }
         node => permission_for_node(node)
@@ -823,6 +856,32 @@ mod tests {
             settings_message(&state, &request(CODEX_ACTION, Action::Click)),
             Some(settings::Message::SignIn(provider)) if provider == ProviderId::CODEX
         ));
+
+        let mut about = SettingsState::default();
+        about.section = Section::About;
+        assert!(matches!(
+            settings_message(&about, &request(SETTINGS_PRIMARY_ACTION, Action::Click)),
+            Some(settings::Message::DownloadUpdate(
+                settings::UpdateChannel::Stable
+            ))
+        ));
+        assert!(matches!(
+            settings_message(&about, &request(SETTINGS_SECONDARY_ACTION, Action::Click)),
+            Some(settings::Message::DownloadUpdate(
+                settings::UpdateChannel::Nightly
+            ))
+        ));
+        assert!(matches!(
+            settings_message(&about, &request(SETTINGS_TERTIARY_ACTION, Action::Click)),
+            Some(settings::Message::CopyDiagnostics)
+        ));
+
+        // Keep the assignment mutable in this test: it mirrors the runtime's
+        // section switch and makes accidental state-sensitive routing visible.
+        about.section = Section::Providers;
+        assert!(
+            settings_message(&about, &request(SETTINGS_SECONDARY_ACTION, Action::Click)).is_none()
+        );
     }
 
     #[test]

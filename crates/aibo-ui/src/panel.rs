@@ -2352,7 +2352,6 @@ fn finder_overlay(state: &PanelState) -> Element<'_, Message> {
         text_input(i18n::t(Key::FinderPlaceholder), &state.file_finder.query)
             .id(FINDER_ID)
             .on_input(Message::FinderQuery)
-            .on_submit(Message::FinderCommit)
             .size(type_scale::BODY)
             // The CJK-capable face; queries and paths are routinely Japanese.
             .font(theme::UI_FONT)

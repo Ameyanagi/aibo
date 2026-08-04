@@ -4,10 +4,10 @@
 # notarised, stapled DMG with `LSUIElement` — but only when the Apple secrets are
 # configured; without them the same DMG is built unsigned so that testing is
 # never blocked on Apple paperwork. Windows is still unsigned: §19 wants an
-# Authenticode-signed MSI or MSIX, and neither the certificate nor the installer
-# exists yet. The generated release notes state which of these is true of the
-# build in hand, rather than leaving a tester to guess whether a Gatekeeper or
-# SmartScreen prompt means the download is broken.
+# Authenticode-signed installer, and the certificate does not exist yet. The
+# generated release notes state which of these is true of the build in hand,
+# rather than leaving a tester to guess whether a Gatekeeper or SmartScreen
+# prompt means the download is broken.
 #
 # Secrets, all optional (`gh secret set NAME < file`):
 #
@@ -63,9 +63,9 @@ jobs:
           - name: Windows
             os: windows-2022
             binary: target/release/aibo.exe
-            # Shipped as a bare `.exe`: the entire point is that a tester can
-            # download it and double-click. A zip would add an extraction step
-            # and buys nothing — Windows applies Mark-of-the-Web to either.
+            # Kept as a portable fallback beside the per-user installer built
+            # below. A zip would add an extraction step and buys nothing —
+            # Windows applies Mark-of-the-Web to either.
             asset: aibo-windows-x86_64.exe
           - name: macOS
             os: macos-14
@@ -82,12 +82,6 @@ jobs:
         with:
           key: release-${{ matrix.os }}
 
-      - name: Build the release binary
-        run: cargo build --release --bin aibo --locked
-
-      # `--locked` above is the load-bearing flag: a release built from a
-      # resolver that quietly picked different versions is not the thing CI
-      # tested.
       - name: Work out the version
         id: version
         shell: bash
@@ -102,6 +96,15 @@ jobs:
             version="0.0.0-dev.${GITHUB_SHA::7}"
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Build the release binary
+        env:
+          AIBO_BUILD_VERSION: ${{ steps.version.outputs.version }}
+        run: cargo build --release --bin aibo --locked
+
+      # `--locked` above is the load-bearing flag: a release built from a
+      # resolver that quietly picked different versions is not the thing CI
+      # tested.
 
       # Whether the Apple credentials are configured. Mapped to an output
       # because `secrets` cannot be read from a step's `if:` directly, and
@@ -272,6 +275,29 @@ jobs:
           mkdir -p dist
           cp "${{ matrix.binary }}" "dist/${{ matrix.asset }}"
 
+      - name: Build the per-user Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup compiler was not found at $iscc"
+          }
+
+          $source = (Resolve-Path '${{ matrix.binary }}').Path
+          $output = (Resolve-Path 'dist').Path
+          $icon = (Resolve-Path 'packaging/windows/aibo.ico').Path
+          & $iscc "/DMyAppVersion=${{ steps.version.outputs.version }}" `
+            "/DMySourceExe=$source" "/DMyOutputDir=$output" `
+            "/DMySetupIcon=$icon" 'packaging/windows/aibo.iss'
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup failed with exit code $LASTEXITCODE"
+          }
+          if (-not (Test-Path 'dist/aibo-windows-x86_64-setup.exe')) {
+            throw 'Inno Setup did not produce the expected installer'
+          }
+
       # Nothing is signed, so a checksum is the only integrity claim a tester
       # can actually check. Cheap to produce and worth having.
       - name: Checksum
@@ -279,12 +305,15 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          if command -v sha256sum >/dev/null; then
-            sha256sum "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
-          else
-            shasum -a 256 "${{ matrix.asset }}" > "${{ matrix.asset }}.sha256"
-          fi
-          cat "${{ matrix.asset }}.sha256"
+          for asset in *; do
+            case "$asset" in *.sha256) continue ;; esac
+            if command -v sha256sum >/dev/null; then
+              sha256sum "$asset" > "$asset.sha256"
+            else
+              shasum -a 256 "$asset" > "$asset.sha256"
+            fi
+            cat "$asset.sha256"
+          done
 
       # §15's budget is 60 MB installed, stretch 40 — see the same step in
       # `ci.yml` for why the 25 MB this used to check was the wrong number.
@@ -384,7 +413,11 @@ jobs:
             echo
             echo "## Windows"
             echo
-            echo "\`aibo-windows-x86_64.exe\` is **not Authenticode signed** — §19 wants an"
+            echo "\`aibo-windows-x86_64-setup.exe\` installs for the current user under"
+            echo "\`%LOCALAPPDATA%\\Programs\\aibo\`; it does not require administrator rights."
+            echo "The portable \`aibo-windows-x86_64.exe\` remains available."
+            echo
+            echo "Both Windows downloads are **not Authenticode signed** — §19 wants an"
             echo "OV certificate and notes that reputation has to accumulate before"
             echo "SmartScreen stops warning. Expect a SmartScreen prompt:"
             echo "More info → Run anyway."

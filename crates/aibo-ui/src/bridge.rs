@@ -349,13 +349,12 @@ pub enum UiRequest {
 
     /// Open a URL in the user's browser.
     ///
-    /// Exists for the device-code sign-in screen (§3a): the verification page
-    /// is the one place aibo sends the user out of the app, and asking them to
-    /// transcribe `auth.openai.com/codex/device` alongside a ten-character code
-    /// is two chances to mistype instead of one.
+    /// Used for the device-code sign-in screen (§3a) and the two fixed release
+    /// download URLs in About. The value always comes from a product constant,
+    /// never captured text or model output.
     OpenUrl {
-        /// The URL. Only ever a constant from the provider crate — never
-        /// anything derived from a model response or captured content (§5).
+        /// The URL. Never anything derived from a model response or captured
+        /// content (§5).
         url: String,
     },
 
