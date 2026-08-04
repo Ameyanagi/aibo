@@ -240,6 +240,10 @@ pub enum Key {
     ActionOpenSettings,
     /// Copy a redacted diagnostics bundle (§13, §19).
     ActionCopyDiagnostics,
+    /// Download the newest non-prerelease build.
+    ActionUpdateStable,
+    /// Download the rolling development build.
+    ActionUpdateNightly,
     /// Cancel in-flight work.
     ActionCancel,
     /// Approve a tool call once.
@@ -578,6 +582,10 @@ pub enum Key {
     SettingsHistory,
     /// Section: about and licence.
     SettingsAbout,
+    /// About heading for release-stream controls.
+    SettingsUpdatesTitle,
+    /// Explains stable versus nightly updates.
+    SettingsUpdatesHint,
     /// Section: language.
     SettingsLanguage,
     /// Section: appearance.
@@ -807,6 +815,8 @@ fn en(key: Key) -> &'static str {
         K::ActionTrimSelection => "Trim selection",
         K::ActionOpenSettings => "Open settings",
         K::ActionCopyDiagnostics => "Copy diagnostics",
+        K::ActionUpdateStable => "Latest stable",
+        K::ActionUpdateNightly => "Nightly",
         K::ActionCancel => "Cancel",
         K::ActionApprove => "Approve",
         K::ActionApproveSession => "Approve for session",
@@ -823,7 +833,7 @@ fn en(key: Key) -> &'static str {
         K::ActionCopied => "✓ copied",
         K::ActionNewChat => "New chat",
         K::FinderPlaceholder => "search files — romaji finds Japanese names",
-        K::ActionAttachFile => "Attach file",
+        K::ActionAttachFile => "Insert file path",
         K::ToastFileAttached => "Attached {}.",
         K::ToastFileAttachFailed => "Could not read {}.",
         K::ActionDictate => "Dictate",
@@ -967,6 +977,10 @@ fn en(key: Key) -> &'static str {
         K::SettingsActions => "Actions",
         K::SettingsHistory => "History",
         K::SettingsAbout => "About",
+        K::SettingsUpdatesTitle => "Updates",
+        K::SettingsUpdatesHint => {
+            "Choose stable for normal use, or nightly for the newest fixes and features. Your settings and history are preserved."
+        }
         K::SettingsLanguage => "Language",
         K::SettingsAppearance => "Appearance",
         K::AppearanceSystem => "Match the system",
@@ -1106,6 +1120,8 @@ fn ja(key: Key) -> &'static str {
         K::ActionTrimSelection => "選択範囲を短縮",
         K::ActionOpenSettings => "設定を開く",
         K::ActionCopyDiagnostics => "診断情報をコピー",
+        K::ActionUpdateStable => "最新の安定版",
+        K::ActionUpdateNightly => "ナイトリー",
         K::ActionCancel => "キャンセル",
         K::ActionApprove => "許可",
         K::ActionApproveSession => "このセッション中は許可",
@@ -1122,7 +1138,7 @@ fn ja(key: Key) -> &'static str {
         K::ActionCopied => "✓ コピーしました",
         K::ActionNewChat => "新しいチャット",
         K::FinderPlaceholder => "ファイルを検索 — ローマ字でも探せます",
-        K::ActionAttachFile => "ファイルを添付",
+        K::ActionAttachFile => "ファイルパスを入力",
         K::ToastFileAttached => "{} を添付しました。",
         K::ToastFileAttachFailed => "{} を読み込めませんでした。",
         K::ActionDictate => "音声入力",
@@ -1274,6 +1290,10 @@ fn ja(key: Key) -> &'static str {
         K::SettingsActions => "アクション",
         K::SettingsHistory => "履歴",
         K::SettingsAbout => "情報",
+        K::SettingsUpdatesTitle => "アップデート",
+        K::SettingsUpdatesHint => {
+            "通常は安定版を、最新の修正や機能を試す場合はナイトリーを選択してください。設定と履歴は保持されます。"
+        }
         K::SettingsLanguage => "言語",
         K::SettingsAppearance => "外観",
         K::AppearanceSystem => "システムに合わせる",

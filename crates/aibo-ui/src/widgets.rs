@@ -579,12 +579,11 @@ pub fn action_list<'a, Message: Clone + 'a>(actions: Vec<Action<Message>>) -> El
         } else {
             theme::text_accent
         };
-        let label = row![
-            text(action.key).size(type_scale::META).style(key_style),
-            text(i18n::t(action.label)).size(type_scale::META),
-        ]
-        .spacing(space(1.5))
-        .align_y(Alignment::Center);
+        let mut label = row![].spacing(space(1.5)).align_y(Alignment::Center);
+        if !action.key.is_empty() {
+            label = label.push(text(action.key).size(type_scale::META).style(key_style));
+        }
+        label = label.push(text(i18n::t(action.label)).size(type_scale::META));
 
         // The overlay's footer is a compact keyboard legend, not a toolbar.
         // The audit pass forced these to 44 pt, which becomes an 88 px wall on

@@ -87,6 +87,33 @@ jobs:
       - name: Build the release binary
         run: cargo build --release --bin aibo --locked
 
+      # Compile the installer on every PR as well as in the release workflow.
+      # Otherwise a typo in the Inno script can pass CI and fail only after a
+      # release is being published.
+      - name: Build the per-user Windows installer
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          New-Item -ItemType Directory -Force 'dist' | Out-Null
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            throw "Inno Setup compiler was not found at $iscc"
+          }
+
+          $source = (Resolve-Path '${{ matrix.path }}').Path
+          $output = (Resolve-Path 'dist').Path
+          $icon = (Resolve-Path 'packaging/windows/aibo.ico').Path
+          & $iscc '/DMyAppVersion=0.0.0-ci' "/DMySourceExe=$source" `
+            "/DMyOutputDir=$output" "/DMySetupIcon=$icon" `
+            'packaging/windows/aibo.iss'
+          if ($LASTEXITCODE -ne 0) {
+            throw "Inno Setup failed with exit code $LASTEXITCODE"
+          }
+          if (-not (Test-Path 'dist/aibo-windows-x86_64-setup.exe')) {
+            throw 'Inno Setup did not produce the expected installer'
+          }
+
       # §15's budget is **60 MB installed, stretch 40** — not the 25 MB an
       # earlier draft carried and this step used to check. §15's own note says
       # 25 MB "was not achievable with wgpu + SQLCipher/OpenSSL + bundled
@@ -109,14 +136,23 @@ jobs:
             echo ":warning: over the 40 MB stretch by $(( mb - 40 )) MB" >> "$GITHUB_STEP_SUMMARY"
           fi
 
-      # Unsigned and un-notarised: §19 puts Authenticode, notarisation and the
-      # installers in P8. This is a build artefact for testing, not a release —
-      # macOS Gatekeeper and Windows SmartScreen will both object.
+      # Unsigned and un-notarised: §19 still puts Authenticode and notarisation
+      # in P8. This is a build artefact for testing, not a release — macOS
+      # Gatekeeper and Windows SmartScreen will both object.
       - name: Upload the binary
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.path }}
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload the Windows installer
+        if: runner.os == 'Windows'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: aibo-windows-x86_64-setup
+          path: dist/aibo-windows-x86_64-setup.exe
           if-no-files-found: error
           retention-days: 14
 

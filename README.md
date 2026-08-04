@@ -24,8 +24,8 @@ measured in milliseconds: no dock icon, no browser tab, no context switch.
   icons; `⌘D` pins favourites, and pins persist.
 - **Dictation** — `⌘L` streams the microphone through OpenAI realtime
   transcription (`gpt-live-transcribe`) into the composer. Works in Japanese.
-- **`@` file attach** — type `@` in the composer to fuzzy-find a file by
-  name and attach its text. Matching is [yuru](https://crates.io/crates/yuru-core),
+- **`@` file path completion** — type `@` in the composer to fuzzy-find a file
+  by name and insert its path. Matching is [yuru](https://crates.io/crates/yuru-core),
   so romaji finds kanji and kana filenames: `toukei` → `統計資料.pdf`.
 - **Agent runs** — toggle agent mode with `⌘J` (or prefix one request with
   `/agent`) and submissions run a minimal coding agent (pi's harness:
@@ -71,6 +71,18 @@ Recording for region capture. Each is optional — the panel works without it,
 minus that feature. Electron and Chrome apps expose no selection until
 `allow_ax_tree_activation` is enabled in settings; it is off by default
 because that flag can degrade window behaviour in those apps.
+
+## Install and update on Windows
+
+Use `aibo-windows-x86_64-setup.exe` from a release. It installs only for the
+current user under `%LOCALAPPDATA%\Programs\aibo`, creates a Start menu entry,
+and does not require administrator rights. The portable
+`aibo-windows-x86_64.exe` remains available.
+
+Settings → About offers two update streams: **Latest stable** follows the
+newest non-prerelease release, while **Nightly** follows the rolling `dev`
+release. Running either downloaded installer updates the existing per-user
+installation without removing configuration or history.
 
 ## Configuration
 

@@ -2106,24 +2106,12 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
                 let stripped = stripped.to_owned();
                 state.panel.set_input(&stripped);
             }
-            if state.panel.agent_mode {
-                // Agent mode wants the *path*, not the bytes (owner,
-                // 2026-08-02: "@ shows could not read test.dmg — give it a
-                // path in agent mode"). The agent's own tools read what it
-                // needs, which also makes binaries attachable at all.
-                let mut input = state.panel.input.clone();
-                if !input.is_empty() && !input.ends_with(char::is_whitespace) {
-                    input.push(' ');
-                }
-                input.push_str(&file.path);
-                input.push(' ');
-                state.panel.set_input(&input);
-            } else {
-                state.send(UiRequest::AttachFile {
-                    session: state.panel.session,
-                    path: file.path,
-                });
-            }
+            // `@` is path completion in both chat and agent mode. Reading a
+            // chosen file asynchronously made binary formats such as DOCX end
+            // in "could not read", and made the same gesture mean content in
+            // one mode but a path in the other. The path is useful visible
+            // input in either mode and selecting it is never a submission.
+            append_path_to_composer(&mut state.panel, &file.path);
             state.panel.file_finder.close();
             resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
         }
@@ -3115,6 +3103,12 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
         M::OpenDeviceUrl => {
             state.send(UiRequest::OpenUrl {
                 url: settings::codex_text::VERIFICATION_URL.to_owned(),
+            });
+            Task::none()
+        }
+        M::DownloadUpdate(channel) => {
+            state.send(UiRequest::OpenUrl {
+                url: channel.download_url().to_owned(),
             });
             Task::none()
         }
@@ -4180,6 +4174,21 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
     }
 }
 
+/// Put a deliberately selected file path at the caret's logical end.
+///
+/// `@` completion uses paths in both chat and agent mode. Keeping this as one
+/// route means file format and mode cannot silently change what the gesture
+/// inserts.
+fn append_path_to_composer(panel: &mut panel::PanelState, path: &str) {
+    let mut input = panel.input.clone();
+    if !input.is_empty() && !input.ends_with(char::is_whitespace) {
+        input.push(' ');
+    }
+    input.push_str(path);
+    input.push(' ');
+    panel.set_input(&input);
+}
+
 /// What the panel may offer to attach, from the capture's clipboard snapshot.
 ///
 /// **This is the one place ambient clipboard state enters the panel, and it
@@ -5004,6 +5013,23 @@ mod tests {
     }
 
     #[test]
+    fn each_update_choice_opens_its_exact_release_stream() {
+        let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+
+        for channel in [
+            settings::UpdateChannel::Stable,
+            settings::UpdateChannel::Nightly,
+        ] {
+            let _ = settings_update(&mut state, settings::Message::DownloadUpdate(channel));
+            assert!(matches!(
+                received.try_recv(),
+                Ok(UiRequest::OpenUrl { url }) if url == channel.download_url()
+            ));
+        }
+    }
+
+    #[test]
     fn stale_persistence_failures_cannot_overwrite_newer_file_root_edits() {
         let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
         let (mut state, _task) = boot(UiConfig::default(), requests);
@@ -5404,6 +5430,55 @@ mod tests {
 
         assert!(state.panel.file_finder.results().is_empty());
         assert_eq!(state.panel.input, "typed");
+    }
+
+    /// Selecting an `@` result is completion, not submission. Windows used to
+    /// deliver Enter to both the finder's `on_submit` handler and the global
+    /// window shortcut: the first event closed the finder, then the second saw
+    /// an ordinary composer and submitted it. One owner report involved a
+    /// binary Japanese-named document, so keep that exact shape in the test.
+    #[test]
+    fn finder_enter_only_inserts_the_path_in_every_mode() {
+        let path = r"C:\Users\ryuichi\Documents\テスト2.docx";
+
+        for agent_mode in [false, true] {
+            let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+            let (mut state, _boot) = boot(UiConfig::default(), requests);
+            while received.try_recv().is_ok() {}
+
+            state.panel_visible = true;
+            state.panel.phase = Phase::Idle;
+            state.panel.agent_mode = agent_mode;
+            state.panel.set_input("inspect @");
+            state.panel.file_finder.open();
+            state
+                .panel
+                .file_finder
+                .set_candidates(vec![crate::bridge::FileCandidate {
+                    display: "~/Documents/テスト2.docx".to_owned(),
+                    path: path.to_owned(),
+                }]);
+
+            let panel_window = state.panel_window;
+            let _ = update(
+                &mut state,
+                Message::WindowKey(
+                    panel_window,
+                    WindowChord::Enter {
+                        command: false,
+                        shift: false,
+                    },
+                ),
+            );
+
+            assert_eq!(state.panel.input, format!("inspect {path} "));
+            assert!(!state.panel.file_finder.open);
+            assert!(
+                received.try_recv().is_err(),
+                "@ completion must send neither AttachFile nor Submit (agent={agent_mode})"
+            );
+            assert!(matches!(state.panel.phase, Phase::Idle));
+        }
     }
 
     #[test]

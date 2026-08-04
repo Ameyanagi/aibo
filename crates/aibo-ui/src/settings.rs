@@ -326,6 +326,40 @@ pub struct PermissionRow {
     pub status: PermissionStatus,
 }
 
+/// The release stream selected from About.
+///
+/// Stable follows GitHub's newest non-prerelease release. Nightly follows the
+/// rolling `dev` release, whose URL stays fixed as CI replaces its assets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UpdateChannel {
+    /// Newest non-prerelease version.
+    Stable,
+    /// Rolling build of `main`.
+    Nightly,
+}
+
+impl UpdateChannel {
+    /// Direct download for the installer/image used by this platform.
+    pub const fn download_url(self) -> &'static str {
+        match (self, cfg!(target_os = "windows"), cfg!(target_os = "macos")) {
+            (Self::Stable, true, _) => {
+                "https://github.com/Ameyanagi/aibo/releases/latest/download/aibo-windows-x86_64-setup.exe"
+            }
+            (Self::Nightly, true, _) => {
+                "https://github.com/Ameyanagi/aibo/releases/download/dev/aibo-windows-x86_64-setup.exe"
+            }
+            (Self::Stable, _, true) => {
+                "https://github.com/Ameyanagi/aibo/releases/latest/download/aibo-macos-aarch64.dmg"
+            }
+            (Self::Nightly, _, true) => {
+                "https://github.com/Ameyanagi/aibo/releases/download/dev/aibo-macos-aarch64.dmg"
+            }
+            (Self::Stable, _, _) => "https://github.com/Ameyanagi/aibo/releases/latest",
+            (Self::Nightly, _, _) => "https://github.com/Ameyanagi/aibo/releases/tag/dev",
+        }
+    }
+}
+
 /// Settings window state.
 #[derive(Debug, Clone, Default)]
 pub struct SettingsState {
@@ -751,6 +785,8 @@ pub enum Message {
     OpenDeviceUrl,
     /// Copy a redacted diagnostics bundle (§19).
     CopyDiagnostics,
+    /// Download an update from the selected release stream.
+    DownloadUpdate(UpdateChannel),
     /// Enable local SQLCipher history after an explicit user gesture.
     InitializeHistory,
     /// Copy the one-time recovery code.
@@ -2168,13 +2204,31 @@ const fn selection_marker(selected: bool) -> &'static str {
 }
 
 fn about<'a>(_state: &'a SettingsState) -> Element<'a, Message> {
+    let version = option_env!("AIBO_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
     column![
         text(i18n::t(Key::AppName))
             .size(type_scale::HEADING)
             .style(theme::text_primary),
-        text(env!("CARGO_PKG_VERSION"))
+        text(version).size(type_scale::META).style(theme::text_dim),
+        text(i18n::t(Key::SettingsUpdatesTitle))
+            .size(type_scale::BODY)
+            .style(theme::text_primary),
+        text(i18n::t(Key::SettingsUpdatesHint))
             .size(type_scale::META)
             .style(theme::text_dim),
+        widgets::action_list(vec![
+            Action::new(
+                Key::ActionUpdateStable,
+                "",
+                Message::DownloadUpdate(UpdateChannel::Stable),
+            )
+            .primary(),
+            Action::new(
+                Key::ActionUpdateNightly,
+                "",
+                Message::DownloadUpdate(UpdateChannel::Nightly),
+            ),
+        ]),
         widgets::action_list(vec![Action::new(
             Key::ActionCopyDiagnostics,
             widgets::primary_shortcut("⌘C", "Ctrl+C"),
@@ -2198,6 +2252,24 @@ pub const BINDABLE_ROLES: [Role; 5] = [
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn update_channels_are_distinct_and_point_at_release_artifacts() {
+        let stable = UpdateChannel::Stable.download_url();
+        let nightly = UpdateChannel::Nightly.download_url();
+
+        assert_ne!(stable, nightly);
+        assert!(stable.contains("/releases/latest"));
+        assert!(nightly.contains("/releases/download/dev/") || nightly.ends_with("/tag/dev"));
+
+        if cfg!(target_os = "windows") {
+            assert!(stable.ends_with("aibo-windows-x86_64-setup.exe"));
+            assert!(nightly.ends_with("aibo-windows-x86_64-setup.exe"));
+        } else if cfg!(target_os = "macos") {
+            assert!(stable.ends_with("aibo-macos-aarch64.dmg"));
+            assert!(nightly.ends_with("aibo-macos-aarch64.dmg"));
+        }
+    }
 
     /// Every backend the picker offers must be a spelling `config.toml`'s
     /// loader accepts.
