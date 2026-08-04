@@ -1135,9 +1135,6 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
 
         Message::PanelFrameFallback(placement) => {
             let size = Size::new(placement.size.0, placement.size.1);
-            if state.panel_dragged {
-                return window::resize(state.panel_window, size);
-            }
             let position = Point::new(placement.position.0, placement.position.1);
             window::resize(state.panel_window, size)
                 .chain(window::move_to(state.panel_window, position))
@@ -4390,9 +4387,7 @@ fn resize_panel_if_visible(state: &mut Aibo) -> Task<Message> {
         return backdrop;
     }
     let size = Size::new(placement.size.0, placement.size.1);
-    if state.panel_dragged
-        || previous.is_some_and(|previous| previous.position == placement.position)
-    {
+    if previous.is_some_and(|previous| previous.position == placement.position) {
         // A size-only change should travel through iced/winit so the renderer's
         // client bounds and AppKit's frame advance together. Calling AppKit
         // directly here briefly stretched the previous Metal frame, which is
@@ -6429,6 +6424,29 @@ mod tests {
 
         assert!(state.panel_dragged);
         assert!(task.units() > 0, "the native window drag must be requested");
+    }
+
+    #[test]
+    fn a_dragged_panel_fallback_still_applies_an_edge_clamped_position() {
+        let mut state = app();
+        let _ = update(&mut state, Message::Ready);
+        state.panel_dragged = true;
+        let placement = Placement {
+            display_id: 1,
+            position: (320.0, 180.0),
+            size: (720.0, 520.0),
+            scale_factor: 2.0,
+            anchored: false,
+            assumed: false,
+        };
+
+        let task = update(&mut state, Message::PanelFrameFallback(placement));
+
+        assert_eq!(
+            task.units(),
+            2,
+            "fallback must resize and move even after a user drag"
+        );
     }
 
     /// The re-probe that follows every show must not re-show the panel when
