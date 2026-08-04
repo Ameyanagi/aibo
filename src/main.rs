@@ -68,6 +68,7 @@ use anyhow::Context as _;
 mod files;
 mod skills;
 mod stt;
+mod updater;
 mod workdirs;
 
 /// How long the tokio runtime is given to finish in-flight work at shutdown.
@@ -379,6 +380,11 @@ mod paths {
         /// pid ledger for orphan cleanup (§6).
         pub fn children(&self) -> PathBuf {
             self.root.join("children.pids")
+        }
+
+        /// Staging area for checksum-verified release installers/images.
+        pub fn updates_dir(&self) -> PathBuf {
+            self.root.join("updates")
         }
 
         /// The user's TOML configuration. Written via [`atomic_write`].
@@ -2011,6 +2017,28 @@ mod config_file {
         write_ui_key(path, "appearance", Some(&quote(tag)))
     }
 
+    /// Persist automatic-update enablement and stream as one atomic rewrite.
+    pub fn write_update_preferences(
+        path: &Path,
+        enabled: bool,
+        channel: aibo_ui::bridge::UpdateChannel,
+    ) -> io::Result<()> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+        let updated =
+            splice_key_in_table(&existing, "ui", "auto_update", Some(&enabled.to_string()));
+        let updated = splice_key_in_table(
+            &updated,
+            "ui",
+            "update_channel",
+            Some(&quote(channel.tag())),
+        );
+        crate::paths::atomic_write(path, updated.as_bytes())
+    }
+
     /// Persist whether ⏎ ends a live dictation turn.
     pub fn write_stt_end_on_send(path: &Path, enabled: bool) -> io::Result<()> {
         let existing = match std::fs::read_to_string(path) {
@@ -2507,6 +2535,26 @@ mod config_file {
             assert!(updated.contains("language = \"ja\""));
             assert!(!updated.contains("language = \"en\""));
             assert!(updated.contains("[pins]"));
+        }
+
+        #[test]
+        fn update_preferences_are_one_atomic_ui_edit() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(
+                &path,
+                "[ui]\nlanguage = \"ja\"\nauto_update = false\nupdate_channel = \"stable\"\n",
+            )
+            .unwrap();
+
+            write_update_preferences(&path, true, aibo_ui::bridge::UpdateChannel::Nightly).unwrap();
+            let written = std::fs::read_to_string(path).unwrap();
+            assert!(written.contains("language = \"ja\""));
+            assert!(written.contains("auto_update = true"));
+            assert!(written.contains("update_channel = \"nightly\""));
+            let parsed = aibo_session::Config::from_toml_str(&written).unwrap();
+            assert!(parsed.ui.auto_update);
+            assert_eq!(parsed.ui.update_channel.as_deref(), Some("nightly"));
         }
 
         #[test]
@@ -3082,7 +3130,7 @@ mod runtime {
         AgentEvent, AgentSink, Capture, Config, Engine, EventSink, Outcome, SessionEvent,
         Submission,
     };
-    use aibo_ui::bridge::PersistenceScope;
+    use aibo_ui::bridge::{PersistenceScope, UpdateChannel, UpdateState};
     use aibo_ui::settings::CodexPhase;
     use aibo_ui::{Lang, ModelOption, SessionId, UiEvent, UiRequest};
     use futures::StreamExt as _;
@@ -3423,6 +3471,14 @@ mod runtime {
             generation: u64,
             catalogue: Box<aibo_provider::ModelCatalogue>,
         },
+        /// A release check and, when needed, verified download completed.
+        UpdateFinished {
+            generation: u64,
+            channel: UpdateChannel,
+            result: Result<crate::updater::Outcome, String>,
+        },
+        /// A newer release was found and its artifact is about to download.
+        UpdateDownloading { generation: u64 },
     }
 
     /// What the backend remembers about the Codex login (§3a).
@@ -3733,6 +3789,16 @@ mod runtime {
         /// answer ([`UiRequest::Approve`]) resolves it. Dropping an entry —
         /// cancellation, shutdown — resolves as Deny, never as a hang.
         pending_approvals: PendingApprovals,
+        /// Whether checks happen at startup and once per day.
+        auto_update: bool,
+        /// Release stream currently selected in settings.
+        update_channel: UpdateChannel,
+        /// Prevent overlapping checks/downloads.
+        update_busy: bool,
+        /// Invalidates results from a release stream selected earlier.
+        update_generation: u64,
+        /// Installer/image whose checksum has been verified.
+        ready_update: Option<crate::updater::VerifiedUpdate>,
     }
 
     /// Shared parking lot for in-flight approval prompts.
@@ -3828,6 +3894,17 @@ mod runtime {
             let engine = bootstrap.engine();
             let onboarding_required = engine.providers().ids().is_empty();
             let startup_history_ready = bootstrap.history_ready();
+            let auto_update = config.ui.auto_update;
+            let update_channel = UpdateChannel::from_tag(config.ui.update_channel.as_deref())
+                .unwrap_or_else(|| {
+                    if option_env!("AIBO_BUILD_VERSION")
+                        .is_some_and(|version| version.contains("-dev."))
+                    {
+                        UpdateChannel::Nightly
+                    } else {
+                        UpdateChannel::Stable
+                    }
+                });
             Self {
                 platform: platform_backend(&config),
                 engine,
@@ -3851,6 +3928,11 @@ mod runtime {
                 stt_backend: config.stt.backend.clone(),
                 steering: std::sync::Arc::new(std::sync::Mutex::new(HashMap::new())),
                 pending_approvals: Arc::new(std::sync::Mutex::new(HashMap::new())),
+                auto_update,
+                update_channel,
+                update_busy: false,
+                update_generation: 0,
+                ready_update: None,
             }
         }
 
@@ -3867,6 +3949,13 @@ mod runtime {
             // Ask every configured provider what it serves, now that there is
             // somewhere to deliver the answer.
             self.spawn_model_refresh();
+            if self.auto_update {
+                self.spawn_update_check(internal_tx.clone());
+            }
+            let mut update_timer = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+            update_timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            // The startup check above owns the immediate tick.
+            update_timer.tick().await;
 
             // The first thing the UI should know is which providers exist and
             // what aibo currently believes about them.
@@ -3950,6 +4039,8 @@ mod runtime {
                     }),
                     stt_backend: self.stt_backend.clone(),
                     stt_end_on_send: config.stt.end_on_send.unwrap_or(true),
+                    auto_update: self.auto_update,
+                    update_channel: self.update_channel,
                 }
             };
             if self.events.send(startup_settings).await.is_err() {
@@ -3982,6 +4073,9 @@ mod runtime {
                         Some(request) => self.handle(request, &internal_tx).await,
                     },
                     Some(message) = internal_rx.recv() => self.handle_internal(message).await,
+                    _ = update_timer.tick(), if self.auto_update => {
+                        self.spawn_update_check(internal_tx.clone());
+                    },
                 }
             }
 
@@ -4069,6 +4163,32 @@ mod runtime {
                 generation,
                 succeeded,
             });
+        }
+
+        fn spawn_update_check(&mut self, internal: Sender<Internal>) {
+            if self.update_busy {
+                return;
+            }
+            self.update_busy = true;
+            self.update_generation = self.update_generation.wrapping_add(1);
+            let generation = self.update_generation;
+            self.emit(UiEvent::UpdateState(UpdateState::Checking));
+            let channel = self.update_channel;
+            let destination = self.bootstrap.paths().updates_dir();
+            tokio::spawn(crate::diagnostics::supervise("updater", async move {
+                let progress = internal.clone();
+                let result = crate::updater::check_and_download(channel, &destination, move || {
+                    let _ = progress.try_send(Internal::UpdateDownloading { generation });
+                })
+                .await;
+                let _ = internal
+                    .send(Internal::UpdateFinished {
+                        generation,
+                        channel,
+                        result,
+                    })
+                    .await;
+            }));
         }
 
         async fn handle(&mut self, request: UiRequest, internal: &Sender<Internal>) {
@@ -4217,6 +4337,46 @@ mod runtime {
                         generation,
                         result.is_ok(),
                     );
+                }
+
+                UiRequest::SetUpdatePreferences {
+                    generation,
+                    enabled,
+                    channel,
+                } => {
+                    let result = crate::config_file::write_update_preferences(
+                        &self.bootstrap.paths().config(),
+                        enabled,
+                        channel,
+                    );
+                    if let Err(error) = &result {
+                        tracing::warn!(%error, "could not persist update preferences");
+                    } else {
+                        self.auto_update = enabled;
+                        if self.update_channel != channel {
+                            self.update_channel = channel;
+                            self.ready_update = None;
+                            self.update_generation = self.update_generation.wrapping_add(1);
+                            self.update_busy = false;
+                        }
+                    }
+                    self.persistence_result(PersistenceScope::Updates, generation, result.is_ok());
+                }
+
+                UiRequest::CheckForUpdates => self.spawn_update_check(internal.clone()),
+
+                UiRequest::InstallUpdate => {
+                    let result = match self.ready_update.as_ref() {
+                        Some(update) => crate::updater::install(update).await,
+                        None => Err("no verified update is ready".to_owned()),
+                    };
+                    match result {
+                        Ok(()) => self.emit(UiEvent::UpdateState(UpdateState::Installing)),
+                        Err(error) => {
+                            tracing::warn!(%error, "could not start the update installer");
+                            self.emit(UiEvent::UpdateState(UpdateState::Failed));
+                        }
+                    }
                 }
 
                 // §P9+ @ file mentions. The walk and the read are blocking
@@ -4719,6 +4879,38 @@ mod runtime {
                             tracing::error!(%error, "could not initialize encrypted history");
                             let _ = self.events.send(UiEvent::HistorySetupFailed).await;
                         }
+                    }
+                }
+                Internal::UpdateFinished {
+                    generation,
+                    channel,
+                    result,
+                } => {
+                    if generation != self.update_generation || channel != self.update_channel {
+                        tracing::debug!(?channel, "discarded update from an old release stream");
+                        return;
+                    }
+                    self.update_busy = false;
+                    match result {
+                        Ok(crate::updater::Outcome::UpToDate) => {
+                            self.ready_update = None;
+                            self.emit(UiEvent::UpdateState(UpdateState::UpToDate));
+                        }
+                        Ok(crate::updater::Outcome::Ready(update)) => {
+                            let version = update.version.clone();
+                            tracing::info!(%version, sha256 = %update.sha256, "update downloaded and verified");
+                            self.ready_update = Some(update);
+                            self.emit(UiEvent::UpdateState(UpdateState::Ready { version }));
+                        }
+                        Err(error) => {
+                            tracing::warn!(%error, "update check or download failed");
+                            self.emit(UiEvent::UpdateState(UpdateState::Failed));
+                        }
+                    }
+                }
+                Internal::UpdateDownloading { generation } => {
+                    if generation == self.update_generation {
+                        self.emit(UiEvent::UpdateState(UpdateState::Downloading));
                     }
                 }
             }

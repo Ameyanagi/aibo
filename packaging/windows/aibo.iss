@@ -57,4 +57,7 @@ Name: "{autoprograms}\aibo"; Filename: "{app}\aibo.exe"; WorkingDir: "{app}"
 Name: "{autodesktop}\aibo"; Filename: "{app}\aibo.exe"; WorkingDir: "{app}"; Tasks: desktopicon
 
 [Run]
-Filename: "{app}\aibo.exe"; Description: "Launch aibo"; Flags: nowait postinstall skipifsilent
+; The updater invokes Setup silently after an explicit in-app confirmation.
+; Let that path relaunch the app too; `skipifsilent` left a successful update
+; looking like a crash because nothing came back after the old process exited.
+Filename: "{app}\aibo.exe"; Description: "Launch aibo"; Flags: nowait postinstall

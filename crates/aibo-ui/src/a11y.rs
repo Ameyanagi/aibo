@@ -37,6 +37,8 @@ const SETTINGS_STATUS: NodeId = NodeId(80);
 const SETTINGS_PRIMARY_ACTION: NodeId = NodeId(81);
 const SETTINGS_SECONDARY_ACTION: NodeId = NodeId(82);
 const SETTINGS_TERTIARY_ACTION: NodeId = NodeId(83);
+const SETTINGS_QUATERNARY_ACTION: NodeId = NodeId(84);
+const SETTINGS_QUINARY_ACTION: NodeId = NodeId(85);
 const SETTINGS_PERMISSION_BASE: u64 = 100;
 const SETTINGS_LANGUAGE_BASE: u64 = 120;
 
@@ -217,8 +219,40 @@ pub fn settings_tree(
                 SETTINGS_TERTIARY_ACTION,
                 interactive_node(
                     Role::Button,
-                    i18n::t(Key::ActionCopyDiagnostics),
+                    i18n::t(if state.auto_update {
+                        Key::ActionDisableAutoUpdates
+                    } else {
+                        Key::ActionEnableAutoUpdates
+                    }),
                     logical_rect(content_x, 212.0, 220.0, 44.0),
+                ),
+            ));
+            let mut update_action = interactive_node(
+                Role::Button,
+                i18n::t(
+                    if matches!(state.update_state, crate::bridge::UpdateState::Ready { .. }) {
+                        Key::ActionRestartAndUpdate
+                    } else {
+                        Key::ActionCheckForUpdates
+                    },
+                ),
+                logical_rect(content_x + 232.0, 212.0, 180.0, 44.0),
+            );
+            if matches!(
+                state.update_state,
+                crate::bridge::UpdateState::Checking
+                    | crate::bridge::UpdateState::Downloading
+                    | crate::bridge::UpdateState::Installing
+            ) {
+                update_action.set_disabled();
+            }
+            nodes.push((SETTINGS_QUATERNARY_ACTION, update_action));
+            nodes.push((
+                SETTINGS_QUINARY_ACTION,
+                interactive_node(
+                    Role::Button,
+                    i18n::t(Key::ActionCopyDiagnostics),
+                    logical_rect(content_x, 268.0, 220.0, 44.0),
                 ),
             ));
             content_children.extend([
@@ -226,6 +260,8 @@ pub fn settings_tree(
                 SETTINGS_PRIMARY_ACTION,
                 SETTINGS_SECONDARY_ACTION,
                 SETTINGS_TERTIARY_ACTION,
+                SETTINGS_QUATERNARY_ACTION,
+                SETTINGS_QUINARY_ACTION,
             ]);
         }
         Section::Files => {
@@ -643,12 +679,22 @@ pub fn settings_message(
             }
         }
         SETTINGS_PRIMARY_ACTION if state.section == Section::About => Some(
-            settings::Message::DownloadUpdate(settings::UpdateChannel::Stable),
+            settings::Message::SetUpdateChannel(crate::bridge::UpdateChannel::Stable),
         ),
         SETTINGS_SECONDARY_ACTION if state.section == Section::About => Some(
-            settings::Message::DownloadUpdate(settings::UpdateChannel::Nightly),
+            settings::Message::SetUpdateChannel(crate::bridge::UpdateChannel::Nightly),
         ),
         SETTINGS_TERTIARY_ACTION if state.section == Section::About => {
+            Some(settings::Message::AutoUpdateToggle(!state.auto_update))
+        }
+        SETTINGS_QUATERNARY_ACTION if state.section == Section::About => match state.update_state {
+            crate::bridge::UpdateState::Ready { .. } => Some(settings::Message::InstallUpdate),
+            crate::bridge::UpdateState::Checking
+            | crate::bridge::UpdateState::Downloading
+            | crate::bridge::UpdateState::Installing => None,
+            _ => Some(settings::Message::CheckForUpdates),
+        },
+        SETTINGS_QUINARY_ACTION if state.section == Section::About => {
             Some(settings::Message::CopyDiagnostics)
         }
         node => permission_for_node(node)
@@ -861,18 +907,26 @@ mod tests {
         about.section = Section::About;
         assert!(matches!(
             settings_message(&about, &request(SETTINGS_PRIMARY_ACTION, Action::Click)),
-            Some(settings::Message::DownloadUpdate(
-                settings::UpdateChannel::Stable
+            Some(settings::Message::SetUpdateChannel(
+                crate::bridge::UpdateChannel::Stable
             ))
         ));
         assert!(matches!(
             settings_message(&about, &request(SETTINGS_SECONDARY_ACTION, Action::Click)),
-            Some(settings::Message::DownloadUpdate(
-                settings::UpdateChannel::Nightly
+            Some(settings::Message::SetUpdateChannel(
+                crate::bridge::UpdateChannel::Nightly
             ))
         ));
         assert!(matches!(
             settings_message(&about, &request(SETTINGS_TERTIARY_ACTION, Action::Click)),
+            Some(settings::Message::AutoUpdateToggle(true))
+        ));
+        assert!(matches!(
+            settings_message(&about, &request(SETTINGS_QUATERNARY_ACTION, Action::Click)),
+            Some(settings::Message::CheckForUpdates)
+        ));
+        assert!(matches!(
+            settings_message(&about, &request(SETTINGS_QUINARY_ACTION, Action::Click)),
             Some(settings::Message::CopyDiagnostics)
         ));
 

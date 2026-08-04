@@ -132,6 +132,7 @@ enigo = "0.6"                        # §8 [plan note: self-described early alph
 
 # --- updates ----------------------------------------------------------------
 ed25519-dalek = "2.2"                # §19 [plan note: prefer the 2.2 line over 3.0]
+sha2 = "0.10"
 
 # --- macOS ------------------------------------------------------------------
 objc2 = "0.6"
@@ -231,6 +232,7 @@ keyring = { workspace = true }
 # `aibo_provider::StoredTokens` is `serde`-shaped; credential storage holds one
 # JSON document per token pair.
 serde_json = { workspace = true }
+sha2 = { workspace = true }
 
 # §P9+ dictation: microphone → OpenAI realtime transcription (`src/stt.rs`).
 cpal = { workspace = true }

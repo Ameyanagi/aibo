@@ -84,6 +84,10 @@ enum PersistenceSnapshot {
         hard_stop: bool,
         spend_fraction: Option<f32>,
     },
+    Updates {
+        enabled: bool,
+        channel: crate::bridge::UpdateChannel,
+    },
 }
 
 struct PendingPersistence {
@@ -501,6 +505,8 @@ fn is_critical_request(request: &UiRequest) -> bool {
             | UiRequest::SetAxTreeActivation { .. }
             | UiRequest::SetFileRoots { .. }
             | UiRequest::SetMonthlyBudget { .. }
+            | UiRequest::SetUpdatePreferences { .. }
+            | UiRequest::InstallUpdate
             | UiRequest::Quit
     )
 }
@@ -1089,6 +1095,7 @@ fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) 
     // True until `SettingsLoaded` says otherwise: ending dictation on ⏎ is
     // the default, and the brief pre-hydration window must agree with it.
     state.settings.stt_end_on_send = true;
+    state.settings.auto_update = true;
 
     (
         state,
@@ -2907,6 +2914,10 @@ fn apply_persistence_result(
             state.settings.budget_hard_stop = hard_stop;
             state.settings.spend_fraction = spend_fraction;
         }
+        PersistenceSnapshot::Updates { enabled, channel } => {
+            state.settings.auto_update = enabled;
+            state.settings.update_channel = channel;
+        }
     }
     Task::none()
 }
@@ -3106,10 +3117,49 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
             });
             Task::none()
         }
-        M::DownloadUpdate(channel) => {
-            state.send(UiRequest::OpenUrl {
-                url: channel.download_url().to_owned(),
+        M::AutoUpdateToggle(enabled) => {
+            let generation = state.begin_persistence(
+                PersistenceScope::Updates,
+                PersistenceSnapshot::Updates {
+                    enabled: state.settings.auto_update,
+                    channel: state.settings.update_channel,
+                },
+            );
+            state.settings.auto_update = enabled;
+            state.send(UiRequest::SetUpdatePreferences {
+                generation,
+                enabled,
+                channel: state.settings.update_channel,
             });
+            if enabled {
+                state.send(UiRequest::CheckForUpdates);
+            }
+            Task::none()
+        }
+        M::SetUpdateChannel(channel) => {
+            let generation = state.begin_persistence(
+                PersistenceScope::Updates,
+                PersistenceSnapshot::Updates {
+                    enabled: state.settings.auto_update,
+                    channel: state.settings.update_channel,
+                },
+            );
+            state.settings.update_channel = channel;
+            state.settings.update_state = crate::bridge::UpdateState::Idle;
+            state.send(UiRequest::SetUpdatePreferences {
+                generation,
+                enabled: state.settings.auto_update,
+                channel,
+            });
+            state.send(UiRequest::CheckForUpdates);
+            Task::none()
+        }
+        M::CheckForUpdates => {
+            state.send(UiRequest::CheckForUpdates);
+            Task::none()
+        }
+        M::InstallUpdate => {
+            state.send(UiRequest::InstallUpdate);
             Task::none()
         }
         M::SetAppearance(preference) => {
@@ -4118,6 +4168,8 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             budget,
             stt_backend,
             stt_end_on_send,
+            auto_update,
+            update_channel,
         } => {
             state.settings.ax_tree_activation = ax_tree_activation;
             state.settings.stt_end_on_send = stt_end_on_send;
@@ -4126,6 +4178,8 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             state.settings.file_roots = file_roots;
             state.settings.default_file_roots = default_file_roots;
             state.settings.budget_configured = budget.is_some();
+            state.settings.auto_update = auto_update;
+            state.settings.update_channel = update_channel;
             if let Some((limit_micros, warn_at_percent, hard_stop)) = budget {
                 // Micros back to whole units for the draft; trailing zeros
                 // trimmed so "20" round-trips as "20", not "20.000000".
@@ -4142,6 +4196,17 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 state.settings.budget_hard_stop = hard_stop;
             }
             Task::none()
+        }
+
+        UiEvent::UpdateState(update_state) => {
+            let installing = update_state == crate::bridge::UpdateState::Installing;
+            state.settings.update_state = update_state;
+            if installing {
+                state.send(UiRequest::Quit);
+                iced::exit()
+            } else {
+                Task::none()
+            }
         }
 
         UiEvent::DictationFailed { turn, failure } => {
@@ -4978,6 +5043,8 @@ mod tests {
                 budget: None,
                 stt_backend: None,
                 stt_end_on_send: true,
+                auto_update: true,
+                update_channel: crate::bridge::UpdateChannel::Stable,
             },
         );
 
@@ -5013,18 +5080,22 @@ mod tests {
     }
 
     #[test]
-    fn each_update_choice_opens_its_exact_release_stream() {
+    fn each_update_choice_is_persisted_and_checked() {
         let (requests, mut received) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
         let (mut state, _task) = boot(UiConfig::default(), requests);
 
         for channel in [
-            settings::UpdateChannel::Stable,
-            settings::UpdateChannel::Nightly,
+            crate::bridge::UpdateChannel::Stable,
+            crate::bridge::UpdateChannel::Nightly,
         ] {
-            let _ = settings_update(&mut state, settings::Message::DownloadUpdate(channel));
+            let _ = settings_update(&mut state, settings::Message::SetUpdateChannel(channel));
             assert!(matches!(
                 received.try_recv(),
-                Ok(UiRequest::OpenUrl { url }) if url == channel.download_url()
+                Ok(UiRequest::SetUpdatePreferences { channel: saved, .. }) if saved == channel
+            ));
+            assert!(matches!(
+                received.try_recv(),
+                Ok(UiRequest::CheckForUpdates)
             ));
         }
     }

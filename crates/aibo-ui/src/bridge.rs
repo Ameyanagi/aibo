@@ -76,6 +76,60 @@ pub enum PersistenceScope {
     FileRoots,
     /// Monthly spending ceiling.
     MonthlyBudget,
+    /// Automatic update enablement and release stream.
+    Updates,
+}
+
+/// Release stream used by the automatic updater.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum UpdateChannel {
+    /// GitHub's newest non-prerelease release.
+    #[default]
+    Stable,
+    /// The rolling `dev` release built from `main`.
+    Nightly,
+}
+
+impl UpdateChannel {
+    /// Config-file spelling.
+    pub const fn tag(self) -> &'static str {
+        match self {
+            Self::Stable => "stable",
+            Self::Nightly => "nightly",
+        }
+    }
+
+    /// Parse the config-file spelling.
+    pub fn from_tag(tag: Option<&str>) -> Option<Self> {
+        match tag {
+            Some("stable") => Some(Self::Stable),
+            Some("nightly") => Some(Self::Nightly),
+            _ => None,
+        }
+    }
+}
+
+/// User-visible state of the background updater.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum UpdateState {
+    /// No check has completed in this process yet.
+    #[default]
+    Idle,
+    /// Looking up the selected release stream.
+    Checking,
+    /// The installed build is current.
+    UpToDate,
+    /// An installer/image is being downloaded and verified.
+    Downloading,
+    /// A verified update can be installed with an explicit restart.
+    Ready {
+        /// Version embedded in the downloaded release.
+        version: String,
+    },
+    /// The check or download failed. Details stay in diagnostics.
+    Failed,
+    /// The installer has started and the app is shutting down.
+    Installing,
 }
 
 /// One model the runtime permits the panel to select.
@@ -516,6 +570,22 @@ pub enum UiRequest {
         hard_stop: bool,
     },
 
+    /// Persist automatic-update preferences and apply them immediately.
+    SetUpdatePreferences {
+        /// Persistence generation.
+        generation: u64,
+        /// Whether checks should happen automatically at startup and daily.
+        enabled: bool,
+        /// Stable or rolling nightly releases.
+        channel: UpdateChannel,
+    },
+
+    /// Check the selected release stream immediately.
+    CheckForUpdates,
+
+    /// Install the already downloaded and verified update.
+    InstallUpdate,
+
     /// Begin push-to-talk dictation: microphone → realtime transcription,
     /// streaming text back as [`UiEvent::DictationDelta`]s (§P9+).
     StartDictation {
@@ -820,7 +890,14 @@ pub enum UiEvent {
         /// `[stt] end_on_send` — ⏎ ends a live dictation turn (owner,
         /// 2026-08-03). Defaulted true by the runtime.
         stt_end_on_send: bool,
+        /// Whether update checks run automatically.
+        auto_update: bool,
+        /// Selected release stream.
+        update_channel: UpdateChannel,
     },
+
+    /// Background updater progress.
+    UpdateState(UpdateState),
 
     /// A picked file's content, size-capped and text-decoded. The UI routes
     /// it into the fenced selection slot — file bytes are §5 untrusted
