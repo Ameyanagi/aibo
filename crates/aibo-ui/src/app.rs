@@ -88,6 +88,7 @@ enum PersistenceSnapshot {
         enabled: bool,
         channel: crate::bridge::UpdateChannel,
     },
+    PanelSize(Option<(f32, f32)>),
 }
 
 struct PendingPersistence {
@@ -119,6 +120,9 @@ pub struct UiConfig {
     pub screen_capture_hotkey: Option<global_hotkey::hotkey::HotKey>,
     /// Optional task-window shortcut. This action is unbound by default.
     pub show_tasks_hotkey: Option<global_hotkey::hotkey::HotKey>,
+    /// The panel size the user last dragged to (`ui.panel_width` /
+    /// `ui.panel_height`). `None` sizes the panel from its content.
+    pub panel_size: Option<(f32, f32)>,
 }
 
 impl Default for UiConfig {
@@ -131,8 +135,25 @@ impl Default for UiConfig {
             panel_hotkey: None,
             screen_capture_hotkey: None,
             show_tasks_hotkey: None,
+            panel_size: None,
         }
     }
+}
+
+/// A corner-grip drag in flight.
+///
+/// The anchor is taken from the *first* motion rather than from the press:
+/// `mouse_area` reports a press without a position, and asking the window
+/// server where the cursor is would be a second source of truth for something
+/// the next event already carries. Sizes are therefore relative from the first
+/// move, which also makes the drag immune to where inside the grip the press
+/// landed.
+#[derive(Debug, Clone, Copy)]
+struct ResizeDrag {
+    /// Panel size when the drag began, in logical points.
+    origin: (f32, f32),
+    /// Cursor position at the first motion of this drag, window-local.
+    anchor: Option<Point>,
 }
 
 /// The two ends of the §6 bridge, handed to [`run`] by the binary.
@@ -300,6 +321,10 @@ pub enum Message {
     /// The native animated resize was unavailable; apply this placement with
     /// iced's instant resize/move instead.
     PanelFrameFallback(Placement),
+    /// Pointer motion while the corner grip is held, in window-local points.
+    PanelResizeMoved(Point),
+    /// The pointer was released, ending a corner-grip drag.
+    PanelResizeEnded,
     /// Nothing. Returned where a branch has no work, so `update` stays total.
     Ignored,
 }
@@ -433,6 +458,16 @@ pub struct Aibo {
     /// Content growth must resize a hand-placed panel without snapping it back
     /// to the computed caret/fallback position. Cleared on every new summon.
     panel_dragged: bool,
+    /// A corner-grip drag in progress.
+    ///
+    /// winit 0.30 implements `drag_resize_window` on Windows and answers
+    /// `NotSupported` on macOS, so the OS cannot be asked to do this and the
+    /// drag is tracked here instead — one implementation, identical on both
+    /// platforms. Both backends deliver pointer motion to the window that
+    /// received the press even once the cursor leaves it (AppKit routes
+    /// dragged events to that window; winit calls `SetCapture` on Win32), so
+    /// growing the panel does not lose the pointer.
+    panel_resize: Option<ResizeDrag>,
 
     settings_window: Option<window::Id>,
     settings: SettingsState,
@@ -523,6 +558,21 @@ impl Aibo {
             },
         );
         generation
+    }
+
+    /// Write the hand-set panel size, or clear it and return to automatic.
+    ///
+    /// The rollback restores the size that was in force before this write, so
+    /// a config file that cannot be written leaves the panel where the file
+    /// says it is rather than where the last gesture put it.
+    fn persist_panel_size(&mut self, size: Option<(f32, f32)>) -> Task<Message> {
+        let generation = self.begin_persistence(
+            PersistenceScope::PanelSize,
+            PersistenceSnapshot::PanelSize(self.config.panel_size),
+        );
+        self.config.panel_size = size;
+        self.send(UiRequest::SetPanelSize { generation, size });
+        Task::none()
     }
 
     fn role_of(&self, id: window::Id) -> Option<Role> {
@@ -784,6 +834,9 @@ impl Aibo {
         self.panel_visible = false;
         self.panel_focused = false;
         self.context_capture_pending = false;
+        // A drag cannot survive the panel it was sizing: the release would
+        // land on whatever the user is looking at instead.
+        self.panel_resize = None;
         // A show that was still waiting on the window server must not land
         // after the user has already dismissed the panel.
         self.pending_show = false;
@@ -813,8 +866,12 @@ impl Aibo {
             // §9's width range, finally given a number: 45 % of the display,
             // clamped. A fixed 680 is a column down the middle of a 5K screen
             // and wider than the window it describes on a small one.
-            preferred_width: Some(ui_theme::panel_width_for(self.panel.display_width)),
+            preferred_width: Some(self.panel.user_size.map_or_else(
+                || ui_theme::panel_width_for(self.panel.display_width),
+                |(width, _)| width,
+            )),
             content_height: self.panel.desired_height(),
+            user_sized: self.panel.user_size.is_some(),
         })
     }
 
@@ -1019,7 +1076,12 @@ fn panel_platform_settings() -> window::settings::PlatformSpecific {
 /// Settings for the settings window.
 fn settings_window_settings() -> window::Settings {
     window::Settings {
-        size: Size::new(880.0, 520.0),
+        // Tall enough for the whole section list at the 44 pt accessibility
+        // floor: eleven sections plus the sidebar's padding need 516 pt, and
+        // 520 did not clear the title bar — About sat under the window edge
+        // with no way to scroll to it. The list scrolls now as well, so this
+        // is comfort rather than the fix.
+        size: Size::new(880.0, 620.0),
         min_size: Some(Size::new(640.0, 420.0)),
         // Keep the first frame private until the native semantic tree is
         // attached; see the task-window setting above.
@@ -1046,11 +1108,18 @@ fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) 
     // the daemon otherwise runs with none.
     let (panel_window, opened) = window::open(panel_window_settings());
 
+    let mut panel = PanelState::new(Uuid::now_v7());
+    // A size the user dragged to in an earlier run. Clamping to the display
+    // happens in `placement`, which knows the display this show lands on; a
+    // saved size from a monitor that is no longer attached therefore comes
+    // back as the nearest size that fits rather than as an off-screen panel.
+    panel.user_size = config.panel_size;
+
     let state = Aibo {
         config,
         requests,
         panel_window,
-        panel: PanelState::new(Uuid::now_v7()),
+        panel,
         panel_visible: false,
         panel_focused: false,
         context_capture_pending: false,
@@ -1060,6 +1129,7 @@ fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) 
         observed: None,
         pending_show: false,
         panel_dragged: false,
+        panel_resize: None,
         settings_window: None,
         settings: SettingsState::default(),
         file_list_generation: 0,
@@ -1139,6 +1209,10 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
             window::resize(state.panel_window, size)
                 .chain(window::move_to(state.panel_window, position))
         }
+
+        Message::PanelResizeMoved(position) => resize_drag_moved(state, position),
+
+        Message::PanelResizeEnded => resize_drag_ended(state),
 
         Message::WindowOpened(id) => {
             let Some(role) = state.role_of(id) else {
@@ -1486,20 +1560,37 @@ fn update(state: &mut Aibo, message: Message) -> Task<Message> {
             state.panel.display_width = monitor.map(|s| s.width);
 
             let pending = std::mem::take(&mut state.pending_show);
-            if pending || state.panel_visible {
+            if pending {
                 let placement = state.placement();
-                // §9's "re-layout on scale-factor and size changes" — but only
-                // when something actually changed. `show_panel` issues a
-                // resize, which produces another resize event, which probes
-                // again; without this guard that is a loop, not a correction.
-                if pending || state.last_placement != Some(placement) {
-                    update(state, Message::Place(placement))
-                } else {
-                    Task::none()
-                }
-            } else {
-                Task::none()
+                return Task::batch([shell_task, update(state, Message::Place(placement))]);
             }
+            if !state.panel_visible {
+                return Task::batch([shell_task, Task::none()]);
+            }
+            // §9's "re-layout on scale-factor and size changes" — but only
+            // when something actually changed. `show_panel` issues a resize,
+            // which produces another resize event, which probes again; without
+            // this guard that is a loop, not a correction.
+            let fresh = state.placement();
+            let settled = state.last_placement.is_some_and(|previous| {
+                previous.size == fresh.size && previous.scale_factor == fresh.scale_factor
+            });
+            if settled {
+                return Task::batch([shell_task, Task::none()]);
+            }
+            // **A visible panel follows the new geometry in size, never in
+            // position.** This used to re-`Place` it, which recomputes the
+            // §9 position from scratch — and since a resize is what triggers
+            // this probe, dragging the corner grip re-centred the panel on
+            // every pointer motion (owner report, 2026-08-05). Content growth
+            // hid the bug: it changes only the height, and the fallback's
+            // 28 %-from-the-top is a constant, so the recomputed position came
+            // back identical. Changing the *width* is what made it visible.
+            //
+            // `Place` is also the wrong instrument for a second reason: it
+            // runs `show_panel`, which re-asserts focus on the composer. Focus
+            // must not move on a resize, or a mid-answer selection is yanked.
+            resize_panel_if_visible(state)
         }
 
         Message::Displays(displays) => {
@@ -1610,6 +1701,14 @@ fn focus_first_task(state: &mut Aibo) -> Task<Message> {
 
 fn open_settings(state: &mut Aibo) -> Task<Message> {
     state.refresh_appearance();
+    // Ask what the OS currently thinks. Until this existed, the permission
+    // rows had no producer at all: `UiEvent::PermissionChanged` was only ever
+    // going to arrive from a capture that had already failed, so a user whose
+    // permissions were fine saw an empty space where their status should be,
+    // and a user whose permissions were broken had to break something again to
+    // find out. TCC state also changes behind the app's back — an OS update
+    // resets it — so this is asked on every open, not cached from startup.
+    state.send(UiRequest::RefreshPermissions);
     // The panel floats at `Level::AlwaysOnTop`; a normal-level settings window
     // can only ever open *behind* it. Opening settings is a statement about
     // where the user is going next, so the panel steps aside. Nothing is lost:
@@ -2035,6 +2134,33 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
         M::BeginDrag => {
             state.panel_dragged = true;
             window::drag(state.panel_window)
+        }
+        M::BeginResize => {
+            // The size the drag grows from is whatever is on screen now — the
+            // hand-set one if there is one, otherwise the size the content
+            // arrived at, so the first drag continues from what the user can
+            // see rather than jumping to a default.
+            let origin = state.panel.user_size.unwrap_or_else(|| {
+                state.last_placement.map_or(
+                    (ui_theme::PANEL_WIDTH_DEFAULT, state.panel.desired_height()),
+                    |placement| placement.size,
+                )
+            });
+            state.panel_resize = Some(ResizeDrag {
+                origin,
+                anchor: None,
+            });
+            Task::none()
+        }
+        M::ResetSize => {
+            // The press that opened this double-click already started a drag;
+            // it moved nothing, and this ends it.
+            state.panel_resize = None;
+            if state.panel.user_size.take().is_none() {
+                return Task::none();
+            }
+            let persist = state.persist_panel_size(None);
+            resize_panel_if_visible(state).chain(persist)
         }
         M::PickerToggleFavourite => {
             let rollback = PersistenceSnapshot::PinnedModels {
@@ -2914,6 +3040,10 @@ fn apply_persistence_result(
         PersistenceSnapshot::Updates { enabled, channel } => {
             state.settings.auto_update = enabled;
             state.settings.update_channel = channel;
+        }
+        PersistenceSnapshot::PanelSize(size) => {
+            state.panel.user_size = size;
+            return resize_panel_if_visible(state);
         }
     }
     Task::none()
@@ -4367,6 +4497,12 @@ fn resize_panel_if_visible(state: &mut Aibo) -> Task<Message> {
             Placement {
                 position: (x, y),
                 size: (width, height),
+                // §9 wants the scale factor re-read on every show and every
+                // display change, and this is now one of the paths a display
+                // change arrives on. Everything else — which display the panel
+                // is on, whether it is caret-anchored — describes where the
+                // panel already is, and is preserved with the position.
+                scale_factor: fresh.scale_factor,
                 ..previous
             }
         }
@@ -4401,6 +4537,83 @@ fn resize_panel_if_visible(state: &mut Aibo) -> Task<Message> {
     // while interpolating bounds, which makes the text visibly grow and shrink.
     // The existing 48 pt height steps keep these instant updates infrequent.
     set_panel_geometry(state.panel_window, placement).chain(backdrop)
+}
+
+/// Pointer motion during a corner-grip drag.
+///
+/// The panel's top-left corner is the anchor — the grip is diagonally opposite
+/// it — so the new size is the old size plus the cursor's travel, and no
+/// `move_to` is involved at any point.
+fn resize_drag_moved(state: &mut Aibo, position: Point) -> Task<Message> {
+    let Some(drag) = state.panel_resize.as_mut() else {
+        return Task::none();
+    };
+    // The first motion only establishes where the drag started from; treating
+    // it as a delta would jump the panel by the cursor's offset inside the
+    // grip.
+    let Some(anchor) = drag.anchor else {
+        drag.anchor = Some(position);
+        return Task::none();
+    };
+    // Only the floors are applied here. The display ceiling belongs to
+    // `placement`, which is the one place that knows which display the panel
+    // is on — and clamping the stored size to it here would make a drag past
+    // the edge and back again lose the size it started from.
+    let size = (
+        (drag.origin.0 + (position.x - anchor.x)).max(ui_theme::PANEL_WIDTH_MIN),
+        (drag.origin.1 + (position.y - anchor.y)).max(ui_theme::PANEL_HEIGHT_COLLAPSED),
+    );
+    if state.panel.user_size == Some(size) {
+        return Task::none();
+    }
+    state.panel.user_size = Some(size);
+    let before = state.last_placement.map(|placement| placement.position);
+    let task = resize_panel_if_visible(state);
+    // Growing past the bottom of the display makes `resize_panel_if_visible`
+    // walk the panel *upwards* to keep it on screen. The cursor positions in
+    // these events are window-local, so a window that moved under a stationary
+    // pointer reports motion that never happened — and since that phantom
+    // motion is downward, it grows the panel, which moves the window again.
+    // Carrying the move into the anchor is what stops that loop.
+    let after = state.last_placement.map(|placement| placement.position);
+    if let (Some(before), Some(after), Some(drag)) = (before, after, state.panel_resize.as_mut())
+        && let Some(anchor) = drag.anchor
+        && before != after
+    {
+        // A window origin that moved up by `d` makes a stationary pointer read
+        // `d` further down the window, so the anchor moves down by `d` too:
+        // `before - after`, not the other way round.
+        drag.anchor = Some(Point::new(
+            anchor.x + (before.0 - after.0),
+            anchor.y + (before.1 - after.1),
+        ));
+    }
+    task
+}
+
+/// The pointer was released: settle the size and write it once.
+///
+/// Persisting on release rather than on motion is the whole reason the drag is
+/// stateful — a write per pointer event would rewrite `config.toml` a hundred
+/// times across one gesture.
+fn resize_drag_ended(state: &mut Aibo) -> Task<Message> {
+    let Some(drag) = state.panel_resize.take() else {
+        return Task::none();
+    };
+    // A press that never moved is a click on the corner, not a resize; it
+    // changed nothing, so it writes nothing.
+    if drag.anchor.is_none() {
+        return Task::none();
+    }
+    // What is written is the size actually on screen, which `placement` may
+    // have trimmed to the display — so the next launch restores what the user
+    // was last looking at rather than a size the display never allowed.
+    let size = state
+        .last_placement
+        .map(|placement| placement.size)
+        .or(state.panel.user_size);
+    state.panel.user_size = size;
+    state.persist_panel_size(size)
 }
 
 /// Apply `placement` through the platform's atomic frame call, falling back to
@@ -4701,6 +4914,31 @@ fn subscription(state: &Aibo) -> Subscription<Message> {
             }
             captured_hotkey(physical_key, modifiers)
                 .map(|spec| Message::Settings(settings::Message::HotkeyCaptured(spec)))
+        }));
+    }
+
+    // Pointer motion, live only while the corner grip is held — for the same
+    // reason as the recorder above. A permanent cursor subscription turns
+    // every mouse movement over the panel into an `update` and a re-render,
+    // which on a panel rendering markdown is the most expensive thing the app
+    // could do with an idle pointer.
+    if state.panel_resize.is_some() {
+        subscriptions.push(iced::event::listen_with(|event, _status, _window| {
+            match event {
+                iced::Event::Mouse(iced::mouse::Event::CursorMoved { position }) => {
+                    Some(Message::PanelResizeMoved(position))
+                }
+                // Deliberately not `CursorLeft`: growing the panel outruns the
+                // window it is growing, so the pointer leaves the old bounds
+                // constantly during a normal drag. Both backends deliver the
+                // release to the window that took the press, so the release is
+                // the only end condition needed — and `hide_panel` covers the
+                // panel going away mid-gesture.
+                iced::Event::Mouse(iced::mouse::Event::ButtonReleased(
+                    iced::mouse::Button::Left,
+                )) => Some(Message::PanelResizeEnded),
+                _ => None,
+            }
         }));
     }
 
@@ -6424,6 +6662,143 @@ mod tests {
 
         assert!(state.panel_dragged);
         assert!(task.units() > 0, "the native window drag must be requested");
+    }
+
+    /// The gesture end to end: press, two motions, release. The first motion
+    /// only anchors, so the size that lands is the travel from *it* — a drag
+    /// that started 6 pt inside the grip must not shift the panel by 6 pt.
+    #[test]
+    fn dragging_the_grip_sizes_the_panel_from_the_first_motion() {
+        let mut state = app();
+        let _ = update(&mut state, monitor(1920.0, 1080.0, 2.0));
+        let _ = state.open_panel();
+        let before = state.last_placement.expect("shown").size;
+
+        let _ = panel_update(&mut state, panel::Message::BeginResize);
+        let _ = update(&mut state, Message::PanelResizeMoved(Point::new(6.0, 6.0)));
+        assert_eq!(
+            state.panel.user_size, None,
+            "the anchoring motion must not resize anything"
+        );
+
+        let _ = update(
+            &mut state,
+            Message::PanelResizeMoved(Point::new(86.0, 46.0)),
+        );
+        let size = state.panel.user_size.expect("the drag set a size");
+        assert!(
+            (size.0 - (before.0 + 80.0)).abs() < 0.5 && (size.1 - (before.1 + 40.0)).abs() < 0.5,
+            "expected {:?} + (80, 40), got {size:?}",
+            before
+        );
+
+        let _ = update(&mut state, Message::PanelResizeEnded);
+        assert!(state.panel_resize.is_none(), "the drag is over");
+        assert_eq!(
+            state.config.panel_size, state.panel.user_size,
+            "the size on screen is the size that gets written"
+        );
+    }
+
+    /// The floors belong to the drag; the display ceiling belongs to
+    /// `placement`. Dragging the corner up and to the left past both floors
+    /// must stop at them rather than invert the panel.
+    #[test]
+    fn a_drag_cannot_shrink_the_panel_below_its_floors() {
+        let mut state = app();
+        let _ = update(&mut state, monitor(1920.0, 1080.0, 2.0));
+        let _ = state.open_panel();
+
+        let _ = panel_update(&mut state, panel::Message::BeginResize);
+        let _ = update(&mut state, Message::PanelResizeMoved(Point::new(0.0, 0.0)));
+        let _ = update(
+            &mut state,
+            Message::PanelResizeMoved(Point::new(-4000.0, -4000.0)),
+        );
+
+        assert_eq!(
+            state.panel.user_size,
+            Some((ui_theme::PANEL_WIDTH_MIN, ui_theme::PANEL_HEIGHT_COLLAPSED))
+        );
+    }
+
+    /// Double-clicking the grip hands sizing back to the content, and says so
+    /// in the config file rather than leaving the old size behind to come back
+    /// at the next launch.
+    #[test]
+    fn double_clicking_the_grip_returns_the_panel_to_automatic_sizing() {
+        let mut state = app();
+        let _ = update(&mut state, monitor(1920.0, 1080.0, 2.0));
+        let _ = state.open_panel();
+        let automatic = state.last_placement.expect("shown").size;
+
+        let _ = panel_update(&mut state, panel::Message::BeginResize);
+        let _ = update(&mut state, Message::PanelResizeMoved(Point::new(0.0, 0.0)));
+        let _ = update(
+            &mut state,
+            Message::PanelResizeMoved(Point::new(120.0, 120.0)),
+        );
+        let _ = update(&mut state, Message::PanelResizeEnded);
+        assert!(state.panel.user_size.is_some());
+
+        let _ = panel_update(&mut state, panel::Message::ResetSize);
+
+        assert_eq!(state.panel.user_size, None);
+        assert_eq!(state.config.panel_size, None, "and the file is cleared");
+        assert_eq!(
+            state.last_placement.expect("still shown").size,
+            automatic,
+            "the panel goes back to the size the content asks for"
+        );
+    }
+
+    /// A hand-set size is a preference, not session state.
+    #[test]
+    fn a_new_chat_keeps_the_size_the_user_dragged_to() {
+        let mut state = app();
+        let _ = update(&mut state, monitor(1920.0, 1080.0, 2.0));
+        let _ = state.open_panel();
+        state.panel.user_size = Some((800.0, 600.0));
+
+        state.begin_panel_session();
+
+        assert_eq!(state.panel.user_size, Some((800.0, 600.0)));
+    }
+
+    /// A size restored from `config.toml` has to reach the first placement, or
+    /// the panel opens at the automatic size and only obeys the preference
+    /// after something else triggers a resize.
+    #[test]
+    fn a_restored_size_is_used_by_the_first_show() {
+        let (requests, _rx) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(
+            UiConfig {
+                panel_size: Some((900.0, 640.0)),
+                ..UiConfig::default()
+            },
+            requests,
+        );
+        let _ = update(&mut state, monitor(1920.0, 1080.0, 2.0));
+        let _ = state.open_panel();
+
+        assert_eq!(state.last_placement.expect("shown").size, (900.0, 640.0));
+    }
+
+    /// The permission rows had no producer: `PermissionChanged` only ever came
+    /// from a capture that had already failed, so the section was blank on a
+    /// healthy machine and blank on a broken one until something broke twice.
+    #[test]
+    fn opening_settings_asks_the_os_for_permission_status() {
+        let (requests, mut rx) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _task) = boot(UiConfig::default(), requests);
+
+        let _ = open_settings(&mut state);
+
+        let mut asked = false;
+        while let Ok(request) = rx.try_recv() {
+            asked |= matches!(request, UiRequest::RefreshPermissions);
+        }
+        assert!(asked, "settings must ask, never assume, on every open");
     }
 
     #[test]

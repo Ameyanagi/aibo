@@ -116,6 +116,17 @@ pub struct PlacementRequest {
     pub preferred_width: Option<f32>,
     /// Height the content currently needs; the panel height animates to this.
     pub content_height: f32,
+    /// The two sizes above came from the user dragging the corner grip, not
+    /// from the content.
+    ///
+    /// Only the display bounds then apply. [`PANEL_WIDTH_MAX`] and
+    /// [`PANEL_HEIGHT_MAX`] exist to stop *content* from running away — a
+    /// long answer must not grow the panel to fill the screen — and applying
+    /// them to a deliberate gesture would silently refuse it, which reads as
+    /// the grip being broken. Staying on one display still holds: that rule is
+    /// about not losing the panel, and the user cannot drag it back from
+    /// off-screen.
+    pub user_sized: bool,
 }
 
 /// The resolved geometry for one `show`.
@@ -325,16 +336,23 @@ pub fn place(request: &PlacementRequest) -> Placement {
     let (fw, fh) = (frame.width as f32, frame.height as f32);
 
     // Width grows within bounds for localisation, shrinks on small displays (§9).
+    // A hand-set size answers to the display and nothing else; see
+    // `PlacementRequest::user_sized`.
+    let (width_max, height_max) = if request.user_sized {
+        (fw, fh)
+    } else {
+        (PANEL_WIDTH_MAX, PANEL_HEIGHT_MAX)
+    };
     let width = fit(
         finite_or(desired_width, PANEL_WIDTH_DEFAULT),
         PANEL_WIDTH_MIN,
-        PANEL_WIDTH_MAX,
+        width_max,
         fw,
     );
     let height = fit(
         finite_or(request.content_height, PANEL_HEIGHT_COLLAPSED),
         PANEL_HEIGHT_COLLAPSED,
-        PANEL_HEIGHT_MAX,
+        height_max,
         fh,
     );
 
@@ -786,6 +804,43 @@ mod tests {
             assert_section_9_invariants(&request).size.0,
             PANEL_WIDTH_MAX
         );
+    }
+
+    /// The content ceilings are there to stop an answer from growing the panel
+    /// to fill the screen. A drag is not an answer.
+    #[test]
+    fn a_hand_set_size_is_bounded_by_the_display_and_not_by_the_content_ceiling() {
+        let request = PlacementRequest {
+            preferred_width: Some(PANEL_WIDTH_MAX + 200.0),
+            content_height: PANEL_HEIGHT_MAX + 200.0,
+            user_sized: true,
+            ..request(primary_only(), None)
+        };
+        let p = assert_section_9_invariants(&request);
+        assert!(
+            p.size.0 > PANEL_WIDTH_MAX,
+            "a hand-set width must pass the localisation ceiling, got {}",
+            p.size.0
+        );
+        assert!(
+            p.size.1 > PANEL_HEIGHT_MAX,
+            "a hand-set height must pass the content ceiling, got {}",
+            p.size.1
+        );
+    }
+
+    /// A size dragged on a large display, restored on a small one.
+    #[test]
+    fn a_hand_set_size_still_fits_on_the_display_it_is_restored_to() {
+        let displays = vec![display(1, rect(0.0, 0.0, 1280.0, 800.0), true)];
+        let request = PlacementRequest {
+            preferred_width: Some(2400.0),
+            content_height: 1600.0,
+            user_sized: true,
+            ..request(displays, None)
+        };
+        let p = assert_section_9_invariants(&request);
+        assert!(p.size.0 <= 1280.0 && p.size.1 <= 800.0, "got {:?}", p.size);
     }
 
     #[test]

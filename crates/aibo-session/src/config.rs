@@ -670,6 +670,17 @@ pub struct UiSettings {
     /// parses and applies it; an unknown value is reported and falls dark.
     #[serde(default)]
     pub appearance: Option<String>,
+    /// Panel width in logical points, as last set by dragging the corner grip.
+    ///
+    /// Present only once the user has resized by hand; absent means the panel
+    /// sizes itself from its content and the display, which is the default and
+    /// stays the default. Both this and [`Self::panel_height`] are required
+    /// before either is honoured — half a size is not a size.
+    #[serde(default)]
+    pub panel_width: Option<f32>,
+    /// Panel height in logical points; see [`Self::panel_width`].
+    #[serde(default)]
+    pub panel_height: Option<f32>,
     /// Check the selected GitHub release stream at startup and once per day.
     /// Enabled by default so installed builds receive security and reliability
     /// fixes without requiring users to watch the releases page.
@@ -690,6 +701,8 @@ impl Default for UiSettings {
             screen_capture_hotkey: None,
             show_tasks_hotkey: None,
             appearance: None,
+            panel_width: None,
+            panel_height: None,
             auto_update: true,
             update_channel: None,
         }

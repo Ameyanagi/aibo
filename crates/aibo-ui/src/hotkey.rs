@@ -313,19 +313,14 @@ pub enum Caution {
 }
 
 impl Caution {
-    /// One line of explanatory copy.
+    /// One line of explanatory copy, in the UI language.
     ///
-    /// TODO(§9 i18n): this is the one user-visible literal left in the crate.
-    /// `i18n::Key` has no variant for a *soft* hotkey caution — `HotkeyRejectedByOs`
-    /// asserts outright refusal, which is false for the shipped default and so
-    /// cannot be reused here. Adding `Key::HotkeyOptionOnlyCaution` to
-    /// `i18n.rs` (en + ja) replaces this method body.
-    pub const fn explanation(self) -> &'static str {
+    /// It reads as a caution and not a refusal, which is why it cannot reuse
+    /// `HotkeyRejectedByOs`: the shipped default lands here, and telling a
+    /// user their working shortcut was rejected is worse than saying nothing.
+    pub fn explanation(self) -> &'static str {
         match self {
-            Caution::ShiftOrOptionOnly => {
-                "Some macOS releases refuse shortcuts that use only shift or option. \
-                 This one registered; if it ever stops working, add ⌃ or ⌘."
-            }
+            Caution::ShiftOrOptionOnly => crate::i18n::t(crate::i18n::Key::HotkeyOptionOnlyCaution),
         }
     }
 }

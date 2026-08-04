@@ -78,6 +78,8 @@ pub enum PersistenceScope {
     MonthlyBudget,
     /// Automatic update enablement and release stream.
     Updates,
+    /// The panel size the user dragged the corner grip to.
+    PanelSize,
 }
 
 /// Release stream used by the automatic updater.
@@ -448,6 +450,25 @@ pub enum UiRequest {
         generation: u64,
         /// New language.
         language: Lang,
+    },
+
+    /// Report the current status of every OS permission aibo can answer for,
+    /// as one [`UiEvent::PermissionChanged`] each.
+    ///
+    /// Sent when the settings window opens. The status is asked for, never
+    /// cached: TCC grants disappear on OS updates and identity changes (§17),
+    /// and a permission screen showing a remembered answer is the one screen
+    /// where being out of date is the whole failure.
+    RefreshPermissions,
+
+    /// Persist the size the panel was dragged to (`ui.panel_width` /
+    /// `ui.panel_height`), or clear both and return it to automatic sizing.
+    /// The window has already been resized; the runtime only writes the file.
+    SetPanelSize {
+        /// Persistence generation.
+        generation: u64,
+        /// Logical width and height, or `None` for automatic.
+        size: Option<(f32, f32)>,
     },
 
     /// Persist the appearance preference (`ui.appearance`). The UI applies
