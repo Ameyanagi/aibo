@@ -1452,7 +1452,27 @@ impl PanelState {
             // The quick-pick floats over the panel. The window grows only when
             // the panel is too short to contain the menu, and never shrinks
             // for it — mid-conversation, opening the picker moves nothing.
-            return base.max(PICKER_PANEL_HEIGHT.min(self.max_panel_height()));
+            //
+            // Attach is a compact action menu, not a scrolling picker. Giving
+            // it the picker's full 500 pt reservation painted the unused
+            // height as a large empty panel below the menu on Windows, whose
+            // DWM backdrop cannot be clipped to the visible chrome. Keep the
+            // larger reservation whenever another overlay has precedence in
+            // `view`; otherwise size the attach-only window to its contents.
+            let only_attach_menu = self.attach_menu_open
+                && !self.picker.open
+                && !self.file_finder.open
+                && !self.tasks_open
+                && !self.slash.open
+                && !self.help_open
+                && !self.workdir_picker.open
+                && !self.skills_open;
+            let overlay_height = if only_attach_menu {
+                ATTACH_MENU_PANEL_HEIGHT
+            } else {
+                PICKER_PANEL_HEIGHT
+            };
+            return base.max(overlay_height.min(self.max_panel_height()));
         }
         base
     }
@@ -3413,6 +3433,14 @@ fn model_row<'a>(
 /// easy.
 const PICKER_PANEL_HEIGHT: f32 = 500.0;
 
+/// Window height needed by the compact attachment action menu.
+///
+/// This covers its 56 pt top offset, three action rows, dismiss row, menu
+/// padding and shadow breathing room. It deliberately does not inherit the
+/// scrolling picker's 500 pt reservation: on Windows that unused reservation
+/// is visible panel surface rather than transparent native-window slack.
+const ATTACH_MENU_PANEL_HEIGHT: f32 = 240.0;
+
 /// Widest the floating quick-pick menu grows.
 const PICKER_MENU_WIDTH: f32 = 560.0;
 /// The running activity card: header row plus a three-row scrolling interior.
@@ -4696,10 +4724,11 @@ mod tests {
         state
     }
 
-    /// Every menu needs the same room, and an *empty* panel is the case that
+    /// Every menu needs enough room, and an *empty* panel is the case that
     /// broke: its chrome is one row tall, and a menu clipped to the chrome
     /// showed one command or a sliver of results (owner screenshots,
-    /// 2026-08-02). The window must ask for menu height in every state.
+    /// 2026-08-02). Scrolling pickers keep their stable full height; the compact
+    /// attachment menu asks only for the height its rows actually need.
     #[test]
     fn an_empty_panel_still_makes_room_for_every_menu() {
         let mut state = panel();
@@ -4707,15 +4736,19 @@ mod tests {
         let collapsed = state.desired_height();
 
         type Opener = fn(&mut PanelState, bool);
-        let openers: [(&str, Opener); 6] = [
-            ("slash", |s, on| s.slash.open = on),
-            ("help", |s, on| s.help_open = on),
-            ("attach", |s, on| s.attach_menu_open = on),
-            ("skills", |s, on| s.skills_open = on),
-            ("tasks", |s, on| s.tasks_open = on),
-            ("workdir", |s, on| s.workdir_picker.open = on),
+        let openers: [(&str, f32, Opener); 6] = [
+            ("slash", PICKER_PANEL_HEIGHT, |s, on| s.slash.open = on),
+            ("help", PICKER_PANEL_HEIGHT, |s, on| s.help_open = on),
+            ("attach", ATTACH_MENU_PANEL_HEIGHT, |s, on| {
+                s.attach_menu_open = on;
+            }),
+            ("skills", PICKER_PANEL_HEIGHT, |s, on| s.skills_open = on),
+            ("tasks", PICKER_PANEL_HEIGHT, |s, on| s.tasks_open = on),
+            ("workdir", PICKER_PANEL_HEIGHT, |s, on| {
+                s.workdir_picker.open = on;
+            }),
         ];
-        for (name, set) in openers {
+        for (name, overlay_height, set) in openers {
             set(&mut state, true);
             let with_menu = state.desired_height();
             assert!(
@@ -4724,9 +4757,15 @@ mod tests {
                  ({with_menu} vs {collapsed})"
             );
             assert!(
-                with_menu >= PICKER_PANEL_HEIGHT.min(state.max_panel_height()),
+                with_menu >= overlay_height.min(state.max_panel_height()),
                 "{name}: and grow to menu height, not merely a little"
             );
+            if name == "attach" {
+                assert!(
+                    with_menu < PICKER_PANEL_HEIGHT,
+                    "attach is an action menu and must not reserve picker-height dead space"
+                );
+            }
             set(&mut state, false);
         }
 
