@@ -253,32 +253,46 @@ fn paint_badge(rgba: &mut [u8], size: u32, fill: [u8; 4]) {
 #[cfg(not(target_os = "windows"))]
 fn state_icon(state: TrayState) -> Icon {
     const SIZE: u32 = 32;
-    let mut rgba = vec![0u8; (SIZE * SIZE * 4) as usize];
+    let rgba = template_icon_rgba(state, SIZE);
+    Icon::from_rgba(rgba, SIZE, SIZE).expect("generated icon is well-formed")
+}
 
-    let centre = (SIZE as f32 - 1.0) / 2.0;
-    let outer = SIZE as f32 * 0.42;
-    let inner = SIZE as f32 * 0.30;
+/// A monochrome version of the aibo app mark for native template rendering.
+///
+/// Passing the full square app icon as a macOS template would reduce it to an
+/// opaque rounded square. This keeps the recognisable amber rail and its two
+/// horizon strokes as silhouette/alpha, letting AppKit tint it correctly for
+/// either menu-bar appearance. Activity remains a deliberately small badge so
+/// it does not turn aibo into an unrelated generic status circle.
+#[cfg(not(target_os = "windows"))]
+fn template_icon_rgba(state: TrayState, size: u32) -> Vec<u8> {
+    let mut rgba = vec![0u8; (size * size * 4) as usize];
+    let scale = size as f32 / 32.0;
 
-    for y in 0..SIZE {
-        for x in 0..SIZE {
-            let dx = x as f32 - centre;
-            let dy = y as f32 - centre;
-            let distance = (dx * dx + dy * dy).sqrt();
+    for y in 0..size {
+        for x in 0..size {
+            let px = (x as f32 + 0.5) / scale;
+            let py = (y as f32 + 0.5) / scale;
 
-            // Antialiased ring; the interior is filled only when busy or
-            // asking for attention, so state reads at a glance in the menu bar.
-            let ring = (1.0 - (distance - outer).abs()).clamp(0.0, 1.0);
-            let fill = match state {
+            let rail = rounded_rect_coverage(px, py, 7.0, 16.0, 2.35, 11.0, 2.0);
+            let upper = rounded_rect_coverage(px, py, 18.5, 10.0, 8.5, 1.45, 1.35) * 0.82;
+            let lower = rounded_rect_coverage(px, py, 17.0, 21.0, 7.0, 1.45, 1.35) * 0.64;
+            let mark = rail.max(upper).max(lower);
+
+            let badge = match state {
                 TrayState::Idle => 0.0,
-                TrayState::Busy => (inner - distance).clamp(0.0, 1.0) * 0.55,
-                TrayState::Attention => (inner - distance).clamp(0.0, 1.0),
+                TrayState::Busy => {
+                    let outer = circle_coverage(px, py, 26.0, 25.0, 3.75);
+                    let inner = circle_coverage(px, py, 26.0, 25.0, 1.65);
+                    outer * (1.0 - inner)
+                }
+                TrayState::Attention => circle_coverage(px, py, 26.0, 25.0, 3.75),
             };
-            let alpha = (ring.max(fill) * 255.0) as u8;
+            let alpha = (mark.max(badge) * 255.0).round() as u8;
 
-            let index = ((y * SIZE + x) * 4) as usize;
-            // White pixels with a shaped alpha: on macOS `with_icon_as_template`
-            // recolours by the menu-bar tint, and on Windows white-on-dark is
-            // the notification-area convention.
+            let index = ((y * size + x) * 4) as usize;
+            // The RGB value is irrelevant to template rendering; white makes
+            // the raw icon useful on other Unix status areas too.
             rgba[index] = 255;
             rgba[index + 1] = 255;
             rgba[index + 2] = 255;
@@ -286,7 +300,31 @@ fn state_icon(state: TrayState) -> Icon {
         }
     }
 
-    Icon::from_rgba(rgba, SIZE, SIZE).expect("generated icon is well-formed")
+    rgba
+}
+
+#[cfg(not(target_os = "windows"))]
+fn rounded_rect_coverage(
+    x: f32,
+    y: f32,
+    centre_x: f32,
+    centre_y: f32,
+    half_width: f32,
+    half_height: f32,
+    radius: f32,
+) -> f32 {
+    let qx = (x - centre_x).abs() - (half_width - radius);
+    let qy = (y - centre_y).abs() - (half_height - radius);
+    let outside = (qx.max(0.0).powi(2) + qy.max(0.0).powi(2)).sqrt();
+    let inside = qx.max(qy).min(0.0);
+    let signed_distance = outside + inside - radius;
+    (0.75 - signed_distance).clamp(0.0, 1.0)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn circle_coverage(x: f32, y: f32, centre_x: f32, centre_y: f32, radius: f32) -> f32 {
+    let distance = ((x - centre_x).powi(2) + (y - centre_y).powi(2)).sqrt();
+    (radius + 0.75 - distance).clamp(0.0, 1.0)
 }
 
 #[cfg(test)]
@@ -312,5 +350,24 @@ mod tests {
         for state in [TrayState::Idle, TrayState::Busy, TrayState::Attention] {
             let _ = state_icon(state);
         }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn the_template_icon_uses_the_aibo_mark_and_distinct_status_badges() {
+        let idle = template_icon_rgba(TrayState::Idle, 32);
+        let busy = template_icon_rgba(TrayState::Busy, 32);
+        let attention = template_icon_rgba(TrayState::Attention, 32);
+
+        let alpha = |pixels: &[u8], x: usize, y: usize| pixels[(y * 32 + x) * 4 + 3];
+        assert_eq!(alpha(&idle, 0, 0), 0, "template corners stay transparent");
+        assert!(
+            alpha(&idle, 7, 16) > 240,
+            "the vertical aibo rail is present"
+        );
+        assert!(alpha(&idle, 18, 10) > 160, "the upper horizon is present");
+        assert!(alpha(&idle, 17, 21) > 120, "the lower horizon is present");
+        assert_ne!(idle, busy, "busy adds a status ring");
+        assert_ne!(busy, attention, "attention fills the status badge");
     }
 }

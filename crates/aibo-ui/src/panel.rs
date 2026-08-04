@@ -3993,13 +3993,25 @@ fn conversation(state: &PanelState, appearance: theme::Appearance) -> Element<'_
     // while the window still grows with content nothing scrolls, and the
     // moment content exceeds what the region actually has, it scrolls.
     //
-    // Anchored to the end so a streaming answer stays in view; iced detaches
-    // the anchor while the user scrolls up to reread, the chat convention.
-    scrollable(transcript)
+    let transcript = scrollable(transcript)
         .height(Length::Fill)
-        .anchor_bottom()
-        .style(theme::scroller)
-        .into()
+        .style(theme::scroller);
+
+    // Protect the first prompt while the dispatch footer is still arriving.
+    // Bottom anchoring is correct once there is an answer (and for follow-up
+    // turns), but before the first token it makes every newly-added footer row
+    // steal space from the top of the only user bubble. Keeping that one
+    // transient state top-anchored also avoids a visible crop during the frame
+    // between the backend event and the corresponding window resize.
+    if transcript_anchors_to_bottom(state) {
+        transcript.anchor_bottom().into()
+    } else {
+        transcript.into()
+    }
+}
+
+fn transcript_anchors_to_bottom(state: &PanelState) -> bool {
+    !state.turns.is_empty() || !state.response.is_empty() || state.session_tasks().next().is_some()
 }
 
 fn content(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Message> {
@@ -5980,6 +5992,39 @@ mod tests {
         assert!(state.response.is_empty());
         assert!(state.input.is_empty());
         assert_eq!(state.phase, Phase::Loading);
+    }
+
+    #[test]
+    fn the_first_prompt_stays_top_anchored_until_an_answer_arrives() {
+        let mut state = panel();
+        state.begin_turn("first question".to_owned());
+        assert!(!transcript_anchors_to_bottom(&state));
+
+        state.append_response("first token");
+        assert!(transcript_anchors_to_bottom(&state));
+
+        state.phase = Phase::Finished {
+            reason: StopReason::EndTurn,
+        };
+        state.begin_turn("follow up".to_owned());
+        assert!(
+            transcript_anchors_to_bottom(&state),
+            "follow-ups keep the established conversation anchored at its end"
+        );
+    }
+
+    #[test]
+    fn a_new_turn_never_reuses_the_previous_token_accounting() {
+        let mut state = panel();
+        state.usage = Usage {
+            input_tokens: 1_120,
+            cached_input_tokens: 3_712,
+            output_tokens: 13,
+            ..Usage::default()
+        };
+
+        state.begin_turn("another question".to_owned());
+        assert_eq!(state.usage, Usage::default());
     }
 
     #[test]

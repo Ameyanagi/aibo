@@ -3679,6 +3679,7 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             if session != state.panel.session {
                 return Task::none();
             }
+            let height_before = state.panel.desired_height();
             state.settings.active_model = Some(aibo_core::types::ModelBinding {
                 provider: provider.clone(),
                 model: model.clone(),
@@ -3687,7 +3688,12 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             state.panel.attribution.model = Some(model);
             state.panel.attribution.substituted_for = substituted_for;
             state.panel.phase = Phase::Loading;
-            Task::none()
+            // Attribution is a real footer row, and a fallback adds another.
+            // The first-turn submit has already sized for the user/thinking
+            // bubbles by the time this event arrives. Failing to grow again
+            // makes the bottom-anchored transcript pay for these rows by
+            // clipping the top of the user's first message.
+            resize_panel_if_height_changed(state, height_before)
         }
 
         UiEvent::Stream { session, event } => {
@@ -3716,8 +3722,12 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                     Task::none()
                 }
                 StreamEvent::Usage(usage) => {
+                    let height_before = state.panel.desired_height();
                     state.panel.usage = usage;
-                    Task::none()
+                    // The first non-zero usage report inserts a footer row.
+                    // Later reports normally only change its text, so the
+                    // height comparison avoids redundant window-server work.
+                    resize_panel_if_height_changed(state, height_before)
                 }
                 StreamEvent::Done(reason) => {
                     state.panel.phase = Phase::Finished { reason };
@@ -3761,8 +3771,10 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             usage,
         } => {
             if session == state.panel.session {
+                let height_before = state.panel.desired_height();
                 state.panel.attribution.cost_label = Some(label);
                 state.panel.usage = usage;
+                return resize_panel_if_height_changed(state, height_before);
             }
             Task::none()
         }
@@ -3868,6 +3880,7 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
         UiEvent::DisplaysChanged { displays } => update(state, Message::Displays(displays)),
 
         UiEvent::PermissionChanged { permission, status } => {
+            let height_before = state.panel.desired_height();
             match state
                 .settings
                 .permissions
@@ -3889,7 +3902,7 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             {
                 state.panel.context = ContextState::PermissionDenied { status };
             }
-            Task::none()
+            resize_panel_if_height_changed(state, height_before)
         }
 
         UiEvent::ProviderRemoved { provider } => {
@@ -3899,6 +3912,7 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
         }
 
         UiEvent::ProviderHealth { provider, health } => {
+            let height_before = state.panel.desired_height();
             match state
                 .settings
                 .providers
@@ -3932,7 +3946,7 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             {
                 state.panel.error = None;
             }
-            Task::none()
+            resize_panel_if_height_changed(state, height_before)
         }
 
         UiEvent::ModelOptions { options, selected } => {
@@ -3955,6 +3969,7 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
         }
 
         UiEvent::LanguageChanged { language } => {
+            let height_before = state.panel.desired_height();
             i18n::set_language(language);
             state.settings.language = language;
             state.config.language = language;
@@ -3963,7 +3978,10 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             {
                 tracing::warn!(%error, "could not relocalise the tray menu");
             }
-            Task::none()
+            // Localised footer and notice rows can wrap differently. Most
+            // language changes retain the same height, in which case this is
+            // a no-op; a real change must reach the window server.
+            resize_panel_if_height_changed(state, height_before)
         }
 
         UiEvent::Spend {
@@ -4312,6 +4330,14 @@ fn clipboard_offer(item: Option<&aibo_core::types::ClipboardItem>) -> panel::Cli
 /// yanked back into the input while the user was reading — or worse, while they
 /// were selecting the text they wanted to copy. Growing a window and presenting
 /// a window are two different operations that happened to share a code path.
+fn resize_panel_if_height_changed(state: &mut Aibo, height_before: f32) -> Task<Message> {
+    if (state.panel.desired_height() - height_before).abs() >= 1.0 {
+        resize_panel_if_visible(state)
+    } else {
+        Task::none()
+    }
+}
+
 fn resize_panel_if_visible(state: &mut Aibo) -> Task<Message> {
     if !state.panel_visible {
         return Task::none();
@@ -4364,7 +4390,15 @@ fn resize_panel_if_visible(state: &mut Aibo) -> Task<Message> {
         return backdrop;
     }
     let size = Size::new(placement.size.0, placement.size.1);
-    if state.panel_dragged {
+    if state.panel_dragged
+        || previous.is_some_and(|previous| previous.position == placement.position)
+    {
+        // A size-only change should travel through iced/winit so the renderer's
+        // client bounds and AppKit's frame advance together. Calling AppKit
+        // directly here briefly stretched the previous Metal frame, which is
+        // what made text appear to resize with the window. The native atomic
+        // frame path below remains necessary when growth also moves the panel
+        // upward to keep it on-screen.
         return window::resize(state.panel_window, size).chain(backdrop);
     }
     // One native, atomic frame change instead of separate resize/move effects.
@@ -4856,7 +4890,7 @@ pub fn run(config: UiConfig, handles: UiHandles) -> Result<()> {
 mod tests {
     use super::*;
     use aibo_core::types::{
-        AppInfo, AppRef, ClipboardKind, FieldContext, ModelBinding, ProviderId, StopReason,
+        AppInfo, AppRef, ClipboardKind, FieldContext, ModelBinding, ProviderId, StopReason, Usage,
     };
 
     fn app() -> Aibo {
@@ -5958,6 +5992,51 @@ mod tests {
             Ok(UiRequest::CaptureContext { session, .. }) if session == previous
         ));
         assert_eq!(state.panel.session, previous, "same session, same history");
+    }
+
+    /// The first prompt used to be cropped from its top as these two backend
+    /// events populated footer rows after `Submit` had already sized the
+    /// window. Both mutations must schedule the matching geometry update.
+    #[test]
+    fn dispatch_and_usage_rows_resize_the_visible_first_turn() {
+        let mut state = app();
+        let _ = update(&mut state, monitor(1920.0, 1080.0, 2.0));
+        let _ = state.open_panel();
+        state.panel.phase = Phase::Idle;
+        state.panel.set_input("hello");
+
+        let _ = panel_update(&mut state, panel::Message::Submit);
+        let after_submit = state.last_placement.expect("submitted panel is placed");
+        let session = state.panel.session;
+
+        let dispatched = backend_update(
+            &mut state,
+            UiEvent::Dispatched {
+                session,
+                provider: ProviderId::CODEX,
+                model: "gpt-5.6-sol".to_owned(),
+                substituted_for: None,
+            },
+        );
+        let after_dispatch = state.last_placement.expect("dispatch resized panel");
+        assert!(after_dispatch.size.1 > after_submit.size.1);
+        assert!(dispatched.units() > 0, "dispatch schedules window geometry");
+
+        let usage = backend_update(
+            &mut state,
+            UiEvent::Stream {
+                session,
+                event: Box::new(StreamEvent::Usage(Usage {
+                    input_tokens: 1_120,
+                    cached_input_tokens: 3_712,
+                    output_tokens: 13,
+                    ..Usage::default()
+                })),
+            },
+        );
+        let after_usage = state.last_placement.expect("usage resized panel");
+        assert!(after_usage.size.1 > after_dispatch.size.1);
+        assert!(usage.units() > 0, "usage schedules window geometry");
     }
 
     /// An explicit new (`⌘N`) and a screen capture both go through
