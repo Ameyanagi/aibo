@@ -326,40 +326,6 @@ pub struct PermissionRow {
     pub status: PermissionStatus,
 }
 
-/// The release stream selected from About.
-///
-/// Stable follows GitHub's newest non-prerelease release. Nightly follows the
-/// rolling `dev` release, whose URL stays fixed as CI replaces its assets.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum UpdateChannel {
-    /// Newest non-prerelease version.
-    Stable,
-    /// Rolling build of `main`.
-    Nightly,
-}
-
-impl UpdateChannel {
-    /// Direct download for the installer/image used by this platform.
-    pub const fn download_url(self) -> &'static str {
-        match (self, cfg!(target_os = "windows"), cfg!(target_os = "macos")) {
-            (Self::Stable, true, _) => {
-                "https://github.com/Ameyanagi/aibo/releases/latest/download/aibo-windows-x86_64-setup.exe"
-            }
-            (Self::Nightly, true, _) => {
-                "https://github.com/Ameyanagi/aibo/releases/download/dev/aibo-windows-x86_64-setup.exe"
-            }
-            (Self::Stable, _, true) => {
-                "https://github.com/Ameyanagi/aibo/releases/latest/download/aibo-macos-aarch64.dmg"
-            }
-            (Self::Nightly, _, true) => {
-                "https://github.com/Ameyanagi/aibo/releases/download/dev/aibo-macos-aarch64.dmg"
-            }
-            (Self::Stable, _, _) => "https://github.com/Ameyanagi/aibo/releases/latest",
-            (Self::Nightly, _, _) => "https://github.com/Ameyanagi/aibo/releases/tag/dev",
-        }
-    }
-}
-
 /// Settings window state.
 #[derive(Debug, Clone, Default)]
 pub struct SettingsState {
@@ -457,6 +423,12 @@ pub struct SettingsState {
     /// Whether a monthly ceiling is currently applied, so "remove" is only
     /// offered when there is something to remove.
     pub budget_configured: bool,
+    /// Whether update checks run automatically.
+    pub auto_update: bool,
+    /// Stable or rolling nightly release stream.
+    pub update_channel: crate::bridge::UpdateChannel,
+    /// Current background update activity.
+    pub update_state: crate::bridge::UpdateState,
 }
 
 /// A copy affordance that confirms itself with a momentary `✓ copied`.
@@ -785,8 +757,14 @@ pub enum Message {
     OpenDeviceUrl,
     /// Copy a redacted diagnostics bundle (§19).
     CopyDiagnostics,
-    /// Download an update from the selected release stream.
-    DownloadUpdate(UpdateChannel),
+    /// Enable or disable automatic checks.
+    AutoUpdateToggle(bool),
+    /// Select the release stream.
+    SetUpdateChannel(crate::bridge::UpdateChannel),
+    /// Check the selected stream now.
+    CheckForUpdates,
+    /// Restart into the downloaded installer.
+    InstallUpdate,
     /// Enable local SQLCipher history after an explicit user gesture.
     InitializeHistory,
     /// Copy the one-time recovery code.
@@ -2203,8 +2181,50 @@ const fn selection_marker(selected: bool) -> &'static str {
     if selected { "✓" } else { "" }
 }
 
-fn about<'a>(_state: &'a SettingsState) -> Element<'a, Message> {
+fn about<'a>(state: &'a SettingsState) -> Element<'a, Message> {
     let version = option_env!("AIBO_BUILD_VERSION").unwrap_or(env!("CARGO_PKG_VERSION"));
+    let selected_channel = match state.update_channel {
+        crate::bridge::UpdateChannel::Stable => i18n::t(Key::ActionUpdateStable),
+        crate::bridge::UpdateChannel::Nightly => i18n::t(Key::ActionUpdateNightly),
+    };
+    let selected_channel = format!("✓ {selected_channel}");
+    let status = match &state.update_state {
+        crate::bridge::UpdateState::Idle => "",
+        crate::bridge::UpdateState::Checking => i18n::t(Key::UpdateStatusChecking),
+        crate::bridge::UpdateState::UpToDate => i18n::t(Key::UpdateStatusCurrent),
+        crate::bridge::UpdateState::Downloading => i18n::t(Key::UpdateStatusDownloading),
+        crate::bridge::UpdateState::Ready { .. } => i18n::t(Key::UpdateStatusReady),
+        crate::bridge::UpdateState::Failed => i18n::t(Key::UpdateStatusFailed),
+        crate::bridge::UpdateState::Installing => i18n::t(Key::ActionRestartAndUpdate),
+    };
+    let available_version = match &state.update_state {
+        crate::bridge::UpdateState::Ready { version } => version.as_str(),
+        _ => "",
+    };
+    let update_action = match state.update_state {
+        crate::bridge::UpdateState::Ready { .. } => {
+            Action::new(Key::ActionRestartAndUpdate, "", Message::InstallUpdate).primary()
+        }
+        crate::bridge::UpdateState::Checking
+        | crate::bridge::UpdateState::Downloading
+        | crate::bridge::UpdateState::Installing => {
+            Action::new(Key::ActionCheckForUpdates, "", Message::CheckForUpdates).disabled()
+        }
+        _ => Action::new(Key::ActionCheckForUpdates, "", Message::CheckForUpdates).primary(),
+    };
+    let auto_action = if state.auto_update {
+        Action::new(
+            Key::ActionDisableAutoUpdates,
+            "",
+            Message::AutoUpdateToggle(false),
+        )
+    } else {
+        Action::new(
+            Key::ActionEnableAutoUpdates,
+            "",
+            Message::AutoUpdateToggle(true),
+        )
+    };
     column![
         text(i18n::t(Key::AppName))
             .size(type_scale::HEADING)
@@ -2216,19 +2236,28 @@ fn about<'a>(_state: &'a SettingsState) -> Element<'a, Message> {
         text(i18n::t(Key::SettingsUpdatesHint))
             .size(type_scale::META)
             .style(theme::text_dim),
+        text(selected_channel)
+            .size(type_scale::META)
+            .style(theme::text_accent),
         widgets::action_list(vec![
             Action::new(
                 Key::ActionUpdateStable,
                 "",
-                Message::DownloadUpdate(UpdateChannel::Stable),
+                Message::SetUpdateChannel(crate::bridge::UpdateChannel::Stable),
             )
-            .primary(),
+            .primary_if(state.update_channel == crate::bridge::UpdateChannel::Stable),
             Action::new(
                 Key::ActionUpdateNightly,
                 "",
-                Message::DownloadUpdate(UpdateChannel::Nightly),
-            ),
+                Message::SetUpdateChannel(crate::bridge::UpdateChannel::Nightly),
+            )
+            .primary_if(state.update_channel == crate::bridge::UpdateChannel::Nightly),
         ]),
+        widgets::action_list(vec![auto_action, update_action]),
+        text(status).size(type_scale::META).style(theme::text_dim),
+        text(available_version)
+            .size(type_scale::META)
+            .style(theme::text_dim),
         widgets::action_list(vec![Action::new(
             Key::ActionCopyDiagnostics,
             widgets::primary_shortcut("⌘C", "Ctrl+C"),
@@ -2254,20 +2283,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn update_channels_are_distinct_and_point_at_release_artifacts() {
-        let stable = UpdateChannel::Stable.download_url();
-        let nightly = UpdateChannel::Nightly.download_url();
-
-        assert_ne!(stable, nightly);
-        assert!(stable.contains("/releases/latest"));
-        assert!(nightly.contains("/releases/download/dev/") || nightly.ends_with("/tag/dev"));
-
-        if cfg!(target_os = "windows") {
-            assert!(stable.ends_with("aibo-windows-x86_64-setup.exe"));
-            assert!(nightly.ends_with("aibo-windows-x86_64-setup.exe"));
-        } else if cfg!(target_os = "macos") {
-            assert!(stable.ends_with("aibo-macos-aarch64.dmg"));
-            assert!(nightly.ends_with("aibo-macos-aarch64.dmg"));
+    fn update_channels_round_trip_config_tags() {
+        for channel in [
+            crate::bridge::UpdateChannel::Stable,
+            crate::bridge::UpdateChannel::Nightly,
+        ] {
+            assert_eq!(
+                crate::bridge::UpdateChannel::from_tag(Some(channel.tag())),
+                Some(channel)
+            );
         }
     }
 

@@ -287,6 +287,12 @@ impl<Message> Action<Message> {
         self
     }
 
+    /// Mark this action as emphasised when it represents the selected option.
+    pub fn primary_if(mut self, selected: bool) -> Self {
+        self.primary = selected;
+        self
+    }
+
     /// Mark this as destructive.
     pub fn destructive(mut self) -> Self {
         self.destructive = true;

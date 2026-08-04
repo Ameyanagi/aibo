@@ -69,6 +69,10 @@ use crate::health::{
 };
 use crate::trust::{TrustBoundary, TrustMap};
 
+const fn default_true() -> bool {
+    true
+}
+
 /// Why a configuration could not be turned into a running engine.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -624,7 +628,7 @@ pub struct AzureSttSettings {
 }
 
 /// Persisted desktop-shell preferences.
-#[derive(Debug, Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct UiSettings {
     /// BCP-47 language tag. Unsupported tags fall back in the UI layer.
@@ -666,6 +670,30 @@ pub struct UiSettings {
     /// parses and applies it; an unknown value is reported and falls dark.
     #[serde(default)]
     pub appearance: Option<String>,
+    /// Check the selected GitHub release stream at startup and once per day.
+    /// Enabled by default so installed builds receive security and reliability
+    /// fixes without requiring users to watch the releases page.
+    #[serde(default = "default_true")]
+    pub auto_update: bool,
+    /// `"stable"` or `"nightly"`. An absent value is resolved from the
+    /// embedded build version, so development builds stay on their stream.
+    #[serde(default)]
+    pub update_channel: Option<String>,
+}
+
+impl Default for UiSettings {
+    fn default() -> Self {
+        Self {
+            language: None,
+            allow_ax_tree_activation: false,
+            panel_hotkey: None,
+            screen_capture_hotkey: None,
+            show_tasks_hotkey: None,
+            appearance: None,
+            auto_update: true,
+            update_channel: None,
+        }
+    }
 }
 
 impl Config {
@@ -1219,6 +1247,7 @@ mod tests {
     #[test]
     fn an_empty_config_is_valid_and_yields_no_providers() {
         let config = Config::from_toml_str("").unwrap();
+        assert!(config.ui.auto_update, "fresh installs check for updates");
         let (registry, engine) = config.build(&NoCredentials, PriceTable::empty()).unwrap();
         assert!(registry.is_empty());
         // §4: with nothing configured every role is empty, which §13 renders as

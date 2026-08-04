@@ -244,6 +244,14 @@ pub enum Key {
     ActionUpdateStable,
     /// Download the rolling development build.
     ActionUpdateNightly,
+    /// Enable automatic update checks.
+    ActionEnableAutoUpdates,
+    /// Disable automatic update checks.
+    ActionDisableAutoUpdates,
+    /// Check the selected release stream now.
+    ActionCheckForUpdates,
+    /// Exit and run the verified installer.
+    ActionRestartAndUpdate,
     /// Cancel in-flight work.
     ActionCancel,
     /// Approve a tool call once.
@@ -586,6 +594,16 @@ pub enum Key {
     SettingsUpdatesTitle,
     /// Explains stable versus nightly updates.
     SettingsUpdatesHint,
+    /// Update lookup is in progress.
+    UpdateStatusChecking,
+    /// Installed build matches the selected stream.
+    UpdateStatusCurrent,
+    /// Update artifact is downloading.
+    UpdateStatusDownloading,
+    /// Verified update is ready.
+    UpdateStatusReady,
+    /// Update check/download failed.
+    UpdateStatusFailed,
     /// Section: language.
     SettingsLanguage,
     /// Section: appearance.
@@ -817,6 +835,10 @@ fn en(key: Key) -> &'static str {
         K::ActionCopyDiagnostics => "Copy diagnostics",
         K::ActionUpdateStable => "Latest stable",
         K::ActionUpdateNightly => "Nightly",
+        K::ActionEnableAutoUpdates => "Enable automatic updates",
+        K::ActionDisableAutoUpdates => "Disable automatic updates",
+        K::ActionCheckForUpdates => "Check now",
+        K::ActionRestartAndUpdate => "Restart and update",
         K::ActionCancel => "Cancel",
         K::ActionApprove => "Approve",
         K::ActionApproveSession => "Approve for session",
@@ -979,8 +1001,13 @@ fn en(key: Key) -> &'static str {
         K::SettingsAbout => "About",
         K::SettingsUpdatesTitle => "Updates",
         K::SettingsUpdatesHint => {
-            "Choose stable for normal use, or nightly for the newest fixes and features. Your settings and history are preserved."
+            "Choose Stable or Nightly. Downloads are verified before installation."
         }
+        K::UpdateStatusChecking => "Checking for updates…",
+        K::UpdateStatusCurrent => "aibo is up to date.",
+        K::UpdateStatusDownloading => "Downloading update…",
+        K::UpdateStatusReady => "A verified update is ready.",
+        K::UpdateStatusFailed => "Could not check for updates. See diagnostics.",
         K::SettingsLanguage => "Language",
         K::SettingsAppearance => "Appearance",
         K::AppearanceSystem => "Match the system",
@@ -1122,6 +1149,10 @@ fn ja(key: Key) -> &'static str {
         K::ActionCopyDiagnostics => "診断情報をコピー",
         K::ActionUpdateStable => "最新の安定版",
         K::ActionUpdateNightly => "ナイトリー",
+        K::ActionEnableAutoUpdates => "自動アップデートを有効にする",
+        K::ActionDisableAutoUpdates => "自動アップデートを無効にする",
+        K::ActionCheckForUpdates => "今すぐ確認",
+        K::ActionRestartAndUpdate => "再起動してアップデート",
         K::ActionCancel => "キャンセル",
         K::ActionApprove => "許可",
         K::ActionApproveSession => "このセッション中は許可",
@@ -1292,8 +1323,13 @@ fn ja(key: Key) -> &'static str {
         K::SettingsAbout => "情報",
         K::SettingsUpdatesTitle => "アップデート",
         K::SettingsUpdatesHint => {
-            "通常は安定版を、最新の修正や機能を試す場合はナイトリーを選択してください。設定と履歴は保持されます。"
+            "安定版またはナイトリーを選択できます。インストール前にダウンロードを検証します。"
         }
+        K::UpdateStatusChecking => "アップデートを確認しています…",
+        K::UpdateStatusCurrent => "aiboは最新です。",
+        K::UpdateStatusDownloading => "アップデートをダウンロードしています…",
+        K::UpdateStatusReady => "検証済みのアップデートをインストールできます。",
+        K::UpdateStatusFailed => "アップデートを確認できませんでした。診断情報を確認してください。",
         K::SettingsLanguage => "言語",
         K::SettingsAppearance => "外観",
         K::AppearanceSystem => "システムに合わせる",
