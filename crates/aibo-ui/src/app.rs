@@ -33,7 +33,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use accesskit::{NodeId, TreeUpdate};
-use aibo_core::types::{DisplayInfo, StreamEvent, Surface};
+use aibo_core::types::{AppRef, DisplayInfo, StreamEvent, Surface};
 use aibo_platform::{AccessibilityEvent, AccessibilitySurface};
 use iced::widget::operation;
 use iced::window::{self, Mode};
@@ -393,6 +393,12 @@ pub struct Aibo {
     /// pressing the hotkey while another app has the keyboard summons the
     /// visible panel instead of destroying the session it still displays.
     panel_focused: bool,
+    /// A summon is capturing from the previous foreground application.
+    ///
+    /// The panel may be visible during this short window, but it must remain
+    /// non-activating so Windows can use its safe Ctrl+C selection fallback.
+    /// The matching context event clears the flag and focuses the composer.
+    context_capture_pending: bool,
     /// The command modifier is currently down; see [`Message::CommandHeld`].
     command_held: bool,
     /// The in-flight region capture joins the session in progress — the
@@ -728,17 +734,17 @@ impl Aibo {
     fn show_panel(&mut self, placement: Placement) -> Task<Message> {
         self.last_placement = Some(placement);
         self.panel_visible = true;
-        // Optimistic: `gain_focus` below asks for it, and waiting for the
-        // window server's confirmation would make an immediate second hotkey
-        // press read as "summon" instead of "dismiss".
-        self.panel_focused = true;
+        // A context capture keeps the source app active until its selection is
+        // safely read. Every other presentation focuses immediately.
+        let focus_now = !self.context_capture_pending;
+        self.panel_focused = focus_now;
         self.pending_show = false;
         self.panel_dragged = false;
 
         let position = Point::new(placement.position.0, placement.position.1);
         let size = Size::new(placement.size.0, placement.size.1);
 
-        window::resize(self.panel_window, size)
+        let shown = window::resize(self.panel_window, size)
             .chain(sync_backdrop_to_chrome(
                 self.panel_window,
                 self.panel.chrome_height(),
@@ -749,9 +755,14 @@ impl Aibo {
             // WS_EX_TOOLWINDOW after the show so the panel stays out of the
             // taskbar and Alt-Tab, matching AppKit's utility-window policy.
             .chain(configure_or_present_panel(self.panel_window, true))
-            .chain(configure_or_present_panel(self.panel_window, false))
-            .chain(window::gain_focus(self.panel_window))
-            .chain(operation::focus(panel::INPUT_ID))
+            .chain(configure_or_present_panel(self.panel_window, false));
+        if focus_now {
+            shown
+                .chain(window::gain_focus(self.panel_window))
+                .chain(operation::focus(panel::INPUT_ID))
+        } else {
+            shown
+        }
     }
 
     /// Hide the panel. Never cancels an agent run (§6).
@@ -766,6 +777,7 @@ impl Aibo {
         }
         self.panel_visible = false;
         self.panel_focused = false;
+        self.context_capture_pending = false;
         // A show that was still waiting on the window server must not land
         // after the user has already dismissed the panel.
         self.pending_show = false;
@@ -816,6 +828,12 @@ impl Aibo {
     /// **agent run** does not interrupt — the run continues in its task window
     /// and a fresh panel opens.
     fn begin_panel_session(&mut self) {
+        self.begin_panel_session_for(None);
+    }
+
+    /// Begin a panel invocation while retaining a focus snapshot captured
+    /// before the panel activated.
+    fn begin_panel_session_for(&mut self, app_ref: Option<AppRef>) {
         let old_session = self.panel.session;
         if matches!(self.panel.phase, Phase::Loading | Phase::Streaming) {
             self.send(UiRequest::Cancel {
@@ -829,7 +847,7 @@ impl Aibo {
         let session: SessionId = Uuid::now_v7();
         self.panel.reset(session);
         self.panel.phase = Phase::Idle;
-        self.send(UiRequest::CaptureContext { session });
+        self.send(UiRequest::CaptureContext { session, app_ref });
     }
 
     fn present_panel(&mut self) -> Task<Message> {
@@ -861,7 +879,7 @@ impl Aibo {
     /// A fresh start still happens whenever new context arrives, because that
     /// is a different question rather than a follow-up: a selection (see the
     /// `UiEvent::Context` arm) or a screen capture. `⌘N` forces one on demand.
-    fn resume_panel_session(&mut self) {
+    fn resume_panel_session_for(&mut self, app_ref: Option<AppRef>) {
         // §13 unchanged: reopening mid-stream cancels the request. What is
         // dropped is the in-flight answer, not the conversation above it.
         if matches!(self.panel.phase, Phase::Loading | Phase::Streaming) {
@@ -871,12 +889,19 @@ impl Aibo {
         }
         self.panel.phase = Phase::Idle;
         let session = self.panel.session;
-        self.send(UiRequest::CaptureContext { session });
+        self.send(UiRequest::CaptureContext { session, app_ref });
     }
 
     fn open_panel(&mut self) -> Task<Message> {
         self.refresh_appearance();
-        self.resume_panel_session();
+        // `present_panel` ultimately asks the OS for keyboard focus. Snapshot
+        // its current owner first so Windows UIA and the safe Ctrl+C fallback
+        // still target the application where the summon gesture occurred.
+        // Windows' last-resort selection read is an ordinary Ctrl+C and can
+        // only target the foreground app. macOS AX reads are addressable and
+        // do not need to delay activation.
+        self.context_capture_pending = cfg!(target_os = "windows");
+        self.resume_panel_session_for(aibo_platform::focused_app_ref());
         self.present_panel()
     }
 
@@ -1022,6 +1047,7 @@ fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) 
         panel: PanelState::new(Uuid::now_v7()),
         panel_visible: false,
         panel_focused: false,
+        context_capture_pending: false,
         command_held: false,
         region_capture_keeps_session: false,
         last_placement: None,
@@ -3486,6 +3512,18 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
     }
 }
 
+/// Finish a non-activating summon once the source application's context has
+/// been captured. If cold-start geometry is still pending, `show_panel` will
+/// perform the focus step when it eventually reveals the window.
+fn finish_context_capture(state: &mut Aibo, task: Task<Message>) -> Task<Message> {
+    if !std::mem::take(&mut state.context_capture_pending) || !state.panel_visible {
+        return task;
+    }
+    state.panel_focused = true;
+    task.chain(window::gain_focus(state.panel_window))
+        .chain(operation::focus(panel::INPUT_ID))
+}
+
 fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
     match event {
         UiEvent::PersistenceResult {
@@ -3524,7 +3562,7 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 && state.panel.has_conversation()
                 && !matches!(state.panel.phase, Phase::Loading | Phase::Streaming)
             {
-                state.begin_panel_session();
+                state.begin_panel_session_for(app.as_ref().map(|app| app.app_ref.clone()));
                 // `begin_panel_session` re-requests context against the new
                 // id, so this event now belongs to a session that is gone.
                 // Letting it fall through would file the selection under the
@@ -3564,7 +3602,8 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                     None => ContextState::Unavailable { app: None },
                 },
             };
-            resize_panel_if_visible(state)
+            let resized = resize_panel_if_visible(state);
+            finish_context_capture(state, resized)
         }
 
         UiEvent::ContextFailed { session, error } => {
@@ -3583,7 +3622,8 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
             state.panel.fail(&error);
             // Same as `UiEvent::Failed`: the error ends the capture, so the
             // caret returns to the composer for the retry.
-            resize_panel_if_visible(state).chain(operation::focus(panel::INPUT_ID))
+            let resized = resize_panel_if_visible(state);
+            finish_context_capture(state, resized)
         }
 
         UiEvent::Dispatched {
@@ -5769,7 +5809,7 @@ mod tests {
         let _ = state.open_panel();
         assert!(matches!(
             events.try_recv(),
-            Ok(UiRequest::CaptureContext { session }) if session == previous
+            Ok(UiRequest::CaptureContext { session, .. }) if session == previous
         ));
         assert_eq!(state.panel.session, previous, "same session, same history");
     }
@@ -5814,6 +5854,41 @@ mod tests {
             state.panel.session, before,
             "a selection is a new question, not a follow-up"
         );
+    }
+
+    /// When a selection replaces an existing conversation, its fresh session
+    /// must keep reading from the app that produced the selection. Re-snapshotting
+    /// after the panel has focus names aibo on Windows and loses the text.
+    #[test]
+    fn selection_fresh_start_preserves_the_original_focus_snapshot() {
+        let (requests, mut events) = tokio::sync::mpsc::channel(UI_REQUEST_CHANNEL_CAPACITY);
+        let (mut state, _boot) = boot(UiConfig::default(), requests);
+        state.panel.active_user = Some("previous question".to_owned());
+        let before = state.panel.session;
+        let source = app_info();
+
+        let _ = backend_update(
+            &mut state,
+            UiEvent::Context {
+                session: before,
+                app: Some(source.clone()),
+                field: None,
+                selection: Some("selected on Windows".to_owned()),
+                clipboard: None,
+            },
+        );
+
+        assert!(matches!(
+            events.try_recv(),
+            Ok(UiRequest::DiscardSession { session }) if session == before
+        ));
+        assert!(matches!(
+            events.try_recv(),
+            Ok(UiRequest::CaptureContext {
+                app_ref: Some(app_ref),
+                ..
+            }) if app_ref == source.app_ref
+        ));
     }
 
     fn context_with_selection(session: SessionId, selection: Option<&str>) -> UiEvent {

@@ -73,6 +73,12 @@ pub use worker::{MacosConfig, content_hash};
 /// §8: the hard deadline for a pure AX read.
 pub const AX_DEADLINE: Duration = Duration::from_millis(120);
 
+/// The synchronous focus snapshot used by the UI before it presents aibo.
+pub(crate) fn frontmost_app_ref() -> Result<AppRef> {
+    worker::Worker::focused_app_ref()
+        .map_err(|error| error.into_capture_error(&MacosBackend::frontmost_identifier()))
+}
+
 /// §8: the hard deadline for a capture that is allowed to fall back to the
 /// clipboard.
 pub const CAPTURE_DEADLINE: Duration = Duration::from_millis(250);
@@ -137,8 +143,7 @@ impl PlatformBackend for MacosBackend {
     // `visibleFrame` (bounds minus menu bar and Dock) that §9 clamps against.
 
     fn focused_app_ref(&self) -> Result<AppRef> {
-        worker::Worker::focused_app_ref()
-            .map_err(|e| e.into_capture_error(&Self::frontmost_identifier()))
+        frontmost_app_ref()
     }
 
     fn active_display(&self) -> Result<DisplayInfo> {

@@ -30,6 +30,27 @@ pub use overlay::{
 };
 pub use screen_capture::{ScreenCaptureError, capture_screen_region};
 
+/// Snapshot the application that owns focus before aibo presents its panel.
+///
+/// This is intentionally the cheap, synchronous half of context capture. The
+/// UI calls it in the same update that handles the summon gesture, before the
+/// returned window task can move keyboard focus to aibo. Slow accessibility
+/// reads remain on their dedicated platform threads.
+pub fn focused_app_ref() -> Option<aibo_core::types::AppRef> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::frontmost_app_ref().ok()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        windows::foreground_app_ref().ok()
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
+}
+
 /// The proxy the OS says to use for HTTPS, or `None` for a direct connection.
 ///
 /// §13: a managed network is a supported environment, not an edge case. reqwest

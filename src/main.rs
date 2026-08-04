@@ -4031,8 +4031,8 @@ mod runtime {
 
         async fn handle(&mut self, request: UiRequest, internal: &Sender<Internal>) {
             match request {
-                UiRequest::CaptureContext { session } => {
-                    self.capture(session, internal.clone()).await;
+                UiRequest::CaptureContext { session, app_ref } => {
+                    self.capture(session, app_ref, internal.clone()).await;
                 }
 
                 UiRequest::UiReady => self.prewarm_providers(),
@@ -5255,7 +5255,12 @@ mod runtime {
         /// value to substitute — "whatever is frontmost now" is aibo. A failed
         /// snapshot therefore reports empty context rather than capturing
         /// something and attributing it to the wrong application.
-        async fn capture(&mut self, session: SessionId, internal: Sender<Internal>) {
+        async fn capture(
+            &mut self,
+            session: SessionId,
+            app_ref: Option<AppRef>,
+            internal: Sender<Internal>,
+        ) {
             if let Some(previous) =
                 activate_session(&mut self.active_session, &mut self.sessions, session)
             {
@@ -5266,7 +5271,7 @@ mod runtime {
             let events = self.events.clone();
 
             // §8 step 1: instant, cannot block, taken before the panel appears.
-            let app_ref = match platform.focused_app_ref() {
+            let app_ref = match app_ref.map_or_else(|| platform.focused_app_ref(), Ok) {
                 Ok(app_ref) => app_ref,
                 Err(error) => {
                     // Not fatal: §8 requires the panel to tolerate context that

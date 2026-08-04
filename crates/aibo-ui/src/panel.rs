@@ -2594,12 +2594,12 @@ fn attach_menu_overlay(state: &PanelState) -> Element<'_, Message> {
         state.clipboard.is_attachable().then_some(Message::Attach),
     )]
     .spacing(space(0.5));
-    // Region capture is currently backed by macOS' native picker only. Do not
-    // advertise a macOS chord as a disabled Windows action.
-    if cfg!(target_os = "macos") {
+    // Keep the action hidden only on platforms without a region picker. macOS
+    // uses `screencapture`; Windows uses the native `ms-screenclip:` overlay.
+    if let Some(chord) = screen_capture_shortcut() {
         menu = menu.push(row_for(
             Key::ActionScreenshot,
-            "⌥⇧Space",
+            chord,
             Some(Message::AttachScreenshot),
         ));
     }
@@ -2626,8 +2626,8 @@ fn help_overlay<'a>() -> Element<'a, Message> {
         widgets::platform_key("⌥Space", "Ctrl+Shift+Space"),
         Key::HelpSummon,
     )];
-    if cfg!(target_os = "macos") {
-        shortcuts.push(("⌥⇧Space", Key::HelpCrop));
+    if let Some(chord) = screen_capture_shortcut() {
+        shortcuts.push((chord, Key::HelpCrop));
     }
     shortcuts.extend([
         (
@@ -2749,6 +2749,26 @@ fn help_overlay<'a>() -> Element<'a, Message> {
     ]
     .spacing(space(1.5))
     .into()
+}
+
+/// The shipped region-capture binding on platforms with a native picker.
+///
+/// This mirrors [`crate::hotkey::default_screen_capture_hotkey`] in UI-ready
+/// notation. Keeping unsupported platforms at `None` prevents advertising an
+/// action whose handler can only return `ScreenCaptureError::Unsupported`.
+const fn screen_capture_shortcut() -> Option<&'static str> {
+    #[cfg(target_os = "macos")]
+    {
+        Some("⌥⇧Space")
+    }
+    #[cfg(target_os = "windows")]
+    {
+        Some("Ctrl+Shift+Alt+Space")
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        None
+    }
 }
 
 /// Width of the chord column in the help overlay, so the labels align.
