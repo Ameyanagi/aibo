@@ -24,8 +24,8 @@ use crate::hotkey::HotkeyAction;
 use aibo_core::AiboError;
 use aibo_core::context::Turn;
 use aibo_core::types::{
-    AgentStep, AppInfo, Attachment, ClipboardItem, DisplayInfo, FieldContext, Health, ModelBinding,
-    Permission, PermissionStatus, ProviderId, Role, StreamEvent, Surface, Usage,
+    AgentStep, AppInfo, AppRef, Attachment, ClipboardItem, DisplayInfo, FieldContext, Health,
+    ModelBinding, Permission, PermissionStatus, ProviderId, Role, StreamEvent, Surface, Usage,
 };
 use secrecy::SecretString;
 use uuid::Uuid;
@@ -219,6 +219,12 @@ pub enum UiRequest {
     CaptureContext {
         /// The session this capture belongs to.
         session: SessionId,
+        /// Focus owner snapshotted before the panel was allowed to activate.
+        ///
+        /// `None` preserves the runtime fallback for startup and tests, but a
+        /// summon gesture normally supplies this so Windows never has to infer
+        /// the old foreground app after aibo has taken focus.
+        app_ref: Option<AppRef>,
     },
 
     /// Run the user's instruction.

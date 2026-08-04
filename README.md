@@ -44,7 +44,7 @@ measured in milliseconds: no dock icon, no browser tab, no context switch.
 | Key | Action |
 |---|---|
 | `⌥Space` | Summon / dismiss the panel (Windows: `Ctrl+Shift+Space`) |
-| `⌥⇧Space` | Crop a screen region and open it as an attachment (macOS) |
+| `⌥⇧Space` | Crop a screen region and open it as an attachment (Windows: `Ctrl+Shift+Alt+Space`) |
 | `⏎` / `⇧⏎` | Send / newline |
 | `⌘⏎` | Paste the latest answer back into the app you came from |
 | `⌘⇧⏎` | Escalate the last question to the smart model |
