@@ -27,7 +27,7 @@ tracing = { workspace = true }
 # catastrophic backtracking, so a model- or user-supplied pattern cannot turn a
 # tier-0 "pure, sub-ms, no consent" tool into a denial of service.
 regex = "1"
-sha2 = "0.10"
+sha2 = { workspace = true }
 hex = "0.4"
 similar = { workspace = true }
 
