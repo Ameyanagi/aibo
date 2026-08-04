@@ -1506,10 +1506,19 @@ mod tests {
 
     #[cfg(windows)]
     #[tokio::test]
-    async fn powershell_process_has_no_window() {
+    async fn powershell_process_has_no_console() {
         let f = fixture();
         let exec = ShellExecutor::new(f.scope.clone());
-        let request = ShellRequest::new("(Get-Process -Id $PID).MainWindowHandle", &f.root);
+        // MainWindowHandle is not a valid console test: the window belongs to
+        // conhost.exe rather than powershell.exe, so it can report zero while
+        // a console is visibly flashing. GetConsoleWindow asks the console
+        // subsystem directly and is zero only when CREATE_NO_WINDOW worked.
+        let request = ShellRequest::new(
+            "$source = '[DllImport(\"kernel32.dll\")] public static extern IntPtr GetConsoleWindow();'; \
+             Add-Type -MemberDefinition $source -Name NativeMethods -Namespace Aibo; \
+             [Aibo.NativeMethods]::GetConsoleWindow().ToInt64()",
+            &f.root,
+        );
         let approval = CommandApproval::granted(&request);
         let outcome = exec
             .run(&request, &approval, CancellationToken::new())

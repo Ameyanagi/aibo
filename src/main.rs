@@ -76,6 +76,48 @@ mod workdirs;
 /// commit; short enough that quitting feels immediate.
 const SHUTDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// Build a Windows child process that cannot allocate a visible console.
+///
+/// The main executable uses the Windows GUI subsystem in release builds, but
+/// console programs launched by it (`cmd`, `tasklist`, and `taskkill`) would
+/// otherwise be free to create a new console and briefly flash a terminal
+/// window. `CREATE_NO_WINDOW` applies to the child and all of these helpers are
+/// console programs, so keep the flag in one constructor rather than relying
+/// on each call site to remember it.
+#[cfg(windows)]
+fn hidden_windows_command(program: impl AsRef<std::ffi::OsStr>) -> std::process::Command {
+    use std::os::windows::process::CommandExt as _;
+
+    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+
+    let mut command = std::process::Command::new(program);
+    command.creation_flags(CREATE_NO_WINDOW);
+    command
+}
+
+#[cfg(all(test, windows))]
+mod windows_process_tests {
+    #[test]
+    fn hidden_windows_children_have_no_console() {
+        let script = "$source = '[DllImport(\"kernel32.dll\")] public static extern IntPtr GetConsoleWindow();'; \
+                      Add-Type -MemberDefinition $source -Name NativeMethods -Namespace Aibo; \
+                      [Aibo.NativeMethods]::GetConsoleWindow().ToInt64()";
+        let output = super::hidden_windows_command("powershell.exe")
+            .args([
+                "-NoLogo",
+                "-NoProfile",
+                "-NonInteractive",
+                "-Command",
+                script,
+            ])
+            .output()
+            .expect("launch hidden PowerShell child");
+
+        assert!(output.status.success(), "PowerShell failed: {output:?}");
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), "0");
+    }
+}
+
 /// Global hotkey overrides from `config.toml`.
 ///
 /// Read here rather than taken from the backend's already-loaded config because
@@ -1187,7 +1229,7 @@ mod children {
         if token.is_empty() {
             return false;
         }
-        let Ok(output) = std::process::Command::new("tasklist")
+        let Ok(output) = crate::hidden_windows_command("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
             .output()
         else {
@@ -1218,7 +1260,7 @@ mod children {
     /// parent and cannot be escaped) — see the report.
     #[cfg(windows)]
     fn terminate(pid: u32) {
-        let _ = std::process::Command::new("taskkill")
+        let _ = crate::hidden_windows_command("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .status();
     }
@@ -2924,7 +2966,7 @@ mod codex_signin {
         };
         #[cfg(target_os = "windows")]
         let mut command = {
-            let mut c = std::process::Command::new("cmd");
+            let mut c = crate::hidden_windows_command("cmd");
             c.args(["/C", "start", "", uri]);
             c
         };
@@ -4575,7 +4617,7 @@ mod runtime {
             };
             #[cfg(target_os = "windows")]
             let mut command = {
-                let mut c = std::process::Command::new("cmd");
+                let mut c = crate::hidden_windows_command("cmd");
                 c.args(["/C", "start", "", url]);
                 c
             };
