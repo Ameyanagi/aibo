@@ -706,6 +706,19 @@ pub struct PanelState {
     /// [`PanelState::display_height`], and likewise not reset by
     /// [`PanelState::reset`] — it describes the hardware, not the session.
     pub display_width: Option<f32>,
+    /// The size the user dragged the panel to, in logical points.
+    ///
+    /// `Some` turns off automatic sizing entirely: the window keeps this size
+    /// through every phase instead of following the content, and the transcript
+    /// — the one `Length::Fill` row — absorbs the difference by scrolling. A
+    /// panel that still grew and shrank under a size the user set by hand would
+    /// be ignoring the gesture, and half-obeying it is worse than not offering
+    /// it. Double-clicking the grip clears this and automatic sizing returns.
+    ///
+    /// Like the display fields above, **not** reset by [`PanelState::reset`]:
+    /// it is a durable preference, restored from `ui.panel_width` /
+    /// `ui.panel_height` at startup and persisted when a drag ends.
+    pub user_size: Option<(f32, f32)>,
     /// Completed exchanges above the active turn.
     pub turns: Vec<ConversationTurn>,
     /// User message currently being answered or reviewed.
@@ -834,6 +847,7 @@ impl PanelState {
             turns: Vec::new(),
             display_height: None,
             display_width: None,
+            user_size: None,
             active_user: None,
             context_expanded: false,
             reasoning: String::new(),
@@ -890,6 +904,9 @@ impl PanelState {
         // a visible shrink between the hotkey and the first frame.
         let display_height = self.display_height;
         let display_width = self.display_width;
+        // A hand-set size is a preference, not session state: ⌘N must not undo
+        // a drag the user made two questions ago.
+        let user_size = self.user_size;
         // Neither favourites nor recents belong to a panel session: a pin is a
         // durable preference, and recency describes the user's day rather than
         // one invocation. `pins_customised` travels with the pins — dropping
@@ -919,6 +936,7 @@ impl PanelState {
         self.selected_model = selected_model;
         self.display_height = display_height;
         self.display_width = display_width;
+        self.user_size = user_size;
         if warm {
             self.phase = Phase::Idle;
         }
@@ -1487,6 +1505,13 @@ impl PanelState {
 
     /// The panel's height with no floating menu in play.
     fn height_without_overlay(&self) -> f32 {
+        // A hand-set height wins over every estimate below, and it is the one
+        // place that decision has to be made: `chrome_height` and
+        // `desired_height` both come through here, so the macOS backdrop and
+        // the window agree without either learning about the grip.
+        if let Some((_, height)) = self.user_size {
+            return height;
+        }
         // The chips are their own row above the input, so they add height in
         // every phase — including the collapsed one, which is otherwise a
         // constant. Attaching an image into a fixed-height panel would push the
@@ -1671,6 +1696,10 @@ pub enum Message {
     HelpClose,
     /// Begin an OS-managed drag of the borderless panel.
     BeginDrag,
+    /// The corner grip was pressed: start sizing the panel by hand.
+    BeginResize,
+    /// The corner grip was double-clicked: return to automatic sizing.
+    ResetSize,
     /// Toggle the composer's ＋ attach menu.
     AttachMenuToggle,
     /// Close the attach menu without choosing.
@@ -1832,12 +1861,24 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
     } else {
         Length::Fill
     };
-    let base: Element<'_, Message> = container(stack)
-        .width(Length::Fill)
-        .height(chrome_height)
-        .padding(space(4.0))
-        .style(theme::panel_surface)
-        .into();
+    // The grip floats over the chrome's bottom-right corner rather than
+    // occupying a row: it must cost no height, or offering a way to size the
+    // panel would itself change the panel's size. It follows `chrome_height`
+    // and not the window so it stays on the visible corner while a menu holds
+    // the window open below.
+    let base: Element<'_, Message> = stack![
+        container(stack)
+            .width(Length::Fill)
+            .height(chrome_height)
+            .padding(space(4.0))
+            .style(theme::panel_surface),
+        container(resize_grip())
+            .width(Length::Fill)
+            .height(chrome_height)
+            .align_x(Alignment::End)
+            .align_y(Alignment::End),
+    ]
+    .into();
     if let Some((overlay, dismiss)) = menu {
         return stack![
             // The stack takes its size from this first layer, so the chrome
@@ -1877,6 +1918,33 @@ pub fn view(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Me
     }
 
     base
+}
+
+/// The corner grip: drag to size the panel, double-click to hand the size back
+/// to the content.
+///
+/// A glyph rather than a labelled control, for the same reason the attachment
+/// chip's remove affordance is a bare ring: a word in the corner of a panel
+/// this small reads as content. The cursor does the explaining — the hand
+/// already knows what a bottom-right corner is for.
+fn resize_grip<'a>() -> Element<'a, Message> {
+    mouse_area(
+        container(text("◢").size(type_scale::META).style(theme::text_faint)).padding(
+            iced::Padding {
+                top: space(1.0),
+                // The panel's corner is an 18 pt radius and its content sits
+                // inside a 16 pt band; the trailing insets keep the glyph in
+                // that band — clear of the curve, clear of the send row.
+                right: space(2.0),
+                bottom: space(2.0),
+                left: space(1.5),
+            },
+        ),
+    )
+    .on_press(Message::BeginResize)
+    .on_double_click(Message::ResetSize)
+    .interaction(mouse::Interaction::ResizingDiagonallyDown)
+    .into()
 }
 
 /// The `@` file finder's contents (§P9+): yuru-matched files, name first and

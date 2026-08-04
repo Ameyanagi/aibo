@@ -68,13 +68,20 @@ pub(crate) fn configure_panel_window(
         window.setOpaque(false);
         window.setBackgroundColor(Some(&NSColor::clearColor()));
         // Give the visually borderless panel a real, transparent AppKit title
-        // region. `movableByWindowBackground` alone is ignored by winit's
-        // renderer view; the title region provides a dependable drag target in
-        // the unused outer surface while FullSizeContentView preserves the
-        // existing edge-to-edge layout.
+        // region: it is the dependable drag target in the unused outer
+        // surface, while FullSizeContentView preserves the existing
+        // edge-to-edge layout.
         window.setTitleVisibility(NSWindowTitleVisibility::Hidden);
         window.setTitlebarAppearsTransparent(true);
-        window.setMovableByWindowBackground(true);
+        // **Off, deliberately.** With this on, AppKit begins a window drag on
+        // a press anywhere in the panel's background — including the corner
+        // resize grip, which then moved the panel instead of sizing it and
+        // made the grip look broken (owner report, 2026-08-05). The window
+        // follows the pointer one-for-one during such a drag, so the grip's
+        // own window-local arithmetic sees no travel at all and the size never
+        // changes. The title region above still drags the panel, and the
+        // context row drags it through iced, so nothing is lost.
+        window.setMovableByWindowBackground(false);
 
         pin_content_gravity(view);
 

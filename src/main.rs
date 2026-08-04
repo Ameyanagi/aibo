@@ -186,6 +186,61 @@ fn appearance_preference(paths: &paths::Paths) -> aibo_ui::theme::AppearancePref
     })
 }
 
+/// The hand-set panel size from `config.toml`, if there is a usable one.
+///
+/// Both keys are required and both must be finite and positive: a file
+/// hand-edited to `panel_width = 0` should give back the automatic panel, not
+/// a window one point wide. The display clamp happens later, in
+/// `aibo_ui::placement`, which knows which display the panel lands on.
+fn panel_size(paths: &paths::Paths) -> Option<(f32, f32)> {
+    let config = aibo_session::config::Config::load(&paths.config()).ok()?;
+    let (width, height) = (config.ui.panel_width?, config.ui.panel_height?);
+    (width.is_finite() && width > 0.0 && height.is_finite() && height > 0.0)
+        .then_some((width, height))
+}
+
+#[cfg(test)]
+mod panel_size_tests {
+    use super::*;
+
+    fn config_with(body: &str) -> (tempfile::TempDir, paths::Paths) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("config.toml"), body).unwrap();
+        let paths = paths::Paths::for_root(dir.path().to_path_buf());
+        (dir, paths)
+    }
+
+    /// The file half of the round trip: `write_ui_panel_size` puts the keys in
+    /// and this reads them back out. The two halves are in different modules
+    /// and only meet at startup, which is the one moment nothing is watching.
+    #[test]
+    fn a_saved_size_is_read_back_at_startup() {
+        let (_dir, paths) = config_with("[ui]\npanel_width = 981\npanel_height = 268\n");
+        assert_eq!(panel_size(&paths), Some((981.0, 268.0)));
+    }
+
+    #[test]
+    fn half_a_size_and_a_nonsense_size_are_both_no_size() {
+        let (_dir, paths) = config_with("[ui]\npanel_width = 981\n");
+        assert_eq!(panel_size(&paths), None, "a width alone is not a size");
+
+        let (_dir, paths) = config_with("[ui]\npanel_width = 0\npanel_height = 268\n");
+        assert_eq!(panel_size(&paths), None, "zero is not a panel");
+
+        let (_dir, paths) = config_with("[ui]\n");
+        assert_eq!(panel_size(&paths), None, "the default is automatic sizing");
+    }
+
+    /// A config the parser rejects must not also cost the user their panel
+    /// size silently — but it must not stop startup either, so `None` (the
+    /// automatic panel) is the answer.
+    #[test]
+    fn an_unparseable_config_falls_back_to_automatic() {
+        let (_dir, paths) = config_with("[ui]\npanel_width = \"wide\"\n");
+        assert_eq!(panel_size(&paths), None);
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     diagnostics::init_tracing();
 
@@ -299,6 +354,7 @@ fn main() -> anyhow::Result<()> {
             // `main` runs on the main thread, so the OS can answer "system"
             // here; later re-resolutions happen on panel/settings open.
             appearance: appearance_preference.resolve(aibo_platform::system_prefers_dark()),
+            panel_size: panel_size(&paths),
             ..aibo_ui::UiConfig::default()
         };
         aibo_ui::run(
@@ -2017,6 +2073,29 @@ mod config_file {
         write_ui_key(path, "appearance", Some(&quote(tag)))
     }
 
+    /// Persist the panel size the user dragged to; `None` removes both keys
+    /// and returns the panel to sizing itself from its content.
+    pub fn write_ui_panel_size(path: &Path, size: Option<(f32, f32)>) -> io::Result<()> {
+        let existing = match std::fs::read_to_string(path) {
+            Ok(source) => source,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => String::new(),
+            Err(error) => return Err(error),
+        };
+        // Whole points: the drag arrives in fractional logical points, and a
+        // config file full of `681.3157` describes precision the gesture did
+        // not have.
+        let (width, height) = match size {
+            Some((width, height)) => (
+                Some(width.round().to_string()),
+                Some(height.round().to_string()),
+            ),
+            None => (None, None),
+        };
+        let updated = splice_key_in_table(&existing, "ui", "panel_width", width.as_deref());
+        let updated = splice_key_in_table(&updated, "ui", "panel_height", height.as_deref());
+        crate::paths::atomic_write(path, updated.as_bytes())
+    }
+
     /// Persist automatic-update enablement and stream as one atomic rewrite.
     pub fn write_update_preferences(
         path: &Path,
@@ -2555,6 +2634,30 @@ mod config_file {
             let parsed = aibo_session::Config::from_toml_str(&written).unwrap();
             assert!(parsed.ui.auto_update);
             assert_eq!(parsed.ui.update_channel.as_deref(), Some("nightly"));
+        }
+
+        /// A drag writes both keys; a double-click removes both. Leaving one
+        /// behind would restore half a size, and `panel_size` in `main` reads
+        /// half a size as none at all — the preference would silently vanish
+        /// instead of being cleared.
+        #[test]
+        fn a_panel_size_round_trips_and_clears_completely() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, "[ui]\nlanguage = \"ja\"\n").unwrap();
+
+            write_ui_panel_size(&path, Some((812.4, 596.6))).unwrap();
+            let written = std::fs::read_to_string(&path).unwrap();
+            let parsed = aibo_session::Config::from_toml_str(&written).unwrap();
+            assert_eq!(parsed.ui.panel_width, Some(812.0));
+            assert_eq!(parsed.ui.panel_height, Some(597.0));
+            assert_eq!(parsed.ui.language.as_deref(), Some("ja"));
+
+            write_ui_panel_size(&path, None).unwrap();
+            let cleared = std::fs::read_to_string(&path).unwrap();
+            assert!(!cleared.contains("panel_width"), "{cleared}");
+            assert!(!cleared.contains("panel_height"), "{cleared}");
+            assert!(cleared.contains("language = \"ja\""));
         }
 
         #[test]
@@ -4307,6 +4410,27 @@ mod runtime {
                     }
                 }
 
+                UiRequest::RefreshPermissions => {
+                    // Everything aibo's own features depend on. Notifications
+                    // and autostart are deliberately absent: both need a real
+                    // signed bundle to answer honestly (SPIKE S8), and a row
+                    // that says "not determined" forever is an advertised
+                    // control backed by nothing.
+                    use aibo_core::types::Permission;
+                    const REPORTED: [Permission; 3] = [
+                        Permission::Accessibility,
+                        Permission::PostEvents,
+                        Permission::ElevatedWindowAccess,
+                    ];
+                    for permission in REPORTED {
+                        let status = self.platform.permission_status(permission);
+                        let _ = self
+                            .events
+                            .send(UiEvent::PermissionChanged { permission, status })
+                            .await;
+                    }
+                }
+
                 UiRequest::SetLanguage {
                     generation,
                     language,
@@ -4319,6 +4443,21 @@ mod runtime {
                         tracing::warn!(%error, "could not persist UI language");
                     }
                     self.persistence_result(PersistenceScope::Language, generation, result.is_ok());
+                }
+
+                UiRequest::SetPanelSize { generation, size } => {
+                    let result = crate::config_file::write_ui_panel_size(
+                        &self.bootstrap.paths().config(),
+                        size,
+                    );
+                    if let Err(error) = &result {
+                        tracing::warn!(%error, "could not persist the panel size");
+                    }
+                    self.persistence_result(
+                        PersistenceScope::PanelSize,
+                        generation,
+                        result.is_ok(),
+                    );
                 }
 
                 UiRequest::SetAppearance {

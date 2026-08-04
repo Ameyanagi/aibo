@@ -434,6 +434,9 @@ pub enum Key {
     HotkeyFailedBody,
     /// macOS 15 rejects some modifier combinations outright (§8).
     HotkeyRejectedByOs,
+    /// The shortcut registered, but uses only shift/option — a combination
+    /// some macOS releases refuse (§9 "soft warning").
+    HotkeyOptionOnlyCaution,
     /// The way to change the binding while no in-app picker exists (§9).
     HotkeyChangeHint,
 
@@ -908,6 +911,10 @@ fn en(key: Key) -> &'static str {
         K::HotkeyFailedTitle => "The shortcut {} is unavailable",
         K::HotkeyFailedBody => "Another app has already claimed it.",
         K::HotkeyRejectedByOs => "macOS does not accept this combination as a global shortcut.",
+        K::HotkeyOptionOnlyCaution => {
+            "Some macOS releases refuse shortcuts that use only shift or option. This one \
+             registered; if it ever stops working, add ⌃ or ⌘."
+        }
         K::HotkeyChangeHint => "Choose a different shortcut below.",
 
         K::TaskWindowTitle => "aibo — task",
@@ -1229,6 +1236,10 @@ fn ja(key: Key) -> &'static str {
         K::HotkeyFailedBody => "他のアプリが使用しています。",
         K::HotkeyRejectedByOs => {
             "macOS はこの組み合わせをグローバルショートカットとして受け付けません。"
+        }
+        K::HotkeyOptionOnlyCaution => {
+            "shift や option だけのショートカットを受け付けない macOS もあります。この設定は登録\
+             できましたが、効かなくなったら ⌃ か ⌘ を加えてください。"
         }
         K::HotkeyChangeHint => "下で別のショートカットを選んでください。",
 
@@ -1630,6 +1641,10 @@ mod tests {
             Key::SettingsProviders,
             Key::SettingsWelcomeTitle,
             Key::SettingsWelcomeBody,
+            // Shipped as an English literal inside `hotkey.rs` until
+            // 2026-08-05, where it rendered mid-sentence in the Japanese
+            // permissions section (owner screenshot).
+            Key::HotkeyOptionOnlyCaution,
         ];
         for key in SAMPLE {
             for lang in Lang::ALL {

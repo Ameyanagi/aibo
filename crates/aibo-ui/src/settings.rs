@@ -133,6 +133,14 @@ impl Section {
 /// `bridge.rs` and `app.rs` are in scope. This encoding is the interim.
 const CODEX_MARKER: &str = "\u{1f}aibo-codex\u{1f}";
 
+/// Widest a settings section is allowed to be, in logical points.
+///
+/// Not a guess: the window's own default content pane is 651 pt wide, so at
+/// the default size nothing changes at all. This only bites when the window is
+/// widened or maximised, which is exactly when rows start putting their label
+/// and their control a screen apart.
+const CONTENT_MEASURE: f32 = 680.0;
+
 /// Where a Codex device-code login has got to (§3a).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum CodexPhase {
@@ -816,15 +824,34 @@ pub fn view(state: &SettingsState) -> Element<'_, Message> {
     // so the two regions read as one undifferentiated field with a floating
     // selection box in it.
     let body = row![
-        container(navigation(state))
+        // **The section list scrolls.** Eleven sections at the 44 pt
+        // accessibility floor need 516 pt, which did not fit the window's own
+        // default height — so About, the last one, was clipped and there was
+        // no gesture that could reach it (owner screenshot, 2026-08-05). The
+        // window is now tall enough for all eleven, and this scrollable is
+        // what keeps that true at the minimum size and for the twelfth
+        // section, whenever it arrives.
+        container(scrollable(navigation(state)).style(theme::scroller))
             .width(Length::Fixed(180.0))
             .height(Length::Fill)
             .padding(space(2.0))
             .style(theme::raised),
         rule::vertical(1).style(theme::separator),
-        container(scrollable(section_body(state)).style(theme::scroller))
-            .width(Length::Fill)
-            .padding(space(3.0)),
+        // Content stops at a readable measure instead of stretching with the
+        // window: a settings row 1200 pt wide puts its label and its control
+        // at opposite ends of the screen, and prose set that wide is unreadable
+        // by every typographic measure there is.
+        container(
+            scrollable(
+                container(section_body(state))
+                    .max_width(CONTENT_MEASURE)
+                    .width(Length::Fill)
+            )
+            .style(theme::scroller)
+        )
+        .width(Length::Fill)
+        .align_x(iced::Alignment::Start)
+        .padding(space(3.0)),
     ];
 
     container(body)
@@ -1686,7 +1713,14 @@ fn permissions(state: &SettingsState) -> Element<'_, Message> {
         }),
     );
 
-    for row in &state.permissions {
+    // `NotApplicable` is the platform saying this permission does not exist
+    // here — macOS Accessibility on Windows, UIPI elevation on macOS. Showing
+    // it as a row would be inventing a concern the user does not have.
+    for row in state
+        .permissions
+        .iter()
+        .filter(|row| row.status != PermissionStatus::NotApplicable)
+    {
         list = list.push(widgets::permission_banner(
             row.status,
             i18n::t(permission_key(row.permission)),
@@ -2640,6 +2674,37 @@ mod tests {
         assert_eq!(phase, CodexPhase::SignedIn);
         assert!(matches!(signed_in.providers[0].health, Health::Ok { .. }));
         let _ = providers(&signed_in);
+    }
+
+    /// A permission the platform calls `NotApplicable` is not a permission on
+    /// this machine, and a row for it is an invented concern — macOS
+    /// Accessibility on Windows, UIPI elevation on macOS.
+    #[test]
+    fn permissions_that_do_not_exist_here_get_no_row() {
+        let state = SettingsState {
+            section: Section::Permissions,
+            permissions: vec![
+                PermissionRow {
+                    permission: Permission::Accessibility,
+                    status: PermissionStatus::Granted,
+                },
+                PermissionRow {
+                    permission: Permission::ElevatedWindowAccess,
+                    status: PermissionStatus::NotApplicable,
+                },
+            ],
+            ..SettingsState::default()
+        };
+
+        let shown = state
+            .permissions
+            .iter()
+            .filter(|row| row.status != PermissionStatus::NotApplicable)
+            .count();
+
+        assert_eq!(shown, 1);
+        // And the section still builds with both rows present.
+        let _ = permissions(&state);
     }
 
     /// Regression, F5. A shift/option-only combination registers, so it is a
