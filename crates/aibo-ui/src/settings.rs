@@ -586,9 +586,9 @@ pub struct ProviderDraft {
     /// resource endpoint).
     pub base_url: String,
     /// Azure only: deployment names, comma-separated, served through the
-    /// `v1` surface — each becomes a model in the picker. Prefilled with
-    /// the current gpt-5.6 trio because the portal suggests naming a
-    /// deployment after its model; edit to match yours.
+    /// `v1` surface — each becomes a model in the picker. These must be the
+    /// exact user-chosen deployment names, so this is never prefilled with
+    /// model names that may not exist on the resource.
     pub models: String,
     /// The API key, as typed.
     key: String,
@@ -604,11 +604,7 @@ impl ProviderDraft {
             backend,
             id: String::new(),
             base_url: String::new(),
-            models: if backend == Backend::Azure {
-                "gpt-5.6-luna, gpt-5.6-terra, gpt-5.6-sol".to_owned()
-            } else {
-                String::new()
-            },
+            models: String::new(),
             key: String::new(),
         }
     }
@@ -661,7 +657,7 @@ impl ProviderDraft {
         // other backend has everything compiled in.
         match self.backend {
             Backend::Custom => !(self.base_url.trim().is_empty() || self.id.trim().is_empty()),
-            Backend::Azure => !self.base_url.trim().is_empty(),
+            Backend::Azure => !self.base_url.trim().is_empty() && !self.models.trim().is_empty(),
             _ => true,
         }
     }
@@ -1534,8 +1530,13 @@ fn provider_draft(state: &SettingsState) -> Element<'_, Message> {
         );
     }
     if matches!(draft.backend, Backend::Custom | Backend::Azure) {
+        let placeholder = if draft.backend == Backend::Azure {
+            Key::ProviderAzureBaseUrlPlaceholder
+        } else {
+            Key::ProviderBaseUrlPlaceholder
+        };
         form = form.push(
-            text_input(i18n::t(Key::ProviderBaseUrlPlaceholder), &draft.base_url)
+            text_input(i18n::t(placeholder), &draft.base_url)
                 .on_input(Message::DraftBaseUrl)
                 .size(type_scale::BODY)
                 .font(theme::MONO_FONT)
@@ -2542,6 +2543,20 @@ mod tests {
             "a provider with no key is not saveable"
         );
         draft.set_key("sk-or-test".to_owned());
+        assert!(draft.is_saveable());
+    }
+
+    #[test]
+    fn azure_needs_an_endpoint_and_an_exact_deployment_name() {
+        let mut draft = ProviderDraft::new(Backend::Azure);
+        draft.set_key("azure-test-key".to_owned());
+        draft.base_url = "https://resource.openai.azure.com/openai/v1/".to_owned();
+        assert!(
+            !draft.is_saveable(),
+            "a model name cannot be safely invented"
+        );
+
+        draft.models = "my-production-deployment".to_owned();
         assert!(draft.is_saveable());
     }
 

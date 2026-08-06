@@ -195,8 +195,7 @@ pub fn v1_provider(
     use aibo_core::types::ModelInfo;
 
     let id = ProviderId::AZURE_OPENAI;
-    let base = format!("{}/openai/v1", endpoint.trim_end_matches('/'));
-    let url = Url::parse(&base).map_err(|e| AiboError::Internal(Box::new(e)))?;
+    let url = v1_base_url(endpoint)?;
     let auth = match &credential {
         Credential::AzureKey { key, .. } if !key.expose_secret().trim().is_empty() => {
             AuthStyle::AzureApiKey
@@ -236,6 +235,30 @@ pub fn v1_provider(
     )
 }
 
+/// Accept either spelling Microsoft exposes in the portal: the resource root
+/// (`https://resource.openai.azure.com`) or the complete OpenAI-compatible
+/// endpoint (`https://resource.openai.azure.com/openai/v1/`).
+///
+/// Treating the latter as a root used to produce
+/// `/openai/v1/openai/v1/chat/completions`, which Azure correctly answered with
+/// `ResourceNotFound`. Project-scoped Foundry endpoints keep their existing
+/// path and receive the suffix in the same way as resource roots.
+fn v1_base_url(endpoint: &str) -> Result<Url> {
+    let mut url = Url::parse(endpoint).map_err(|e| AiboError::Internal(Box::new(e)))?;
+    let path = url.path().trim_end_matches('/').to_owned();
+    if path.to_ascii_lowercase().ends_with("/openai/v1") {
+        url.set_path(&path);
+    } else {
+        let base = path.trim_end_matches('/');
+        url.set_path(&format!("{base}/openai/v1"));
+    }
+    // A copied endpoint may carry a documentation/example query or fragment;
+    // neither belongs on every data-plane request.
+    url.set_query(None);
+    url.set_fragment(None);
+    Ok(url)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -267,6 +290,41 @@ mod tests {
         assert!(
             !p.quirks().models_endpoint,
             "the statement is the catalogue"
+        );
+        assert_eq!(
+            p.base_url().as_str(),
+            "https://r.services.ai.azure.com/openai/v1"
+        );
+    }
+
+    #[test]
+    fn a_full_v1_endpoint_is_not_appended_twice() {
+        let cred = Credential::AzureKey {
+            key: SecretString::from("k".to_string()),
+            deployment: String::new(),
+            api_version: "unused".to_string(),
+        };
+        let p = v1_provider(
+            "https://r.openai.azure.com/openai/v1/",
+            cred,
+            vec!["my-deployment".to_string()],
+        )
+        .unwrap();
+
+        assert_eq!(
+            p.base_url().as_str(),
+            "https://r.openai.azure.com/openai/v1"
+        );
+    }
+
+    #[test]
+    fn a_project_endpoint_keeps_its_project_path() {
+        let url =
+            v1_base_url("https://r.services.ai.azure.com/api/projects/team-project/").unwrap();
+
+        assert_eq!(
+            url.as_str(),
+            "https://r.services.ai.azure.com/api/projects/team-project/openai/v1"
         );
     }
 

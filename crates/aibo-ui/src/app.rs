@@ -3127,12 +3127,6 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
                 // wrong row was picked first is a real annoyance.
                 Some(draft) => {
                     draft.backend = backend;
-                    // …but the Azure deployments prefill only exists in
-                    // `new()`, so arriving at Azure with an untouched field
-                    // still gets the model-named defaults.
-                    if backend == settings::Backend::Azure && draft.models.trim().is_empty() {
-                        draft.models = settings::ProviderDraft::new(backend).models.clone();
-                    }
                 }
                 None => state.settings.draft = Some(settings::ProviderDraft::new(backend)),
             }

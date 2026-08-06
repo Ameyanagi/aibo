@@ -317,6 +317,8 @@ pub enum Key {
     ProviderIdPlaceholder,
     /// Placeholder for a custom endpoint's base URL.
     ProviderBaseUrlPlaceholder,
+    /// Placeholder for an Azure OpenAI resource or complete v1 endpoint.
+    ProviderAzureBaseUrlPlaceholder,
     /// The shortcut recorder's idle label.
     SettingsHotkeyRecord,
     /// The shortcut recorder while it listens.
@@ -814,6 +816,9 @@ fn en(key: Key) -> &'static str {
         K::SettingsAddProvider => "Add a provider",
         K::ProviderIdPlaceholder => "Name, e.g. deepseek",
         K::ProviderBaseUrlPlaceholder => "Base URL, e.g. https://api.deepseek.com/v1",
+        K::ProviderAzureBaseUrlPlaceholder => {
+            "Azure endpoint, e.g. https://resource.openai.azure.com/openai/v1/"
+        }
         K::SettingsHotkeyRecord => "Set a shortcut",
         K::SettingsHotkeyListening => "Press the keys… (esc to cancel)",
         K::SettingsHotkeyPanel => "Open panel",
@@ -1132,6 +1137,9 @@ fn ja(key: Key) -> &'static str {
         K::SettingsAddProvider => "プロバイダーを追加",
         K::ProviderIdPlaceholder => "名前（例: deepseek）",
         K::ProviderBaseUrlPlaceholder => "ベース URL（例: https://api.deepseek.com/v1）",
+        K::ProviderAzureBaseUrlPlaceholder => {
+            "Azure エンドポイント（例: https://resource.openai.azure.com/openai/v1/）"
+        }
         K::SettingsHotkeyRecord => "ショートカットを設定",
         K::SettingsHotkeyListening => "キーを押してください…（esc で中止）",
         K::SettingsHotkeyPanel => "パネルを開く",

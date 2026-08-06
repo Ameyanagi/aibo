@@ -672,6 +672,18 @@ mod diagnostics {
     {
         fn on_event(&self, event: &Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
             let metadata = event.metadata();
+            // `tracing-log` converts every dependency `log` record into a
+            // generic `log: log event`. At TRACE volume those records evicted
+            // the useful aibo events in under a second. The copyable ring is an
+            // aibo diagnostic channel, not a second unfiltered logging sink.
+            if !metadata.target().starts_with("aibo")
+                || matches!(
+                    *metadata.level(),
+                    tracing::Level::DEBUG | tracing::Level::TRACE
+                )
+            {
+                return;
+            }
             let kind = match *metadata.level() {
                 tracing::Level::ERROR => "error",
                 tracing::Level::WARN => "warn",
@@ -688,6 +700,59 @@ mod diagnostics {
                 redact_home(&message),
                 location.map(|value| redact_home(&value)),
             );
+        }
+    }
+
+    /// Record a useful but field-safe summary of a failed request.
+    ///
+    /// Provider error bodies can echo request material, so only a small
+    /// allowlist of non-sensitive Azure/OpenAI error classifications survives.
+    pub fn record_failure(error: &aibo_core::error::AiboError) {
+        use aibo_core::error::AiboError;
+
+        let message = match error {
+            AiboError::Auth { provider, kind } => {
+                format!("{} authentication failed: {kind}", provider.as_str())
+            }
+            AiboError::RateLimited { provider, .. } => {
+                format!("{} rate limited the request", provider.as_str())
+            }
+            AiboError::ProviderUnavailable {
+                provider,
+                status,
+                detail,
+            } => {
+                let detail = detail.as_deref().unwrap_or_default().to_ascii_lowercase();
+                let safe_detail = if detail.contains("resourcenotfound")
+                    || detail.contains("resource not found")
+                {
+                    ": resource not found"
+                } else if detail.contains("deploymentnotfound")
+                    || (detail.contains("deployment") && detail.contains("not found"))
+                {
+                    ": deployment not found"
+                } else if detail.contains("model_not_found")
+                    || (detail.contains("model") && detail.contains("not found"))
+                {
+                    ": model not found"
+                } else {
+                    ""
+                };
+                format!("{} returned HTTP {status}{safe_detail}", provider.as_str())
+            }
+            AiboError::Offline => "network unavailable".to_owned(),
+            AiboError::Timeout { phase } => format!("request timed out during {phase}"),
+            _ => "request failed".to_owned(),
+        };
+        record("request-failed", message, None);
+    }
+
+    /// The stamped workflow version when present, otherwise Cargo's package
+    /// version for local builds.
+    pub const fn build_version() -> &'static str {
+        match option_env!("AIBO_BUILD_VERSION") {
+            Some(version) => version,
+            None => env!("CARGO_PKG_VERSION"),
         }
     }
 
@@ -806,8 +871,14 @@ mod diagnostics {
     mod tests {
         use super::*;
 
+        fn test_lock() -> std::sync::MutexGuard<'static, ()> {
+            static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+            LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+        }
+
         #[test]
         fn formatted_payloads_are_redacted_to_a_length() {
+            let _guard = test_lock();
             let secret = String::from("sk-live-0123456789 and the user's selected text");
             let redacted = redact_payload(&secret);
             assert!(!redacted.contains("sk-live"));
@@ -816,12 +887,14 @@ mod diagnostics {
 
         #[test]
         fn literal_payloads_survive() {
+            let _guard = test_lock();
             let literal: &'static str = "router: unreachable rule";
             assert_eq!(redact_payload(&literal), literal);
         }
 
         #[test]
         fn ring_buffer_is_bounded() {
+            let _guard = test_lock();
             for i in 0..RING_CAPACITY + 32 {
                 record("test", format!("{i}"), None);
             }
@@ -830,6 +903,7 @@ mod diagnostics {
 
         #[test]
         fn tracing_layer_records_metadata_without_event_fields() {
+            let _guard = test_lock();
             use tracing_subscriber::prelude::*;
 
             let secret = "sk-live-must-not-enter-the-ring";
@@ -847,9 +921,41 @@ mod diagnostics {
             assert!(!record.message.contains(secret));
         }
 
-        #[tokio::test]
-        async fn a_panicking_task_does_not_take_the_process_with_it() {
-            supervise("deliberate", async { panic!("deliberate") }).await;
+        #[test]
+        fn a_provider_failure_keeps_only_an_allowlisted_classification() {
+            let _guard = test_lock();
+            use aibo_core::error::AiboError;
+            use aibo_core::types::ProviderId;
+
+            record_failure(&AiboError::ProviderUnavailable {
+                provider: ProviderId::AZURE_OPENAI,
+                status: 404,
+                detail: Some(
+                    "ResourceNotFound; never retain this selected text: secret-sentence".to_owned(),
+                ),
+            });
+
+            let records = snapshot();
+            let record = records
+                .iter()
+                .rev()
+                .find(|record| {
+                    record.kind == "request-failed"
+                        && record.message.starts_with("azure-openai returned HTTP 404")
+                })
+                .expect("failure record");
+            assert!(record.message.contains("resource not found"));
+            assert!(!record.message.contains("secret-sentence"));
+        }
+
+        #[test]
+        fn a_panicking_task_does_not_take_the_process_with_it() {
+            let _guard = test_lock();
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("test runtime")
+                .block_on(supervise("deliberate", async { panic!("deliberate") }));
             assert!(
                 snapshot()
                     .iter()
@@ -5180,7 +5286,7 @@ mod runtime {
             use std::time::UNIX_EPOCH;
 
             let mut bundle = String::from("aibo diagnostics\n");
-            let _ = writeln!(bundle, "version: {}", env!("CARGO_PKG_VERSION"));
+            let _ = writeln!(bundle, "version: {}", crate::diagnostics::build_version());
             let _ = writeln!(bundle, "os: {}", std::env::consts::OS);
             let _ = writeln!(bundle, "arch: {}", std::env::consts::ARCH);
             let providers = self
@@ -5946,6 +6052,7 @@ mod runtime {
                         tracing::info!(?reason, "partial result; not insertable (§13)");
                     }
                     Outcome::Failed(error) => {
+                        crate::diagnostics::record_failure(error);
                         tracing::info!(%error, "request failed");
                         // §3a: a Codex `Auth` failure is the one health signal
                         // the settings row must not miss — it means the stored
