@@ -662,11 +662,12 @@ pub struct Attribution {
 pub struct ConversationTurn {
     /// The instruction the user submitted.
     pub user: String,
+    /// Read-only selection state for [`Self::user`].
+    user_editor: text_editor::Content,
     /// The assistant response.
     pub assistant: String,
-    /// The response, pre-split into markdown and rendered display math
-    /// (`crate::math`), retained for zero-copy rendering.
-    assistant_segments: Vec<crate::math::Segment>,
+    /// Read-only selection state for [`Self::assistant`].
+    assistant_editor: text_editor::Content,
 }
 
 /// Everything the panel renders from.
@@ -687,8 +688,6 @@ pub struct PanelState {
     pub response: String,
     /// Selectable rendering state for [`Self::response`].
     response_editor: text_editor::Content,
-    /// Incrementally parsed Markdown for the active assistant response.
-    response_markdown: markdown::Content,
     /// Usable height of the display the panel is on, in logical points.
     ///
     /// `design.md` §4 sizes the answer area as a fraction of the display rather
@@ -723,6 +722,8 @@ pub struct PanelState {
     pub turns: Vec<ConversationTurn>,
     /// User message currently being answered or reviewed.
     pub active_user: Option<String>,
+    /// Read-only selection state for [`Self::active_user`].
+    active_user_editor: text_editor::Content,
     /// Whether the pinned selected-text card is expanded.
     pub context_expanded: bool,
     /// Reasoning tokens, kept on their own channel: rendered collapsed, never
@@ -811,9 +812,6 @@ pub struct PanelState {
     pub skills_dir: Option<std::path::PathBuf>,
     /// The task whose detail the overlay shows; `None` lists all.
     pub selected_task: Option<Uuid>,
-    /// The finished active response, split into markdown and typeset math.
-    /// Built once at `Done`; `None` while streaming.
-    pub active_segments: Option<Vec<crate::math::Segment>>,
     /// Insert one space before the first dictation delta, because the input
     /// already ends mid-word. Set on `DictationStarted`, spent on the first
     /// delta.
@@ -843,12 +841,12 @@ impl PanelState {
             surface: Surface::Ask,
             response: String::new(),
             response_editor: text_editor::Content::new(),
-            response_markdown: markdown::Content::new(),
             turns: Vec::new(),
             display_height: None,
             display_width: None,
             user_size: None,
             active_user: None,
+            active_user_editor: text_editor::Content::new(),
             context_expanded: false,
             reasoning: String::new(),
             reserved_answer_height: theme::ANSWER_BOX_MIN_HEIGHT,
@@ -879,7 +877,6 @@ impl PanelState {
             skill_catalog: Vec::new(),
             skills_dir: None,
             selected_task: None,
-            active_segments: None,
             dictation_pad: false,
             recent_models: Vec::new(),
             // Constructed once at boot, not per session, so recall survives
@@ -946,7 +943,6 @@ impl PanelState {
     pub fn set_response(&mut self, response: impl Into<String>) {
         self.response = response.into();
         self.response_editor = text_editor::Content::with_text(&self.response);
-        self.response_markdown = markdown::Content::parse(&self.response);
     }
 
     /// Append a streaming chunk to both response representations.
@@ -961,23 +957,12 @@ impl PanelState {
             .perform(text_editor::Action::Edit(text_editor::Edit::Paste(
                 Arc::new(chunk.to_owned()),
             )));
-        self.response_markdown.push_str(chunk);
     }
 
     /// Clear both response representations.
     pub fn clear_response(&mut self) {
         self.response.clear();
         self.response_editor = text_editor::Content::new();
-        self.response_markdown = markdown::Content::new();
-        self.active_segments = None;
-    }
-
-    /// Split the finished response into markdown and typeset display math.
-    /// Called once, at `Done` — never per view, never mid-stream.
-    pub fn segment_finished_response(&mut self) {
-        if !self.response.is_empty() {
-            self.active_segments = Some(crate::math::segments(&self.response));
-        }
     }
 
     /// Completed turns to include before the next user message.
@@ -1020,10 +1005,12 @@ impl PanelState {
         {
             self.turns.push(ConversationTurn {
                 user: previous_user,
+                user_editor: std::mem::take(&mut self.active_user_editor),
                 assistant: self.response.clone(),
-                assistant_segments: crate::math::segments(&self.response),
+                assistant_editor: std::mem::take(&mut self.response_editor),
             });
         }
+        self.active_user_editor = text_editor::Content::with_text(&user);
         self.active_user = Some(user);
         self.input.clear();
         self.input_editor = text_editor::Content::new();
@@ -1053,6 +1040,7 @@ impl PanelState {
     pub fn retract_handed_off_turn(&mut self) {
         if matches!(self.phase, Phase::Loading) {
             self.active_user = None;
+            self.active_user_editor = text_editor::Content::new();
             self.clear_response();
             self.phase = Phase::Idle;
         }
@@ -1126,6 +1114,31 @@ impl PanelState {
     pub fn perform_response_action(&mut self, action: text_editor::Action) {
         if !action.is_edit() {
             self.response_editor.perform(action);
+        }
+    }
+
+    /// Apply selection/cursor actions to a completed user message.
+    pub fn perform_turn_user_action(&mut self, index: usize, action: text_editor::Action) {
+        if !action.is_edit()
+            && let Some(turn) = self.turns.get_mut(index)
+        {
+            turn.user_editor.perform(action);
+        }
+    }
+
+    /// Apply selection/cursor actions to a completed assistant message.
+    pub fn perform_turn_assistant_action(&mut self, index: usize, action: text_editor::Action) {
+        if !action.is_edit()
+            && let Some(turn) = self.turns.get_mut(index)
+        {
+            turn.assistant_editor.perform(action);
+        }
+    }
+
+    /// Apply selection/cursor actions to the active user message.
+    pub fn perform_active_user_action(&mut self, action: text_editor::Action) {
+        if !action.is_edit() {
+            self.active_user_editor.perform(action);
         }
     }
 
@@ -1630,6 +1643,12 @@ pub enum Message {
     CopyLink(String),
     /// Selection, cursor, or an ignored edit attempt in the read-only answer.
     ResponseAction(text_editor::Action),
+    /// Selection/cursor action in a completed user bubble.
+    TurnUserAction(usize, text_editor::Action),
+    /// Selection/cursor action in a completed assistant bubble.
+    TurnAssistantAction(usize, text_editor::Action),
+    /// Selection/cursor action in the active user bubble.
+    ActiveUserAction(text_editor::Action),
     /// `⌘N`: drop the conversation and start a fresh session, deliberately.
     NewChat,
     /// `⌘L`, or the composer action: start or finish push-to-talk dictation.
@@ -3856,7 +3875,11 @@ fn composer_actions_for(state: &PanelState) -> Vec<Action<Message>> {
     vec![attach, primary]
 }
 
-fn user_bubble(message: &str) -> Element<'_, Message> {
+fn user_bubble<'a>(
+    message: &'a str,
+    editor: &'a text_editor::Content,
+    on_action: impl Fn(text_editor::Action) -> Message + 'a,
+) -> Element<'a, Message> {
     row![
         Space::new().width(Length::FillPortion(1)),
         container(
@@ -3864,10 +3887,12 @@ fn user_bubble(message: &str) -> Element<'_, Message> {
                 text(i18n::t(Key::ChatYou))
                     .size(type_scale::META)
                     .style(theme::text_dim),
-                text(message.to_owned())
-                    .size(type_scale::BODY)
-                    .font(theme::UI_FONT)
-                    .style(theme::text_primary),
+                widgets::selectable_chat_answer(
+                    editor,
+                    estimated_text_height(message, CHAT_USER_CHARS_PER_LINE),
+                    false,
+                    on_action,
+                ),
             ]
             .spacing(space(1.0)),
         )
@@ -3946,17 +3971,19 @@ fn markdown_view<'a>(
         .map(Message::CopyLink)
 }
 
-fn assistant_text_bubble(
-    turn: &ConversationTurn,
-    appearance: theme::Appearance,
-) -> Element<'_, Message> {
+fn assistant_text_bubble(turn: &ConversationTurn, index: usize) -> Element<'_, Message> {
     row![
         container(
             column![
                 text(i18n::t(Key::ChatAssistant))
                     .size(type_scale::META)
                     .style(theme::text_dim),
-                segments_view(&turn.assistant_segments, appearance),
+                widgets::selectable_chat_answer(
+                    &turn.assistant_editor,
+                    estimated_text_height(&turn.assistant, CHAT_ASSISTANT_CHARS_PER_LINE),
+                    false,
+                    move |action| Message::TurnAssistantAction(index, action),
+                ),
             ]
             .spacing(space(1.0)),
         )
@@ -3968,42 +3995,21 @@ fn assistant_text_bubble(
     .into()
 }
 
-fn active_assistant_bubble(
-    state: &PanelState,
-    appearance: theme::Appearance,
-) -> Element<'_, Message> {
+fn active_assistant_bubble(state: &PanelState) -> Element<'_, Message> {
     let body: Element<'_, Message> = match state.phase {
         Phase::Loading => widgets::thinking(Some(state.chat_answer_height())),
-        Phase::Streaming | Phase::Finished { .. } => {
-            let rendered = match (&state.phase, state.active_segments.as_deref()) {
-                // Finished and segmented: display math snaps to its typeset
-                // form. While streaming, the incremental markdown stands.
-                (Phase::Finished { .. }, Some(segments)) => segments_view(segments, appearance),
-                _ => markdown_view(state.response_markdown.items(), appearance),
-            };
-            if state.is_truncated() {
-                column![
-                    rendered,
-                    text(i18n::t(Key::StateTruncated))
-                        .size(type_scale::META)
-                        .font(theme::MONO_FONT)
-                        .style(theme::text_dim),
-                ]
-                .spacing(space(1.0))
-                .into()
-            } else {
-                rendered
-            }
-        }
-        Phase::Failed if !state.response.is_empty() => column![
-            markdown_view(state.response_markdown.items(), appearance),
-            text(i18n::t(Key::StateTruncated))
-                .size(type_scale::META)
-                .font(theme::MONO_FONT)
-                .style(theme::text_dim),
-        ]
-        .spacing(space(1.0))
-        .into(),
+        Phase::Streaming | Phase::Finished { .. } => widgets::selectable_chat_answer(
+            &state.response_editor,
+            state.chat_answer_height(),
+            state.is_truncated(),
+            Message::ResponseAction,
+        ),
+        Phase::Failed if !state.response.is_empty() => widgets::selectable_chat_answer(
+            &state.response_editor,
+            state.chat_answer_height(),
+            true,
+            Message::ResponseAction,
+        ),
         _ => Space::new().height(0.0).into(),
     };
 
@@ -4028,18 +4034,24 @@ fn active_assistant_bubble(
 fn conversation(state: &PanelState, appearance: theme::Appearance) -> Element<'_, Message> {
     // The spacing constant is shared with `transcript_content_height`; see it.
     let mut transcript = column![].spacing(CHAT_MESSAGE_SPACING);
-    for turn in &state.turns {
+    for (index, turn) in state.turns.iter().enumerate() {
         transcript = transcript
-            .push(user_bubble(&turn.user))
-            .push(assistant_text_bubble(turn, appearance));
+            .push(user_bubble(&turn.user, &turn.user_editor, move |action| {
+                Message::TurnUserAction(index, action)
+            }))
+            .push(assistant_text_bubble(turn, index));
     }
     if let Some(user) = &state.active_user {
-        transcript = transcript.push(user_bubble(user));
+        transcript = transcript.push(user_bubble(
+            user,
+            &state.active_user_editor,
+            Message::ActiveUserAction,
+        ));
         if matches!(
             state.phase,
             Phase::Loading | Phase::Streaming | Phase::Finished { .. } | Phase::Failed
         ) {
-            transcript = transcript.push(active_assistant_bubble(state, appearance));
+            transcript = transcript.push(active_assistant_bubble(state));
         }
     }
     // Agent runs of this session, as activity cards in the conversation
@@ -6008,33 +6020,36 @@ mod tests {
     }
 
     #[test]
-    fn streamed_chunks_build_markdown_incrementally() {
+    fn completed_chat_bubbles_keep_read_only_selection_state() {
         let mut state = panel();
-        for chunk in [
-            "# Heading\n\n",
-            "- **one**\n- two\n\n",
-            "```rust\nfn main() {}\n",
-            "```\n",
-        ] {
-            state.append_response(chunk);
-        }
+        state.begin_turn("question".to_owned());
+        state.append_response("answer");
+        state.phase = Phase::Finished {
+            reason: StopReason::EndTurn,
+        };
+        state.begin_turn("next".to_owned());
 
-        let items = state.response_markdown.items();
-        assert!(
-            items
-                .iter()
-                .any(|item| matches!(item, markdown::Item::Heading(..)))
+        state.perform_turn_user_action(0, text_editor::Action::SelectAll);
+        state.perform_turn_assistant_action(0, text_editor::Action::SelectAll);
+        assert_eq!(
+            state.turns[0].user_editor.selection().as_deref(),
+            Some("question")
         );
-        assert!(
-            items
-                .iter()
-                .any(|item| matches!(item, markdown::Item::List { .. }))
+        assert_eq!(
+            state.turns[0].assistant_editor.selection().as_deref(),
+            Some("answer")
         );
-        assert!(
-            items
-                .iter()
-                .any(|item| matches!(item, markdown::Item::CodeBlock { .. }))
+        state.perform_active_user_action(text_editor::Action::SelectAll);
+        assert_eq!(
+            state.active_user_editor.selection().as_deref(),
+            Some("next")
         );
+
+        state.perform_turn_assistant_action(
+            0,
+            text_editor::Action::Edit(text_editor::Edit::Insert('x')),
+        );
+        assert_eq!(state.turns[0].assistant_editor.text(), "answer");
     }
 
     #[test]
@@ -6055,7 +6070,7 @@ mod tests {
         assert_eq!(state.turns.len(), 1);
         assert_eq!(state.turns[0].user, "first question");
         assert_eq!(state.turns[0].assistant, "first answer");
-        assert!(!state.turns[0].assistant_segments.is_empty());
+        assert_eq!(state.turns[0].assistant_editor.text(), "first answer");
         assert_eq!(state.active_user.as_deref(), Some("follow up"));
         assert!(state.response.is_empty());
         assert!(state.input.is_empty());

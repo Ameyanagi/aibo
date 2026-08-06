@@ -61,7 +61,10 @@
 // This is invisible to `cargo check`, to `cargo test`, and to every unit test
 // in the workspace: it is a property of the linked artefact, which is why it
 // went unnoticed until CI produced one.
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+#![cfg_attr(
+    all(target_os = "windows", not(debug_assertions)),
+    windows_subsystem = "windows"
+)]
 
 use anyhow::Context as _;
 
@@ -2018,6 +2021,8 @@ mod config_file {
     use std::io;
     use std::path::Path;
 
+    use aibo_core::types::ModelBinding;
+
     /// Rewrite `config.toml`'s `[codex]` table (§3a).
     pub fn write_codex(
         path: &Path,
@@ -2071,6 +2076,12 @@ mod config_file {
     /// Persist the appearance preference (`dark`/`light`/`system`).
     pub fn write_ui_appearance(path: &Path, tag: &str) -> io::Result<()> {
         write_ui_key(path, "appearance", Some(&quote(tag)))
+    }
+
+    /// Persist the panel quick-pick's provider/model choice.
+    pub fn write_ui_selected_model(path: &Path, binding: &ModelBinding) -> io::Result<()> {
+        let value = quote(&format!("{}/{}", binding.provider.as_str(), binding.model));
+        write_ui_key(path, "selected_model", Some(&value))
     }
 
     /// Persist the panel size the user dragged to; `None` removes both keys
@@ -2614,6 +2625,27 @@ mod config_file {
             assert!(updated.contains("language = \"ja\""));
             assert!(!updated.contains("language = \"en\""));
             assert!(updated.contains("[pins]"));
+        }
+
+        #[test]
+        fn selected_provider_model_round_trips_without_rewriting_ui_neighbours() {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("config.toml");
+            std::fs::write(&path, "[ui]\nlanguage = \"ja\"\n").unwrap();
+            let binding = ModelBinding {
+                provider: aibo_core::types::ProviderId::AZURE_OPENAI,
+                model: "team/quoted\"deployment".to_owned(),
+            };
+
+            write_ui_selected_model(&path, &binding).unwrap();
+
+            let written = std::fs::read_to_string(&path).unwrap();
+            let parsed = aibo_session::Config::from_toml_str(&written).unwrap();
+            assert_eq!(
+                parsed.ui.selected_model.as_deref(),
+                Some("azure-openai/team/quoted\"deployment")
+            );
+            assert_eq!(parsed.ui.language.as_deref(), Some("ja"));
         }
 
         #[test]
@@ -3653,6 +3685,41 @@ mod runtime {
             option.cost = cost;
         }
 
+        // Every live, non-Codex catalogue row is a real configured-provider
+        // option. The refresh already obtained Azure's user-specified static
+        // deployment list; omitting this append reduced the supposedly global
+        // picker to the five shipped Codex rows.
+        for model in catalogue
+            .entries()
+            .iter()
+            .filter(|model| !model.deprecated && model.provider != ProviderId::CODEX)
+        {
+            let binding = ModelBinding {
+                provider: model.provider.clone(),
+                model: model.id.clone(),
+            };
+            if options.iter().any(|option| option.binding == binding) {
+                continue;
+            }
+            let (abilities, cost) = model_facts(catalogue, prices, &binding);
+            options.push(ModelOption {
+                binding,
+                display_name: model.display_name.clone(),
+                latency_ms: None,
+                released_at: model.released_at,
+                abilities,
+                cost,
+            });
+        }
+
+        let selected = config
+            .ui
+            .selected_model
+            .as_deref()
+            .and_then(parse_model_binding)
+            .filter(|binding| options.iter().any(|option| option.binding == *binding))
+            .or(selected);
+
         // Grouped by provider, then **newest first** within each provider.
         //
         // Alphabetical ordering was actively harmful: it put `chat-latest` and
@@ -3757,7 +3824,7 @@ mod runtime {
     /// Codex slot and never activates the provider the user selected.
     fn model_selection_allowed(
         config: &Config,
-        _catalogue: &aibo_provider::ModelCatalogue,
+        catalogue: &aibo_provider::ModelCatalogue,
         binding: &ModelBinding,
     ) -> bool {
         if binding.provider == ProviderId::CODEX {
@@ -3766,7 +3833,20 @@ mod runtime {
             return aibo_provider::registry::is_codex_model_allowed(&binding.model)
                 || binding.model == config.codex.model;
         }
-        false
+        catalogue.entries().iter().any(|model| {
+            !model.deprecated && model.provider == binding.provider && model.id == binding.model
+        })
+    }
+
+    fn parse_model_binding(raw: &str) -> Option<ModelBinding> {
+        let (provider, model) = raw.split_once('/')?;
+        if provider.is_empty() || model.is_empty() {
+            return None;
+        }
+        Some(ModelBinding {
+            provider: ProviderId::new(provider.to_owned()),
+            model: model.to_owned(),
+        })
     }
 
     /// The deadline-bounded half of §8's capture, once it has landed.
@@ -4544,6 +4624,23 @@ mod runtime {
                         }
                     }));
                 }
+                UiRequest::ListDirectories { generation, parent } => {
+                    let events = self.events.clone();
+                    tokio::spawn(crate::diagnostics::supervise(
+                        "directory-list",
+                        async move {
+                            if let Ok(dirs) = tokio::task::spawn_blocking(move || {
+                                crate::files::directories(&parent)
+                            })
+                            .await
+                            {
+                                let _ = events
+                                    .send(UiEvent::DirectoryCandidates { generation, dirs })
+                                    .await;
+                            }
+                        },
+                    ));
+                }
                 UiRequest::SetSttEndOnSend {
                     generation,
                     enabled,
@@ -5176,10 +5273,10 @@ mod runtime {
 
         /// Persist and activate a backend-offered model.
         ///
-        /// Only Codex is exposed today. The second predicate allows the
-        /// already-configured future id emitted by [`Self::model_options_event`]
-        /// while rejecting arbitrary provider/model pairs injected across the
-        /// UI bridge.
+        /// Codex choices are checked against its allowlist; all other choices
+        /// must be a live, non-deprecated entry emitted from the refreshed
+        /// configured-provider catalogue. This rejects arbitrary
+        /// provider/model pairs injected across the UI bridge.
         fn set_model(&mut self, binding: ModelBinding) -> bool {
             let config = self.bootstrap.config();
             if !model_selection_allowed(&config, &self.catalogue, &binding) {
@@ -5188,12 +5285,7 @@ mod runtime {
             }
 
             let path = self.bootstrap.paths().config();
-            if let Err(error) = crate::config_file::write_codex(
-                &path,
-                config.codex.enabled,
-                &binding.model,
-                config.codex.client_id.as_deref(),
-            ) {
+            if let Err(error) = crate::config_file::write_ui_selected_model(&path, &binding) {
                 tracing::warn!(%error, "could not persist the selected model");
                 return false;
             }
@@ -6820,6 +6912,35 @@ mod runtime {
             };
             assert!(!options.is_empty());
             assert_eq!(selected, None);
+        }
+
+        #[test]
+        fn azure_static_deployments_are_emitted_and_selectable() {
+            let config =
+                Config::from_toml_str("[ui]\nselected_model = \"azure-openai/team-gpt\"\n")
+                    .unwrap();
+            let azure = ModelBinding {
+                provider: ProviderId::AZURE_OPENAI,
+                model: "team-gpt".to_owned(),
+            };
+            let catalogue = aibo_provider::ModelCatalogue::new(vec![aibo_core::types::ModelInfo {
+                provider: azure.provider.clone(),
+                id: azure.model.clone(),
+                display_name: "Team GPT".to_owned(),
+                capabilities: aibo_core::types::Capabilities::default(),
+                released_at: None,
+                deprecated: false,
+                replaced_by: None,
+            }]);
+
+            let UiEvent::ModelOptions { options, selected } =
+                model_options_event(&config, &catalogue, &aibo_core::cost::PriceTable::default())
+            else {
+                panic!("expected model options");
+            };
+            assert!(options.iter().any(|option| option.binding == azure));
+            assert_eq!(selected, Some(azure.clone()));
+            assert!(model_selection_allowed(&config, &catalogue, &azure));
         }
 
         #[test]

@@ -633,6 +633,12 @@ pub struct AzureSttSettings {
 pub struct UiSettings {
     /// BCP-47 language tag. Unsupported tags fall back in the UI layer.
     pub language: Option<String>,
+    /// Model chosen in the panel quick-pick, as `provider/model`.
+    ///
+    /// Kept separate from `[codex].model`: the picker covers every configured
+    /// provider, including user-named Azure deployments.
+    #[serde(default)]
+    pub selected_model: Option<String>,
     /// Let aibo switch on an application's accessibility tree so its content
     /// can be read (§8, macOS only).
     ///
@@ -696,6 +702,7 @@ impl Default for UiSettings {
     fn default() -> Self {
         Self {
             language: None,
+            selected_model: None,
             allow_ax_tree_activation: false,
             panel_hotkey: None,
             screen_capture_hotkey: None,
@@ -1043,7 +1050,7 @@ impl Config {
         registry: &ProviderRegistry,
         codex_authenticated: bool,
     ) -> Result<RoleBindings, ConfigError> {
-        if self.roles.is_empty() {
+        let mut bindings = if self.roles.is_empty() {
             // §4's shipped table, filtered to what is actually usable. A chain
             // whose primary is a provider the user never configured spends its
             // first request discovering that.
@@ -1055,36 +1062,87 @@ impl Config {
             if codex_authenticated {
                 self.retarget_codex_model(&mut seeded)?;
             }
-            return Ok(seeded);
+            seeded
+        } else {
+            let mut chains = Vec::new();
+            for (name, role_config) in &self.roles {
+                let role = parse_role(name)?;
+                let entries: Vec<ModelBinding> = role_config
+                    .entries
+                    .iter()
+                    .map(|e| ModelBinding {
+                        provider: ProviderId::new(e.provider.clone()),
+                        model: e.model.clone(),
+                    })
+                    .collect();
+                // Same pre-dispatch refusal as the seeded path, applied to a chain
+                // the user typed. §4's no-fallback-on-400 rule makes a rejected
+                // Codex id a dead end wherever it came from.
+                for binding in &entries {
+                    if binding.provider == ProviderId::CODEX {
+                        check_codex_model(&binding.model)?;
+                    }
+                }
+                chains.push(RoleChain {
+                    role,
+                    entries,
+                    fallback_enabled: role_config.fallback,
+                    allow_crossing_trust_boundary: role_config.allow_crossing_trust_boundary,
+                });
+            }
+            RoleBindings::from_chains(chains)?
+        };
+        self.apply_selected_model(&mut bindings, registry)?;
+        Ok(bindings)
+    }
+
+    /// Put the quick-pick's explicit choice at the front of the roles that
+    /// represent a user-selected general model. The provider must still exist
+    /// in the built registry; a stale preference after provider removal is
+    /// ignored rather than breaking startup.
+    fn apply_selected_model(
+        &self,
+        bindings: &mut RoleBindings,
+        registry: &ProviderRegistry,
+    ) -> Result<(), ConfigError> {
+        let Some(raw) = self.ui.selected_model.as_deref() else {
+            return Ok(());
+        };
+        let Some((provider, model)) = raw.split_once('/') else {
+            tracing::warn!(selected_model = raw, "ignoring malformed selected model");
+            return Ok(());
+        };
+        if provider.is_empty() || model.is_empty() {
+            tracing::warn!(selected_model = raw, "ignoring malformed selected model");
+            return Ok(());
+        }
+        let selected = ModelBinding {
+            provider: ProviderId::new(provider.to_owned()),
+            model: model.to_owned(),
+        };
+        if registry.get(&selected.provider).is_none() {
+            tracing::warn!(
+                selected_model = raw,
+                "selected model provider is not configured"
+            );
+            return Ok(());
+        }
+        if selected.provider == ProviderId::CODEX {
+            check_codex_model(&selected.model)?;
         }
 
-        let mut chains = Vec::new();
-        for (name, role_config) in &self.roles {
-            let role = parse_role(name)?;
-            let entries: Vec<ModelBinding> = role_config
-                .entries
-                .iter()
-                .map(|e| ModelBinding {
-                    provider: ProviderId::new(e.provider.clone()),
-                    model: e.model.clone(),
-                })
-                .collect();
-            // Same pre-dispatch refusal as the seeded path, applied to a chain
-            // the user typed. §4's no-fallback-on-400 rule makes a rejected
-            // Codex id a dead end wherever it came from.
-            for binding in &entries {
-                if binding.provider == ProviderId::CODEX {
-                    check_codex_model(&binding.model)?;
-                }
-            }
-            chains.push(RoleChain {
+        for role in [Role::Smart, Role::Vision, Role::Agent] {
+            let mut chain = bindings.chain(role).cloned().unwrap_or(RoleChain {
                 role,
-                entries,
-                fallback_enabled: role_config.fallback,
-                allow_crossing_trust_boundary: role_config.allow_crossing_trust_boundary,
+                entries: Vec::new(),
+                fallback_enabled: false,
+                allow_crossing_trust_boundary: false,
             });
+            chain.entries.retain(|binding| binding != &selected);
+            chain.entries.insert(0, selected.clone());
+            bindings.set_chain(chain)?;
         }
-        Ok(RoleBindings::from_chains(chains)?)
+        Ok(())
     }
 
     /// Point every seeded Codex entry at the model the user actually chose.
@@ -1316,6 +1374,34 @@ mod tests {
             1,
             "§14: fallback is a spend and privacy decision, so it is opt-in"
         );
+    }
+
+    #[test]
+    fn a_selected_azure_deployment_becomes_the_general_model() {
+        let config = Config::from_toml_str(
+            r#"
+            [ui]
+            selected_model = "azure-openai/team-gpt"
+
+            [[providers]]
+            backend = "azure"
+            base_url = "https://team.services.ai.azure.com"
+            models = ["team-gpt"]
+            "#,
+        )
+        .unwrap();
+
+        let (_, engine) = config.build(&FixedKey, PriceTable::empty()).unwrap();
+        for role in [Role::Smart, Role::Vision, Role::Agent] {
+            assert_eq!(
+                engine.bindings.primary(role),
+                Some(&ModelBinding {
+                    provider: ProviderId::AZURE_OPENAI,
+                    model: "team-gpt".to_owned(),
+                }),
+                "{role:?} must use the explicit quick-pick choice"
+            );
+        }
     }
 
     #[test]

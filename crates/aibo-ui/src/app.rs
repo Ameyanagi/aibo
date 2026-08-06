@@ -473,6 +473,8 @@ pub struct Aibo {
     settings: SettingsState,
     /// Last issued async file-list generation.
     file_list_generation: u64,
+    /// Last issued Files-settings directory-list generation.
+    directory_list_generation: u64,
     /// Last issued async workdir-list generation.
     workdir_list_generation: u64,
     /// Current dictation turn id; terminal events from older turns are ignored.
@@ -1133,6 +1135,7 @@ fn boot(config: UiConfig, requests: Sender<UiRequest>) -> (Aibo, Task<Message>) 
         settings_window: None,
         settings: SettingsState::default(),
         file_list_generation: 0,
+        directory_list_generation: 0,
         workdir_list_generation: 0,
         dictation_turn: 0,
         dictation_stopping: false,
@@ -1763,6 +1766,14 @@ fn request_file_list(state: &mut Aibo) {
     state.send(UiRequest::ListFiles {
         session: state.panel.session,
         generation: state.file_list_generation,
+    });
+}
+
+fn request_directory_list(state: &mut Aibo, parent: String) {
+    state.directory_list_generation = state.directory_list_generation.wrapping_add(1);
+    state.send(UiRequest::ListDirectories {
+        generation: state.directory_list_generation,
+        parent,
     });
 }
 
@@ -2843,6 +2854,18 @@ fn panel_update(state: &mut Aibo, message: panel::Message) -> Task<Message> {
             state.panel.perform_response_action(action);
             Task::none()
         }
+        M::TurnUserAction(index, action) => {
+            state.panel.perform_turn_user_action(index, action);
+            Task::none()
+        }
+        M::TurnAssistantAction(index, action) => {
+            state.panel.perform_turn_assistant_action(index, action);
+            Task::none()
+        }
+        M::ActiveUserAction(action) => {
+            state.panel.perform_active_user_action(action);
+            Task::none()
+        }
 
         M::ToggleContext => {
             if state.panel.includes_selection() {
@@ -3363,6 +3386,18 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
                 return Task::none();
             }
             state.settings.root_draft = draft;
+            if let Some(parent) = state
+                .settings
+                .root_completer
+                .update_draft(&state.settings.root_draft)
+            {
+                request_directory_list(state, parent);
+            }
+            Task::none()
+        }
+        M::RootComplete(path) => {
+            state.settings.root_draft = path;
+            state.settings.root_completer.dismiss();
             Task::none()
         }
         M::RootAdd => {
@@ -3385,6 +3420,7 @@ fn settings_update(state: &mut Aibo, message: settings::Message) -> Task<Message
                 PersistenceSnapshot::FileRoots(state.settings.file_roots.clone()),
             );
             state.settings.root_draft.clear();
+            let _ = state.settings.root_completer.update_draft("");
             state.settings.file_roots = Some(roots.clone());
             state.send(UiRequest::SetFileRoots {
                 generation,
@@ -3858,9 +3894,6 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 }
                 StreamEvent::Done(reason) => {
                     state.panel.phase = Phase::Finished { reason };
-                    // Typeset any display equations now that the text is
-                    // final (`crate::math`); streaming showed the raw TeX.
-                    state.panel.segment_finished_response();
                     aibo_platform::announce_accessibility(i18n::t(crate::i18n::Key::TaskCompleted));
                     // Give the caret back, **once, on completion**.
                     //
@@ -4242,6 +4275,14 @@ fn backend_update(state: &mut Aibo, event: UiEvent) -> Task<Message> {
                 return Task::none();
             }
             state.panel.file_finder.set_candidates(files);
+            Task::none()
+        }
+
+        UiEvent::DirectoryCandidates { generation, dirs } => {
+            if generation != state.directory_list_generation {
+                return Task::none();
+            }
+            state.settings.root_completer.set_candidates(dirs);
             Task::none()
         }
 
@@ -5327,6 +5368,10 @@ mod tests {
         ));
 
         let _ = settings_update(&mut state, settings::Message::RootDraft("~/dev".to_owned()));
+        assert!(matches!(
+            received.try_recv(),
+            Ok(UiRequest::ListDirectories { parent, .. }) if parent == "~/"
+        ));
         let _ = settings_update(&mut state, settings::Message::RootAdd);
         assert_eq!(
             state.settings.file_roots,
@@ -5336,7 +5381,11 @@ mod tests {
             state.settings.root_draft.is_empty(),
             "the draft is consumed"
         );
-        let _ = received.try_recv();
+        assert!(matches!(
+            received.try_recv(),
+            Ok(UiRequest::SetFileRoots { roots: Some(roots), .. })
+                if roots == ["/d/Desktop", "~/dev"]
+        ));
 
         let _ = settings_update(&mut state, settings::Message::RootsReset);
         assert_eq!(state.settings.file_roots, None);

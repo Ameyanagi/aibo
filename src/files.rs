@@ -19,6 +19,10 @@ const MAX_DEPTH: usize = 5;
 /// a bound because an unbounded walk of a mounted archive is a hang.
 const MAX_CANDIDATES: usize = 20_000;
 
+/// Immediate folders offered for one autocomplete path component. A directory
+/// with thousands of generated children should not make a settings field hang.
+const MAX_DIRECTORY_COMPLETIONS: usize = 256;
+
 /// The largest file the attach path will read. Bigger than any §5 context
 /// budget can use, small enough that a stray binary costs nothing.
 const MAX_FILE_BYTES: u64 = 256 * 1024;
@@ -121,6 +125,57 @@ pub fn walk(roots: &[PathBuf]) -> Vec<FileCandidate> {
         }
     }
     out
+}
+
+/// List the visible immediate child directories of `parent` for path
+/// completion. The field sends one path component at a time, so this stays
+/// cheap and lets yuru rank folder names without ever indexing ordinary files.
+///
+/// `~/` keeps its friendly spelling in the returned rows. A bare query is
+/// scoped to home by the UI; absolute and explicitly relative parents keep
+/// their own spelling semantics.
+pub fn directories(parent: &str) -> Vec<String> {
+    directories_with_home(parent, home_dir())
+}
+
+fn directories_with_home(parent: &str, home: Option<PathBuf>) -> Vec<String> {
+    let trimmed = parent.trim();
+    let expanded = if trimmed == "~" || trimmed == "~/" || trimmed == "~\\" {
+        let Some(home) = home.as_ref() else {
+            return Vec::new();
+        };
+        home.clone()
+    } else if let Some(rest) = trimmed
+        .strip_prefix("~/")
+        .or_else(|| trimmed.strip_prefix("~\\"))
+    {
+        let Some(home) = home.as_ref() else {
+            return Vec::new();
+        };
+        home.join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+
+    let Ok(entries) = std::fs::read_dir(expanded) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_str()
+                .is_some_and(|name| !name.starts_with('.'))
+        })
+        .map(|entry| entry.path())
+        .collect();
+    dirs.sort_by(|left, right| left.file_name().cmp(&right.file_name()));
+    dirs.truncate(MAX_DIRECTORY_COMPLETIONS);
+    dirs.into_iter()
+        .map(|path| display_path(&path, home.as_deref()))
+        .collect()
 }
 
 /// Read one picked file as bounded text.
@@ -231,5 +286,18 @@ mod tests {
         );
         assert_eq!(roots_with_home(None, home).len(), 3, "the default roots");
         assert!(roots_with_home(None, None).is_empty(), "no home, no walk");
+    }
+
+    #[test]
+    fn directory_completion_returns_folders_only() {
+        let home = tempfile::tempdir().expect("home");
+        std::fs::create_dir(home.path().join("統計資料")).expect("mkdir");
+        std::fs::create_dir(home.path().join("Documents")).expect("mkdir");
+        std::fs::create_dir(home.path().join(".hidden")).expect("mkdir");
+        std::fs::write(home.path().join("report.txt"), "x").expect("write");
+
+        let dirs = directories_with_home("~/", Some(home.path().to_path_buf()));
+        assert_eq!(dirs, vec!["~/Documents", "~/統計資料"]);
+        assert!(dirs.iter().all(|path| !path.ends_with("report.txt")));
     }
 }

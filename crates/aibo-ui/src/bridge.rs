@@ -497,6 +497,15 @@ pub enum UiRequest {
         generation: u64,
     },
 
+    /// List the immediate child directories of one path for the Files settings
+    /// autocomplete. Answered by [`UiEvent::DirectoryCandidates`].
+    ListDirectories {
+        /// Monotonic UI generation; stale listings must not replace newer results.
+        generation: u64,
+        /// Parent path in the spelling used by the field (including `~/`).
+        parent: String,
+    },
+
     /// Read one picked file so it can ride the fenced selection pipeline.
     /// Answered by [`UiEvent::FileAttached`] or [`UiEvent::FileAttachFailed`].
     AttachFile {
@@ -871,6 +880,14 @@ pub enum UiEvent {
         generation: u64,
         /// Bounded by the runtime's walk limits.
         files: Vec<FileCandidate>,
+    },
+
+    /// Folder-only candidates for the Files settings path autocomplete.
+    DirectoryCandidates {
+        /// Request generation, for last-request-wins delivery.
+        generation: u64,
+        /// Home-relative or absolute paths suitable for inserting into the field.
+        dirs: Vec<String>,
     },
 
     /// Candidate agent working directories, answering

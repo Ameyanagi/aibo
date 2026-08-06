@@ -19,6 +19,7 @@ use iced::widget::{
 };
 use iced::{Element, Length};
 use secrecy::{ExposeSecret as _, SecretString};
+use yuru_core::{Candidate, SearchConfig, build_index, search};
 
 use crate::hotkey::{Binding, FailureReason, HotkeyAction, HotkeyStatus};
 use crate::i18n::{self, Key, Lang};
@@ -334,6 +335,123 @@ pub struct PermissionRow {
     pub status: PermissionStatus,
 }
 
+/// Yuru-backed completion for one directory path component.
+///
+/// The runtime lists only the immediate folders under [`Self::parent`]. This
+/// state indexes only their final names, so path prefixes do not pollute the
+/// ranking and a romaji query can still find a Japanese folder name.
+#[derive(Debug, Clone)]
+pub struct RootCompleter {
+    parent: String,
+    query: String,
+    dirs: Vec<String>,
+    index: Vec<Candidate>,
+    config: SearchConfig,
+    dismissed: bool,
+}
+
+impl Default for RootCompleter {
+    fn default() -> Self {
+        Self {
+            parent: String::new(),
+            query: String::new(),
+            dirs: Vec::new(),
+            index: Vec::new(),
+            config: SearchConfig {
+                limit: 6,
+                ..SearchConfig::default()
+            },
+            dismissed: false,
+        }
+    }
+}
+
+impl RootCompleter {
+    /// Update the field text. Returns a parent that needs a fresh directory
+    /// listing; edits within the same final component reuse the warm index.
+    pub fn update_draft(&mut self, draft: &str) -> Option<String> {
+        self.dismissed = false;
+        let Some((parent, query)) = root_completion_parts(draft) else {
+            self.parent.clear();
+            self.query.clear();
+            self.dirs.clear();
+            self.index.clear();
+            return None;
+        };
+        self.query = query;
+        if self.parent == parent {
+            return None;
+        }
+        self.parent = parent.clone();
+        self.dirs.clear();
+        self.index.clear();
+        Some(parent)
+    }
+
+    /// Replace the folder-only candidate list returned by the runtime.
+    pub fn set_candidates(&mut self, dirs: Vec<String>) {
+        self.index = build_index(
+            dirs.iter().map(|path| directory_name(path).to_owned()),
+            crate::file_finder::japanese_backend(),
+            &self.config,
+        );
+        self.dirs = dirs;
+    }
+
+    /// Hide candidates after one was accepted; the next real edit reopens it.
+    pub fn dismiss(&mut self) {
+        self.dismissed = true;
+    }
+
+    /// Matching directory paths, best first.
+    pub fn results(&self) -> Vec<&str> {
+        if self.parent.is_empty() || self.dismissed {
+            return Vec::new();
+        }
+        if self.query.is_empty() {
+            return self
+                .dirs
+                .iter()
+                .take(self.config.limit)
+                .map(String::as_str)
+                .collect();
+        }
+        search(
+            &self.query,
+            &self.index,
+            crate::file_finder::japanese_backend(),
+            &self.config,
+        )
+        .into_iter()
+        .filter_map(|scored| self.dirs.get(scored.id).map(String::as_str))
+        .collect()
+    }
+}
+
+/// Split a typed path into the directory to list and the final component yuru
+/// should match. A bare name searches home, which is the useful interpretation
+/// in a field whose examples and defaults are all home-relative.
+fn root_completion_parts(draft: &str) -> Option<(String, String)> {
+    let draft = draft.trim();
+    if draft.is_empty() {
+        return None;
+    }
+    if draft == "~" {
+        return Some(("~/".to_owned(), String::new()));
+    }
+    match draft.rfind(['/', '\\']) {
+        Some(separator) => Some((
+            draft[..=separator].to_owned(),
+            draft[separator + 1..].to_owned(),
+        )),
+        None => Some(("~/".to_owned(), draft.to_owned())),
+    }
+}
+
+fn directory_name(path: &str) -> &str {
+    path.rsplit(['/', '\\']).next().unwrap_or(path)
+}
+
 /// Settings window state.
 #[derive(Debug, Clone, Default)]
 pub struct SettingsState {
@@ -413,6 +531,8 @@ pub struct SettingsState {
     pub default_file_roots: Vec<String>,
     /// A root being typed, not yet added.
     pub root_draft: String,
+    /// Folder-only path autocomplete state for [`Self::root_draft`].
+    pub root_completer: RootCompleter,
     /// The hotkey spec being typed, in `hotkey::parse` syntax.
     pub hotkey_draft: String,
     /// Whether the current [`Self::hotkey_draft`] failed to parse on apply.
@@ -786,6 +906,8 @@ pub enum Message {
     RootDraft(String),
     /// Add the drafted finder root.
     RootAdd,
+    /// Accept one folder-only autocomplete result into the draft.
+    RootComplete(String),
     /// Remove one finder root by position.
     RootRemove(usize),
     /// Return the finder roots to the platform defaults.
@@ -1964,6 +2086,10 @@ fn files(state: &SettingsState) -> Element<'_, Message> {
         );
     }
 
+    let completions = state.root_completer.results();
+    let submit = completions.first().map_or(Message::RootAdd, |path| {
+        Message::RootComplete((*path).to_owned())
+    });
     list = list.push(
         row![
             text_input(
@@ -1971,7 +2097,7 @@ fn files(state: &SettingsState) -> Element<'_, Message> {
                 &state.root_draft
             )
             .on_input(Message::RootDraft)
-            .on_submit(Message::RootAdd)
+            .on_submit(submit)
             .size(type_scale::BODY)
             .font(theme::MONO_FONT)
             .padding([space(1.5), space(2.0)])
@@ -1988,6 +2114,34 @@ fn files(state: &SettingsState) -> Element<'_, Message> {
         .align_y(iced::Alignment::Center)
         .spacing(space(2.0)),
     );
+    if !completions.is_empty() {
+        let mut choices = column![].spacing(space(0.5));
+        for path in completions {
+            choices = choices.push(
+                button(
+                    row![
+                        text("↳").size(type_scale::META).style(theme::text_dim),
+                        text(path)
+                            .size(type_scale::META)
+                            .font(theme::MONO_FONT)
+                            .style(theme::text_primary),
+                    ]
+                    .align_y(iced::Alignment::Center)
+                    .spacing(space(1.0)),
+                )
+                .width(Length::Fill)
+                .padding([space(1.0), space(2.0)])
+                .style(theme::list_row_button(false))
+                .on_press(Message::RootComplete(path.to_owned())),
+            );
+        }
+        list = list.push(
+            container(choices)
+                .width(Length::Fill)
+                .padding(space(1.0))
+                .style(theme::overlay_menu),
+        );
+    }
     if customised {
         list = list.push(
             button(
@@ -2793,5 +2947,35 @@ mod tests {
             "a debug or panic report must not disclose a recovery code"
         );
         let _ = history(&state);
+    }
+
+    #[test]
+    fn root_completion_matches_only_the_final_path_component_with_yuru() {
+        let mut completer = RootCompleter::default();
+        assert_eq!(
+            completer.update_draft("~/Documents/toukei"),
+            Some("~/Documents/".to_owned())
+        );
+        completer.set_candidates(vec![
+            "~/Documents/report".to_owned(),
+            "~/Documents/統計資料".to_owned(),
+        ]);
+        assert_eq!(completer.results(), vec!["~/Documents/統計資料"]);
+    }
+
+    #[test]
+    fn a_bare_folder_query_is_scoped_to_home() {
+        assert_eq!(
+            root_completion_parts("Doc"),
+            Some(("~/".to_owned(), "Doc".to_owned()))
+        );
+        assert_eq!(
+            root_completion_parts("/Users/x/Doc"),
+            Some(("/Users/x/".to_owned(), "Doc".to_owned()))
+        );
+        assert_eq!(
+            root_completion_parts("~/Documents/"),
+            Some(("~/Documents/".to_owned(), String::new()))
+        );
     }
 }
